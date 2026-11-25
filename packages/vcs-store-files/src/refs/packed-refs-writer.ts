@@ -18,6 +18,7 @@ import {
   PACKED_REFS_PEELED,
   type Ref,
 } from "@statewalker/vcs-core";
+import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { type AtomicFiles, atomicFilesOver } from "@statewalker/vcs-utils/files";
 import {
   createFilesRefOps,
@@ -34,8 +35,6 @@ export interface PackedRefsWriteOptions extends FilesRefBatchOptions {
    */
   atomicFiles?: AtomicFiles;
 }
-
-const enc = new TextEncoder();
 
 const opsFor = (files: FilesApi, gitDir: string, options: PackedRefsWriteOptions): FilesRefOps =>
   createFilesRefOps(options.atomicFiles ?? atomicFilesOver(files, gitDir), options);
@@ -62,7 +61,7 @@ export async function writePackedRefs(
 ): Promise<void> {
   // git's order: byte order of the names
   const sortedRefs = [...refs].sort((a, b) => compareRefNames(a.name, b.name));
-  const content = enc.encode(formatPackedRefs(sortedRefs, peeled));
+  const content = encodeGitPath(formatPackedRefs(sortedRefs, peeled));
   await opsFor(files, gitDir, options).updatePackedRefs(() => content);
 }
 
@@ -120,7 +119,7 @@ export async function addPackedRef(
     const index = refs.findIndex((r) => r.name === ref.name);
     if (index >= 0) refs[index] = ref;
     else refs.push(ref);
-    return enc.encode(
+    return encodeGitPath(
       formatPackedRefs(
         [...refs].sort((a, b) => compareRefNames(a.name, b.name)),
         peeled,
@@ -152,7 +151,7 @@ export async function removePackedRef(
     if (index < 0) return undefined;
     refs.splice(index, 1);
     removed = true;
-    return refs.length > 0 ? enc.encode(formatPackedRefs(refs, peeled)) : null;
+    return refs.length > 0 ? encodeGitPath(formatPackedRefs(refs, peeled)) : null;
   });
   return removed;
 }

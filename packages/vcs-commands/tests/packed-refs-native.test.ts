@@ -7,7 +7,7 @@
  * read under a header claiming them peeled).
  */
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -69,6 +69,24 @@ describeGit("packed-refs: written as native git writes it", () => {
     expect(packedRefs(mine)).toBe(packedRefs(theirs));
     expect(packedRefs(mine)).toMatch(/^# pack-refs with: peeled fully-peeled sorted \n/);
     expect(packedRefs(mine)).toMatch(/refs\/tags\/v1-nested\n\^[0-9a-f]{40}\n/);
+  });
+
+  it("pack-refs --all: a branch whose name holds a non-UTF-8 byte is packed as git packs it (#376)", async () => {
+    const dir = repo();
+    // refs/heads/caf\xe9 (Latin-1) and refs/heads/caf\xc3\xa9 (UTF-8): argv bytes through sh
+    execFileSync(
+      "sh",
+      ["-c", `git branch "$(printf 'caf\\351')" && git branch "$(printf 'caf\\303\\251')"`],
+      { cwd: dir, env: testEnv(root) },
+    );
+    const [theirs, mine] = twins(dir);
+    git(theirs, ["pack-refs", "--all"]);
+    await (await ours(mine)).packRefs().setAll(true).call();
+    expect(packedRefs(mine)).toContain(" refs/heads/caf\xe9\n");
+    expect(packedRefs(mine)).toBe(packedRefs(theirs));
+    expect(readdirSync(join(mine, ".git/refs/heads"))).toEqual(
+      readdirSync(join(theirs, ".git/refs/heads")),
+    );
   });
 
   it("branch -D of a packed branch: packed-refs rewritten as git rewrites it", async () => {

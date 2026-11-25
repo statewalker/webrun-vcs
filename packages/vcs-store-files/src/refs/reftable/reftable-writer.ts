@@ -27,6 +27,7 @@
  */
 
 import { deflateSync } from "@statewalker/vcs-utils/compression";
+import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import { crc32 } from "@statewalker/vcs-utils/hash/crc32";
 import { hexToBytes } from "@statewalker/vcs-utils/hash/utils";
@@ -92,7 +93,6 @@ const TYPE_INDEX = 0x69;
 const FORMAT_ID_SHA256 = 0x73323536; // "s256"
 const LOG_COMPRESSION_LEVEL = 9;
 
-const encoder = new TextEncoder();
 const EMPTY = new Uint8Array(0);
 
 class TooBig extends Error {}
@@ -257,11 +257,11 @@ interface IndexEntry {
   offset: number;
 }
 
-const refKey = (name: string) => encoder.encode(name);
+const refKey = (name: string) => encodeGitPath(name);
 
 /** git's log key: the name, a NUL, and the update index reversed (newest sorts first). */
 function logKey(refName: string, updateIndex: number): Uint8Array {
-  const name = encoder.encode(refName);
+  const name = encodeGitPath(refName);
   const key = new Uint8Array(name.length + 9);
   key.set(name);
   put64(key, name.length + 1, 0xffffffffffffffffn - BigInt(updateIndex));
@@ -493,7 +493,7 @@ export function writeReftable(
         else if (value.type === "peeled") {
           out.put(id(value.id));
           out.put(id(value.peeled));
-        } else if (value.type === "symref") out.string(encoder.encode(value.target));
+        } else if (value.type === "symref") out.string(encodeGitPath(value.target));
       },
     });
     if (indexObjects && (value.type === "id" || value.type === "peeled")) {
@@ -529,9 +529,9 @@ export function writeReftable(
       }
       const old = id(update.oldId);
       const neu = id(update.newId);
-      const name = encoder.encode(update.name);
-      const email = encoder.encode(update.email);
-      const text = encoder.encode(message);
+      const name = encodeGitPath(update.name);
+      const email = encodeGitPath(update.email);
+      const text = encodeGitPath(message);
       add(TYPE_LOG, {
         key,
         valueType: 1,
