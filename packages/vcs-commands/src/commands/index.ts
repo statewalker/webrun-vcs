@@ -141,6 +141,7 @@ export * from "./patch-id-command.js";
 export { type PatchIdTextOptions, patchIdsOfPatchText } from "./patch-id.js";
 export * from "./status-command.js";
 export * from "./url-parse-command.js";
+export * from "./var-command.js";
 export * from "./stripspace-command.js";
 export * from "./status-format.js";
 export * from "./submodule-add-command.js";

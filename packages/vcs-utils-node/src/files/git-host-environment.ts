@@ -72,10 +72,33 @@ export interface NodeGitHostEnvironmentOptions {
   effectiveUid?: number | null;
   /** git's runtime prefix for `%(prefix)/` (default `/usr`, as a distribution's git) */
   prefix?: string;
+  /** The build's `DEFAULT_EDITOR` (default `vi`) */
+  defaultEditor?: string;
+  /** The build's `DEFAULT_PAGER` (default `less`) */
+  defaultPager?: string;
 }
+
+/** The variables naming the user's editor and pager, as `git var` reads them. */
+const PROGRAM_VARIABLES = [
+  "GIT_EDITOR",
+  "GIT_SEQUENCE_EDITOR",
+  "VISUAL",
+  "EDITOR",
+  "TERM",
+  "GIT_PAGER",
+  "PAGER",
+] as const;
 
 /** The environment as `GitHostEnvironment` describes it. */
 export interface NodeGitHostEnvironment {
+  defaultEditor?: string;
+  defaultPager?: string;
+  programVariables?: Partial<
+    Record<
+      "GIT_EDITOR" | "GIT_SEQUENCE_EDITOR" | "VISUAL" | "EDITOR" | "TERM" | "GIT_PAGER" | "PAGER",
+      string
+    >
+  >;
   readFile(path: string): Promise<Uint8Array | undefined>;
   /** The Node storage holding a host path (`git config --global` writes through it) */
   hostFilesOf(path: string): Promise<{ files: FilesApi; path: string }>;
@@ -418,6 +441,9 @@ export function createNodeGitHostEnvironment(
     ...(env.GIT_ICASE_PATHSPECS !== undefined ? { icase: env.GIT_ICASE_PATHSPECS } : {}),
   };
   const pathspecs = Object.keys(pathspecFlags).length > 0 ? pathspecFlags : undefined;
+  const programVariables = Object.fromEntries(
+    PROGRAM_VARIABLES.filter((name) => env[name] !== undefined).map((name) => [name, env[name]]),
+  ) as Partial<Record<(typeof PROGRAM_VARIABLES)[number], string>>;
   const effectiveUid =
     options.effectiveUid === null
       ? undefined
@@ -444,6 +470,9 @@ export function createNodeGitHostEnvironment(
     }
   };
   return {
+    programVariables,
+    ...(options.defaultEditor !== undefined ? { defaultEditor: options.defaultEditor } : {}),
+    ...(options.defaultPager !== undefined ? { defaultPager: options.defaultPager } : {}),
     readFile: readHostFile,
     hostFilesOf: async (path: string) => {
       if (options.files) return { files: options.files, path };

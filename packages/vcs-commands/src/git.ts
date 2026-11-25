@@ -24,6 +24,7 @@ import {
   BundleUnbundleCommand,
   BundleVerifyCommand,
   CheckMailmapCommand,
+  VarCommand,
   PatchIdCommand,
   UrlParseCommand,
   StripspaceCommand,
@@ -971,6 +972,20 @@ export class Git implements Disposable {
   checkMailmap(): CheckMailmapCommand {
     this.checkClosed();
     return new CheckMailmapCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a VarCommand (`git var`): one of git's logical variables (`GIT_AUTHOR_IDENT`,
+   * `GIT_EDITOR`, `GIT_PAGER`, `GIT_DEFAULT_BRANCH`, ...), or the configuration and all of them (`-l`).
+   *
+   * @example
+   * ```typescript
+   * await git.var().setVariable("GIT_DEFAULT_BRANCH").call(); // { exitCode: 0, stdout: "master\\n", stderr: "" }
+   * ```
+   */
+  var(): VarCommand {
+    this.checkClosed();
+    return new VarCommand(this._workingCopy);
   }
 
   /**
