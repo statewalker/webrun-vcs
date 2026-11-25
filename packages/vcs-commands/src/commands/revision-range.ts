@@ -57,6 +57,11 @@ export interface RevisionArgOptions {
   refs?(): Promise<RefTip[]>;
   /** What HEAD names (`--all` adds it after the refs); undefined when it names nothing */
   head?(): Promise<ObjectId | undefined>;
+  /**
+   * `--ignore-missing`: a revision that names nothing is skipped instead of dying
+   * (handle_revision_arg's `revs->ignore_missing`), on the command line and in `--stdin`
+   */
+  ignoreMissing?: boolean;
 }
 
 /**
@@ -227,7 +232,7 @@ export async function parseRevisionArgs(
       }
     }
     const ok = await handleRevisionArg(resolver, arg, not, options, entries, true);
-    if (ok === false) {
+    if (ok === false && !options.ignoreMissing) {
       // revisions given apart from paths (after them comes `--`): git's `bad revision`
       throw new RevisionError(
         arg,
@@ -282,7 +287,7 @@ async function readStdinRevisions(
       throw new RevisionError(arg, `fatal: invalid option '${arg}' in --stdin mode`);
     }
     const ok = await handleRevisionArg(resolver, arg, not, options, out, true);
-    if (ok === false) {
+    if (ok === false && !options.ignoreMissing) {
       throw new RevisionError(
         arg,
         [...resolver.warnings, `fatal: bad revision '${arg}'`].join("\n"),

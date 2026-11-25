@@ -58,6 +58,7 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
   private readonly revisions: RevisionArg[] = [];
   private readonly mixed: string[] = [];
   private committish = true;
+  private ignoreMissing = false;
   private logConfig = false;
   private readonly configure: ((log: LogCommand) => void)[] = [];
   /** The paths of {@link addPath}, for `--bisect`'s walk */
@@ -389,6 +390,13 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
     return this;
   }
 
+  /** `--ignore-missing`: revisions that name nothing are skipped instead of dying. */
+  setIgnoreMissing(ignore: boolean): this {
+    this.checkCallable();
+    this.ignoreMissing = ignore;
+    return this;
+  }
+
   /**
    * Read plain revisions as committishes, as `git log` does (the default), or as given, as
    * `git rev-list` does (it matters only to an abbreviated id that names several objects).
@@ -493,6 +501,7 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
     let tips: Promise<RefTip[]> | undefined;
     const options = {
       committish: this.committish,
+      ...(this.ignoreMissing ? { ignoreMissing: true } : {}),
       mergeBases: (a: string, b: string) => revisionMergeBases(this.walkCommits, a, b),
       refs: () => {
         tips ??= this.refTips();
