@@ -53,6 +53,17 @@ export class LfsEndpointCommand extends GitCommand<LfsEndpointResult> {
   private credentialOrigins: string[] = [];
   private credentialsFor?: CredentialsForUrl;
   private headersFor?: HeadersForUrl;
+  private compatibility?: string;
+
+  /**
+   * The git-lfs version to follow (default `LFS_DEFAULT_COMPATIBILITY`, see
+   * `LfsConfigLoadOptions.compatibility`).
+   */
+  setCompatibility(version: string): this {
+    this.checkCallable();
+    this.compatibility = version;
+    return this;
+  }
 
   /** `download` (default) or `upload` (`lfs.pushurl`, `lfspushurl`, `pushurl`, `pushInsteadOf`). */
   setOperation(operation: LfsEndpointOperation): this {
@@ -119,7 +130,8 @@ export class LfsEndpointCommand extends GitCommand<LfsEndpointResult> {
   async call(): Promise<LfsEndpointResult> {
     this.checkCallable();
     this.setCallable(false);
-    const lfs = await LfsConfig.load(this._workingCopy);
+    const compat = this.compatibility !== undefined ? { compatibility: this.compatibility } : {};
+    const lfs = await LfsConfig.load(this._workingCopy, compat);
     const choice =
       this.remote !== undefined
         ? { name: this.remote, fromLfsconfig: false }
@@ -131,7 +143,7 @@ export class LfsEndpointCommand extends GitCommand<LfsEndpointResult> {
     if (origins.length === 0 && (this.credentials || this.headers)) {
       // the user's own endpoint: `.lfsconfig` left out entirely, its remote choice too (it may
       // name a URL as the default remote, or turn `git://` into `http://`)
-      const mine = await LfsConfig.load(this._workingCopy, { withoutLfsconfig: true });
+      const mine = await LfsConfig.load(this._workingCopy, { ...compat, withoutLfsconfig: true });
       const own = await mine.endpoint(
         this.operation,
         this.remote ?? mine.remoteChoice(this.operation).name,

@@ -61,6 +61,7 @@ import {
   InitCommand,
   InterpretTrailersCommand,
   LfsConfig,
+  type LfsConfigLoadOptions,
   LfsEndpointCommand,
   ListBranchCommand,
   ListTagCommand,
@@ -1269,9 +1270,9 @@ export class Git implements Disposable {
   }
 
   /** The Git LFS configuration (`.lfsconfig` and the git configuration, as git-lfs merges them). */
-  async lfsConfig(): Promise<LfsConfig> {
+  async lfsConfig(options: LfsConfigLoadOptions = {}): Promise<LfsConfig> {
     this.checkClosed();
-    return LfsConfig.load(this._workingCopy);
+    return LfsConfig.load(this._workingCopy, options);
   }
 
   var(): VarCommand {

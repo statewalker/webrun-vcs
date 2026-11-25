@@ -29,9 +29,10 @@ import { collectChunks, type WorkingCopy } from "@statewalker/vcs-working-tree";
 
 import { GitCommand } from "../../git-command.js";
 import { RemoteConfigStore } from "../../remote-config/index.js";
+import { gitFileOf } from "../git-hooks.js";
 import { hostEnvironmentOf } from "../git-ident.js";
 import { worktreeHostPath } from "../submodule-model.js";
-import { type GoUrl, goUrlParse, goUrlString } from "./go-url.js";
+import { type GoUrl, goEscapedPath, goUrlParse, goUrlString } from "./go-url.js";
 
 /** The LFS operation an endpoint is for. */
 export type LfsEndpointOperation = "download" | "upload";
@@ -57,7 +58,9 @@ export type LfsEndpointSource =
   | "remote.pushurl"
   | "remote.url"
   /** The remote's name read as a URL (a remote without URL, or a URL given as the remote) */
-  | "remote.name";
+  | "remote.name"
+  /** git-lfs 3.5+: the URL `FETCH_HEAD`'s first line names (`origin` without any URL) */
+  | "fetch-head";
 
 /** An LFS endpoint, as git-lfs's `lfshttp.Endpoint`. */
 export interface LfsEndpoint {
@@ -111,6 +114,42 @@ type HostStat = (path: string) => Promise<"file" | "directory" | "other" | undef
 export interface LfsConfigLoadOptions {
   /** Leave `.lfsconfig` out (the user's own configuration alone) */
   withoutLfsconfig?: boolean;
+  /**
+   * The git-lfs version to follow (default {@link LFS_DEFAULT_COMPATIBILITY}): 3.5 added the
+   * `FETCH_HEAD` fallback; 3.8.1 takes from `.lfsconfig` only `remote.<name>.lfsurl` of the
+   * `remote.*` keys and only `lfs.*.access` of the access keys, and escapes the path of an ssh
+   * remote's HTTPS fallback
+   */
+  compatibility?: string;
+}
+
+/** The git-lfs version followed by default. */
+export const LFS_DEFAULT_COMPATIBILITY = "3.8.1";
+
+/** `version` is at least `min` (dotted numbers). */
+function atLeast(version: string, min: string): boolean {
+  const a = version.split(".").map((n) => Number.parseInt(n, 10) || 0);
+  const b = min.split(".").map((n) => Number.parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const d = (a[i] ?? 0) - (b[i] ?? 0);
+    if (d !== 0) return d > 0;
+  }
+  return true;
+}
+
+/** What a git-lfs version does (see {@link LfsConfigLoadOptions.compatibility}). */
+interface LfsFeatures {
+  fetchHead: boolean;
+  strictLfsconfig: boolean;
+  escapedSshPath: boolean;
+}
+
+function featuresOf(version: string): LfsFeatures {
+  return {
+    fetchHead: atLeast(version, "3.5.0"),
+    strictLfsconfig: atLeast(version, "3.8.1"),
+    escapedSshPath: atLeast(version, "3.8.1"),
+  };
 }
 
 /** Reads `.lfsconfig` as git-lfs's `Sources` does. */
@@ -229,6 +268,9 @@ export class LfsConfig {
     private readonly currentBranch: string | undefined,
     private readonly stat: HostStat,
     private readonly cwd: string | undefined,
+    private readonly features: LfsFeatures,
+    /** The first line of the worktree's `FETCH_HEAD`, when there is one */
+    private readonly fetchHeadLine: string | undefined,
   ) {
     this.gitProtocol = this.get("lfs.gitprotocol") ?? "https";
     // initAliases: every `url.<base>.insteadof` / `.pushinsteadof` value names an alias
@@ -264,6 +306,7 @@ export class LfsConfig {
     workingCopy: WorkingCopy,
     options: LfsConfigLoadOptions = {},
   ): Promise<LfsConfig> {
+    const features = featuresOf(options.compatibility ?? LFS_DEFAULT_COMPATIBILITY);
     const warnings: string[] = [];
     const errors: string[] = [];
     const sources: { lines: [string, string][]; onlySafeKeys: boolean }[] = [];
@@ -317,14 +360,21 @@ export class LfsConfig {
           }
           if (parts[3] === "priority") allowed = true;
         } else if (parts.length > 1 && parts[0] === "remote") {
-          if (source.onlySafeKeys && parts.length === 3 && parts[2] !== "lfsurl") {
+          const unsafe = features.strictLfsconfig
+            ? parts.length < 3 || parts[parts.length - 1] !== "lfsurl"
+            : parts.length === 3 && parts[2] !== "lfsurl";
+          if (source.onlySafeKeys && unsafe) {
             ignored.push(key);
             continue;
           }
           allowed = true;
           const remote = parts.slice(1, parts.length - 1).join(".");
           if (!remotes.includes(remote)) remotes.push(remote);
-        } else if (parts.length > 2 && parts[parts.length - 1] === "access") {
+        } else if (
+          parts.length > 2 &&
+          (!features.strictLfsconfig || parts[0] === "lfs") &&
+          parts[parts.length - 1] === "access"
+        ) {
           allowed = true;
         }
         if (!allowed && !SAFE_KEYS.has(key)) {
@@ -356,6 +406,8 @@ export class LfsConfig {
       await currentBranchOf(workingCopy),
       stat,
       await worktreeHostPath(workingCopy).catch(() => undefined),
+      features,
+      features.fetchHead ? await fetchHeadLineOf(workingCopy) : undefined,
     );
   }
 
@@ -449,15 +501,38 @@ export class LfsConfig {
     const lfsurl = this.entry(`remote.${name}.lfsurl`);
     if (lfsurl) return this.newEndpoint(operation, lfsurl, "remote.lfsurl", name);
     const git = this.gitRemoteUrl(name, operation === "upload");
-    if (git) {
-      const ep = await this.newEndpoint(operation, git.entry, git.source, name);
-      if (ep.url === LFS_URL_UNKNOWN) return ep;
-      if (ep.url.endsWith("/")) ep.url = ep.url.slice(0, -1);
-      if (ep.url.startsWith("file://")) return ep;
-      ep.url += pathExt(ep.url) === ".git" ? "/info/lfs" : ".git/info/lfs";
-      return ep;
+    if (git) return this.cloneUrlEndpoint(operation, operation, git.entry, git.source, name);
+    // git-lfs 3.5+: the URL of FETCH_HEAD's first line, for `origin` only, read as a download
+    if (name === "origin" && this.fetchHeadLine !== undefined) {
+      const url = fetchHeadUrl(this.fetchHeadLine);
+      if (url !== undefined) {
+        return this.cloneUrlEndpoint(
+          operation,
+          "download",
+          { value: url, lfsconfig: false },
+          "fetch-head",
+          name,
+        );
+      }
     }
     return { url: "", operation, remote: name, fromLfsconfig: false };
+  }
+
+  /** git-lfs's `NewEndpointFromCloneURL`: the URL with `.git/info/lfs` appended. */
+  private async cloneUrlEndpoint(
+    operation: LfsEndpointOperation,
+    aliasOperation: LfsEndpointOperation,
+    entry: LfsValue,
+    source: LfsEndpointSource,
+    name: string,
+  ): Promise<LfsEndpoint> {
+    const ep = await this.newEndpoint(aliasOperation, entry, source, name);
+    ep.operation = operation;
+    if (ep.url === LFS_URL_UNKNOWN) return ep;
+    if (ep.url.endsWith("/")) ep.url = ep.url.slice(0, -1);
+    if (ep.url.startsWith("file://")) return ep;
+    ep.url += pathExt(ep.url) === ".git" ? "/info/lfs" : ".git/info/lfs";
+    return ep;
   }
 
   /** git-lfs's `GitRemoteURL`: `pushurl` (push), `url`, else the name if it is a remote or a URL. */
@@ -505,13 +580,13 @@ export class LfsConfig {
     try {
       u = goUrlParse(rawurl);
     } catch {
-      return endpointFromBareSshUrl(rawurl);
+      return endpointFromBareSshUrl(rawurl, this.features.escapedSshPath);
     }
     switch (u.scheme) {
       case "ssh":
       case "git+ssh":
       case "ssh+git":
-        return endpointFromSshUrl(u);
+        return endpointFromSshUrl(u, this.features.escapedSshPath);
       case "http":
       case "https":
       case "file":
@@ -522,13 +597,13 @@ export class LfsConfig {
         if ((await this.stat(this.hostPath(rawurl))) !== undefined) {
           return { url: await this.localPathUrl(rawurl) };
         }
-        return endpointFromBareSshUrl(goUrlString(u));
+        return endpointFromBareSshUrl(goUrlString(u), this.features.escapedSshPath);
       default:
         if (rawurl.startsWith(`${u.scheme}::`)) return { url: rawurl };
         if ((await this.stat(this.hostPath(rawurl))) !== undefined) {
           return { url: await this.localPathUrl(rawurl) };
         }
-        return endpointFromBareSshUrl(goUrlString(u));
+        return endpointFromBareSshUrl(goUrlString(u), this.features.escapedSshPath);
     }
   }
 
@@ -587,20 +662,23 @@ function isRemoteUrl(remote: string): boolean {
 }
 
 /** git-lfs's `EndpointFromSshUrl`. */
-function endpointFromSshUrl(u: GoUrl): { url: string; ssh?: LfsSshMetadata } {
+function endpointFromSshUrl(u: GoUrl, escaped: boolean): { url: string; ssh?: LfsSshMetadata } {
   const match = /^([^:]+)(?::(\d+))?$/.exec(u.host);
   if (!match) return { url: LFS_URL_UNKNOWN };
   const host = match[1] as string;
   const userAndHost =
     u.user !== undefined && u.user.username !== "" ? `${u.user.username}@${host}` : host;
   return {
-    url: `https://${host}${u.path}`,
+    url: `https://${host}${escaped ? goEscapedPath(u.path) : u.path}`,
     ssh: { userAndHost, port: match[2] ?? "", path: u.path },
   };
 }
 
 /** git-lfs's `EndpointFromBareSshUrl`: `user@host:path`, `[user@host:port]:path`. */
-function endpointFromBareSshUrl(rawurl: string): { url: string; ssh?: LfsSshMetadata } {
+function endpointFromBareSshUrl(
+  rawurl: string,
+  escaped: boolean,
+): { url: string; ssh?: LfsSshMetadata } {
   const parts = rawurl.split(":");
   if (parts.length < 2) return { url: rawurl };
   let newPath: string;
@@ -617,7 +695,7 @@ function endpointFromBareSshUrl(rawurl: string): { url: string; ssh?: LfsSshMeta
   } catch {
     return { url: LFS_URL_UNKNOWN };
   }
-  const endpoint = endpointFromSshUrl(u);
+  const endpoint = endpointFromSshUrl(u, escaped);
   if (endpoint.ssh?.path.startsWith("/")) endpoint.ssh.path = endpoint.ssh.path.slice(1);
   return endpoint;
 }
@@ -636,4 +714,22 @@ class HeadBranchReader extends GitCommand<string | undefined> {
     if ((await this.resolveRevision("HEAD").catch(() => undefined)) === undefined) return undefined;
     return ref.slice("refs/heads/".length);
   }
+}
+
+/** git-lfs's `ExtractRemoteUrl`: the URL of a FETCH_HEAD line, if it matches. */
+function fetchHeadUrl(line: string): string | undefined {
+  const match =
+    /^[a-f0-9]{40,64}\t(not-for-merge)?\t(tag |branch |)'.*' of ([/.\-:_a-zA-Z0-9]+)$/.exec(line);
+  return match ? (match[3] as string).trim() : undefined;
+}
+
+/** The first line of the worktree's `FETCH_HEAD` (git-lfs's `parseFetchHead`). */
+async function fetchHeadLineOf(workingCopy: WorkingCopy): Promise<string | undefined> {
+  const file = await gitFileOf(workingCopy, "FETCH_HEAD").catch(() => undefined);
+  if (!file) return undefined;
+  const bytes = await collectChunks(file.files.read(file.path)).catch(() => undefined);
+  if (!bytes || bytes.length === 0) return undefined;
+  const text = new TextDecoder().decode(bytes);
+  const end = text.indexOf("\n");
+  return end < 0 ? text : text.slice(0, end);
 }

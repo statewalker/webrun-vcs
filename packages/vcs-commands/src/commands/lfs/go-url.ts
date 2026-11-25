@@ -333,6 +333,11 @@ function escapedFragment(u: GoUrl): string {
   return goEscape(u.fragment, "fragment");
 }
 
+/** `(&url.URL{Path: path}).EscapedPath()`. */
+export function goEscapedPath(path: string): string {
+  return path === "*" ? "*" : goEscape(path, "path");
+}
+
 /** Go's `(*URL).String`. */
 export function goUrlString(u: GoUrl): string {
   let buf = "";

@@ -48,6 +48,13 @@ function gitLfsAvailable(): boolean {
 
 const hasGitLfs = process.platform === "linux" && gitLfsAvailable();
 
+/** The installed git-lfs's version (`git-lfs/3.4.1 (...)`): ours follows it. */
+const lfsVersion = hasGitLfs
+  ? (/git-lfs\/(\d+\.\d+\.\d+)/.exec(execFileSync("git", ["lfs", "version"]).toString())?.[1] ??
+    "3.8.1")
+  : "3.8.1";
+const compat = { compatibility: lfsVersion };
+
 let root: string;
 let counter = 0;
 
@@ -131,7 +138,7 @@ async function oursBare(dir: string): Promise<Git> {
 
 /** Ours as `git lfs env` prints it. */
 async function oursEnv(g: Git): Promise<{ endpoints: string[]; warnings: string[] }> {
-  const lfs = await g.lfsConfig();
+  const lfs = await g.lfsConfig(compat);
   const blocks: string[] = [];
   const show = (label: string, ep: { url: string; ssh?: { userAndHost: string; path: string } }) =>
     blocks.push(
@@ -158,7 +165,7 @@ async function compare(
 ): Promise<void> {
   expect(await oursEnv(g)).toEqual(nativeEnv(dir));
   if (!options.locks) return;
-  const lfs = await g.lfsConfig();
+  const lfs = await g.lfsConfig(compat);
   for (const upload of [false, true]) {
     for (const remote of [undefined, ...(options.remotes ?? [])]) {
       const native = nativeLocks(dir, upload, remote);
@@ -210,12 +217,14 @@ describe.skipIf(!hasGitLfs)("LFS endpoint as git-lfs resolves it", { timeout: 60
     commitFile(dir, ".lfsconfig", "[lfs]\n\turl = http://127.0.0.1:1/from-lfsconfig\n");
     const g = await ours(dir);
     await compare(dir, g, { locks: true, remotes: ["origin"] });
-    const ep = await g.lfsEndpoint().call();
+    const ep = await g.lfsEndpoint().setCompatibility(lfsVersion).call();
     expect(ep).toMatchObject({ source: "lfs.url", fromLfsconfig: true });
     git(dir, "config", "lfs.url", "http://127.0.0.1:1/from-config");
     const g2 = await ours(dir);
     await compare(dir, g2, { locks: true, remotes: ["origin"] });
-    expect(await g2.lfsEndpoint().call()).toMatchObject({ fromLfsconfig: false });
+    expect(await g2.lfsEndpoint().setCompatibility(lfsVersion).call()).toMatchObject({
+      fromLfsconfig: false,
+    });
   });
 
   it('LfsConfigGitTest, t-config.sh "lfsconfig in index": .lfsconfig from the index, then HEAD', async () => {
@@ -236,7 +245,9 @@ describe.skipIf(!hasGitLfs)("LFS endpoint as git-lfs resolves it", { timeout: 60
   it("LfsConfigGitTest: nothing configured", async () => {
     const dir = repo();
     await compare(dir, await ours(dir));
-    expect((await (await ours(dir)).lfsEndpoint().call()).url).toBe("");
+    expect((await (await ours(dir)).lfsEndpoint().setCompatibility(lfsVersion).call()).url).toBe(
+      "",
+    );
   });
 
   it("endpoint_finder_test.go TestEndpointOverridesOrigin, TestEndpointUseAlternateRemote, TestEndpointGlobalSeparateLfsPush", async () => {
@@ -376,7 +387,9 @@ describe.skipIf(!hasGitLfs)("LFS endpoint as git-lfs resolves it", { timeout: 60
     // git-lfs runs in the bare repository's directory
     const g = await oursBare(dir);
     expect(await oursEnv(g)).toEqual(nativeEnv(dir));
-    expect(nativeLocks(dir, false)).toBe((await g.lfsEndpoint().call()).url);
+    expect(nativeLocks(dir, false)).toBe(
+      (await g.lfsEndpoint().setCompatibility(lfsVersion).call()).url,
+    );
   });
 
   it("local paths and file:// URLs", async () => {
@@ -414,8 +427,32 @@ describe.skipIf(!hasGitLfs)("LFS endpoint as git-lfs resolves it", { timeout: 60
     writeFileSync(join(dir, ".lfsconfig"), "[lfs\n");
     const g = await ours(dir);
     await compare(dir, g);
-    expect((await g.lfsConfig()).errors).toEqual([
+    expect((await g.lfsConfig(compat)).errors).toEqual([
       "Error reading `git config`: fatal: bad config line 1 in file .lfsconfig",
     ]);
+  });
+
+  it("git-lfs 3.5+: origin without any URL falls back on FETCH_HEAD's first line", async () => {
+    const dir = repo();
+    commitFile(dir, "a", "a");
+    const id = git(dir, "rev-parse", "HEAD").trim();
+    writeFileSync(
+      join(dir, ".git/FETCH_HEAD"),
+      `${id}\t\tbranch 'main' of http://127.0.0.1:1/fetched\n${id}\tnot-for-merge\tbranch 'x' of http://127.0.0.1:1/other\n`,
+    );
+    await compare(dir, await ours(dir), { locks: true, remotes: ["origin"] });
+    // a line the pattern refuses (an ssh URL holds `@`): no endpoint
+    writeFileSync(join(dir, ".git/FETCH_HEAD"), `${id}\t\tbranch 'main' of git@host:x\n`);
+    await compare(dir, await ours(dir), { locks: true, remotes: ["origin"] });
+    // another remote's own URL wins, and a remote other than origin never reads FETCH_HEAD
+    git(dir, "config", "remote.up.url", "http://127.0.0.1:1/up");
+    await compare(dir, await ours(dir), { locks: true, remotes: ["origin", "up"] });
+  });
+
+  it("ssh paths that need escaping (git-lfs 3.8.1 escapes the HTTPS fallback's path)", async () => {
+    const dir = repo();
+    git(dir, "config", "remote.origin.url", "ssh://git@example.com/a b/c%41/ü");
+    git(dir, "config", "remote.bare.url", "git@example.com:x y/z?.git");
+    await compare(dir, await ours(dir));
   });
 });
