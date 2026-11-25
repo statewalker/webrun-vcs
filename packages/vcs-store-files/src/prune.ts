@@ -15,8 +15,7 @@ import {
   objectsWithoutLazyFetch,
 } from "@statewalker/vcs-core";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
-import { objectLinks, typeOfObject } from "./cruft-pack.js";
-import { recentPackedObjects } from "./gc.js";
+import { objectLinks, recentPackedObjects, typeOfObject } from "./cruft-pack.js";
 import { promisorExclusions } from "./promisor-objects.js";
 import { listReachableObjects, rebaseFileRoots } from "./reachable-objects.js";
 import { assertObjectsDeletable, readRepositoryFormat } from "./repository-format.js";
