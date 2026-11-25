@@ -28,6 +28,7 @@ import {
   CheckIgnoreCommand,
   CheckMailmapCommand,
   CheckoutCommand,
+  CheckoutIndexCommand,
   CheckRefFormatCommand,
   CherryCommand,
   CherryPickCommand,
@@ -67,6 +68,7 @@ import {
   LsTreeCommand,
   MergeBaseCommand,
   MergeCommand,
+  MktagCommand,
   MvCommand,
   NameRevCommand,
   NotesCommands,
@@ -134,6 +136,7 @@ import {
   SwitchCommand,
   TagCommand,
   UnsetUpstreamBranchCommand,
+  UpdateIndexCommand,
   UrlParseCommand,
   VarCommand,
   VerifyCommitCommand,
@@ -833,6 +836,48 @@ export class Git implements Disposable {
   readTree(): ReadTreeCommand {
     this.checkClosed();
     return new ReadTreeCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a CheckoutIndexCommand writing index entries into the worktree, under a prefix
+   * or into temporary files (`git checkout-index`).
+   *
+   * @example
+   * ```typescript
+   * await git.checkoutIndex().setAll(true).setForce(true).setUpdateIndex(true).call();
+   * ```
+   */
+  checkoutIndex(): CheckoutIndexCommand {
+    this.checkClosed();
+    return new CheckoutIndexCommand(this._workingCopy);
+  }
+
+  /**
+   * Create an UpdateIndexCommand editing index entries as `git update-index` does, its
+   * options and paths applied in the order given.
+   *
+   * @example
+   * ```typescript
+   * await git.updateIndex().setAdd(true).addPath("new.txt").setChmod("+x").addPath("run.sh").call();
+   * ```
+   */
+  updateIndex(): UpdateIndexCommand {
+    this.checkClosed();
+    return new UpdateIndexCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a MktagCommand writing a tag object from its text after git's strict fsck check
+   * (`git mktag`).
+   *
+   * @example
+   * ```typescript
+   * const { id } = await git.mktag().setInput(tagText).call();
+   * ```
+   */
+  mktag(): MktagCommand {
+    this.checkClosed();
+    return new MktagCommand(this._workingCopy);
   }
 
   // ============ Rm Operations ============
