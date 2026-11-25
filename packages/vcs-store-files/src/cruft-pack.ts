@@ -29,6 +29,7 @@ import {
   parsePackMtimes,
   writePack,
 } from "@statewalker/vcs-core";
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import { objectIdPattern } from "./object-names.js";
 import type { FileRawStorage } from "./storage/raw/file-raw-storage.js";
 
@@ -313,4 +314,56 @@ async function readBytes(files: FilesApi, path: string): Promise<Uint8Array> {
       yield* parts;
     })(),
   );
+}
+
+/**
+ * The unreachable packed objects newer than `cutoff` (ms): a cruft pack's by its `.mtimes`,
+ * any other pack's by the pack's own time (git's add_recent_packed).
+ * @internal
+ */
+export async function recentPackedObjects(
+  files: FilesApi,
+  objectsDir: string,
+  packs: PackSet,
+  cutoffMs: number,
+  kept: ReadonlySet<string>,
+  objectFormat: ObjectFormat,
+): Promise<string[]> {
+  const out: string[] = [];
+  const cutoff = Math.floor(cutoffMs / 1000);
+  await packs.refresh();
+  for (const pack of await packs.packs()) {
+    const base = joinPath(objectsDir, "pack", `pack-${pack.packId}`);
+    let times: Uint32Array | undefined;
+    if ((await files.stats(`${base}.mtimes`))?.kind === "file") {
+      try {
+        const parts: Uint8Array[] = [];
+        for await (const c of files.read(`${base}.mtimes`)) parts.push(c);
+        times = parsePackMtimes(concatBytes(parts), pack.count, `${base}.mtimes`, objectFormat);
+      } catch {
+        times = undefined;
+      }
+    }
+    const modified = (await files.stats(`${base}.pack`))?.lastModified;
+    // git's p->mtime: whole seconds
+    const packTime =
+      modified === undefined ? Number.POSITIVE_INFINITY : Math.floor(modified / 1000);
+    let at = 0;
+    for (const id of pack.ids()) {
+      const t = times ? (times[at] as number) : packTime;
+      at++;
+      if (t > cutoff && !kept.has(id)) out.push(id);
+    }
+  }
+  return out;
+}
+
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
 }
