@@ -57,6 +57,11 @@ export enum RefUpdateStatus {
 export interface FetchResult {
   /** URI of the remote that was fetched from */
   uri: string;
+  /**
+   * upload-pack's session id, advertised under its `transfer.advertiseSID` (git's trace2
+   * `server-sid`); this side sends its own (`processSessionId()`) under its own setting
+   */
+  serverSessionId?: string;
   /** Refs advertised by the remote */
   advertisedRefs: Map<string, ObjectId>;
   /** Tracking ref updates that were performed */

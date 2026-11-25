@@ -11,6 +11,7 @@ import type { RefStore } from "../context/process-context.js";
 import { INFINITE_DEPTH } from "../fsm/index.js";
 import { encodeDelim, encodeFlush, encodePacketLine, TransportError } from "../protocol/index.js";
 import { formatOf, isObjectIdOf, remoteObjectFormat } from "../protocol/object-format.js";
+import { validSessionId } from "../protocol/session-id.js";
 import { type AbbrevLengths, abbrevLengthsOf, transportSummaryWidth } from "../summary/index.js";
 import { parseRefSpec } from "../utils/index.js";
 import { Completeness } from "./completeness.js";
@@ -230,6 +231,11 @@ export interface FetchClientOptions {
    * {@link ShallowRemoteRejectedError} before the pack is read
    */
   rejectShallow?: boolean;
+  /**
+   * The client's session id (git's `transfer.advertiseSID`): sent as `session-id=<id>` to a
+   * server that advertises its own; undefined: none sent
+   */
+  sessionId?: string;
 }
 
 /** A shallow remote refused under `rejectShallow` (git's "source repository is shallow"). */
@@ -252,6 +258,11 @@ export interface RefspecResolver {
 export interface FetchClientResult {
   /** The protocol spoken: 2 or 0 */
   protocolVersion: 0 | 2;
+  /**
+   * The server's `session-id` (advertised under its `transfer.advertiseSID`), as git's trace2
+   * `server-sid`
+   */
+  serverSessionId?: string;
   /** The remote refs listed (heads, tags, and HEAD with its symref) */
   remoteRefs: RemoteRef[];
   /** The remote HEAD's branch (`refs/heads/main`), when the server says */
@@ -418,8 +429,10 @@ export async function fetchFromConnection(
     if (missing.length > 0) throw new TransportError(`couldn't find remote ref ${missing[0]}`);
   }
   const planned = mapRefs(remoteRefs, refspecs);
+  const serverSid = validSessionId(connection.capabilities.get("session-id"));
   const result: FetchClientResult = {
     protocolVersion: connection.version,
+    ...(serverSid !== undefined ? { serverSessionId: serverSid } : {}),
     remoteRefs,
     defaultBranch,
     isEmpty,
@@ -563,6 +576,7 @@ export async function fetchFromConnection(
       filter: options.filter,
       ...(options.onWarning ? { onWarning: options.onWarning } : {}),
       ...(options.serverOptions?.length ? { serverOptions: options.serverOptions } : {}),
+      ...(options.sessionId !== undefined ? { sessionId: options.sessionId } : {}),
       includeTag: autoTags,
       onProgress: options.onProgress,
       // a dry run stores the objects too (git's fetch_refs runs; only the refs are left)
@@ -665,6 +679,13 @@ export async function fetchFromConnection(
       for (const want of wants) deepenChecked.add(want);
     }
     // the pack is in (its trailer checked): the wants are complete now
+    // receive_wanted_refs: a ref asked for by name takes the id the server sent (it may have
+    // moved since it was listed)
+    for (const [name, oid] of fetched.wantedRefs ?? []) {
+      for (const p of planned) if (p.remoteRef === name) p.oid = oid;
+      for (const f of result.fetched) if (f.remoteRef === name) f.oid = oid;
+      complete.addTip(oid);
+    }
     for (const want of wants) complete.addTip(want);
     result.imports.push(imported);
     result.packObjects += fetched.packObjects;
@@ -698,11 +719,19 @@ export async function fetchFromConnection(
   // wants: the selected tips not here yet (all of them when deepening: their history changes)
   const wants: string[] = [];
   const wanted = new Set<string>();
+  // the refs fetch-pack asks for by name (`want-ref`) where the server takes them: each
+  // wanted ref listed by the remote (not an id a refspec names: git's exact_oid)
+  const listedNames = new Set(remoteRefs.map((r) => r.name));
+  const wantRefs: Array<{ name: string; oid: string }> = [];
   for (const p of planned) {
-    if (wanted.has(p.oid)) continue;
+    if (wanted.has(p.oid)) {
+      if (listedNames.has(p.remoteRef)) wantRefs.push({ name: p.remoteRef, oid: p.oid });
+      continue;
+    }
     if (deepen || options.refetch || !(await complete.isComplete(p.oid))) {
       wants.push(p.oid);
       wanted.add(p.oid);
+      if (listedNames.has(p.remoteRef)) wantRefs.push({ name: p.remoteRef, oid: p.oid });
     }
   }
   // find_non_local_tags puts the tags of objects fetched or already here into the ref map
@@ -719,6 +748,7 @@ export async function fetchFromConnection(
       if (!(await complete.isComplete(oid))) {
         wants.push(oid);
         wanted.add(oid);
+        wantRefs.push({ name: ref.name, oid });
       }
     }
   }
@@ -734,6 +764,7 @@ export async function fetchFromConnection(
     if (options.cloning) soughtNames.add("HEAD");
     promisorSought = remoteRefs.filter((r) => r.oid && soughtNames.has(r.name));
     await runFetchPack(wants, {
+      ...(wantRefs.length > 0 ? { wantRefs } : {}),
       depth,
       deepenRelative: options.deepenRelative,
       deepenSince,

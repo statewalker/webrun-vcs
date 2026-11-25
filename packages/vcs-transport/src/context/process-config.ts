@@ -242,6 +242,18 @@ export class ProcessConfiguration {
   requestPolicy?: UploadPackRequestPolicy;
 
   /**
+   * Protocol v2: advertise `fetch=... ref-in-want` and take `want-ref` lines (git's
+   * `uploadpack.allowRefInWant`, default false: a `want-ref` line is an unexpected line)
+   */
+  allowRefInWant?: boolean;
+
+  /**
+   * Server side: the session id advertised as `session-id=<id>` (git's `transfer.advertiseSID`
+   * advertises its trace2 session id); undefined: none advertised
+   */
+  sessionId?: string;
+
+  /**
    * Protocol v2: advertise and serve `object-info` (git's `transfer.advertiseObjectInfo`,
    * default false: not advertised, and the command is refused as "invalid command"). Added
    * to `serverCapabilities` as `object-info=size type` unless they name it already.

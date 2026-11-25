@@ -312,6 +312,11 @@ function httpOptionsOf(
     requestPolicy,
     advertiseObjectInfo,
     uploadPackFilter,
+    uploadPackRequestPolicy,
+    allowRefInWant,
+    advertiseSID,
+    sessionId,
+    packObjectsHook,
     logger,
     capabilities: _capabilities,
     ...receive
@@ -329,6 +334,11 @@ function httpOptionsOf(
   if (policy !== undefined) out.requestPolicy = policy;
   if (advertiseObjectInfo !== undefined) out.advertiseObjectInfo = advertiseObjectInfo;
   if (uploadPackFilter !== undefined) out.uploadPackFilter = uploadPackFilter;
+  if (uploadPackRequestPolicy !== undefined) out.uploadPackRequestPolicy = uploadPackRequestPolicy;
+  if (allowRefInWant !== undefined) out.allowRefInWant = allowRefInWant;
+  if (advertiseSID !== undefined) out.advertiseSID = advertiseSID;
+  if (sessionId !== undefined) out.sessionId = sessionId;
+  if (packObjectsHook !== undefined) out.packObjectsHook = packObjectsHook;
   if (options.maxRequestBodyBytes !== undefined) {
     out.maxRequestBodyBytes = options.maxRequestBodyBytes;
   }
@@ -690,7 +700,7 @@ export function createServedHttpHandler(
     const uploadPackOptions: HttpServerOptions = {
       ...serverOptions,
       capabilities: defaultUploadPackCapabilities(
-        serverOptions.requestPolicy ?? "ADVERTISED",
+        serverOptions.requestPolicy ?? serverOptions.uploadPackRequestPolicy ?? "ADVERTISED",
         repository,
       ),
     };

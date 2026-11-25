@@ -13,10 +13,16 @@ export class PackObjectsError extends Error {
   override name = "PackObjectsError";
   /** What pack-objects printed before it died (`warning: ...` lines), relayed first */
   readonly lines: readonly string[];
+  /**
+   * Only the abort reaches the client (the death is upload-pack's own `error()`, on the
+   * server's stderr: a pack-objects hook that failed)
+   */
+  readonly abortOnly: boolean;
 
-  constructor(message: string, options: { lines?: readonly string[] } = {}) {
+  constructor(message: string, options: { lines?: readonly string[]; abortOnly?: boolean } = {}) {
     super(message);
     this.lines = options.lines ?? [];
+    this.abortOnly = options.abortOnly ?? false;
   }
 }
 

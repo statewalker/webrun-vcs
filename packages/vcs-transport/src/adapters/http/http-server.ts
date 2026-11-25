@@ -29,6 +29,7 @@ import type {
 import type { ProcessContext, RefStore } from "../../context/process-context.js";
 import { ProtocolState } from "../../context/protocol-state.js";
 import { createTransportApi } from "../../factories/transport-api-factory.js";
+import type { PackObjectsHook } from "../../fsm/fetch/pack-objects-hook.js";
 import {
   defaultUploadPackCapabilities,
   serverFetchHandlers,
@@ -42,7 +43,10 @@ import { peelFully } from "../../fsm/fetch/upload-pack-graph.js";
 import type { UploadPackConfig, UploadPackHooks } from "../../fsm/fetch/upload-pack-hooks.js";
 import { Fsm } from "../../fsm/fsm.js";
 import { serverV2Handlers, serverV2Transitions } from "../../fsm/protocol-v2/server-v2-fsm.js";
-import { serverV2Capabilities } from "../../fsm/protocol-v2/types.js";
+import {
+  type ServerV2CapabilityOptions,
+  serverV2Capabilities,
+} from "../../fsm/protocol-v2/types.js";
 import {
   DEFAULT_RECEIVE_PACK_WRITE_TIMEOUT_MS,
   type ReceiveDenyAction,
@@ -59,6 +63,7 @@ import {
 import { receivePackRefs, visibleRefs } from "../../protocol/hidden-refs.js";
 import { formatOf, v0ObjectFormatCapabilities } from "../../protocol/object-format.js";
 import { encodeFlush, encodePacketLine } from "../../protocol/pkt-line-codec.js";
+import { processSessionId, validSessionId } from "../../protocol/session-id.js";
 import { readStreamWithIdleTimeout, withWriteTimeout } from "../../utils/idle-timeout.js";
 import { createSimpleDuplex } from "./http-duplex.js";
 
@@ -138,6 +143,19 @@ export interface HttpServerOptions {
    * `uploadpackfilter.*`; see `UploadPackFilterPolicy`). Default: none advertised.
    */
   uploadPackFilter?: UploadPackFilterPolicy;
+  /**
+   * upload-pack over v0/v1: git's `uploadpack.allow*SHA1InWant` (see
+   * `ServeOverDuplexOptions.uploadPackRequestPolicy`); `requestPolicy` wins over it
+   */
+  uploadPackRequestPolicy?: UploadPackRequestPolicy;
+  /** Protocol v2: `fetch=... ref-in-want` and `want-ref` (git's `uploadpack.allowRefInWant`) */
+  allowRefInWant?: boolean;
+  /** git's `transfer.advertiseSID`: `session-id=<sessionId>` advertised by both services */
+  advertiseSID?: boolean;
+  /** The id {@link advertiseSID} advertises (default `processSessionId()`) */
+  sessionId?: string;
+  /** upload-pack: git's `uploadpack.packObjectsHook`, as the host runs it (`PackObjectsHook`) */
+  packObjectsHook?: PackObjectsHook;
   /** receive-pack (push) hooks, limits and ref policies */
   receivePack?: ReceivePackServerOptions;
   /** upload-pack (fetch) hooks and hidden refs */
@@ -335,6 +353,7 @@ function uploadPackConfig(
   return {
     hooks: options.uploadPack?.hooks,
     logger: options.logger,
+    ...(options.packObjectsHook ? { packObjectsHook: options.packObjectsHook } : {}),
     request: {
       method: request.method,
       path: request.path,
@@ -523,6 +542,50 @@ const DEFAULT_UPLOAD_PACK_CAPABILITIES = [
   "no-done",
 ];
 
+/** The session id advertised (`transfer.advertiseSID`), or undefined. */
+function advertisedSessionId(options: HttpServerOptions): string | undefined {
+  return options.advertiseSID
+    ? (validSessionId(options.sessionId) ?? processSessionId())
+    : undefined;
+}
+
+/** The v0 want policy: `requestPolicy`, else `uploadpack.allow*SHA1InWant`, else "ADVERTISED". */
+function v0RequestPolicy(options: HttpServerOptions): UploadPackRequestPolicy {
+  return options.requestPolicy ?? options.uploadPackRequestPolicy ?? "ADVERTISED";
+}
+
+/**
+ * upload-pack's v0 capabilities over HTTP: the given ones, or the defaults with git's
+ * `allow-tip-sha1-in-want` / `allow-reachable-sha1-in-want` for the want policy; `filter`
+ * with uploadpack.allowFilter; `session-id=` with transfer.advertiseSID.
+ */
+function v0UploadPackCapabilities(options: HttpServerOptions): string[] {
+  const capabilities = withFilterCapability(
+    options.capabilities ?? [
+      ...DEFAULT_UPLOAD_PACK_CAPABILITIES,
+      ...allowWantCapabilities(v0RequestPolicy(options)),
+    ],
+    options.uploadPackFilter,
+  );
+  const sid = advertisedSessionId(options);
+  if (sid !== undefined && !capabilities.some((c) => c.startsWith("session-id="))) {
+    capabilities.push(`session-id=${sid}`);
+  }
+  return capabilities;
+}
+
+/** The `allow-*-sha1-in-want` capabilities of a want policy (write_v0_ref). */
+function allowWantCapabilities(policy: UploadPackRequestPolicy): string[] {
+  const out: string[] = [];
+  if (policy === "TIP" || policy === "REACHABLE_COMMIT_TIP" || policy === "ANY") {
+    out.push("allow-tip-sha1-in-want");
+  }
+  if (policy === "REACHABLE_COMMIT" || policy === "REACHABLE_COMMIT_TIP" || policy === "ANY") {
+    out.push("allow-reachable-sha1-in-want");
+  }
+  return out;
+}
+
 /**
  * Handles GET /info/refs?service=git-upload-pack
  *
@@ -558,10 +621,7 @@ export async function handleInfoRefs(
   // Default capabilities (copied: the symref below must not change the caller's array)
   // `object-format=sha256` for a SHA-256 repository (a SHA-1 one advertises as before)
   const format = formatOf(repository);
-  const capabilities = withFilterCapability(
-    options.capabilities ?? DEFAULT_UPLOAD_PACK_CAPABILITIES,
-    options.uploadPackFilter,
-  );
+  const capabilities = v0UploadPackCapabilities(options);
 
   // Add symref capability if HEAD is a symbolic ref
   if (refStore.getSymrefTarget) {
@@ -670,6 +730,15 @@ export function isProtocolV2Request(
  * // "version 2", "agent=…", "ls-refs=unborn", "fetch=shallow wait-for-done", …, flush
  * ```
  */
+/** What the v2 advertisement adds: `ref-in-want`, `session-id=`. */
+function v2CapabilityOptions(options: HttpServerOptions): ServerV2CapabilityOptions {
+  const sid = advertisedSessionId(options);
+  return {
+    ...(options.allowRefInWant ? { allowRefInWant: true } : {}),
+    ...(sid !== undefined ? { sessionId: sid } : {}),
+  };
+}
+
 export function handleInfoRefsV2(
   options: HttpServerOptions = {},
   repository?: Pick<RepositoryFacade, "getObjectSize" | "getObjectType" | "objectFormat">,
@@ -682,6 +751,7 @@ export function handleInfoRefsV2(
     options.advertiseObjectInfo,
     repository,
     options.uploadPackFilter,
+    v2CapabilityOptions(options),
   )) {
     chunks.push(encodePacketLine(`${capability}\n`));
   }
@@ -730,15 +800,12 @@ export async function handleUploadPack(
 
   // What GET /info/refs advertised; the client's first want line picks from it (the FSM sets
   // `state.capabilities` to that request, possibly empty)
-  for (const cap of withFilterCapability(
-    options.capabilities ?? DEFAULT_UPLOAD_PACK_CAPABILITIES,
-    options.uploadPackFilter,
-  )) {
+  for (const cap of v0UploadPackCapabilities(options)) {
     state.advertisedCapabilities.add(cap);
   }
 
   const config: ProcessConfiguration = {
-    requestPolicy: options.requestPolicy ?? "ADVERTISED",
+    requestPolicy: v0RequestPolicy(options),
     ...(options.uploadPackFilter ? { uploadPackFilter: options.uploadPackFilter } : {}),
     maxEmptyBatches: 10,
     keepAliveMs: options.keepAliveMs,
@@ -794,6 +861,10 @@ export async function handleUploadPackV2(
     ...(options.uploadPackFilter ? { uploadPackFilter: options.uploadPackFilter } : {}),
     // git's v2 upload-pack serves any object it has
     requestPolicy: options.requestPolicy ?? "ANY",
+    ...(options.allowRefInWant ? { allowRefInWant: true } : {}),
+    ...(advertisedSessionId(options) !== undefined
+      ? { sessionId: advertisedSessionId(options) }
+      : {}),
     keepAliveMs: options.keepAliveMs,
     hiddenRefs: uploadPackHiddenRefs(options),
     uploadPack: uploadPackConfig(options, request, context.repoPath),
@@ -936,9 +1007,16 @@ function concatBytes(chunks: Uint8Array[]): Uint8Array {
 /** receive-pack's capabilities: `push-options` only while `receive.advertisePushOptions` allows. */
 function receivePackCapabilities(options: HttpServerOptions): string[] {
   const capabilities = [...(options.capabilities ?? RECEIVE_PACK_CAPABILITIES)];
-  return options.receivePack?.advertisePushOptions === false
-    ? capabilities.filter((c) => c !== "push-options")
-    : capabilities;
+  const offered =
+    options.receivePack?.advertisePushOptions === false
+      ? capabilities.filter((c) => c !== "push-options")
+      : capabilities;
+  // transfer.advertiseSID: after push-options (show_ref)
+  const sid = advertisedSessionId(options);
+  if (sid !== undefined && !offered.some((c) => c.startsWith("session-id="))) {
+    offered.push(`session-id=${sid}`);
+  }
+  return offered;
 }
 
 /**
@@ -1309,6 +1387,14 @@ export interface HttpHandlerOptions {
   v2Capabilities?: string[];
   /** Advertise and serve v2 `object-info` (see {@link HttpServerOptions.advertiseObjectInfo}) */
   advertiseObjectInfo?: boolean;
+  /** v2 `ref-in-want` (see {@link HttpServerOptions.allowRefInWant}) */
+  allowRefInWant?: boolean;
+  /** `session-id` advertised (see {@link HttpServerOptions.advertiseSID}) */
+  advertiseSID?: boolean;
+  /** The id {@link advertiseSID} advertises (see {@link HttpServerOptions.sessionId}) */
+  sessionId?: string;
+  /** upload-pack's pack-objects hook (see {@link HttpServerOptions.packObjectsHook}) */
+  packObjectsHook?: PackObjectsHook;
   /** receive-pack hooks, limits and ref policies (see {@link ReceivePackServerOptions}) */
   receivePack?: ReceivePackServerOptions;
   /** upload-pack hooks and hidden refs (see {@link UploadPackServerOptions}) */
@@ -1356,6 +1442,10 @@ export function createHttpHandler(
     protocolV2,
     v2Capabilities,
     advertiseObjectInfo,
+    allowRefInWant,
+    advertiseSID,
+    sessionId,
+    packObjectsHook,
     receivePack,
     uploadPack,
     hideRefs,
@@ -1381,6 +1471,10 @@ export function createHttpHandler(
       protocolV2,
       v2Capabilities,
       advertiseObjectInfo,
+      ...(allowRefInWant ? { allowRefInWant } : {}),
+      ...(advertiseSID ? { advertiseSID } : {}),
+      ...(sessionId !== undefined ? { sessionId } : {}),
+      ...(packObjectsHook ? { packObjectsHook } : {}),
       receivePack,
       uploadPack,
       hideRefs,

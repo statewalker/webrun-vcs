@@ -49,4 +49,5 @@ export {
   GIT_SERVER_SETTINGS_DEFAULTS,
   httpServerSettings,
   serverSettingsFromConfig,
+  uploadPackRequestPolicyOf,
 } from "./server-config.js";

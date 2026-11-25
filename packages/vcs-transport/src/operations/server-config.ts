@@ -14,6 +14,7 @@
  * ```
  */
 
+import type { UploadPackRequestPolicy } from "../context/process-config.js";
 import {
   type UploadPackFilterPolicy,
   uploadPackFilterPolicyOf,
@@ -64,6 +65,16 @@ export interface ServerConfigSettings {
    * filter advertised, as git's default)
    */
   uploadPackFilter?: UploadPackFilterPolicy;
+  /**
+   * upload-pack's v0/v1 want policy: `uploadpack.allowTipSHA1InWant`,
+   * `uploadpack.allowReachableSHA1InWant`, `uploadpack.allowAnySHA1InWant` (absent: none set,
+   * only advertised tips, as git's default)
+   */
+  uploadPackRequestPolicy?: UploadPackRequestPolicy;
+  /** `uploadpack.allowRefInWant` (git's default: false) */
+  allowRefInWant?: boolean;
+  /** `transfer.advertiseSID` (git's default: false) */
+  advertiseSID?: boolean;
   /**
    * receive-pack's `receive.procReceiveRefs` values, in order: the commands the proc-receive
    * hook takes (absent: none set)
@@ -192,6 +203,52 @@ function nonBoolError(config: ServerConfigReader, key: string): string {
   return error;
 }
 
+/** upload_pack_config's `allow_uor` bits. */
+const ALLOW_TIP = 1;
+const ALLOW_REACHABLE = 2;
+const ALLOW_ANY = 7;
+const ALLOW_KEYS: Record<string, number> = {
+  "uploadpack.allowtipsha1inwant": ALLOW_TIP,
+  "uploadpack.allowreachablesha1inwant": ALLOW_REACHABLE,
+  "uploadpack.allowanysha1inwant": ALLOW_ANY,
+};
+
+/**
+ * The v0/v1 want policy `uploadpack.allow*SHA1InWant` sets, as upload_pack_config sets and
+ * clears its `allow_uor` bits in config order (`allowAnySHA1InWant=false` after
+ * `allowTipSHA1InWant=true` clears both); undefined when none is set.
+ *
+ * @example
+ * ```typescript
+ * uploadPackRequestPolicyOf(config); // [uploadpack] allowTipSHA1InWant → "TIP"
+ * ```
+ */
+export function uploadPackRequestPolicyOf(
+  config: ServerConfigReader,
+): UploadPackRequestPolicy | undefined {
+  const entries: { key: string; value: unknown }[] = [];
+  if (config.list) {
+    for (const entry of config.list()) {
+      if (ALLOW_KEYS[entry.key.toLowerCase()] !== undefined) entries.push(entry);
+    }
+  } else {
+    for (const key of Object.keys(ALLOW_KEYS)) {
+      for (const value of config.getAll(key)) entries.push({ key, value });
+    }
+  }
+  if (entries.length === 0) return undefined;
+  let bits = 0;
+  for (const { key, value } of entries) {
+    const bit = ALLOW_KEYS[key.toLowerCase()] as number;
+    bits = configBool(value, false) ? bits | bit : bits & ~bit;
+  }
+  if ((bits & ALLOW_ANY) === ALLOW_ANY) return "ANY";
+  if (bits & ALLOW_TIP && bits & ALLOW_REACHABLE) return "REACHABLE_COMMIT_TIP";
+  if (bits & ALLOW_TIP) return "TIP";
+  if (bits & ALLOW_REACHABLE) return "REACHABLE_COMMIT";
+  return "ADVERTISED";
+}
+
 /** git's defaults: what {@link serverSettingsFromConfig} gives for an empty configuration. */
 export const GIT_SERVER_SETTINGS_DEFAULTS: Readonly<ServerConfigSettings> = Object.freeze({
   allowDeletes: true,
@@ -237,6 +294,14 @@ export function explicitServerSettingsFromConfig(
   if (receive.length > 0) out.receivePackHideRefs = receive;
   const filter = filterPolicy(config);
   if (filter) out.uploadPackFilter = filter;
+  const wantPolicy = uploadPackRequestPolicyOf(config);
+  if (wantPolicy !== undefined) out.uploadPackRequestPolicy = wantPolicy;
+  const refInWant = last(config, "uploadpack.allowRefInWant");
+  if (refInWant !== undefined) out.allowRefInWant = configBool(refInWant, false);
+  const sid = last(config, "transfer.advertiseSID");
+  if (sid !== undefined) out.advertiseSID = configBool(sid, false);
+  // uploadpack.packObjectsHook is never read here: git takes it only from protected config
+  // (system, global, command line), never from a served repository's own
   // a key without a value is an error in git (config_error_nonbool): receive-pack dies
   const procReceiveValues = config.getAll("receive.procReceiveRefs");
   const procReceive = procReceiveValues.filter((v): v is string => typeof v === "string");

@@ -201,8 +201,13 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         const refs = await refStore.listAll();
         // `object-format=sha256` for a SHA-256 repository (a SHA-1 one advertises as before)
         const format = formatOf(getRepository(ctx));
+        // transfer.advertiseSID: `session-id=<id>` after push-options (show_ref)
+        const sessionId = getConfig(ctx).sessionId;
+        const offered = getConfig(ctx).serverCapabilities ?? RECEIVE_PACK_CAPABILITIES;
         const capabilities = v0ObjectFormatCapabilities(
-          getConfig(ctx).serverCapabilities ?? RECEIVE_PACK_CAPABILITIES,
+          sessionId !== undefined && !offered.some((c) => c.startsWith("session-id="))
+            ? [...offered, `session-id=${sessionId}`]
+            : offered,
           format,
         );
 
@@ -294,6 +299,9 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
               if (c) state.capabilities.add(c);
             }
             line = line.slice(0, nul);
+            // the client's session id (read_head_info's trace2 `client-sid`)
+            const sid = features.find((c) => c.startsWith("session-id="));
+            if (sid !== undefined) getOutput(ctx).clientSessionId = sid.slice("session-id=".length);
             // read_head_info: a client naming no object format speaks SHA-1; another one
             // than the repository's dies (git: `die("error: unsupported object format ...")`)
             const named = features.find((c) => c.startsWith("object-format="));

@@ -16,6 +16,9 @@ export class HandlerOutput {
    */
   error?: string;
 
+  /** Server side: the `session-id` the client sent (git's trace2 `client-sid`) */
+  clientSessionId?: string;
+
   /**
    * receive-pack: the reason `authorize` refused the whole push, when the run ended there
    * (`receivePack.authorizeFailure: "fatal"`; HTTP answers 403).

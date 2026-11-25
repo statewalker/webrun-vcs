@@ -861,6 +861,77 @@ export class HookSession {
     return this.host.environment()?.alternateObjectDirectories;
   }
 
+  /** The host environment the hooks run in (its runner, protected config), when there is one. */
+  get hostEnvironment(): GitHostEnvironment | undefined {
+    return this.host.environment();
+  }
+
+  /**
+   * Starts a command git runs through the shell in the hook's directory (`use_shell`:
+   * `sh -c '<command> "$@"' '<command>' <args>...`), its stdin given whole and its stdout read
+   * as it writes it, its stderr handed to `onStderr` chunk by chunk: upload-pack's
+   * `uploadpack.packObjectsHook`. Undefined without a runner, or when it cannot start.
+   */
+  async startShellCommand(
+    name: string,
+    command: string,
+    args: readonly string[],
+    stdin: Uint8Array,
+    onStderr: (chunk: Uint8Array) => void,
+  ): Promise<{ stdout: AsyncIterable<Uint8Array>; wait(): Promise<number> } | undefined> {
+    const runner = this.runner;
+    if (!runner) return undefined;
+    const layout = await this.host.layout();
+    if (!layout) return undefined;
+    const { invocation } = this.invocationOf(
+      layout,
+      name,
+      { kind: "configured", name, command },
+      { args: [...args], keepStdout: true, prefix: false },
+    );
+    if (runner.start) {
+      let started: HookProcess | undefined;
+      try {
+        started = await runner.start(invocation, { onStderr });
+      } catch {
+        return undefined;
+      }
+      if (!started) return undefined;
+      const process = started;
+      // pack-objects reads its whole input before it writes the pack
+      void (async () => {
+        try {
+          await process.write(stdin);
+        } catch {
+          // it exited without reading: its status tells
+        }
+        await process.closeStdin().catch(() => {});
+      })();
+      return {
+        stdout: process.stdout,
+        wait: async () => (await process.wait()).exitCode,
+      };
+    }
+    // a runner that only runs to the end: the whole output at once
+    let outcome: HookOutcome | undefined;
+    try {
+      outcome = await runner.run({ ...invocation, stdin });
+    } catch {
+      return undefined;
+    }
+    if (!outcome) return undefined;
+    const done = outcome;
+    if (done.stderr.length > 0) onStderr(done.stderr);
+    return {
+      stdout: {
+        async *[Symbol.asyncIterator]() {
+          if (done.stdout.length > 0) yield done.stdout;
+        },
+      },
+      wait: async () => done.exitCode,
+    };
+  }
+
   /** Whether hooks can run at all: the host environment has a runner. */
   get enabled(): boolean {
     return this.runner !== undefined;

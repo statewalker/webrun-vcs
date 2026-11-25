@@ -171,6 +171,12 @@ export async function withLocalUploadPack<T>(
       uploadPackHideRefs: settings.uploadPackHideRefs,
       // uploadpack.allowFilter and uploadpackfilter.*
       ...(settings.uploadPackFilter ? { uploadPackFilter: settings.uploadPackFilter } : {}),
+      // uploadpack.allow*SHA1InWant (v0), uploadpack.allowRefInWant, transfer.advertiseSID
+      ...(settings.uploadPackRequestPolicy
+        ? { uploadPackRequestPolicy: settings.uploadPackRequestPolicy }
+        : {}),
+      ...(settings.allowRefInWant ? { allowRefInWant: true } : {}),
+      ...(settings.advertiseSID ? { advertiseSID: true } : {}),
       ...(head && "target" in head ? { currentBranch: head.target } : {}),
     }))().finally(() => server.close?.());
   try {
@@ -532,6 +538,8 @@ export async function receivePackSettingsOf(
     shallowUpdate: settings.shallowUpdate,
     // receive.advertisePushOptions (git's default false)
     advertisePushOptions: settings.advertisePushOptions,
+    // transfer.advertiseSID
+    ...(settings.advertiseSID ? { advertiseSID: true } : {}),
     uploadPackHideRefs: settings.uploadPackHideRefs,
     receivePackHideRefs: settings.receivePackHideRefs,
     ...(receiveHooks ? { hooks: receiveHooks, relayPostReceive: true } : {}),

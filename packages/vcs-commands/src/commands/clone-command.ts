@@ -58,6 +58,7 @@ import { promisorOf } from "./promisor-remote.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { isValidRemoteName } from "./remote-command.js";
 import { withRemoteUploadPack } from "./remote-transport.js";
+import { clientSessionIdOf } from "./session-id.js";
 import { SparseCheckoutCommand } from "./sparse-checkout-command.js";
 import { SparseUnpack } from "./sparse-checkout-support.js";
 import { SubmoduleCommandError, type SubmoduleCommandResult } from "./submodule-commands.js";
@@ -1133,7 +1134,9 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       baseDir: await this.hostWorkingDir(),
     });
 
+    const sessionId = clientSessionIdOf(this.workingCopy);
     const fetchOptions: TransportFetchOptions = {
+      ...(sessionId !== undefined ? { sessionId } : {}),
       url: sourceUrl,
       auth: this.credentials,
       headers: this.headers,

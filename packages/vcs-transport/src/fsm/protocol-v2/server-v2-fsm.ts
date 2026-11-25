@@ -20,6 +20,9 @@ import {
   notifyUpload,
   notOurRef,
   okToGiveUp,
+  packFromHook,
+  packObjectsHookArgs,
+  packObjectsHookInput,
   peelFully,
   prepareServedShallow,
   resolveDeepenNot,
@@ -198,8 +201,14 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
               ctx.output.error = `unknown object format '${clientFormat}'`;
               return "ERROR";
             }
+          } else if (
+            (line === "session-id" || line.startsWith("session-id=")) &&
+            advertisesCapability(ctx, "session-id")
+          ) {
+            // serve.c's session_id_receive (git's trace2 `client-sid`)
+            ctx.output.clientSessionId = line.slice("session-id=".length);
           }
-          // other capability lines (agent, server-option, session-id, ...) are accepted
+          // other capability lines (agent, server-option, ...) are accepted
           seen = true;
         }
 
@@ -351,6 +360,12 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           if (line.startsWith("want ")) {
             req.wants.push(line.slice(5));
           } else if (line.startsWith("want-ref ")) {
+            // only with uploadpack.allowRefInWant (process_args): else git dies on an
+            // unexpected line, with no ERR packet
+            if (!ctx.config.allowRefInWant) {
+              ctx.output.error = `unexpected line: '${line}'`;
+              return "ERROR";
+            }
             req.wantRefs.push(line.slice(9));
           } else if (line.startsWith("have ")) {
             req.haves.push(line.slice(5));
@@ -426,6 +441,10 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           if (!oid) {
             ctx.output.error = `unknown ref ${refName}`;
             ctx.output.invalidWant = refName;
+            return "INVALID_WANT";
+          }
+          if (ctx.state.wantedRefs.has(refName)) {
+            ctx.output.error = `duplicate want-ref ${refName}`;
             return "INVALID_WANT";
           }
           ctx.state.wants.add(oid);
@@ -738,17 +757,38 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
         for (const oid of shallow?.extraWants ?? []) if (!common.has(oid)) wants.add(oid);
         const packShallow =
           shallow?.packShallow ?? (req?.shallow.length ? new Set(req.shallow) : undefined);
-        const packStream = ctx.repository.exportPack(wants, common, {
-          thin,
-          ofsDelta: req?.ofsDeltas ?? false,
-          includeTag: req?.includeTags,
-          // git's pack-objects --include-tag: the visible annotated tags of packed objects
-          includeTags: req?.includeTags
-            ? await includeTagCandidates(ctx.config, ctx.refStore)
-            : undefined,
-          filterSpec: req?.filter ?? undefined,
-          shallow: packShallow,
-        });
+        const hook = ctx.config.uploadPack?.packObjectsHook;
+        const packStream = hook
+          ? // uploadpack.packObjectsHook: the host's command builds the pack (create_pack_file)
+            packFromHook(
+              hook,
+              packObjectsHookArgs({
+                shallow: (packShallow?.size ?? 0) > 0,
+                thin,
+                progress: !(req?.noProgress ?? false),
+                ofsDelta: req?.ofsDeltas ?? false,
+                includeTag: req?.includeTags ?? false,
+                ...(req?.filter ? { filter: req.filter } : {}),
+              }),
+              packObjectsHookInput({
+                shallow: packShallow ?? [],
+                wants: ctx.state.wants,
+                haves: common,
+                extraEdges: shallow?.extraWants ?? [],
+              }),
+              (chunk) => void ctx.transport.writeSideband(2, chunk).catch(() => {}),
+            )
+          : ctx.repository.exportPack(wants, common, {
+              thin,
+              ofsDelta: req?.ofsDeltas ?? false,
+              includeTag: req?.includeTags,
+              // git's pack-objects --include-tag: the visible annotated tags of packed objects
+              includeTags: req?.includeTags
+                ? await includeTagCandidates(ctx.config, ctx.refStore)
+                : undefined,
+              filterSpec: req?.filter ?? undefined,
+              shallow: packShallow,
+            });
 
         // The packfile section is side-band multiplexed (seeded as side-band-64k by the
         // server): keep-alives until the first byte, an error on band 3 after it
@@ -924,6 +964,10 @@ function advertisedCapabilities(ctx: ProcessContext): string[] {
     ctx.config.advertiseObjectInfo,
     ctx.repository,
     ctx.config.uploadPackFilter,
+    {
+      ...(ctx.config.allowRefInWant ? { allowRefInWant: true } : {}),
+      ...(ctx.config.sessionId !== undefined ? { sessionId: ctx.config.sessionId } : {}),
+    },
   );
 }
 
