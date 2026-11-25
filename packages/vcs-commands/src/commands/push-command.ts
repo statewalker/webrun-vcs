@@ -1310,12 +1310,6 @@ export class PushCommand extends TransportCommand<PushResult> {
   }
 
   /**
-   * remote.c's `is_reachable_in_reflog` for `--force-if-includes`: whether the remote's value
-   * (peeled to a commit) is the new value of an entry of the local ref's reflog (the local ref
-   * of the remote ref's name), or an ancestor of one of the entries read until one older than
-   * the remote-tracking ref's latest reflog entry.
-   */
-  /**
    * get_commons_through_negotiation: `git fetch --negotiate-only --negotiation-tip=<id>...
    * <url>` run as git's child, its acknowledged commits the commons; its warnings (stderr)
    * passed on, and no commons when it fails (git's "push negotiation failed").
@@ -1339,6 +1333,12 @@ export class PushCommand extends TransportCommand<PushResult> {
     }
   }
 
+  /**
+   * remote.c's `is_reachable_in_reflog` for `--force-if-includes`: whether the remote's value
+   * (peeled to a commit) is the new value of an entry of the local ref's reflog (the local ref
+   * of the remote ref's name), or an ancestor of one of the entries read until one older than
+   * the remote-tracking ref's latest reflog entry.
+   */
   private async isReachableInReflog(
     localRef: string,
     trackingRef: string | undefined,

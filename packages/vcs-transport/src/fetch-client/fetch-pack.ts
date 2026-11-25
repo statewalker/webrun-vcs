@@ -698,11 +698,9 @@ export async function negotiateUsingFetch(
     }
     if (ready) throw new TransportError("unexpected 'ready' from remote");
     if (
-      await allReachCommon(
-        source,
-        request.tips,
-        (oid) => acked.has(oid) || negotiator.isCommon(oid),
-      )
+      // fetch-pack.c's own COMMON bit: set on acknowledged commits only, never on the
+      // ancestors the negotiator counts as common
+      await allReachCommon(source, request.tips, (oid) => acked.has(oid))
     ) {
       last = true;
     }
@@ -711,8 +709,8 @@ export async function negotiateUsingFetch(
 }
 
 /**
- * can_all_from_reach_with_flag over COMMON: whether every tip (tags peeled) reaches a commit
- * acknowledged or known to be common.
+ * can_all_from_reach_with_flag over fetch-pack's COMMON: whether every tip (tags peeled)
+ * reaches a commit the server acknowledged.
  */
 async function allReachCommon(
   source: NegotiatorSource,

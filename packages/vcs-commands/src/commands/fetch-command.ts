@@ -1187,12 +1187,6 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   }
 
   /**
-   * cmd_fetch's `config.recurse_submodules`: the command line, else `submodule.recurse` and
-   * `fetch.recurseSubmodules` in config order, else `.gitmodules`' `fetch.recurseSubmodules`;
-   * undefined when the fetch does not recurse (`no`, `--porcelain`, no worktree). git checks
-   * `submodule.fetchJobs` there too (a negative one dies).
-   */
-  /**
    * `fetch.negotiationAlgorithm` (repo-settings.c): `feature.experimental` makes `skipping` the
    * default; a variable without a value or an unknown value dies as git does.
    */
@@ -1335,6 +1329,12 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     return result;
   }
 
+  /**
+   * cmd_fetch's `config.recurse_submodules`: the command line, else `submodule.recurse` and
+   * `fetch.recurseSubmodules` in config order, else `.gitmodules`' `fetch.recurseSubmodules`;
+   * undefined when the fetch does not recurse (`no`, `--porcelain`, no worktree). git checks
+   * `submodule.fetchJobs` there too (a negative one dies).
+   */
   private async submoduleRecursion(
     store: RemoteConfigStore,
   ): Promise<

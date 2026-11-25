@@ -390,6 +390,54 @@ describeGit("fetch negotiators and negotiation tips (native twins)", () => {
     );
   });
 
+  it(`t5702-protocol-v2.sh: "file:// --negotiate-only" (two tips: a round ends only when every tip reaches an acknowledged commit)`, async () => {
+    // server: B, then A (main) and D (side) on it. client: 20 commits on side, dated before
+    // A, and one on main, newest: the first round's haves get A acknowledged (B is common to
+    // the negotiator), and D is acknowledged only in a later round
+    const dir = scenario("server");
+    const server = join(dir, "server");
+    testCommit(server, "B");
+    git(server, "checkout", "-q", "-b", "side");
+    testCommit(server, "D");
+    git(server, "checkout", "-q", "main");
+    tick = 1500000000;
+    testCommit(server, "A");
+    const client = join(dir, "client");
+    git(dir, "clone", "-q", "--no-tags", `file://${server}`, client);
+    git(client, "checkout", "-q", "-b", "side", "origin/side");
+    tick = 1200000000;
+    for (let i = 1; i <= 20; i++) testCommit(client, `s${i}`);
+    git(client, "checkout", "-q", "main");
+    tick = 1600000000;
+    testCommit(client, "m1");
+    const tips = ["main", "side"].map((b) => git(client, "rev-parse", b).trim());
+    const trace = join(root, `trace-${counter++}`);
+    const theirs = gitRun(
+      root,
+      client,
+      [
+        "-c",
+        "protocol.version=2",
+        "fetch",
+        "--negotiate-only",
+        ...tips.map((t) => `--negotiation-tip=${t}`),
+        "origin",
+      ],
+      { GIT_TRACE_PACKET: trace },
+    );
+    expect(theirs.status, theirs.stderr).toBe(0);
+    const acked = theirs.stdout.split("\n").filter(Boolean).sort();
+    expect(acked).toEqual(["A", "D"].map((n) => git(server, "rev-parse", n).trim()).sort());
+    const ours = await oursAt(client);
+    const result = await ours
+      .fetch()
+      .setRemote("origin")
+      .setNegotiationTips(...tips)
+      .setNegotiateOnly(true)
+      .call();
+    expect([...(result.negotiatedCommits ?? [])].sort()).toEqual(acked);
+  });
+
   it(`t5702-protocol-v2.sh: "file:// --negotiate-only with protocol v0"`, async () => {
     const { client } = negotiateOnlySetup();
     const head = git(client, "rev-parse", "HEAD").trim();

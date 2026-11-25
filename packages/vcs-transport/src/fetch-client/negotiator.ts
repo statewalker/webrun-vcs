@@ -44,7 +44,7 @@ export interface FetchNegotiator {
   next(): Promise<string | undefined>;
   /** The server acknowledged `oid`; whether it was known to be common already */
   ack(oid: string): Promise<boolean>;
-  /** Whether `oid` is known to be common (the COMMON flag `--negotiate-only` checks) */
+  /** Whether `oid` is known to be common with the server (an acknowledged commit or an ancestor) */
   isCommon(oid: string): boolean;
 }
 
