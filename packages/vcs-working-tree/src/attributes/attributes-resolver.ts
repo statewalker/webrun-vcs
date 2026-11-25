@@ -72,6 +72,13 @@ interface Frame {
  * it) when a file it read may have changed.
  */
 export class AttributesMemo {
+  /**
+   * @param onWarning receives the warnings of every file read for this memo (git prints
+   *   them as it reads each file), those of files parsed before too; without it a file's
+   *   warnings go to the resolver's `onWarning` when it is first parsed
+   */
+  constructor(readonly onWarning?: (message: string) => void) {}
+
   /** builtin, system, global (lowest first) and info/attributes */
   outer?: Promise<{ low: Frame[]; info: Frame[] }>;
   /** The in-tree frames of a directory, root first */
@@ -168,25 +175,40 @@ function namedBy(rules: AttributeRule[]): Set<string> {
 export class AttributesResolver {
   private readonly cache = new ParseCache();
   private readonly frameOf = new WeakMap<AttributeRule[], Frame>();
+  /** The warnings each parse gave, replayed to a memo's own sink */
+  private readonly warningsOf = new WeakMap<AttributeRule[], string[]>();
 
   constructor(
     private readonly sources: AttributesSources,
     private readonly options: AttributesResolverOptions = {},
   ) {}
 
-  private frame(base: string, origin: string, content: AttributesContent, macros: boolean): Frame {
+  private frame(
+    base: string,
+    origin: string,
+    content: AttributesContent,
+    macros: boolean,
+    sink?: (message: string) => void,
+  ): Frame {
     if (content === undefined) return { base, rules: [], named: new Set() };
     const keyed = typeof content === "object" && !(content instanceof Uint8Array);
     const cacheKey = `${macros ? "m" : "-"}${origin}\0${keyed ? `#${content.key}` : textOf(content)}`;
-    const rules = this.cache.get(cacheKey, () =>
+    let parsed = false;
+    const warnings: string[] = [];
+    const rules = this.cache.get(cacheKey, () => {
+      parsed = true;
       // the bytes themselves: `parseAttributes` skips their one BOM (a decoded string would
       // lose it here and a second one there)
-      parseAttributes(keyed ? content.content : content, {
+      return parseAttributes(keyed ? content.content : content, {
         source: origin,
         macrosAllowed: macros,
-        onWarning: this.options.onWarning,
-      }),
-    );
+        onWarning: (message) => warnings.push(message),
+      });
+    });
+    if (parsed) this.warningsOf.set(rules, warnings);
+    const said = this.warningsOf.get(rules) ?? [];
+    if (sink) for (const message of said) sink(message);
+    else if (parsed) for (const message of said) this.options.onWarning?.(message);
     // one frame per parse (and base): the names are computed once
     let frame = this.frameOf.get(rules);
     if (!frame || frame.base !== base) {
@@ -196,12 +218,15 @@ export class AttributesResolver {
     return frame;
   }
 
-  private async outer(sources: AttributesSources): Promise<{ low: Frame[]; info: Frame[] }> {
-    const low: Frame[] = [this.frame("", "[builtin]", BUILTIN, true)];
-    if (sources.system) low.push(this.frame("", "system", await sources.system(), true));
-    if (sources.global) low.push(this.frame("", "global", await sources.global(), true));
+  private async outer(
+    sources: AttributesSources,
+    sink?: (message: string) => void,
+  ): Promise<{ low: Frame[]; info: Frame[] }> {
+    const low: Frame[] = [this.frame("", "[builtin]", BUILTIN, true, sink)];
+    if (sources.system) low.push(this.frame("", "system", await sources.system(), true, sink));
+    if (sources.global) low.push(this.frame("", "global", await sources.global(), true, sink));
     const info = sources.info
-      ? [this.frame("", "info/attributes", await sources.info(), true)]
+      ? [this.frame("", "info/attributes", await sources.info(), true, sink)]
       : [];
     return { low, info };
   }
@@ -211,10 +236,18 @@ export class AttributesResolver {
     const known = memo.dirs.get(dir);
     if (known) return known;
     const chain = (async () => {
-      if (!dir) return [this.frame("", ".gitattributes", await sources.inTree(""), true)];
+      if (!dir) {
+        return [this.frame("", ".gitattributes", await sources.inTree(""), true, memo.onWarning)];
+      }
       const slash = dir.lastIndexOf("/");
       const parent = await this.inTree(slash > 0 ? dir.slice(0, slash) : "", sources, memo);
-      const own = this.frame(dir, `${dir}/.gitattributes`, await sources.inTree(dir), false);
+      const own = this.frame(
+        dir,
+        `${dir}/.gitattributes`,
+        await sources.inTree(dir),
+        false,
+        memo.onWarning,
+      );
       return [...parent, own];
     })();
     memo.dirs.set(dir, chain);
@@ -230,7 +263,7 @@ export class AttributesResolver {
     const known = memo.stacks.get(dir);
     if (known) return known;
     const stack = (async () => {
-      memo.outer ??= this.outer(sources);
+      memo.outer ??= this.outer(sources, memo.onWarning);
       const outer = memo.outer;
       outer.catch(() => {
         if (memo.outer === outer) memo.outer = undefined;
@@ -299,6 +332,34 @@ export class AttributesResolver {
           ? this.options.ignoreCase()
           : this.options.ignoreCase,
     });
+  }
+  /**
+   * The attribute names the files read for `path` mention, in the order git first reads them
+   * (`git_attr` interning: builtin, system, global, the root `.gitattributes`,
+   * `info/attributes`, then each directory's file down to `path`'s; each line's macro name,
+   * then its states), added to `order` when new. `git check-attr --all` lists a path's
+   * attributes in this order, kept across the paths of one run.
+   */
+  async nameOrder(
+    path: string,
+    order: Set<string>,
+    options: { sources?: AttributesSources; memo?: AttributesMemo } = {},
+  ): Promise<Set<string>> {
+    const slash = path.lastIndexOf("/");
+    const dir = slash > 0 ? path.slice(0, slash) : "";
+    const sources = options.sources ?? this.sources;
+    const memo = options.memo ?? new AttributesMemo();
+    memo.outer ??= this.outer(sources, memo.onWarning);
+    const { low, info } = await memo.outer;
+    const inTree = await this.inTree(dir, sources, memo);
+    const frames = [...low, ...inTree.slice(0, 1), ...info, ...inTree.slice(1)];
+    for (const frame of frames) {
+      for (const rule of frame.rules) {
+        if (rule.kind === "macro") order.add(rule.name);
+        for (const state of rule.states) order.add(state.name);
+      }
+    }
+    return order;
   }
 }
 
