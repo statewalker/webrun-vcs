@@ -5,7 +5,12 @@
  * vcs-commands' `http-dumb-client-native.test.ts` (t5550).
  */
 import { describe, expect, it } from "vitest";
-import { alternateTargets, looksLikeInfoRefs, parseInfoRefs } from "../src/index.js";
+import {
+  alternateTargets,
+  looksLikeInfoRefs,
+  openHttpConnection,
+  parseInfoRefs,
+} from "../src/index.js";
 
 const enc = (text: string) => new TextEncoder().encode(text);
 const A = "a".repeat(40);
@@ -77,5 +82,40 @@ describe("alternateTargets (http-walker's process_alternates_response)", () => {
 
   it("a ../ climbing past the server is dropped", () => {
     expect(alternateTargets("http://h/r.git", "../../../../x/objects\n", false)).toEqual([]);
+  });
+});
+
+describe("credentials of a dumb connection", () => {
+  it("a first request redirected to another origin takes no credentials along", async () => {
+    const seen: Array<{ url: string; authorization: string | null }> = [];
+    const fetchImpl = async (request: Request): Promise<Response> => {
+      seen.push({ url: request.url, authorization: request.headers.get("authorization") });
+      const url = new URL(request.url);
+      if (url.pathname.endsWith("/info/refs")) {
+        // where the redirect led (fetch dropped the header on the way, as it does)
+        const response = new Response(`${A}\trefs/heads/main\n`, {
+          headers: { "content-type": "text/plain" },
+        });
+        Object.defineProperty(response, "url", {
+          value: "https://evil.example/repo/info/refs?service=git-upload-pack",
+        });
+        return response;
+      }
+      return new Response("ref: refs/heads/main\n", { headers: { "content-type": "text/plain" } });
+    };
+    const connection = await openHttpConnection({
+      url: "https://good.example/repo",
+      fetchImpl,
+      auth: { username: "u", password: "secret" },
+    });
+    expect(connection.dumb?.baseUrl).toBe("https://evil.example/repo");
+    expect(connection.advertisedRefs?.[0]).toEqual({
+      name: "HEAD",
+      oid: A,
+      symref: "refs/heads/main",
+    });
+    // the first request went where the user asked, with credentials; HEAD went elsewhere
+    expect(seen[0]?.authorization).not.toBeNull();
+    expect(seen.slice(1)).toEqual([{ url: "https://evil.example/repo/HEAD", authorization: null }]);
   });
 });

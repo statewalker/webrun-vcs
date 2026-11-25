@@ -43,8 +43,13 @@ export type FollowRedirects = "always" | "initial" | "never";
 export interface DumbHttpOptions {
   /** How requests are sent */
   fetchImpl: (request: Request) => Promise<Response>;
-  /** Headers (`Authorization` included) sent to the repository's origin, never elsewhere */
+  /**
+   * Headers (`Authorization` included) sent only to `credentialOrigin`, never elsewhere (a
+   * redirect to another origin or an alternate gets none)
+   */
   headers: Record<string, string>;
+  /** The origin of the URL as given, before any redirect: the one `headers` are meant for */
+  credentialOrigin: string;
   /** `http.followRedirects` (default `initial`) */
   followRedirects?: FollowRedirects;
   /**
@@ -125,13 +130,13 @@ function urlOf(base: string, path: string): string {
   return base.endsWith("/") ? `${base}${path}` : `${base}/${path}`;
 }
 
-/** A GET of the dumb protocol: headers only to the repository's origin. */
+/** A GET of the dumb protocol: headers only to the origin of the URL as given. */
 async function get(remote: DumbHttpRemote, url: string, initial = false): Promise<Response> {
   const { options } = remote;
   const follow = options.followRedirects ?? "initial";
   const sameOrigin = (() => {
     try {
-      return new URL(url).origin === new URL(remote.baseUrl).origin;
+      return new URL(url).origin === options.credentialOrigin;
     } catch {
       return false;
     }

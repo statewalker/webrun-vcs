@@ -164,6 +164,8 @@ export async function openHttpConnection(
       return openDumbHttpConnection(redirectedBase(baseUrl, tail, response.url), body, {
         fetchImpl: doFetch,
         headers,
+        // the URL as given: a redirect to another origin takes no credentials along
+        credentialOrigin: originOf(baseUrl),
         ...(options.followRedirects ? { followRedirects: options.followRedirects } : {}),
         ...(options.alternateAllowed ? { alternateAllowed: options.alternateAllowed } : {}),
         wait,
@@ -231,6 +233,15 @@ export async function openHttpConnection(
       options.signal?.removeEventListener("abort", onAbort);
     },
   };
+}
+
+/** A URL's origin; "" for one that does not parse (no headers ever match it). */
+function originOf(url: string): string {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return "";
+  }
 }
 
 /**
