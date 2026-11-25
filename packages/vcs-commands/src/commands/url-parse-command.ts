@@ -13,7 +13,7 @@
 import { URL_COMPONENTS, type UrlComponent, urlComponent, urlParse } from "@statewalker/vcs-utils";
 
 import { GitCommand } from "../git-command.js";
-import type { PlumbingOutput } from "./check-ref-format-command.js";
+import type { PlumbingTextOutput } from "./check-ref-format-command.js";
 
 const USAGE =
   "usage: git url-parse [-c <component>] [--] <url>...\n\n" +
@@ -26,7 +26,7 @@ const USAGE =
  * A URL git refuses ends the run with git's `fatal:` line (exit 128) after the earlier URLs'
  * lines; an unknown component dies before any URL is read, no URL prints the usage (129).
  */
-export class UrlParseCommand extends GitCommand<PlumbingOutput> {
+export class UrlParseCommand extends GitCommand<PlumbingTextOutput> {
   private readonly urls: string[] = [];
   private component?: string;
 
@@ -44,7 +44,7 @@ export class UrlParseCommand extends GitCommand<PlumbingOutput> {
     return this;
   }
 
-  async call(): Promise<PlumbingOutput> {
+  async call(): Promise<PlumbingTextOutput> {
     this.checkCallable();
     this.setCallable(false);
     if (this.urls.length === 0) return { exitCode: 129, stdout: "", stderr: USAGE };

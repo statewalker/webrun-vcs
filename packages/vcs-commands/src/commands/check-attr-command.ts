@@ -22,7 +22,7 @@ import {
 import { GitCommand } from "../git-command.js";
 import { quotePath } from "../results/quote-path.js";
 import { attributesSourceResolver, bareAttributesResolver } from "./attributes-source.js";
-import type { PlumbingOutput } from "./check-ref-format-command.js";
+import type { PlumbingTextOutput } from "./check-ref-format-command.js";
 import { configBool } from "./merge-config.js";
 import { directoryPrefix, inputRecords, prefixPath } from "./plumbing-input.js";
 import { worktreeHostPath } from "./submodule-model.js";
@@ -68,7 +68,7 @@ interface AttributeReader {
  * bad `--source` 128. Paths are read against {@link setCurrentDirectory}. git 2.5x computes
  * `builtin_objectmode` (the path's mode in the worktree, or the index's with `--cached`).
  */
-export class CheckAttrCommand extends GitCommand<PlumbingOutput> {
+export class CheckAttrCommand extends GitCommand<PlumbingTextOutput> {
   private readonly attributes: string[] = [];
   private readonly paths: string[] = [];
   private all = false;
@@ -142,7 +142,7 @@ export class CheckAttrCommand extends GitCommand<PlumbingOutput> {
     return this;
   }
 
-  async call(): Promise<PlumbingOutput> {
+  async call(): Promise<PlumbingTextOutput> {
     this.checkCallable();
     this.setCallable(false);
     const usage = (message: string) => ({

@@ -14,7 +14,7 @@ import { expandUserPath, type IgnoreMatch, xdgConfigPath } from "@statewalker/vc
 
 import { GitCommand } from "../git-command.js";
 import { quotePath } from "../results/quote-path.js";
-import type { PlumbingOutput } from "./check-ref-format-command.js";
+import type { PlumbingTextOutput } from "./check-ref-format-command.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { configBool, configValue } from "./merge-config.js";
 import { DO_MATCH_DIRECTORY, matchPathspec, parsePathspecItem } from "./pathspec.js";
@@ -35,7 +35,7 @@ const S_IFDIR = 0o040000;
  * none, 128 for git's deaths (its argument errors, a path beyond a symbolic link or inside a
  * submodule, a bare repository). Paths are read against {@link setCurrentDirectory}.
  */
-export class CheckIgnoreCommand extends GitCommand<PlumbingOutput> {
+export class CheckIgnoreCommand extends GitCommand<PlumbingTextOutput> {
   private readonly paths: string[] = [];
   private stdin?: Uint8Array;
   private nul = false;
@@ -101,7 +101,7 @@ export class CheckIgnoreCommand extends GitCommand<PlumbingOutput> {
     return this;
   }
 
-  async call(): Promise<PlumbingOutput> {
+  async call(): Promise<PlumbingTextOutput> {
     this.checkCallable();
     this.setCallable(false);
     let stdout = "";

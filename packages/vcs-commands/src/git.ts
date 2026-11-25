@@ -23,6 +23,7 @@ import {
   BundleListHeadsCommand,
   BundleUnbundleCommand,
   BundleVerifyCommand,
+  CatFileCommand,
   CheckAttrCommand,
   CheckIgnoreCommand,
   CheckMailmapCommand,
@@ -56,7 +57,9 @@ import {
   ListBranchCommand,
   ListTagCommand,
   LogCommand,
+  LsFilesCommand,
   LsRemoteCommand,
+  LsTreeCommand,
   MergeBaseCommand,
   MergeCommand,
   MvCommand,
@@ -93,6 +96,7 @@ import {
   ShortlogCommand,
   ShowCommand,
   ShowCurrentBranchCommand,
+  ShowRefCommand,
   SparseCheckoutCommand,
   StashApplyCommand,
   StashBranchCommand,
@@ -421,6 +425,20 @@ export class Git implements Disposable {
   show(): ShowCommand {
     this.checkClosed();
     return new ShowCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a ShowRefCommand (`git show-ref`): refs and their ids, `--verify`, `--exists`,
+   * `--exclude-existing`, with git's stdout, stderr and exit status.
+   *
+   * @example
+   * ```typescript
+   * const { stdout, exitCode } = await git.showRef().setTags(true).setDereference(true).callOutput();
+   * ```
+   */
+  showRef(): ShowRefCommand {
+    this.checkClosed();
+    return new ShowRefCommand(this._workingCopy);
   }
 
   /**
@@ -977,6 +995,20 @@ export class Git implements Disposable {
   }
 
   /**
+   * Create a CatFileCommand (`git cat-file`): an object's type, size or content, or many
+   * objects named on stdin (`--batch`, `--batch-check`, `--batch-command`).
+   *
+   * @example
+   * ```typescript
+   * const { stdout } = await git.catFile().setBatch("info").setStdin("HEAD\n").callOutput();
+   * ```
+   */
+  catFile(): CatFileCommand {
+    this.checkClosed();
+    return new CatFileCommand(this._workingCopy);
+  }
+
+  /**
    * Create a CheckIgnoreCommand (`git check-ignore`): which paths the ignore rules exclude, with
    * `-v` the deciding pattern (`-n`, `--no-index`, `--stdin`, `-z`, `-q`).
    *
@@ -1501,6 +1533,34 @@ export class Git implements Disposable {
   lsRemote(): LsRemoteCommand {
     this.checkClosed();
     return this.withTransports(new LsRemoteCommand(this._workingCopy));
+  }
+
+  /**
+   * Create an LsTreeCommand (`git ls-tree`): a tree's entries as git prints them.
+   *
+   * @example
+   * ```typescript
+   * const { stdout } = await git.lsTree().setTreeish("HEAD").setRecursive().callOutput();
+   * ```
+   */
+  lsTree(): LsTreeCommand {
+    this.checkClosed();
+    return new LsTreeCommand(this._workingCopy);
+  }
+
+  /**
+   * Create an LsFilesCommand (`git ls-files`): the index's entries and the untracked,
+   * ignored, deleted, modified and killed files, printed as git prints them.
+   *
+   * @example
+   * ```typescript
+   * // git ls-files -s
+   * const { stdout } = await git.lsFiles().setStage(true).callOutput();
+   * ```
+   */
+  lsFiles(): LsFilesCommand {
+    this.checkClosed();
+    return new LsFilesCommand(this._workingCopy);
   }
 
   // ============ Remote Configuration Operations ============

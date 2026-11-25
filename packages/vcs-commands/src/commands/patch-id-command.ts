@@ -11,7 +11,7 @@
  */
 
 import { GitCommand } from "../git-command.js";
-import type { PlumbingOutput } from "./check-ref-format-command.js";
+import type { PlumbingTextOutput } from "./check-ref-format-command.js";
 import { configBool } from "./merge-config.js";
 import { patchIdsOfPatchText } from "./patch-id.js";
 
@@ -25,7 +25,7 @@ const encoder = new TextEncoder();
  * Without a mode, `patchid.stable` and `patchid.verbatim` decide (verbatim implies stable),
  * unstable when neither is set. Ids are of the repository's hash, as git's `the_hash_algo`.
  */
-export class PatchIdCommand extends GitCommand<PlumbingOutput> {
+export class PatchIdCommand extends GitCommand<PlumbingTextOutput> {
   private input: Uint8Array = new Uint8Array(0);
   private mode?: PatchIdMode;
 
@@ -43,7 +43,7 @@ export class PatchIdCommand extends GitCommand<PlumbingOutput> {
     return this;
   }
 
-  async call(): Promise<PlumbingOutput> {
+  async call(): Promise<PlumbingTextOutput> {
     this.checkCallable();
     this.setCallable(false);
     let stable: boolean;

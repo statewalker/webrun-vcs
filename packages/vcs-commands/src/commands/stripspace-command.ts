@@ -15,7 +15,7 @@ import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
-import type { PlumbingOutput } from "./check-ref-format-command.js";
+import type { PlumbingTextOutput } from "./check-ref-format-command.js";
 import { stripspace } from "./message-cleanup.js";
 
 /** `git stripspace`'s modes: no option, `-s` (`--strip-comments`), `-c` (`--comment-lines`). */
@@ -46,7 +46,7 @@ export function commentLines(text: string, commentPrefix: string): string {
  * knows only `core.commentChar`: anything but one ASCII character), exit 128 with git's two
  * lines. The default mode reads no configuration.
  */
-export class StripspaceCommand extends GitCommand<PlumbingOutput> {
+export class StripspaceCommand extends GitCommand<PlumbingTextOutput> {
   private input = "";
   private mode: StripspaceMode = "default";
   private compatibility: "2.43" | "2.56" = "2.56";
@@ -72,7 +72,7 @@ export class StripspaceCommand extends GitCommand<PlumbingOutput> {
     return this;
   }
 
-  async call(): Promise<PlumbingOutput> {
+  async call(): Promise<PlumbingTextOutput> {
     this.checkCallable();
     this.setCallable(false);
     if (this.mode === "default") {

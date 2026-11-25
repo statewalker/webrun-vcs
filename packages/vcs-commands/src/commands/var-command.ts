@@ -21,7 +21,7 @@ import {
 import { GitApiError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
-import type { PlumbingOutput } from "./check-ref-format-command.js";
+import type { PlumbingTextOutput } from "./check-ref-format-command.js";
 import { isValidBranchName } from "./default-branch.js";
 import { authorIdentOf, committerIdentOf, hostEnvironmentOf } from "./git-ident.js";
 
@@ -75,7 +75,7 @@ function normalizePath(path: string): string | undefined {
  * `defaultEditor` and `defaultPager` name another build's defaults); the shell `/bin/sh`; the
  * file paths those of the host environment.
  */
-export class VarCommand extends GitCommand<PlumbingOutput> {
+export class VarCommand extends GitCommand<PlumbingTextOutput> {
   private variable?: string;
   private list = false;
 
@@ -93,7 +93,7 @@ export class VarCommand extends GitCommand<PlumbingOutput> {
     return this;
   }
 
-  async call(): Promise<PlumbingOutput> {
+  async call(): Promise<PlumbingTextOutput> {
     this.checkCallable();
     this.setCallable(false);
     const usage = { exitCode: 129, stdout: "", stderr: USAGE };

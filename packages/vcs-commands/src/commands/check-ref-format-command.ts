@@ -17,7 +17,7 @@ import { RevisionError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 
 /** What a plumbing command printed and its exit status, as git's process ends. */
-export interface PlumbingOutput {
+export interface PlumbingTextOutput {
   exitCode: number;
   stdout: string;
   stderr: string;
@@ -57,7 +57,7 @@ export function checkRefFormat(
  * for, then checked as `refs/heads/<name>` and printed, or git's
  * `fatal: '<name>' is not a valid branch name` (exit 128).
  */
-export class CheckRefFormatCommand extends GitCommand<PlumbingOutput> {
+export class CheckRefFormatCommand extends GitCommand<PlumbingTextOutput> {
   private refName?: string;
   private branch?: string;
   private readonly options: CheckRefFormatOptions = {};
@@ -97,7 +97,7 @@ export class CheckRefFormatCommand extends GitCommand<PlumbingOutput> {
     return this;
   }
 
-  async call(): Promise<PlumbingOutput> {
+  async call(): Promise<PlumbingTextOutput> {
     this.checkCallable();
     this.setCallable(false);
     if (this.branch !== undefined) return this.checkBranch(this.branch);
@@ -107,7 +107,7 @@ export class CheckRefFormatCommand extends GitCommand<PlumbingOutput> {
   }
 
   /** check_branch_ref: copy_branchname (INTERPRET_BRANCH_LOCAL), then the rules. */
-  private async checkBranch(arg: string): Promise<PlumbingOutput> {
+  private async checkBranch(arg: string): Promise<PlumbingTextOutput> {
     const refused = {
       exitCode: 128,
       stdout: "",
