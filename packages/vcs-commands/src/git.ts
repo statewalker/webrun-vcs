@@ -96,6 +96,7 @@ import {
   RemoteUpdateCommand,
   RenameBranchCommand,
   RepackCommand,
+  ReplaceCommand,
   RerereCommand,
   ResetCommand,
   RestoreCommand,
@@ -466,6 +467,21 @@ export class Git implements Disposable {
   showRef(): ShowRefCommand {
     this.checkClosed();
     return new ShowRefCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a ReplaceCommand (`git replace`): replace refs created, listed (`--format`),
+   * deleted, made by `--edit` or `--graft`, and converted from `info/grafts`.
+   *
+   * @example
+   * ```typescript
+   * await git.replace().setMode("graft").addArgument("HEAD~2").call();
+   * const { stdout } = await git.replace().setFormat("long").callOutput();
+   * ```
+   */
+  replace(): ReplaceCommand {
+    this.checkClosed();
+    return new ReplaceCommand(this._workingCopy);
   }
 
   /**

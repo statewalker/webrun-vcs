@@ -211,6 +211,14 @@ export interface Refs {
   readGrafts?(): Promise<string | undefined>;
 
   /**
+   * Remove the grafts file (`info/grafts`), as `git replace --convert-graft-file` does once
+   * every graft is a replace ref. Returns whether a file was removed.
+   *
+   * Optional: a store without it has no grafts file to remove.
+   */
+  removeGrafts?(): Promise<boolean>;
+
+  /**
    * Replace the shallow commits (an empty list makes the repository complete again: git
    * removes the `shallow` file). With `expected` (the list the caller read), a store whose
    * shallow commits changed meanwhile refuses the write, as git's
