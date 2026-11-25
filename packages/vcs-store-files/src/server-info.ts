@@ -8,7 +8,7 @@
  */
 
 import type { FilesApi, GitObjects, ObjectId, PackSet } from "@statewalker/vcs-core";
-import { isSymbolicRef, joinPath } from "@statewalker/vcs-core";
+import { isSymbolicRef, joinPath, packNameOf } from "@statewalker/vcs-core";
 import { objectLinks } from "./cruft-pack.js";
 import { readAllRefs } from "./refs/index.js";
 
@@ -95,7 +95,7 @@ async function peel(objects: GitObjects, id: ObjectId): Promise<ObjectId | undef
 
 async function infoPacks(o: ServerInfoOptions, path: string): Promise<string> {
   await o.packs.refresh();
-  const names = (await o.packs.packs()).map((p) => `pack-${p.packId}.pack`);
+  const names = (await o.packs.packs()).map((p) => `${packNameOf(p)}.pack`);
   const old = (await readText(o.files, path)) ?? "";
   const oldOrder = old
     .split("\n")

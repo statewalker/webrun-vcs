@@ -31,6 +31,7 @@ import {
   objectFormatOf,
   objectsWithoutLazyFetch,
   type PackFile,
+  packNameOf,
   parseObjectFilter,
   resolveObjectFilter,
   writePack,
@@ -43,7 +44,7 @@ import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { assertAlternatesReadable } from "./alternates/index.js";
 import { objectLinks, recentPackedObjects, writeCruftPacks } from "./cruft-pack.js";
 import { type MultiPackIndexWriteOptions, multiPackIndexWrite } from "./multi-pack-index.js";
-import { objectIdPattern } from "./object-names.js";
+import { keepPackNames, objectIdPattern } from "./object-names.js";
 import {
   type PackWriteSettings,
   packDeltaSearch,
@@ -195,7 +196,7 @@ export interface RepackOptions extends RepackTarget {
   packSettings?: PackWriteSettings;
   /**
    * `git repack --keep-pack=<name>` (gc's `--keep-largest-pack`, `gc.bigPackThreshold`): packs
-   * (`pack-<id>.pack`, `pack-<id>` or the id) treated as kept in core: never replaced, their
+   * (`<name>.pack`, `<name>` or, for `pack-<id>`, the id) treated as kept in core: never replaced, their
    * objects left out of the new pack (whatever `packKeptObjects` says) and of a cruft pack.
    */
   keepPacks?: readonly string[];
@@ -527,13 +528,12 @@ export async function repackListed(
   const kept: Pack[] = [];
   const replaced: Pack[] = [];
   // --keep-pack: kept in core, whatever --pack-kept-objects says
-  const inCore = new Set(
-    (options.keepPacks ?? []).map((n) => n.replace(/^pack-/, "").replace(/\.pack$/, "")),
-  );
+  // by base name, as git's --keep-pack compares pack_basename (`custom-<id>.pack` too)
+  const inCore = keepPackNames(options.keepPacks);
   const keptInCore: Pack[] = [];
   for (const p of before) {
-    if (inCore.has(p.packId)) keptInCore.push(p);
-    else if (await files.exists(joinPath(packDir, `pack-${p.packId}.keep`))) kept.push(p);
+    if (inCore.has(packNameOf(p))) keptInCore.push(p);
+    else if (await files.exists(joinPath(packDir, `${packNameOf(p)}.keep`))) kept.push(p);
     else replaced.push(p);
   }
 
@@ -638,13 +638,13 @@ export async function repackListed(
     bitmaps.mode = "off";
   }
 
-  const keptPacks = [...kept, ...keptInCore].map((p) => `pack-${p.packId}`);
+  const keptPacks = [...kept, ...keptInCore].map((p) => packNameOf(p));
   if (dryRun) {
     return {
       packName: "",
       objectCount: ids.length,
       looseObjectsRemoved: 0,
-      packsRemoved: all ? replaced.map((p) => `pack-${p.packId}`) : [],
+      packsRemoved: all ? replaced.map((p) => packNameOf(p)) : [],
       keptPacks,
       unpackedObjects: 0,
     };
@@ -739,7 +739,7 @@ export async function repackListed(
     if (all && deleteRedundant) {
       for (const p of replaced) {
         if (newPacks.has(p.packId)) continue;
-        const modified = (await files.stats(joinPath(packDir, `pack-${p.packId}.pack`)))
+        const modified = (await files.stats(joinPath(packDir, `${packNameOf(p)}.pack`)))
           ?.lastModified;
         if (modified !== undefined && modified > snapshot.walkStartedAt) continue;
         removable.push({ pack: p, modified });
@@ -807,20 +807,20 @@ export async function repackListed(
     // pack stays (its objects are now in two packs, which every reader accepts)
     for (let i = removable.length - 1; i >= 0; i--) {
       const r = removable[i] as (typeof removable)[number];
-      const modified = (await files.stats(joinPath(packDir, `pack-${r.pack.packId}.pack`)))
+      const modified = (await files.stats(joinPath(packDir, `${packNameOf(r.pack)}.pack`)))
         ?.lastModified;
       if (modified !== undefined && modified !== r.modified && modified > snapshot.walkStartedAt)
         removable.splice(i, 1);
     }
-    const packsRemoved = removable.map((r) => `pack-${r.pack.packId}`);
+    const packsRemoved = removable.map((r) => packNameOf(r.pack));
     // --write-midx: the midx of what stays, written before anything is removed
     let midxWritten: string | undefined;
     if (options.writeMidx) {
       const removed = new Set(removable.map((r) => r.pack.packId));
       const include = new Set<string>();
-      for (const p of [...kept, ...keptInCore]) include.add(`pack-${p.packId}.idx`);
+      for (const p of [...kept, ...keptInCore]) include.add(`${packNameOf(p)}.idx`);
       for (const id of newPacks) include.add(`pack-${id}.idx`);
-      for (const p of replaced) if (!removed.has(p.packId)) include.add(`pack-${p.packId}.idx`);
+      for (const p of replaced) if (!removed.has(p.packId)) include.add(`${packNameOf(p)}.idx`);
       const midx = await multiPackIndexWrite({
         files,
         gitDir,
@@ -850,7 +850,7 @@ export async function repackListed(
         packsRemoved.map((name) => `${name}.pack`),
         { wroteIncremental: false, objectFormat: objectFormatOf(objects) },
       );
-    if (packsRemoved.length) await packs.remove(removable.map((r) => r.pack.packId));
+    if (packsRemoved.length) await packs.remove(removable.map((r) => r.pack));
 
     const looseObjectsRemoved = deleteRedundant
       ? await prunePacked(looseStorage, packs, objectFormatOf(objects), alternates)

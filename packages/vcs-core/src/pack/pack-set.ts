@@ -1,5 +1,5 @@
 /**
- * Every installed pack of a pack directory (`objects/pack/pack-*.idx` with its `.pack`), as git's
+ * Every installed pack of a pack directory (every `objects/pack/*.idx` with its `.pack`), as git's
  * packed_git list and JGit's PackDirectory:
  *
  *  - a pack that cannot be opened (corrupt idx, pack/idx mismatch) is skipped and recorded in
@@ -44,6 +44,7 @@ import {
   type Pack,
   type PackedEntry,
   type PackFile,
+  packNameOf,
   type ResolvedObject,
 } from "./pack-file.js";
 import { runSteps, runStepsAsync, type Steps } from "./run-steps.js";
@@ -168,8 +169,14 @@ export interface PackSet {
   readonly writeReverseIndex?: boolean;
   /** Installs a pack with `installPack` into the directory and adds it to the set. */
   install(source: AsyncIterable<Uint8Array>, options?: InstallPackOptions): Promise<InstalledPack>;
-  /** Removes packs: `.idx` first, then `.pack`, and `.keep`, `.rev`, `.bitmap`… if present. */
-  remove(packIds: readonly string[]): Promise<void>;
+  /**
+   * Removes packs: `.idx` first, then `.pack`, and `.keep`, `.rev`, `.bitmap`… if present. An id
+   * names `pack-<id>`; a pack (from `packs()`) names its own files (`custom-<id>`), and only
+   * those: another pack of the same id under another name stays.
+   */
+  remove(
+    packs: readonly (string | { readonly packId: string; readonly name?: string })[],
+  ): Promise<void>;
   /**
    * Marks an installed pack as a promisor pack (a partial clone's): writes `pack-<id>.promisor`
    * with `content` (git's fetch-pack writes the fetched refs, `<id> <name>` per line, for a
@@ -227,8 +234,9 @@ export async function openPackSet(
   const maxObjectSize = options.maxObjectSize ?? 2 ** 30;
   const objectFormat = options.objectFormat ?? SHA1_OBJECT_FORMAT;
   const sha1 = objectFormat.name === "sha1";
-  const hexLength = objectFormat.hexLength;
-  const PACK_IDX = new RegExp(`^pack-[0-9a-f]{${hexLength}}\\.idx$`);
+  // every `*.idx`, as git's prepare_packed_git_one: `pack-<id>.idx`, and the names
+  // `git pack-objects <dir>/<base>` writes (`<base>-<id>.idx`); the open checks the idx
+  const PACK_IDX = /^[^/\\]+\.idx$/;
   const isId = (id: unknown): id is ObjectId => isHexObjectId(id, objectFormat);
   const rescanInterval = options.rescanIntervalMs ?? 1000;
   /** how long freshen trusts a pack it saw: capped, as a write it skips is never retried */
@@ -299,7 +307,7 @@ export async function openPackSet(
     s.add(id);
   };
   const holds = (p: PackFile, id: ObjectId) => p.has(id) && !isBad(p, id);
-  const nameOf = (p: PackFile) => `pack-${p.packId}`;
+  const nameOf = (p: PackFile) => p.name;
   /** the midx in use and its loaded packs by pack-int-id (undefined: missing) */
   const useMidx = options.multiPackIndex ?? true;
   let midx: MultiPackIndex | undefined;
@@ -998,17 +1006,19 @@ export async function openPackSet(
     async writePromisor(packId, content) {
       await files.write(`${dir}/pack-${packId}.promisor`, [new TextEncoder().encode(content)]);
     },
-    async remove(packIds) {
+    async remove(toRemove) {
+      const names = new Set(
+        toRemove.map((p) => (typeof p === "string" ? `pack-${p}` : packNameOf(p))),
+      );
       // a midx naming a pack about to go is cleared first, as git's repack does
-      if (packIds.length)
+      if (names.size)
         await clearMultiPackIndexNaming(
           files,
           dir,
-          packIds.map((id) => `pack-${id}.pack`),
+          [...names].map((name) => `${name}.pack`),
           sha1 ? {} : { objectFormat },
         );
-      for (const packId of packIds) {
-        const name = `pack-${packId}`;
+      for (const name of names) {
         removedAt.set(name, ++removals);
         removing.add(name);
         const p = byName.get(name);
@@ -1026,7 +1036,7 @@ export async function openPackSet(
         }
       }
       // objects only in the removed packs are gone: cached parses are checked again
-      if (packIds.length) noteObjectRemoved();
+      if (names.size) noteObjectRemoved();
       await loadMidx();
     },
   };

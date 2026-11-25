@@ -1052,7 +1052,8 @@ async function packedTrees(
     if ((await files.stats(dir))?.kind !== "directory") return out;
     const found: { idxPath: string; name: string; mtime: number }[] = [];
     for await (const e of files.list(dir)) {
-      if (e.kind === "file" && /^pack-[0-9a-f]+\.idx$/.test(e.name))
+      // every `*.idx`, as git's packed_git list (`custom-<id>.idx` too)
+      if (e.kind === "file" && /^[^/\\]+\.idx$/.test(e.name))
         found.push({ idxPath: joinPath(dir, e.name), name: e.name, mtime: e.lastModified ?? 0 });
     }
     // newest first, as the store's pack list (git's sort_pack)

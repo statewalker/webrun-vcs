@@ -40,3 +40,16 @@ export function packFilePattern(format: ObjectFormat): RegExp {
   }
   return re;
 }
+
+/**
+ * `--keep-pack` arguments as pack base names, as git compares them with `pack_basename`:
+ * `custom-<id>.pack` and `custom-<id>` name `custom-<id>`, a bare id names `pack-<id>`.
+ */
+export function keepPackNames(keepPacks: readonly string[] = []): Set<string> {
+  return new Set(
+    keepPacks.map((n) => {
+      const base = n.replace(/\.pack$/, "");
+      return /^[0-9a-f]+$/.test(base) ? `pack-${base}` : base;
+    }),
+  );
+}
