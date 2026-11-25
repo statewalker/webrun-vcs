@@ -33,6 +33,7 @@ import {
   type TagMode,
   type FetchOptions as TransportFetchOptions,
   transportSummaryWidth,
+  unpackLimitOf,
 } from "@statewalker/vcs-transport";
 import { parseGitBool } from "@statewalker/vcs-utils";
 import { nullObjectIdLike } from "@statewalker/vcs-utils/hash";
@@ -916,6 +917,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     );
 
     const sessionId = clientSessionIdOf(this.workingCopy);
+    const unpackLimit = unpackLimitOf({ getAll: (key) => store.values(key) }, "fetch");
     const fetchOptions: TransportFetchOptions = {
       ...(sessionId !== undefined ? { sessionId } : {}),
       url: remoteUrl,
@@ -980,6 +982,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       reflogIdent: this.reflogLine("").ident,
       abbrev: parseCoreAbbrev(store.value("core.abbrev")) ?? -1,
       ...(fsck ? { fsckObjects: fsck } : {}),
+      // fetch.unpackLimit / transfer.unpackLimit: keep the pack or unpack it
+      ...(unpackLimit !== undefined ? { unpackLimit } : {}),
       ...(filter ? { filter } : {}),
       ...(this.refetch ? { refetch: true } : {}),
       // the transport's warnings (a filter the server ignores, the dumb walker's alternates)

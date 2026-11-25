@@ -202,7 +202,7 @@ export class DefaultSerializationApi implements SerializationApi {
   ): Promise<PackImportResult> {
     const r = await importPack(this.objects, pack, {
       packs: this.packs,
-      unpackLimit: options.keepPack ? 1 : this.unpackLimit,
+      unpackLimit: options.keepPack ? 1 : (options.unpackLimit ?? this.unpackLimit),
       quarantine: options.quarantine,
       ...(options.onObject ? { onObject: options.onObject } : {}),
       ...(options.onContent ? { onContent: options.onContent } : {}),

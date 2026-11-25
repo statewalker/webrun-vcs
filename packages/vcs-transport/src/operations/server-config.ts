@@ -71,8 +71,10 @@ export interface ServerConfigSettings {
    */
   receiveKeepAliveMs?: number;
   /**
-   * `receive.unpackLimit`, else `transfer.unpackLimit` (git's default 100 when neither): which
-   * child receive-pack names when it refuses a pack (index-pack from this many objects on)
+   * `receive.unpackLimit`, else `transfer.unpackLimit` (a negative value counts as unset;
+   * git's default 100 when neither): a pushed pack of at least this many objects is kept
+   * (index-pack), a smaller one unpacked (unpack-objects), 0 keeping every pack; also the child
+   * receive-pack names when it refuses a pack
    */
   unpackLimit?: number;
   /** upload-pack's hidden ref patterns: `transfer.hideRefs` and `uploadpack.hideRefs` */
@@ -428,6 +430,48 @@ export function explicitServerSettingsFromConfig(
     out.receivePackConfigError = firstInConfigOrder(config, numberErrors);
   }
   return out;
+}
+
+/**
+ * git's `git_config_int` of a value: a decimal integer, optionally followed by `k`, `m` or
+ * `g` (case-insensitive: times 1024, 1024², 1024³); undefined for anything else (git dies
+ * there: `bad numeric config value`).
+ *
+ * @example
+ * ```typescript
+ * parseConfigInt("1k"); // 1024
+ * ```
+ */
+export function parseConfigInt(value: unknown): number | undefined {
+  if (typeof value !== "string" && typeof value !== "number") return undefined;
+  const match = /^\s*([+-]?\d+)\s*([kmg]?)\s*$/i.exec(String(value));
+  if (!match) return undefined;
+  const unit = { "": 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 }[
+    (match[2] ?? "").toLowerCase() as "" | "k" | "m" | "g"
+  ];
+  return Number(match[1]) * unit;
+}
+
+/**
+ * The unpack limit of `<section>.unpackLimit`, else `transfer.unpackLimit` (receive-pack's
+ * `receive`, fetch-pack's `fetch`), each its last value; a negative value counts as unset, as
+ * git's `if (0 <= receive_unpack_limit)`. Undefined when neither is set (git's default 100).
+ * What 0 means is the reader's: receive-pack keeps every pack, fetch-pack unpacks every one.
+ *
+ * @example
+ * ```typescript
+ * unpackLimitOf(config, "fetch"); // [fetch] unpackLimit = 1 → 1
+ * ```
+ */
+export function unpackLimitOf(
+  config: ServerConfigReader,
+  section: "receive" | "fetch",
+): number | undefined {
+  for (const key of [`${section}.unpackLimit`, "transfer.unpackLimit"]) {
+    const limit = parseConfigInt(last(config, key));
+    if (limit !== undefined && limit >= 0) return limit;
+  }
+  return undefined;
 }
 
 /**
