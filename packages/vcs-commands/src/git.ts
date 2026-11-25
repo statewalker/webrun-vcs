@@ -18,6 +18,10 @@ import {
   BisectStateCommand,
   BisectTermsCommand,
   BlameCommand,
+  BundleCreateCommand,
+  BundleListHeadsCommand,
+  BundleUnbundleCommand,
+  BundleVerifyCommand,
   CheckMailmapCommand,
   CheckoutCommand,
   CherryCommand,
@@ -1623,6 +1627,59 @@ export class Git implements Disposable {
   backfill(): BackfillCommand {
     this.checkClosed();
     return new BackfillCommand(this._workingCopy);
+  }
+
+  /**
+   * `git bundle create <file> <git-rev-list-args>`: a bundle of the history the arguments
+   * name (its bytes in the result).
+   *
+   * @example
+   * ```typescript
+   * const { bundle } = await git.bundleCreate().addArgument("--all").call();
+   * ```
+   */
+  bundleCreate(): BundleCreateCommand {
+    this.checkClosed();
+    return new BundleCreateCommand(this._workingCopy);
+  }
+
+  /**
+   * `git bundle verify <file>`: whether the repository has what the bundle needs.
+   *
+   * @example
+   * ```typescript
+   * const { exitCode, stdout } = await git.bundleVerify().setBundle(bytes, "x.bundle").call();
+   * ```
+   */
+  bundleVerify(): BundleVerifyCommand {
+    this.checkClosed();
+    return new BundleVerifyCommand(this._workingCopy);
+  }
+
+  /**
+   * `git bundle list-heads <file> [<refname>...]`: the refs a bundle carries.
+   *
+   * @example
+   * ```typescript
+   * const { stdout } = await git.bundleListHeads().setBundle(bytes).call();
+   * ```
+   */
+  bundleListHeads(): BundleListHeadsCommand {
+    this.checkClosed();
+    return new BundleListHeadsCommand(this._workingCopy);
+  }
+
+  /**
+   * `git bundle unbundle <file> [<refname>...]`: a bundle's pack stored, its refs listed.
+   *
+   * @example
+   * ```typescript
+   * const { refs } = await git.bundleUnbundle().setBundle(bytes).call();
+   * ```
+   */
+  bundleUnbundle(): BundleUnbundleCommand {
+    this.checkClosed();
+    return new BundleUnbundleCommand(this._workingCopy);
   }
 
   /**

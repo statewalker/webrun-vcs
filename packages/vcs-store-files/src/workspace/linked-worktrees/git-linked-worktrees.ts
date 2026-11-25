@@ -1099,6 +1099,7 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
       getFiles: () => place.getFiles?.() as FilesApi,
       openRepository: (location, options) =>
         place.openRepository?.(location, options) ?? Promise.resolve(undefined),
+      readLocalFile: (location) => place.readLocalFile?.(location) ?? Promise.resolve(undefined),
       readFetchHead: () => readFetchHead(),
       writeFetchHead: async (content, options) => {
         const path = `${this.commonDir}/FETCH_HEAD`;
