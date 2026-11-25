@@ -14,6 +14,7 @@
 
 import type { GitObjects, ObjectId } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils";
+import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { RemoteConfigStore } from "../../remote-config/index.js";
 import { quotePath } from "../../results/quote-path.js";
 import { PlumbingCommand, PlumbingError } from "../plumbing-command.js";
@@ -334,8 +335,10 @@ export class CatFileCommand extends PlumbingCommand {
   private async listTree(id: ObjectId): Promise<void> {
     const config = RemoteConfigStore.from(this._workingCopy);
     const quoteFully = parseGitBool(config.value("core.quotePath")) ?? true;
+    const entries = await this.listedTreeEntries(id);
+    if (!entries) throw new PlumbingError(`fatal: Cannot read object ${id}`);
     let out = "";
-    for await (const entry of this.trees.loadTree(id)) {
+    for (const entry of entries) {
       const kind = entry.mode & S_IFMT;
       const type = kind === 0o040000 ? "tree" : kind === S_IFGITLINK ? "commit" : "blob";
       const mode = entry.mode.toString(8).padStart(6, "0");
@@ -600,11 +603,13 @@ function concat(chunks: Uint8Array[]): Uint8Array {
 }
 
 /**
- * `strbuf_getdelim_strip_crlf` over the input as it arrives: each record without its
- * delimiter and a CR before it; a last record without a delimiter is read too.
+ * `strbuf_getline` (`strbuf_getdelim_strip_crlf`) over the input as it arrives: each record
+ * without its delimiter, and for newline-terminated input without a CR before it (`-z`'s
+ * `strbuf_getline_nul` keeps the CR); a last record without a delimiter is read too.
+ * Records are bytes: they are decoded as git paths ({@link decodeGitPath}), so a name that
+ * is not UTF-8 resolves and is echoed (`<name> missing`) with its bytes.
  */
 async function* readLines(input: CatFileInput, delimiter: number): AsyncGenerator<string> {
-  const decoder = new TextDecoder();
   const chunks: AsyncIterable<Uint8Array> | Iterable<Uint8Array> =
     typeof input === "string"
       ? [encoder.encode(input)]
@@ -614,8 +619,8 @@ async function* readLines(input: CatFileInput, delimiter: number): AsyncGenerato
   let pending: Uint8Array[] = [];
   const emit = (bytes: Uint8Array) => {
     let end = bytes.length;
-    if (end > 0 && bytes[end - 1] === 0x0d) end--;
-    return decoder.decode(bytes.subarray(0, end));
+    if (delimiter === 0x0a && end > 0 && bytes[end - 1] === 0x0d) end--;
+    return decodeGitPath(bytes.subarray(0, end));
   };
   for await (const chunk of chunks) {
     let start = 0;

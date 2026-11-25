@@ -166,6 +166,11 @@ export class ShowRefCommand extends PlumbingCommand {
     return this;
   }
 
+  /** It reads objects only: ids are abbreviated over cached listings. */
+  protected override writesNoObjects(): boolean {
+    return true;
+  }
+
   protected async run(): Promise<number> {
     const modes: string[] = [];
     if (this.excludeExisting) modes.push("--exclude-existing");
@@ -259,11 +264,13 @@ export class ShowRefCommand extends PlumbingCommand {
     }
     if (value) return 0;
     const raw = await this.looseRefFile(name);
-    if (raw === "directory") {
+    // 2.43 reports the files backend's EISDIR; 2.5x's read_ref_internal takes a directory
+    // for a missing ref (`reference does not exist`, exit 2)
+    if (raw === "directory" && this.compatibility === "2.43") {
       this.warn("error: failed to look up reference: Is a directory");
       return 1;
     }
-    if (raw !== undefined) {
+    if (raw !== undefined && raw !== "directory") {
       if (this.isObjectIdLine(raw)) return 0;
       this.warn("error: failed to look up reference: Invalid argument");
       return 1;

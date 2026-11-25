@@ -43,6 +43,7 @@ import { RemoteConfigStore } from "../remote-config/index.js";
 import { quotePath } from "../results/quote-path.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { hostEnvironmentOf } from "./git-ident.js";
+import { prefixPathGently, relativePath } from "./git-paths.js";
 import {
   DO_MATCH_DIRECTORY,
   matchPathspec,
@@ -342,6 +343,11 @@ export class LsFilesCommand extends PlumbingCommand {
     return this;
   }
 
+  /** It reads objects only: ids are abbreviated over cached listings. */
+  protected override writesNoObjects(): boolean {
+    return true;
+  }
+
   protected async run(): Promise<number> {
     if (
       this.format !== undefined &&
@@ -392,17 +398,23 @@ export class LsFilesCommand extends PlumbingCommand {
       throw new PlumbingError("fatal: ls-files --recurse-submodules is not supported");
     }
 
-    // parse_pathspec with PATHSPEC_PREFER_CWD: no element is the current directory
+    // parse_pathspec with PATHSPEC_PREFER_CWD: no element, or only excludes, is the current
+    // directory; each element is read against it (prefix_path_gently), absolute ones too
     const prefix = this.prefix;
-    const args = this.paths.length > 0 ? this.paths.map((p) => prefixedElement(p, prefix)) : [];
-    if (args.length === 0 && prefix) args.push(prefix);
+    const top = this.paths.length > 0 ? await this.hostWorkingDir() : undefined;
+    const args = this.paths.map((p) => prefixedElement(p, prefix, top));
+    const originals = this.paths.length > 0 ? [...this.paths] : prefix ? [""] : [];
     let items: PathspecItem[];
     try {
+      if (args.length === 0 && prefix) args.push(prefix);
       items = parsePathspec(args);
+      // only excludes: parse_pathspec's implicit item is the current directory
+      if (prefix && items.length > args.length) {
+        items[items.length - 1] = parsePathspec([prefix])[0] as PathspecItem;
+      }
     } catch (e) {
       throw new PlumbingError(`fatal: ${(e as Error).message}`);
     }
-    const originals = this.paths.length > 0 ? this.paths : args.map(() => "");
     const maxPrefix = pathspecCommonPrefix(items);
     const pruneBy = maxPrefix.endsWith("/") ? maxPrefix.slice(0, -1) : maxPrefix;
     const seen = this.errorUnmatch && items.length > 0 ? items.map(() => 0) : undefined;
@@ -463,7 +475,7 @@ export class LsFilesCommand extends PlumbingCommand {
       true;
     const term = this.nul ? "\0" : "\n";
     const relative = (path: string) =>
-      this.fullName || !prefix ? path : relativeGitPath(path, prefix);
+      this.fullName || !prefix ? path : relativePath(path, prefix);
     const nameText = (path: string) => {
       const rel = relative(path);
       return this.nul ? rel : quotePath(rel, quoteFully);
@@ -853,8 +865,12 @@ export class LsFilesCommand extends PlumbingCommand {
   /** get_cached_convert_stats_ascii: the stage-0 (else stage-2) blob of `path`. */
   private async indexEolInfo(list: ListedEntry[], path: string): Promise<string> {
     let found: ListedEntry | undefined;
-    for (const e of list) {
-      if (e.path !== path || e.shadowed) continue;
+    // the entries of `path` start where index_name_pos puts its stage 0
+    const pos = namePos(list, path);
+    for (let k = pos >= 0 ? pos : -pos - 1; k < list.length; k++) {
+      const e = list[k] as ListedEntry;
+      if (e.path !== path) break;
+      if (e.shadowed) continue;
       if (e.stage === 0) {
         found = e;
         break;
@@ -896,7 +912,9 @@ export class LsFilesCommand extends PlumbingCommand {
         continue;
       }
       if (rest.startsWith("x") && /^[0-9a-fA-F]{2}/.test(rest.slice(1))) {
-        out += String.fromCharCode(Number.parseInt(rest.slice(1, 3), 16));
+        // the byte itself: above 0x7f as the escape encodeGitPath writes back as that byte
+        const byte = Number.parseInt(rest.slice(1, 3), 16);
+        out += String.fromCharCode(byte < 0x80 ? byte : 0xdc00 + byte);
         i = pct + 4;
         continue;
       }
@@ -1119,9 +1137,14 @@ async function readAll(content: AsyncIterable<Uint8Array>): Promise<Uint8Array> 
 
 const SHORT_MAGIC = new Set([..."!\"#%&',-;<=>@_`~^/"]);
 
-/** A pathspec element read against the current directory (`:(top)` and `:/` from the top). */
-function prefixedElement(arg: string, prefix: string): string {
-  if (!prefix) return arg;
+/**
+ * A pathspec element read against the current directory, as parse_pathspec's
+ * `prefix_path_gently` reads it (`:(top)` and `:/` from the top; an absolute path against the
+ * worktree's host directory `top`); dies as git when it leaves the worktree.
+ */
+function prefixedElement(arg: string, prefix: string, top: string | undefined): string {
+  let magicEnd = 0;
+  let fromTop = false;
   if (arg.startsWith(":(")) {
     const close = arg.indexOf(")");
     if (close < 0) return arg;
@@ -1129,67 +1152,24 @@ function prefixedElement(arg: string, prefix: string): string {
       .slice(2, close)
       .split(",")
       .map((w) => w.trim());
-    if (words.includes("top")) return arg;
-    return arg.slice(0, close + 1) + prefix + arg.slice(close + 1);
-  }
-  if (arg.startsWith(":")) {
+    fromTop = words.includes("top");
+    magicEnd = close + 1;
+  } else if (arg.startsWith(":")) {
     let i = 1;
     while (i < arg.length && arg[i] !== ":" && SHORT_MAGIC.has(arg[i] as string)) i++;
-    const magic = arg.slice(1, i);
-    if (magic.includes("/")) return arg;
+    fromTop = arg.slice(1, i).includes("/");
     if (arg[i] === ":") i++;
-    return `${arg.slice(0, i)}${prefix}${arg.slice(i)}`;
+    magicEnd = i;
   }
-  return prefix + arg;
-}
-
-/**
- * path.c's `relative_path(in, prefix)`: `in` (from the top) as seen from the directory
- * `prefix` (from the top, ending with `/`), with `../` to climb.
- */
-export function relativeGitPath(input: string, prefix: string): string {
-  const inLen = input.length;
-  const prefixLen = prefix.length;
-  if (!inLen) return "./";
-  if (!prefixLen) return input;
-  let inOff = 0;
-  let prefixOff = 0;
-  let i = 0;
-  let j = 0;
-  while (i < prefixLen && j < inLen && prefix[i] === input[j]) {
-    if (prefix[i] === "/") {
-      while (prefix[i] === "/") i++;
-      while (input[j] === "/") j++;
-      prefixOff = i;
-      inOff = j;
-    } else {
-      i++;
-      j++;
-    }
+  const rest = arg.slice(magicEnd);
+  if (fromTop) return arg;
+  // an empty element is parse_pathspec's own refusal
+  if (rest === "") return arg;
+  const normalized = prefixPathGently(prefix, rest, top);
+  if (normalized === undefined) {
+    const root = (top ?? "").replace(/\/+$/, "") || "/";
+    throw new PlumbingError(`fatal: ${arg}: '${rest}' is outside repository at '${root}'`);
   }
-  if (i >= prefixLen && prefixOff < prefixLen) {
-    if (j >= inLen) inOff = inLen;
-    else if (input[j] === "/") {
-      while (input[j] === "/") j++;
-      inOff = j;
-    } else i = prefixOff;
-  } else if (j >= inLen && inOff < inLen) {
-    if (prefix[i] === "/") {
-      while (prefix[i] === "/") i++;
-      inOff = inLen;
-    }
-  }
-  const rest = input.slice(inOff);
-  if (i >= prefixLen) return rest.length === 0 ? "./" : rest;
-  let out = "";
-  while (i < prefixLen) {
-    if (prefix[i] === "/") {
-      out += "../";
-      while (prefix[i] === "/") i++;
-      continue;
-    }
-    i++;
-  }
-  if (prefix[prefixLen - 1] !== "/") out += "../";
-  return out + rest;
+  // the top itself (`..` from a subdirectory) matches everything
+  return arg.slice(0, magicEnd) + (normalized === "" ? "." : normalized);
 }

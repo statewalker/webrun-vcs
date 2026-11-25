@@ -86,12 +86,15 @@ function showRefArgs(git: Git, argv: string[], input?: string): ShowRefCommand {
 
 /** `git show-ref <argv>` in `dir`, native and ours, compared; native's outcome. */
 async function check(dir: string, argv: string[], input?: string): Promise<Outcome> {
-  const native = shell.git(dir, ["show-ref", ...argv], input !== undefined ? { input } : {});
+  const native = shell.git(dir, ["show-ref", ...argv], {
+    latin1Stdout: true,
+    ...(input !== undefined ? { input } : {}),
+  });
   const git = await openOurs(dir);
   const out = await showRefArgs(git, argv, input).callOutput();
   const ours: Outcome = {
     status: out.exitCode,
-    stdout: new TextDecoder().decode(out.stdout),
+    stdout: Buffer.from(out.stdout).toString("latin1"),
     stderr: out.stderr,
   };
   expect({ argv, ...ours }).toEqual({ argv, ...native });
@@ -245,7 +248,7 @@ describeGit("git show-ref, native twins", () => {
 
     it("--exists with a directory and with special refs", async () => {
       const d = t1403Setup("exists-special");
-      // a directory: git's generic error (the files backend's EISDIR)
+      // a directory: 2.43 reports EISDIR (exit 1), 2.5x a missing ref (exit 2)
       await check(d, ["--exists", "refs/heads"]);
       await check(d, ["--exists", "FETCH_HEAD"]);
       writeFileSync(join(d, ".git/FETCH_HEAD"), shell.ok(d, "rev-parse", "HEAD"));

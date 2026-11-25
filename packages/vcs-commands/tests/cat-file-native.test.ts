@@ -106,7 +106,8 @@ describeGit("git cat-file, native twins", () => {
     }
   });
 
-  it('t1006-cat-file.sh: "custom --batch-check format", "custom --batch-command format", "--batch-check with %(rest)"', async () => {
+  // the %(rest) case of that script is declared through $test_rest, so it has no title to cite
+  it('t1006-cat-file.sh: "custom --batch-check format", "custom --batch-command format"', async () => {
     for (const [, name] of objects()) {
       await check(["--batch-check=%(objecttype) %(objectname)"], lines(name as string));
       await check(["--batch-command=%(objecttype) %(objectname)"], lines(`info ${name}`));
@@ -266,7 +267,7 @@ describeGit("git cat-file, native twins", () => {
     await check(["-t", prefix], undefined, dir);
   });
 
-  it('t1006-cat-file.sh: "cat-file --batch-all-objects shows all objects", "cat-file --unordered works", "cat-file --batch="%(objectname)" with --batch-all-objects will work", "cat-file --batch="%(rest)" with --batch-all-objects will work", "cat-file --batch="batman" with --batch-all-objects will work"', async () => {
+  it('t1006-cat-file.sh: “cat-file --batch-all-objects shows all objects”, “cat-file --unordered works”, “cat-file --batch="%(objectname)" with --batch-all-objects will work”, “cat-file --batch="%(rest)" with --batch-all-objects will work”, “cat-file --batch="batman" with --batch-all-objects will work”', async () => {
     const one = join(root, "all-one");
     shell.ok(root, "init", "-q", "-b", "main", one);
     writeFileSync(join(one, "file"), "content\n");
@@ -410,5 +411,83 @@ describeGit("git cat-file --batch streams", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describeGit("git cat-file, bytes and odd trees", () => {
+  let dir: string;
+  let odd: string;
+  let blob: string;
+
+  /** Both sides compared; a usage error (129) by its first stderr line. */
+  async function checkHere(argv: string[], input?: string | Uint8Array): Promise<void> {
+    const twin = await catFileTwin(shell, dir, argv, input);
+    if (twin.native.status === 129) {
+      expect(twin.ours.status).toBe(129);
+      expect(twin.ours.stderr.split("\n")[0]).toBe(twin.native.stderr.split("\n")[0]);
+      return;
+    }
+    expect({ ...twin.ours, stdout: twin.ours.stdout.toString("latin1") }).toEqual({
+      ...twin.native,
+      stdout: twin.native.stdout.toString("latin1"),
+    });
+  }
+
+  let base: string;
+  beforeAll(() => {
+    base = mkdtempSync(join(tmpdir(), "cat-file-bytes-"));
+    shell = new Shell(base);
+    dir = join(base, "bytes");
+    shell.ok(base, "init", "-q", "-b", "main", dir);
+    // a tracked name that is not UTF-8 (x\xff.txt)
+    writeFileSync(
+      Buffer.concat([Buffer.from(`${dir}/x`), Buffer.from([0xff]), Buffer.from(".txt")]),
+      "x\n",
+    );
+    writeFileSync(join(dir, "ok"), "ok\n");
+    shell.ok(dir, "add", "-A");
+    shell.tick();
+    shell.ok(dir, "commit", "-qm", "bytes");
+    blob = shell.ok(dir, "rev-parse", "HEAD:ok").trim();
+    // a tree git's fsck refuses but its readers list: an entry named ".."
+    const raw = Buffer.from(blob, "hex");
+    const tree = Buffer.concat([Buffer.from("100644 ..\0"), raw, Buffer.from("100644 ok\0"), raw]);
+    odd = shell
+      .git(dir, ["hash-object", "-t", "tree", "--literally", "--stdin", "-w"], { input: tree })
+      .stdout.trim();
+  });
+  afterAll(() => {
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  it("scenario from t1006: a path that is not UTF-8, -p of its tree and in --batch input", async () => {
+    await checkHere(["-p", "HEAD^{tree}"]);
+    await checkHere(["--batch-check"], Buffer.from("HEAD:x\xff.txt\n\xff\n", "latin1"));
+    shell.ok(dir, "config", "core.quotePath", "false");
+    try {
+      await checkHere(["-p", "HEAD^{tree}"]);
+    } finally {
+      shell.ok(dir, "config", "--unset", "core.quotePath");
+    }
+  });
+
+  it("scenario from t1006: a tree with an entry named '..'", async () => {
+    await checkHere(["-p", odd]);
+    await checkHere(["-t", odd]);
+    await checkHere(["--batch-check"], lines(odd, `${odd}:ok`));
+    await checkHere(["--batch"], lines(`${odd}:ok`));
+  });
+
+  it("scenario from t1006: -z keeps a CR that newline input strips", async () => {
+    await checkHere(["--batch-check", "-z"], "HEAD\r\0HEAD\0");
+    await checkHere(["--batch-check"], "HEAD\r\n");
+  });
+
+  it("scenario from t1006: usage errors", async () => {
+    await checkHere(["--buffer", "HEAD"]);
+    await checkHere(["--batch", "-t", "HEAD"], "");
+    await checkHere(["-z", "HEAD"]);
+    await checkHere(["--batch-all-objects"]);
+    await checkHere(["-t"]);
   });
 });

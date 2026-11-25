@@ -10,6 +10,7 @@
  * ```
  */
 
+import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { GitApiError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 
@@ -41,7 +42,13 @@ export class PlumbingError extends GitApiError {
   }
 }
 
-const encoder = new TextEncoder();
+/** Errors the object stores throw for bytes they refuse to read. */
+const STORE_READ_ERRORS = new Set([
+  "CorruptObjectError",
+  "ObjectIdMismatchError",
+  "InvalidTreeEntryNameError",
+  "MissingObjectError",
+]);
 
 /**
  * The base of the listing plumbing commands: {@link run} writes through {@link write} and
@@ -62,9 +69,13 @@ export abstract class PlumbingCommand extends GitCommand<PlumbingResult> {
   /** The command's work: write stdout, add stderr, return the exit status. */
   protected abstract run(): Promise<number>;
 
-  /** Writes bytes or text (UTF-8) to stdout. */
+  /**
+   * Writes bytes or text to stdout. Text is encoded as a git path ({@link encodeGitPath}):
+   * UTF-8, with the bytes a path read from a tree or the index escapes (U+DC80..U+DCFF)
+   * written back as they were, so names that are not UTF-8 keep their bytes.
+   */
   protected async write(chunk: Uint8Array | string): Promise<void> {
-    const bytes = typeof chunk === "string" ? encoder.encode(chunk) : chunk;
+    const bytes = typeof chunk === "string" ? encodeGitPath(chunk) : chunk;
     if (bytes.length > 0) await this.sink?.(bytes);
   }
 
@@ -86,7 +97,17 @@ export abstract class PlumbingCommand extends GitCommand<PlumbingResult> {
   async call(): Promise<PlumbingResult> {
     this.checkCallable();
     this.setCallable(false);
-    const exitCode = await this.run();
+    let exitCode: number;
+    try {
+      exitCode = await this.run();
+    } catch (e) {
+      // a store's refusal of what it read (a corrupt object, a tree it will not decode) is a
+      // death of the command, as git dies on such objects; anything else is a bug and rethrown
+      if (e instanceof Error && !(e instanceof GitApiError) && STORE_READ_ERRORS.has(e.name)) {
+        throw new PlumbingError(`fatal: ${e.message}`);
+      }
+      throw e;
+    }
     return { exitCode, stderr: this.stderrText };
   }
 

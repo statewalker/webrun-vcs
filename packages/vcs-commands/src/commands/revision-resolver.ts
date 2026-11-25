@@ -33,6 +33,7 @@
 
 import type { Commit, GitObjects, ObjectId, PersonIdent, Refs } from "@statewalker/vcs-core";
 import {
+  decodeTreeBytes,
   isSymbolicRef,
   isValidRefName,
   listObjectsWithPrefix,
@@ -59,6 +60,11 @@ export interface RevisionSources {
   trees: {
     has(id: ObjectId): Promise<boolean>;
     getEntry(treeId: ObjectId, name: string): Promise<{ id: ObjectId; mode: number } | undefined>;
+    /**
+     * The tree's stored bytes: a tree holding a name the store refuses to decode (`..`) is
+     * read through them, as git's `find_tree_entry` reads any tree
+     */
+    raw?(id: ObjectId): Promise<Uint8Array | undefined>;
   };
   blobs: { has(id: ObjectId): Promise<boolean> };
   tags?: {
@@ -910,6 +916,27 @@ export class RevisionResolver {
    * itself for ""). Components are matched exactly: an empty one (`/a`, `d//b`) names
    * nothing, and a trailing `/` only follows a directory (`d/` is d, `a.txt/` nothing).
    */
+  private async findTreeEntry(
+    tree: ObjectId,
+    name: string,
+  ): Promise<{ id: ObjectId; mode: number } | undefined> {
+    const trees = this.sources.trees;
+    try {
+      return await trees.getEntry(tree, name);
+    } catch (e) {
+      if ((e as Error)?.name !== "InvalidTreeEntryNameError" || !trees.raw) return undefined;
+      const raw = await safe(() => trees.raw?.(tree) ?? Promise.resolve(undefined));
+      if (!raw) return undefined;
+      const entries = decodeTreeBytes(raw, {
+        canonicalModes: true,
+        idLength: objectFormatOf(this.sources.objects).rawLength,
+        checkNames: false,
+      });
+      const found = entries.find((e) => e.name === name);
+      return found ? { id: found.id, mode: found.mode } : undefined;
+    }
+  }
+
   private async treeEntry(tree: ObjectId, path: string): Promise<ObjectId | undefined> {
     if (path === "") return tree;
     let current = tree;
@@ -918,7 +945,7 @@ export class RevisionResolver {
       const slash = rest.indexOf("/");
       const name = slash < 0 ? rest : rest.slice(0, slash);
       if (name === "") return undefined;
-      const entry = await safe(() => this.sources.trees.getEntry(current, name));
+      const entry = await this.findTreeEntry(current, name);
       if (!entry) return undefined;
       if (slash < 0) {
         this.lastMode = entry.mode;

@@ -562,6 +562,33 @@ describeGit("git ls-tree, native twins", () => {
       }
     });
 
+    it("a tree holding names fsck refuses ('..', an empty name)", async () => {
+      const dir = repository("dotdot");
+      write(dir, "f", "x\n");
+      shell.ok(dir, "add", "f");
+      shell.tick();
+      shell.ok(dir, "commit", "-q", "-m", "m");
+      const blob = shell.ok(dir, "rev-parse", "HEAD:f").trim();
+      const entry = (mode: string, name: string, id: string) =>
+        Buffer.concat([Buffer.from(`${mode} ${name}\0`), Buffer.from(id, "hex")]);
+      const content = Buffer.concat([entry("100644", "..", blob), entry("100644", "ok", blob)]);
+      const r = spawnSync("git", ["hash-object", "-t", "tree", "-w", "--stdin", "--literally"], {
+        cwd: dir,
+        env: nativeGitEnv(root),
+        input: content,
+      });
+      const tree = r.stdout.toString().trim();
+      for (const argv of [
+        [tree],
+        ["-r", tree],
+        ["-l", tree],
+        ["--name-only", tree],
+        [tree, "ok"],
+      ]) {
+        await check(dir, argv);
+      }
+    });
+
     it("a SHA-256 repository", async () => {
       const dir = repository("sha256", "--object-format=sha256");
       write(dir, "a/b", "x\n");

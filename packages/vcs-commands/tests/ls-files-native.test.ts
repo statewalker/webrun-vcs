@@ -159,14 +159,16 @@ async function twin(
   argv: string[],
   prefix = "",
 ): Promise<{ native: Outcome; ours: Outcome }> {
-  const native = shell.git(prefix ? join(dir, prefix) : dir, ["ls-files", ...argv]);
+  const native = shell.git(prefix ? join(dir, prefix) : dir, ["ls-files", ...argv], {
+    latin1Stdout: true,
+  });
   const git = await openOurs(dir);
   const out = await lsFilesArgs(git, argv, prefix)
     .setCompatibility(compatibilityOf(shell))
     .callOutput();
   const ours = {
     status: out.exitCode,
-    stdout: Buffer.from(out.stdout).toString("utf8"),
+    stdout: Buffer.from(out.stdout).toString("latin1"),
     stderr: out.stderr,
   };
   return { native, ours };
@@ -373,7 +375,7 @@ describeGit("git ls-files, native twins", () => {
       rmSync(top, { recursive: true });
     });
 
-    it('t3001-ls-files-others-exclude.sh: "ls-files with "**" patterns"', async () => {
+    it('t3001-ls-files-others-exclude.sh: “ls-files with "**" patterns”', async () => {
       await check(dir, ["-i", "-o", "--exclude", "/three/a.3[abc]"]);
       await check(dir, ["-o", "-i", "--exclude", "**/a.1"]);
       await check(dir, ["--directory", "-o", "-i", "--exclude", "**/a.1"]);
@@ -775,6 +777,68 @@ describeGit("git ls-files, native twins", () => {
       await check(dir, ["--full-name"], "c");
       await check(dir, [".."], "c");
       await check(dir, ["-o", ".."], "c");
+    });
+  });
+
+  describe("bytes, absolute and exclude-only pathspecs (scenarios from t3004)", () => {
+    let dir: string;
+    beforeAll(() => {
+      dir = repository("bytes");
+      put(dir, "a.txt", "a\n");
+      put(dir, "sub/b.txt", "b\n");
+      put(dir, "sub/c.txt", "c\n");
+      // a tracked and an untracked name that are not UTF-8
+      writeFileSync(
+        Buffer.concat([Buffer.from(`${dir}/x`), Buffer.from([0xff]), Buffer.from(".txt")]),
+        "x\n",
+      );
+      shell.ok(dir, "add", "-A");
+      writeFileSync(Buffer.concat([Buffer.from(`${dir}/u`), Buffer.from([0xfe])]), "u\n");
+      put(dir, "sub/x", "x\n");
+      put(dir, "u.txt", "u\n");
+    });
+
+    it("names that are not UTF-8 keep their bytes", async () => {
+      await check(dir, []);
+      await check(dir, ["-z"]);
+      await check(dir, ["-o", "-z"]);
+      await check(dir, ["-o"]);
+      await check(dir, ["-s", "-z"]);
+      shell.ok(dir, "config", "core.quotePath", "false");
+      try {
+        await check(dir, []);
+        await check(dir, ["-o"]);
+      } finally {
+        shell.ok(dir, "config", "--unset", "core.quotePath");
+      }
+    });
+
+    it("--format's %xNN writes the byte", async () => {
+      await check(dir, ["--format=%xff%(path)"]);
+      await check(dir, ["--format=%x41%x00%(path)"]);
+    });
+
+    it("exclude-only pathspecs in a subdirectory match below it", async () => {
+      await check(dir, [":!b.txt"], "sub");
+      await check(dir, ["-o", ":!x"], "sub");
+      await check(dir, [":!b.txt"]);
+    });
+
+    it("absolute pathspecs", async () => {
+      await check(dir, ["--error-unmatch", join(dir, "a.txt")]);
+      await check(dir, [join(dir, "a.txt")], "sub");
+      await check(dir, [join(dir, "sub")], "sub");
+      await check(dir, ["-o", join(dir, "sub")]);
+    });
+
+    it("a pathspec outside the repository", async () => {
+      await check(dir, ["../../x"], "sub");
+      await check(dir, ["/"]);
+    });
+
+    it("--eol of many entries", async () => {
+      await check(dir, ["--eol"]);
+      await check(dir, ["--format=%(eolinfo:index) %(path)"]);
     });
   });
 });
