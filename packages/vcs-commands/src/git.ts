@@ -78,6 +78,7 @@ import {
   RemoteShowCommand,
   RemoteUpdateCommand,
   RenameBranchCommand,
+  RepackCommand,
   ResetCommand,
   RestoreCommand,
   RevertCommand,
@@ -849,6 +850,20 @@ export class Git implements Disposable {
   gc(): GarbageCollectCommand {
     this.checkClosed();
     return new GarbageCollectCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a RepackCommand (`git repack`).
+   *
+   * @example
+   * ```typescript
+   * await git.repack().setAll(true).setDeleteRedundant(true).call(); // git repack -a -d
+   * await git.repack().setGeometric(2).setDeleteRedundant(true).call();
+   * ```
+   */
+  repack(): RepackCommand {
+    this.checkClosed();
+    return new RepackCommand(this._workingCopy);
   }
 
   /**
