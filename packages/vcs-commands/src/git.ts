@@ -67,6 +67,7 @@ import {
   LsTreeCommand,
   MergeBaseCommand,
   MergeCommand,
+  MergeTreeCommand,
   MvCommand,
   NameRevCommand,
   NotesCommands,
@@ -435,6 +436,21 @@ export class Git implements Disposable {
   show(): ShowCommand {
     this.checkClosed();
     return new ShowCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a MergeTreeCommand (`git merge-tree`): merge-ort in memory (`--write-tree`: the
+   * result tree, conflicted entries and messages) or the old three-tree trivial merge, with
+   * git's stdout, stderr and exit status. Nothing but objects is written.
+   *
+   * @example
+   * ```typescript
+   * const { stdout, exitCode } = await git.mergeTree().setBranches("side1", "side2").callOutput();
+   * ```
+   */
+  mergeTree(): MergeTreeCommand {
+    this.checkClosed();
+    return new MergeTreeCommand(this._workingCopy);
   }
 
   /**
