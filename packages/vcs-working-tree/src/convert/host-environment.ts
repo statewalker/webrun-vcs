@@ -116,6 +116,12 @@ export interface GitHostEnvironment {
    */
   noLazyFetch?: boolean;
   /**
+   * `$GIT_SMART_HTTP` as a boolean (git's `git_env_bool`, default true): false makes an HTTP
+   * fetch ask for `info/refs` without `?service=`, so it speaks the dumb protocol (remote-curl's
+   * `discover_refs`)
+   */
+  smartHttp?: boolean;
+  /**
    * Behave as a git built with `WITH_BREAKING_CHANGES` (the changes planned for git 3.0, in
    * `Documentation/BreakingChanges.adoc`): new repositories in reftable on `main`,
    * `safe.bareRepository` defaulting to `explicit`, and the removed features (grafts,

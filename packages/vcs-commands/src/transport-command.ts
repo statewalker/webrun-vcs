@@ -7,6 +7,7 @@ import {
 import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 import { createPromisorFetcher, promisorOf } from "./commands/promisor-remote.js";
 import {
+  httpSessionSettings,
   openResolvedRemote,
   type PreparedRemote,
   prepareRemote,
@@ -246,6 +247,7 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
       ...(this.timeout !== undefined ? { timeout: this.timeout } : {}),
       ...(this.gzipRequests !== undefined ? { gzipRequests: this.gzipRequests } : {}),
       protocolVersion: protocolVersionOf(RemoteConfigStore.from(this._workingCopy)),
+      ...httpSessionSettings(this._workingCopy),
     };
   }
 

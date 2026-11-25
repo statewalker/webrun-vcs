@@ -120,6 +120,7 @@ export interface NodeGitHostEnvironment {
   attrSource?: string;
   noReplaceObjects?: boolean;
   noLazyFetch?: boolean;
+  smartHttp?: boolean;
   breakingChanges?: boolean;
   indexVersion?: string;
   protocolFromUser?: boolean;
@@ -548,6 +549,7 @@ export function createNodeGitHostEnvironment(
     // git: set to anything (even empty) turns replace refs off
     ...(env.GIT_NO_REPLACE_OBJECTS !== undefined ? { noReplaceObjects: true } : {}),
     ...(env.GIT_NO_LAZY_FETCH !== undefined ? { noLazyFetch: envBool(env.GIT_NO_LAZY_FETCH) } : {}),
+    ...(env.GIT_SMART_HTTP !== undefined ? { smartHttp: envBool(env.GIT_SMART_HTTP) } : {}),
     ...(options.breakingChanges ? { breakingChanges: true } : {}),
     // the object format of a new repository (validate_hash_algorithm), as given
     ...(env.GIT_DEFAULT_HASH !== undefined ? { defaultHash: env.GIT_DEFAULT_HASH } : {}),

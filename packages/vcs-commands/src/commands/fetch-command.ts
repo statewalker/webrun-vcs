@@ -977,6 +977,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       ...(fsck ? { fsckObjects: fsck } : {}),
       ...(filter ? { filter } : {}),
       ...(this.refetch ? { refetch: true } : {}),
+      // the transport's warnings (a filter the server ignores, the dumb walker's alternates)
+      onWarning: (line: string) => messages.push(line),
     };
     // --upload-pack, else remote.<name>.uploadpack (transport_get)
     const uploadPack = this.uploadPack ?? this.remoteProgram(this.remote, "uploadpack");

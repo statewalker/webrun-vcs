@@ -14,6 +14,7 @@ import { type AbbrevLengths, abbrevLengthsOf, transportSummaryWidth } from "../s
 import { parseRefSpec } from "../utils/index.js";
 import { Completeness } from "./completeness.js";
 import type { RemoteRef, UploadPackConnection } from "./connection.js";
+import { walkDumbHttp } from "./dumb-http.js";
 import {
   checkReceivedPack,
   connectivityErrors,
@@ -488,6 +489,31 @@ export async function fetchFromConnection(
   const packMessages: string[] = [];
   let packFetched = false;
   const runFetchPack = async (wants: string[], request: Partial<FetchPackRequest>) => {
+    if (connection.dumb) {
+      // remote-curl's fetch_dumb: http-walker over the remote's files, objects stored as they
+      // come (no quarantine, no index-pack checks); the refs are checked as any fetch's
+      if (
+        request.depth !== undefined ||
+        request.deepenSince !== undefined ||
+        (request.deepenNot?.length ?? 0) > 0
+      ) {
+        throw new TransportError(
+          "fatal: dumb http transport does not support shallow capabilities",
+        );
+      }
+      const walked = await walkDumbHttp(connection.dumb, {
+        repository,
+        wants,
+        isComplete: (id) => complete.isComplete(id),
+        ...(options.onWarning ? { onWarning: options.onWarning } : {}),
+      });
+      packFetched = true;
+      for (const want of wants) complete.addTip(want);
+      result.imports.push(...walked.imports);
+      result.packObjects += walked.objects;
+      result.packBytes += walked.bytes;
+      return;
+    }
     const knownCommon: string[] = [];
     for (const ref of options.refetch ? [] : remoteRefs) {
       if (ref.oid && !knownCommon.includes(ref.oid) && (await complete.isComplete(ref.oid))) {

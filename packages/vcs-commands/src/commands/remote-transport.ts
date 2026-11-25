@@ -9,6 +9,7 @@
 import {
   type Credentials,
   type Duplex,
+  type FollowRedirects,
   type GitConnectRequest,
   type GitService,
   type GitSession,
@@ -23,6 +24,7 @@ import {
   type ReceivePackConnection,
   type UploadPackConnection,
 } from "@statewalker/vcs-transport";
+import { parseGitBool } from "@statewalker/vcs-utils";
 import type {
   GitHostEnvironment,
   OpenedRepository,
@@ -332,6 +334,38 @@ export interface RemoteSessionOptions {
    */
   program?: string;
   signal?: AbortSignal;
+  /** HTTP: `http.followRedirects` ({@link httpSessionSettings}) */
+  followRedirects?: FollowRedirects;
+  /** Dumb HTTP: whether an alternate of the scheme may be used ({@link httpSessionSettings}) */
+  alternateAllowed?: (scheme: string) => boolean;
+  /** HTTP: `$GIT_SMART_HTTP` (false: the dumb protocol) */
+  smartHttp?: boolean;
+}
+
+/**
+ * The HTTP settings a session takes from the configuration and the environment:
+ * `http.followRedirects` (http.c: `initial` by default, `initial` or a boolean), which
+ * alternates a dumb fetch may use (http-walker's `is_transport_allowed(<scheme>, 0)`: as a
+ * transport not from the user), and `$GIT_SMART_HTTP`. A `http.followRedirects` that is no
+ * boolean reads as `initial` here (git dies on it, but only once an HTTP transport reads it).
+ */
+export function httpSessionSettings(
+  workingCopy: WorkingCopy,
+): Pick<RemoteSessionOptions, "followRedirects" | "alternateAllowed" | "smartHttp"> {
+  const config = RemoteConfigStore.from(workingCopy);
+  const environment = hostEnvironmentOf(workingCopy);
+  const value = config.value("http.followRedirects");
+  let followRedirects: FollowRedirects = "initial";
+  if (value !== undefined && value !== "initial") {
+    const bool = parseGitBool(value);
+    if (bool !== undefined) followRedirects = bool ? "always" : "never";
+  }
+  const notFromUser = { ...environment, protocolFromUser: false } as GitHostEnvironment;
+  return {
+    followRedirects,
+    alternateAllowed: (scheme) => isTransportAllowed(scheme, config, notFromUser),
+    ...(environment?.smartHttp === false ? { smartHttp: false } : {}),
+  };
 }
 
 function connectRequest(
@@ -412,6 +446,9 @@ export async function withRemoteUploadPack<T>(
   return withRemoteSession(remote, "git-upload-pack", options, async (session, request) => {
     const connection = await openUploadPack(session, request, {
       ...(options.gzipRequests !== undefined ? { gzipRequests: options.gzipRequests } : {}),
+      ...(options.followRedirects ? { followRedirects: options.followRedirects } : {}),
+      ...(options.alternateAllowed ? { alternateAllowed: options.alternateAllowed } : {}),
+      ...(options.smartHttp === false ? { smartHttp: false } : {}),
     });
     try {
       return await run(connection);

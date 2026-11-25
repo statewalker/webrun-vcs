@@ -10,6 +10,8 @@
 import { fetchWithRequestBody, shouldStreamRequestBody } from "@statewalker/vcs-utils/streams";
 import type { Credentials } from "../api/credentials.js";
 import { type Duplex, endDuplex } from "../api/duplex.js";
+import { looksLikeInfoRefs } from "../fetch-client/dumb-http.js";
+import { anonymizeUrl } from "../fetch-client/fetch-head.js";
 // the idle timer is internal to the clients: not exported from the package
 import { abortErrorOf, IdleTimer } from "../fetch-client/idle-timer.js";
 import {
@@ -130,7 +132,19 @@ async function openHttp(
   );
   if (!response.ok) throw await httpRefsError(response, baseUrl);
   if (!response.body) throw new TransportError("Empty response from info/refs");
-  const advert = new PktStream(response.body, wait);
+  const type = (response.headers.get("content-type") ?? "").split(";")[0]?.trim().toLowerCase();
+  let advertBody: ReadableStream<Uint8Array> = response.body;
+  if (type !== "application/x-git-receive-pack-advertisement") {
+    const body = new Uint8Array(await wait(() => response.arrayBuffer()));
+    if (looksLikeInfoRefs(body)) {
+      // a dumb server: git would push with http-push over WebDAV, which is not implemented
+      throw new TransportError(
+        `fatal: ${anonymizeUrl(baseUrl)}/: not a smart-HTTP git server (a dumb one: pushing over WebDAV, git's http-push, is not supported)`,
+      );
+    }
+    advertBody = new Response(body).body as ReadableStream<Uint8Array>;
+  }
+  const advert = new PktStream(advertBody, wait);
   let first = await advert.read();
   if (first?.type === "data" && first.text.startsWith("# service=")) {
     if (first.text !== "# service=git-receive-pack") {

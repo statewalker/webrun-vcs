@@ -13,6 +13,12 @@ import { type Duplex, endDuplex } from "../api/duplex.js";
 import { authorizationHeader } from "../operations/http-auth.js";
 import { AuthenticationError, ServerError, TransportError } from "../protocol/index.js";
 import { isObjectIdOf, remoteObjectFormat } from "../protocol/object-format.js";
+import {
+  type DumbHttpRemote,
+  type FollowRedirects,
+  looksLikeInfoRefs,
+  openDumbHttpConnection,
+} from "./dumb-http.js";
 import { anonymizeUrl } from "./fetch-head.js";
 import { abortErrorOf, IdleTimer } from "./idle-timer.js";
 import { type Pkt, PktStream } from "./pkt-stream.js";
@@ -49,6 +55,11 @@ export interface UploadPackConnection {
    * advertise_shallow_grafts); empty for a complete repository. v2 sends them in `shallow-info`.
    */
   readonly advertisedShallow?: readonly string[];
+  /**
+   * A dumb HTTP server (no smart answer to `info/refs`): there is no upload-pack to ask, a
+   * fetch walks the remote's objects instead (`walkDumbHttp`); `request` throws.
+   */
+  readonly dumb?: DumbHttpRemote;
   /** Sends one request and returns the stream its answer is read from. */
   request(body: Uint8Array[]): Promise<PktStream>;
   /** Ends the exchange (v2 over a duplex: a final flush), releasing the stream. */
@@ -80,12 +91,34 @@ export interface HttpConnectionOptions {
    * behind a CORS proxy that does not allow it fails the preflight.
    */
   gzipRequests?: boolean;
+  /**
+   * `http.followRedirects` (default `initial`): whether the first request may be redirected
+   * (`never` refuses it), and whether every later one of a dumb fetch may be (`always`, which
+   * also lets it use the remote's alternates)
+   */
+  followRedirects?: FollowRedirects;
+  /**
+   * Whether a dumb fetch may use an alternate of the scheme (git's `protocol.<scheme>.allow`
+   * for a transport not from the user); default: http, https, ftp and ftps
+   */
+  alternateAllowed?: (scheme: string) => boolean;
+  /**
+   * `$GIT_SMART_HTTP` (default true): false asks for `info/refs` without `?service=`, so the
+   * server answers with the dumb protocol's file and the fetch walks the remote's objects
+   */
+  smart?: boolean;
 }
+
+/** The content type of a smart server's ref advertisement (remote-curl's `check_smart_http`). */
+const SMART_ADVERTISEMENT = "application/x-git-upload-pack-advertisement";
 
 /**
  * Opens a smart-HTTP connection to `git-upload-pack`: `GET info/refs` with
  * `Git-Protocol: version=2`. A v2 server answers with its capabilities; any other answers
- * with the v0 ref advertisement, and the connection speaks v0.
+ * with the v0 ref advertisement, and the connection speaks v0. Any other answer (not of the
+ * advertisement's content type) is the dumb protocol's `info/refs` file: the connection is a
+ * dumb one ({@link UploadPackConnection.dumb}), its base URL where the first request's
+ * redirect led.
  */
 export async function openHttpConnection(
   options: HttpConnectionOptions,
@@ -104,22 +137,43 @@ export async function openHttpConnection(
   const wait = <T>(next: () => Promise<T>): Promise<T> =>
     withTimeout(next, options.timeout, controller);
 
+  const smart = options.smart ?? true;
+  const tail = smart ? "info/refs?service=git-upload-pack" : "info/refs";
   const response = await wait(() =>
     doFetch(
-      new Request(`${baseUrl}/info/refs?service=git-upload-pack`, {
+      new Request(`${baseUrl}/${tail}`, {
         method: "GET",
         headers: {
           ...headers,
           Accept: "application/x-git-upload-pack-advertisement",
           ...protocolHeader,
         },
+        // http.followRedirects=false: the first request is not redirected either
+        ...(options.followRedirects === "never" ? { redirect: "manual" as const } : {}),
         signal: controller.signal,
       }),
     ),
   );
   if (!response.ok) throw await httpRefsError(response, baseUrl);
   if (!response.body) throw new TransportError("Empty response from info/refs");
-  const advert = new PktStream(response.body, wait);
+  const type = (response.headers.get("content-type") ?? "").split(";")[0]?.trim().toLowerCase();
+  let advertBody: ReadableStream<Uint8Array> = response.body;
+  if (!smart || type !== SMART_ADVERTISEMENT) {
+    const body = new Uint8Array(await wait(() => response.arrayBuffer()));
+    if (!smart || looksLikeInfoRefs(body)) {
+      return openDumbHttpConnection(redirectedBase(baseUrl, tail, response.url), body, {
+        fetchImpl: doFetch,
+        headers,
+        ...(options.followRedirects ? { followRedirects: options.followRedirects } : {}),
+        ...(options.alternateAllowed ? { alternateAllowed: options.alternateAllowed } : {}),
+        wait,
+        signal: controller.signal,
+      });
+    }
+    // an advertisement served with another content type: read as one
+    advertBody = new Response(body).body as ReadableStream<Uint8Array>;
+  }
+  const advert = new PktStream(advertBody, wait);
   let first = await advert.read();
   if (first?.type === "data" && first.text.startsWith("# service=")) {
     const flush = await advert.read();
@@ -177,6 +231,24 @@ export async function openHttpConnection(
       options.signal?.removeEventListener("abort", onAbort);
     },
   };
+}
+
+/**
+ * http.c's `update_url_from_redirect`: the base URL where the first request's redirect led
+ * (the effective URL less what was asked after the base); the base as given when nothing
+ * redirected.
+ *
+ * @throws TransportError git's death when the redirect's URL does not end as asked
+ */
+function redirectedBase(baseUrl: string, tail: string, effective: string): string {
+  const asked = `${baseUrl}/${tail}`;
+  if (!effective || effective === asked) return baseUrl;
+  if (!effective.endsWith(`/${tail}`)) {
+    throw new TransportError(
+      `fatal: unable to update url base from redirection:\n  asked for: ${anonymizeUrl(asked)}\n   redirect: ${anonymizeUrl(effective)}`,
+    );
+  }
+  return effective.slice(0, -tail.length - 1);
 }
 
 /**
