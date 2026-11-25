@@ -172,6 +172,7 @@ export * from "./submodule-update-command.js";
 export * from "./switch-command.js";
 export * from "./tag-command.js";
 export * from "./trailers.js";
+export * from "./unpack-objects-command.js";
 export * from "./update-index-command.js";
 export * from "./url-parse-command.js";
 export * from "./var-command.js";

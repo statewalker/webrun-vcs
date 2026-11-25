@@ -338,6 +338,13 @@ export interface ReceivePackConfig {
    */
   fsckObjects?: () => ReceivedObjectsFsck | undefined | Promise<ReceivedObjectsFsck | undefined>;
   /**
+   * git's `receive.unpackLimit` (else `transfer.unpackLimit`; see
+   * `ServerConfigSettings.unpackLimit`): a pushed pack of at least this many objects is kept
+   * as a pack (index-pack), a smaller one unpacked into loose objects (unpack-objects); 0 keeps
+   * every pack. Default: the repository's own choice (100 for the files backend).
+   */
+  unpackLimit?: number;
+  /**
    * What receive-pack prints as it dies on a setting it cannot read (see
    * `ServerConfigSettings.receivePackConfigError`): it dies before the advertisement, the
    * text as `output.error`, as git's receive_pack_config dies

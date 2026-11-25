@@ -544,6 +544,8 @@ export async function receivePackSettingsOf(
     ...(configError !== undefined ? { receivePackConfigError: configError } : {}),
     // receive.fsckObjects: unpack-objects / index-pack --strict
     ...(fsck.fsckObjects ? { fsckObjects: fsck.fsckObjects } : {}),
+    // receive.unpackLimit / transfer.unpackLimit: keep the pack or unpack it
+    ...(settings.unpackLimit !== undefined ? { unpackLimit: settings.unpackLimit } : {}),
     // git 2.5x updates the refs of a push that is not atomic in two batches
     ...(hooks?.enabled && hooks.compatibility !== "2.43" ? { batchNonAtomic: true } : {}),
     // ... git 2.43 updates each ref after its update hook

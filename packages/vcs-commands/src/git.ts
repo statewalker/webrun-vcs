@@ -139,6 +139,7 @@ import {
   SubmoduleUpdateCommand,
   SwitchCommand,
   TagCommand,
+  UnpackObjectsCommand,
   UnsetUpstreamBranchCommand,
   UpdateIndexCommand,
   UrlParseCommand,
@@ -897,6 +898,20 @@ export class Git implements Disposable {
   mktag(): MktagCommand {
     this.checkClosed();
     return new MktagCommand(this._workingCopy);
+  }
+
+  /**
+   * Create an UnpackObjectsCommand exploding a pack into loose objects (`git unpack-objects`,
+   * `-n`, `--strict`).
+   *
+   * @example
+   * ```typescript
+   * const { exitCode } = await git.unpackObjects().setInput(packBytes).setStrict(true).call();
+   * ```
+   */
+  unpackObjects(): UnpackObjectsCommand {
+    this.checkClosed();
+    return new UnpackObjectsCommand(this._workingCopy);
   }
 
   // ============ Rm Operations ============

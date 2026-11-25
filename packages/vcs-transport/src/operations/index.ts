@@ -48,5 +48,7 @@ export {
   explicitServerSettingsFromConfig,
   GIT_SERVER_SETTINGS_DEFAULTS,
   httpServerSettings,
+  parseConfigInt,
   serverSettingsFromConfig,
+  unpackLimitOf,
 } from "./server-config.js";

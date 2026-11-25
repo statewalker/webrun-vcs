@@ -288,6 +288,8 @@ export interface ReceivePackServerOptions {
   advertisePushOptions?: boolean;
   /** `receive.fsckObjects`: the fsck of each push's objects (see `ReceivePackConfig.fsckObjects`) */
   fsckObjects?: ReceivePackConfig["fsckObjects"];
+  /** `receive.unpackLimit`: keep or unpack a pushed pack (see `ReceivePackConfig.unpackLimit`) */
+  unpackLimit?: number;
 }
 
 /**
@@ -1128,6 +1130,7 @@ export async function handleReceivePack(
         ? { configError: rp.receivePackConfigError }
         : {}),
       ...(rp.fsckObjects ? { fsckObjects: rp.fsckObjects } : {}),
+      ...(rp.unpackLimit !== undefined ? { unpackLimit: rp.unpackLimit } : {}),
       logger: options.logger,
       request: {
         method: request.method,

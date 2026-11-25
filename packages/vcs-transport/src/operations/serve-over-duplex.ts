@@ -106,6 +106,8 @@ export interface ServeOverDuplexOptions {
   advertisePushOptions?: boolean;
   /** receive-pack: `receive.fsckObjects` (see `ReceivePackConfig.fsckObjects`) */
   fsckObjects?: ReceivePackConfig["fsckObjects"];
+  /** receive-pack: `receive.unpackLimit` (see `ReceivePackConfig.unpackLimit`) */
+  unpackLimit?: number;
   /** upload-pack hooks: authorize (before the negotiation), postUpload (after the pack) */
   uploadPackHooks?: UploadPackHooks;
   /**
@@ -291,6 +293,7 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
         ? { configError: options.receivePackConfigError }
         : {}),
       ...(options.fsckObjects ? { fsckObjects: options.fsckObjects } : {}),
+      ...(options.unpackLimit !== undefined ? { unpackLimit: options.unpackLimit } : {}),
     },
   };
   // post-receive tasks: started once the report is written (detached from this call)

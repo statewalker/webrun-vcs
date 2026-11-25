@@ -63,6 +63,13 @@ export interface PackImportOptions {
    */
   keepPack?: boolean;
   /**
+   * Keep a pack of at least this many objects, unpack a smaller one (receive-pack's
+   * `receive.unpackLimit`, fetch-pack's `fetch.unpackLimit`, else `transfer.unpackLimit`);
+   * default the backend's (100). 0 keeps every pack, `Infinity` unpacks every one (fetch-pack's
+   * limit of 0). Ignored with `keepPack`.
+   */
+  unpackLimit?: number;
+  /**
    * Called for every received object once it is stored (unpacked) or its pack resolved (kept),
    * with its entry in the pack: what git's index-pack checks with `--strict` (see
    * `PackEntryInfo`)

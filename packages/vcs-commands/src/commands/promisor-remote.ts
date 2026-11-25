@@ -34,6 +34,7 @@ import {
   FetchCheckError,
   fetchPromisedObjects,
   type GitTransportRegistry,
+  unpackLimitOf,
 } from "@statewalker/vcs-transport";
 import { parseGitBool } from "@statewalker/vcs-utils";
 import type { WorkingCopy } from "@statewalker/vcs-working-tree";
@@ -178,6 +179,7 @@ export function createPromisorFetcher(
       const { fetchFsckOf } = await import("./fsck/index.js");
       const environment = hostEnvironmentOf(workingCopy);
       const fsckWarnings: string[] = [];
+      const unpackLimit = unpackLimitOf({ getAll: (key) => config.values(key) }, "fetch");
       const fsck = await fetchFsckOf({
         value: (key) => config.value(key),
         entries: (prefix) => config.entriesWithPrefix(prefix),
@@ -216,6 +218,8 @@ export function createPromisorFetcher(
               url: anonymizeUrl(url),
               compatibility,
               ...(fsck ? { fsckObjects: fsck } : {}),
+              // the child fetch's fetch.unpackLimit: whether fetch-pack keeps the pack itself
+              ...(unpackLimit !== undefined ? { unpackLimit } : {}),
             });
           } catch (error) {
             // fetch-pack ran: its start-up warnings came first
