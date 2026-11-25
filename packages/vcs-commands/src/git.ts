@@ -6,6 +6,7 @@ import {
   AddCommand,
   AmCommand,
   ApplyCommand,
+  ArchiveCommand,
   BackfillCommand,
   BisectCommand,
   BisectLogCommand,
@@ -982,6 +983,21 @@ export class Git implements Disposable {
   rangeDiff(): RangeDiffCommand {
     this.checkClosed();
     return new RangeDiffCommand(this._workingCopy);
+  }
+
+  /**
+   * Create an ArchiveCommand (`git archive`): a tar or zip archive of a tree, git's tar
+   * filters (`tgz`, `tar.gz`, `tar.<format>.command`) applied.
+   *
+   * @example
+   * ```typescript
+   * const tar = await git.archive().setTree("HEAD").setPrefix("project/").call();
+   * getTarCommitId(tar).output; // the commit id and a newline
+   * ```
+   */
+  archive(): ArchiveCommand {
+    this.checkClosed();
+    return new ArchiveCommand(this._workingCopy);
   }
 
   /**
