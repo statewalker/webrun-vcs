@@ -83,6 +83,13 @@ export interface FetchResult {
    */
   messages: string[];
   /**
+   * `--negotiate-only`: the commits the server acknowledged (git prints them on stdout, one
+   * per line, in its object set's order: sort to compare)
+   */
+  negotiatedCommits?: ObjectId[];
+  /** `--negotiate-only` that could not negotiate (protocol v0, no `wait-for-done`): 255, git's */
+  exitCode?: number;
+  /**
    * The ref lines git prints on stderr (`From <url>`, ` * [new branch]  main -> origin/main`,
    * `   1a2b3c4..5d6e7f8  dev  -> origin/dev`, ` - [deleted]  (none) -> origin/gone`), ids
    * abbreviated as git's find_unique_abbrev under `core.abbrev`, the columns as wide as git

@@ -146,9 +146,7 @@ export async function adjustSharedPerm(
 export function isReadOnlyObjectFile(path: string): boolean {
   return (
     /\/objects\/[0-9a-f]{2}\/[0-9a-f]{38,62}$/.test(path) ||
-    /\/objects\/pack\/(pack-[0-9a-f]+\.(pack|idx|rev|bitmap|mtimes)|multi-pack-index[^/]*)$/.test(
-      path,
-    ) ||
+    /\/objects\/pack\/([^/]+\.(pack|idx|rev|bitmap|mtimes)|multi-pack-index[^/]*)$/.test(path) ||
     /\/objects\/pack\/multi-pack-index\.d\/[^/]+$/.test(path) ||
     /\/objects\/info\/(commit-graph|commit-graphs\/[^/]+)$/.test(path)
   );

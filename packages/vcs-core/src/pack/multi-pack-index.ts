@@ -145,11 +145,20 @@ export function cmpIdxOrPackName(idxOrPackName: string, idxName: string): number
 const hex32 = (n: number) => n.toString(16);
 
 /**
- * The PNAM entries we accept: `pack-<hex>.idx`, as git writes them. git takes any name and joins
- * it into a path (a crafted `../../victim/pack-v.idx` makes its `expire` unlink files outside the
- * pack directory); we refuse such a midx instead.
+ * The PNAM entries we accept: a file name of the pack directory ending in `.idx`, as git writes
+ * them (`pack-<hex>.idx`, or `custom-<hex>.idx` for a pack `git pack-objects objects/pack/custom`
+ * wrote). git takes any name and joins it into a path (a crafted `../../victim/pack-v.idx`
+ * makes its `expire` unlink files outside the pack directory); we refuse a name holding a path
+ * separator, a control character, or naming `.`/`..`, so every name stays inside the directory.
  */
-const PACK_NAME = /^pack-[0-9a-f]+\.idx$/;
+function isPackIndexName(name: string): boolean {
+  return (
+    name.endsWith(".idx") &&
+    name !== ".idx" &&
+    name !== "..idx" &&
+    ![...name].some((c) => c === "/" || c === "\\" || c.charCodeAt(0) < 0x20)
+  );
+}
 
 /** one decoded id per lookup and id width, reused (lookups are synchronous) */
 const SCRATCH_SHA1 = new Uint8Array(20);
@@ -297,7 +306,7 @@ export function parseMultiPackIndex(
     if (e >= pend)
       throw new MultiPackIndexError("multi-pack-index pack-name chunk is too short", true);
     const name = dec.decode(bytes.subarray(p, e));
-    if (!PACK_NAME.test(name))
+    if (!isPackIndexName(name))
       throw new MultiPackIndexError(
         `multi-pack-index pack name '${name}' is not a pack index name; ignoring ${path}`,
       );

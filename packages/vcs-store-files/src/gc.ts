@@ -11,6 +11,7 @@ import {
   graftFileReader,
   joinPath,
   objectsWithoutLazyFetch,
+  packNameOf,
   sweepPackTemporaries,
 } from "@statewalker/vcs-core";
 import type { ProgressMonitor } from "@statewalker/vcs-utils";
@@ -803,9 +804,9 @@ async function describePacks(
 ): Promise<PackInfo[]> {
   const out: PackInfo[] = [];
   for (const p of packs) {
-    const base = joinPath(objectsDir, "pack", `pack-${p.packId}`);
+    const base = joinPath(objectsDir, "pack", packNameOf(p));
     out.push({
-      name: `pack-${p.packId}.pack`,
+      name: `${packNameOf(p)}.pack`,
       size: (await files.stats(`${base}.pack`))?.size ?? 0,
       keep: await files.exists(`${base}.keep`),
       cruft: await files.exists(`${base}.mtimes`),

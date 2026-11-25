@@ -1,5 +1,6 @@
 /**
- * git's default fetch negotiator (negotiator/default.c), over an async commit source.
+ * git's fetch negotiators (negotiator/default.c, skipping.c, noop.c), over an async commit
+ * source.
  */
 
 /** A local commit as the negotiator walks it. */
@@ -21,6 +22,77 @@ export interface NegotiatorSource {
 export interface NegotiatorOptions {
   /** The local shallow commits: their parents are not walked (they are not here) */
   shallow?: Iterable<string>;
+  /**
+   * The commits git has parsed before the negotiation starts (the skipping negotiator only):
+   * the local tips, the remote refs here and the parents of the commits fetch-pack's
+   * `mark_recent_complete_commits` walked. Its queue orders a commit git has not parsed as
+   * dated 0, and `mark_common` does not walk past one
+   */
+  parsed?: Iterable<string>;
+}
+
+/** `fetch.negotiationAlgorithm`: which negotiator chooses the haves. */
+export type NegotiationAlgorithm = "consecutive" | "skipping" | "noop";
+
+/** What fetch-pack asks of a negotiator (git's `struct fetch_negotiator`). */
+export interface FetchNegotiator {
+  /** A local tip (a ref, or a `--negotiation-tip`), annotated tags peeled */
+  addTip(oid: string): Promise<void>;
+  /** A commit the server has (a remote ref already here, and complete) */
+  knownCommon(oid: string): Promise<void>;
+  /** The next commit to offer as `have`, or undefined when there is none */
+  next(): Promise<string | undefined>;
+  /** The server acknowledged `oid`; whether it was known to be common already */
+  ack(oid: string): Promise<boolean>;
+  /** Whether `oid` is known to be common with the server (an acknowledged commit or an ancestor) */
+  isCommon(oid: string): boolean;
+}
+
+/**
+ * The negotiator `fetch.negotiationAlgorithm` names (repo-settings.c: `consecutive`,
+ * `skipping`, `noop`; `default` is the default, `skipping` under `feature.experimental`).
+ */
+export function createNegotiator(
+  algorithm: NegotiationAlgorithm | undefined,
+  source: NegotiatorSource,
+  options: NegotiatorOptions = {},
+): FetchNegotiator {
+  if (algorithm === "skipping") return new SkippingNegotiator(source, options);
+  if (algorithm === "noop") return new NoopNegotiator();
+  return new Negotiator(source, options);
+}
+
+/**
+ * Reads `fetch.negotiationAlgorithm` as repo-settings.c does: `skipping`, `noop`,
+ * `consecutive` (case-insensitive), `default` (the default: `skipping` under
+ * `feature.experimental`, else `consecutive`); any other value is git's death
+ * `unknown fetch negotiation algorithm '<value>'`.
+ */
+export function negotiationAlgorithmOf(
+  value: string | undefined,
+  experimental = false,
+): NegotiationAlgorithm {
+  const fallback: NegotiationAlgorithm = experimental ? "skipping" : "consecutive";
+  if (value === undefined) return fallback;
+  const lower = value.toLowerCase();
+  if (lower === "skipping" || lower === "noop" || lower === "consecutive") return lower;
+  if (lower === "default") return fallback;
+  throw new Error(`unknown fetch negotiation algorithm '${value}'`);
+}
+
+/** git's noop negotiator: offers nothing, so the server sends everything the wants reach. */
+export class NoopNegotiator implements FetchNegotiator {
+  async addTip(): Promise<void> {}
+  async knownCommon(): Promise<void> {}
+  async next(): Promise<string | undefined> {
+    return undefined;
+  }
+  async ack(): Promise<boolean> {
+    return false;
+  }
+  isCommon(): boolean {
+    return false;
+  }
 }
 
 const COMMON = 1;
@@ -54,7 +126,7 @@ interface Node {
  * }
  * ```
  */
-export class Negotiator {
+export class Negotiator implements FetchNegotiator {
   private readonly nodes = new Map<string, Node>();
   private readonly queue = new CommitQueue();
   private readonly shallow: Set<string>;
@@ -251,5 +323,252 @@ class CommitQueue {
     const x = this.heap[a] as { time: number; seq: number };
     const y = this.heap[b] as { time: number; seq: number };
     return x.time !== y.time ? x.time > y.time : x.seq < y.seq;
+  }
+}
+
+const SKIP_COMMON = 1;
+const SKIP_ADVERTISED = 2;
+const SKIP_SEEN = 4;
+const SKIP_POPPED = 8;
+
+interface SkipNode {
+  oid: string;
+  flags: number;
+  /** Whether git has parsed the commit (its date and parents are known to it) */
+  parsed: boolean;
+  /** undefined until read; null when `oid` is not a local commit */
+  info?: NegotiatorCommit | null;
+  /** The node's queue entry while it is queued */
+  entry?: SkipEntry;
+}
+
+interface SkipEntry {
+  node: SkipNode;
+  originalTtl: number;
+  ttl: number;
+  /** The date the queue compares (0 for a commit git had not parsed when it was queued) */
+  time: number;
+  seq: number;
+}
+
+/**
+ * git's skipping negotiator (negotiator/skipping.c): walks back from the tips by commit date
+ * as the default one, but skips commits, offering one, then one after 1 skipped, then after
+ * 2, 4, ... (each distance about 3/2 of the last), so long histories are negotiated in few
+ * rounds. A commit with no parent left to walk (a root, or parents already popped through
+ * clock skew) is always offered. An acknowledged commit and every ancestor it has walked are
+ * common; an advertised remote ref is offered, its ancestors are not.
+ */
+export class SkippingNegotiator implements FetchNegotiator {
+  private readonly nodes = new Map<string, SkipNode>();
+  private readonly shallow: Set<string>;
+  private readonly preParsed: Set<string>;
+  private readonly heap: SkipEntry[] = [];
+  private seq = 0;
+  /** git's non_common_revs */
+  private nonCommon = 0;
+  private acceptsKnownCommon = true;
+  private acceptsTips = true;
+
+  constructor(
+    private readonly source: NegotiatorSource,
+    options: NegotiatorOptions = {},
+  ) {
+    this.shallow = new Set(options.shallow ?? []);
+    // a Set given is shared: what this negotiator parses stays parsed for the next one (git's
+    // parsed objects outlive a negotiation, as a tag backfill's second fetch sees them)
+    this.preParsed = options.parsed instanceof Set ? options.parsed : new Set(options.parsed ?? []);
+  }
+
+  async knownCommon(oid: string): Promise<void> {
+    if (!this.acceptsKnownCommon) return;
+    const node = await this.commitNode(oid);
+    if (!node || node.flags & SKIP_SEEN) return;
+    this.revListPush(node, SKIP_ADVERTISED);
+  }
+
+  async addTip(oid: string): Promise<void> {
+    this.acceptsKnownCommon = false;
+    if (!this.acceptsTips) return;
+    const node = await this.commitNode(oid);
+    if (!node || node.flags & SKIP_SEEN) return;
+    this.revListPush(node, 0);
+  }
+
+  async next(): Promise<string | undefined> {
+    this.acceptsKnownCommon = false;
+    this.acceptsTips = false;
+    let toSend: SkipNode | undefined;
+    while (!toSend) {
+      if (this.heap.length === 0 || this.nonCommon === 0) return undefined;
+      const entry = this.pop();
+      const node = entry.node;
+      node.entry = undefined;
+      node.flags |= SKIP_POPPED;
+      if (!(node.flags & SKIP_COMMON)) this.nonCommon--;
+      if (!(node.flags & SKIP_COMMON) && !entry.ttl) toSend = node;
+      const info = await this.read(node);
+      this.markParsed(node);
+      let parentPushed = false;
+      for (const parentId of this.parentsOf(node, info)) {
+        if (await this.pushParent(entry, this.node(parentId))) parentPushed = true;
+      }
+      // no parents, or every parent popped already (clock skew): offered anyway
+      if (!(node.flags & SKIP_COMMON) && !parentPushed) toSend = node;
+    }
+    return toSend.oid;
+  }
+
+  async ack(oid: string): Promise<boolean> {
+    const node = this.node(oid);
+    const known = (node.flags & SKIP_COMMON) !== 0;
+    if (!(node.flags & SKIP_SEEN)) {
+      throw new Error(`received ack for commit ${oid} not sent as 'have'`);
+    }
+    await this.markCommon(node);
+    return known;
+  }
+
+  isCommon(oid: string): boolean {
+    return ((this.nodes.get(oid)?.flags ?? 0) & SKIP_COMMON) !== 0;
+  }
+
+  private node(oid: string): SkipNode {
+    let node = this.nodes.get(oid);
+    if (!node) {
+      node = { oid, flags: 0, parsed: this.preParsed.has(oid) };
+      this.nodes.set(oid, node);
+    }
+    return node;
+  }
+
+  /** A tip's commit (tags peeled), parsed as git's deref_tag(parse_object()) leaves it. */
+  private async commitNode(oid: string): Promise<SkipNode | undefined> {
+    let id = oid;
+    for (let i = 0; i < 16; i++) {
+      const node = this.node(id);
+      if (await this.read(node)) {
+        this.markParsed(node);
+        return node;
+      }
+      const target = await this.source.peelTag?.(id);
+      if (!target || target === id) return undefined;
+      id = target;
+    }
+    return undefined;
+  }
+
+  private markParsed(node: SkipNode): void {
+    node.parsed = true;
+    this.preParsed.add(node.oid);
+  }
+
+  private async read(node: SkipNode): Promise<NegotiatorCommit | null> {
+    if (node.info === undefined) {
+      node.info = (await this.source.getCommitInfo(node.oid)) ?? null;
+    }
+    return node.info;
+  }
+
+  private parentsOf(node: SkipNode, info: NegotiatorCommit | null): string[] {
+    if (!info || this.shallow.has(node.oid)) return [];
+    return info.parents;
+  }
+
+  private revListPush(node: SkipNode, mark: number): SkipEntry {
+    node.flags |= mark | SKIP_SEEN;
+    const entry: SkipEntry = {
+      node,
+      originalTtl: 0,
+      ttl: 0,
+      // compare_commits_by_commit_date reads the date of a parsed commit only
+      time: node.parsed ? (node.info?.time ?? 0) : 0,
+      seq: this.seq++,
+    };
+    node.entry = entry;
+    this.put(entry);
+    if (!(mark & SKIP_COMMON)) this.nonCommon++;
+    return entry;
+  }
+
+  /** git's mark_common: `start` and every parsed, seen ancestor become common. */
+  private async markCommon(start: SkipNode): Promise<void> {
+    if (start.flags & SKIP_COMMON) return;
+    const stack: SkipNode[] = [start];
+    start.flags |= SKIP_COMMON;
+    while (stack.length > 0) {
+      const node = stack.pop() as SkipNode;
+      if (!(node.flags & SKIP_POPPED)) this.nonCommon--;
+      if (!node.parsed) continue;
+      for (const parentId of this.parentsOf(node, await this.read(node))) {
+        const parent = this.node(parentId);
+        if (!(parent.flags & SKIP_SEEN) || parent.flags & SKIP_COMMON) continue;
+        parent.flags |= SKIP_COMMON;
+        stack.push(parent);
+      }
+    }
+  }
+
+  /** git's push_parent: the parent's entry gets the skip distance its child hands down. */
+  private async pushParent(entry: SkipEntry, parent: SkipNode): Promise<boolean> {
+    let parentEntry: SkipEntry;
+    if (parent.flags & SKIP_SEEN) {
+      // popped already through clock skew: as if the parent did not exist
+      if (parent.flags & SKIP_POPPED) return false;
+      parentEntry = parent.entry as SkipEntry;
+    } else {
+      parentEntry = this.revListPush(parent, 0);
+    }
+    if (entry.node.flags & (SKIP_COMMON | SKIP_ADVERTISED)) {
+      await this.markCommon(parent);
+    } else {
+      // uint16_t arithmetic, as git's
+      const newOriginalTtl = entry.ttl
+        ? entry.originalTtl
+        : (Math.floor((entry.originalTtl * 3) / 2) + 1) & 0xffff;
+      const newTtl = entry.ttl ? entry.ttl - 1 : newOriginalTtl;
+      if (parentEntry.originalTtl < newOriginalTtl) {
+        parentEntry.originalTtl = newOriginalTtl;
+        parentEntry.ttl = newTtl;
+      }
+    }
+    return true;
+  }
+
+  private before(a: SkipEntry, b: SkipEntry): boolean {
+    return a.time !== b.time ? a.time > b.time : a.seq < b.seq;
+  }
+
+  private put(entry: SkipEntry): void {
+    const heap = this.heap;
+    heap.push(entry);
+    let i = heap.length - 1;
+    while (i > 0) {
+      const parent = (i - 1) >> 1;
+      if (!this.before(heap[i] as SkipEntry, heap[parent] as SkipEntry)) break;
+      [heap[i], heap[parent]] = [heap[parent] as SkipEntry, heap[i] as SkipEntry];
+      i = parent;
+    }
+  }
+
+  private pop(): SkipEntry {
+    const heap = this.heap;
+    const top = heap[0] as SkipEntry;
+    const last = heap.pop() as SkipEntry;
+    if (heap.length > 0) {
+      heap[0] = last;
+      let i = 0;
+      while (true) {
+        const l = 2 * i + 1;
+        const r = l + 1;
+        let best = i;
+        if (l < heap.length && this.before(heap[l] as SkipEntry, heap[best] as SkipEntry)) best = l;
+        if (r < heap.length && this.before(heap[r] as SkipEntry, heap[best] as SkipEntry)) best = r;
+        if (best === i) break;
+        [heap[i], heap[best]] = [heap[best] as SkipEntry, heap[i] as SkipEntry];
+        i = best;
+      }
+    }
+    return top;
   }
 }
