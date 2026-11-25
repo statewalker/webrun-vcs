@@ -881,6 +881,7 @@ function linkStatsOf(stat: import("node:fs").BigIntStats | undefined): LinkStats
     uid: low32(stat.uid),
     gid: low32(stat.gid),
     statSize,
+    blocks: Number(stat.blocks),
   };
 }
 

@@ -24,6 +24,8 @@ export * from "./multi-pack-index.js";
 export * from "./pack/index.js";
 // Quarantine for received packs (receive-pack)
 export * from "./promisor-objects.js";
+// `git prune` without the rest of gc
+export * from "./prune.js";
 
 export * from "./quarantine/index.js";
 // Reachability roots (refs, reflogs, index) for repack and gc

@@ -657,7 +657,7 @@ async function collect(options: GcOptions): Promise<GcResult> {
     const shallow = (await history.refs.getShallow?.().catch(() => [])) ?? [];
     if ((expiredLoose.length > 0 || shallow.length > 0) && pruneExpireMs > 0 && packs) {
       // add_unseen_recent_objects_to_traversal: recent packed objects seed the walk too
-      for (const id of await recentPacked(
+      for (const id of await recentPackedObjects(
         files,
         objectsDir,
         packs,
@@ -816,8 +816,9 @@ function basePacks(packs: readonly PackInfo[], limit: number): string[] {
 /**
  * The unreachable packed objects newer than `cutoff` (ms): a cruft pack's by its `.mtimes`,
  * any other pack's by the pack's own time (git's add_recent_packed).
+ * @internal
  */
-async function recentPacked(
+export async function recentPackedObjects(
   files: FilesApi,
   objectsDir: string,
   packs: PackSet,
