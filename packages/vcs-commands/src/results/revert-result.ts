@@ -42,4 +42,10 @@ export interface RevertResult {
    * despite sparse patterns:" block. Absent when there was nothing to say.
    */
   readonly warnings?: string[];
+  /**
+   * What rerere printed on stderr: at a stopped pick (`Recorded preimage for 'f'`, `Resolved
+   * 'f' using previous resolution.`), after a `--continue`'s commit (`Recorded resolution
+   * for 'f'.`); absent when it said nothing.
+   */
+  readonly rerereOutput?: string[];
 }

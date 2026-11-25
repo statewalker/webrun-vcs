@@ -141,6 +141,11 @@ export interface MergeResult {
    * despite sparse patterns:" block. Absent when there was nothing to say.
    */
   readonly warnings?: string[];
+  /**
+   * What rerere printed on stderr when the merge stopped on conflicts (`Recorded preimage
+   * for 'f'`, `Resolved 'f' using previous resolution.`, ...); absent when it said nothing.
+   */
+  readonly rerereOutput?: string[];
 }
 
 /**

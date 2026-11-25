@@ -123,6 +123,11 @@ import { worktreePathRules } from "./worktree-path-rules.js";
 export interface CommitResult extends Commit {
   /** The ObjectId of the created commit */
   id: ObjectId;
+  /**
+   * What rerere printed on stderr after the commit (`Recorded resolution for 'f'.`), absent
+   * when it said nothing
+   */
+  rerereOutput?: string[];
 }
 
 /**
@@ -2294,6 +2299,9 @@ export class CommitCommand extends GitCommand<CommitResult> {
     // a merge's autostash
     await this.cleanupAfterCommit(state, info.commitIndex);
 
+    // repo_rerere: the resolutions of the paths MERGE_RR lists recorded
+    const rerereOutput = await this.rerere();
+
     // the post-commit hook, over the index (whatever the commit recorded)
     if (this.hooks.enabled) {
       await this.hooks.run("post-commit", {
@@ -2315,7 +2323,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
     }
 
     // Return commit with its ID (like JGit's RevCommit)
-    return { ...commit, id: commitId };
+    return { ...commit, id: commitId, ...(rerereOutput.length > 0 ? { rerereOutput } : {}) };
   }
 
   /** The host directory the signing program runs in, if the repository has one. */
