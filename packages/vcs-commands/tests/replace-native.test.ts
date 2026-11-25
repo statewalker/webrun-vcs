@@ -482,4 +482,21 @@ describeGit("git replace, native twins (t6050-replace.sh)", () => {
     await step(t, ["-g", b, emptyBlob]);
     await step(t, ["-g", a, b]);
   });
+
+  it("git replace parsing commits while info/grafts exists (statewalker/webrun-vcs#364)", async () => {
+    // statewalker/webrun-vcs#364: the first commit a revision parses loads the grafts file and
+    // prints its advice, outside --graft too; `~` follows the grafted parents
+    const t = twins(fixture);
+    for (const dir of [t.native, t.ours]) {
+      writeFileSync(join(dir, ".git/info/grafts"), `${H[6]} ${H[3]}\n`);
+    }
+    await step(t, ["-d", H[2] as string]);
+    await step(t, ["HEAD~1", "HEAD"]);
+    await step(t, ["-d", "HEAD~1"]);
+    await step(t, ["HEAD~2", "HEAD"]);
+    await step(t, ["-d", "HEAD~2"]);
+    await step(t, ["--edit", "HEAD~1"], "true");
+    await step(t, ["HEAD^{tree}", "HEAD~1^{tree}"]);
+    await step(t, ["-d", "HEAD^{tree}"]);
+  });
 });
