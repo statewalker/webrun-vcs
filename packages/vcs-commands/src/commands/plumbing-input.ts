@@ -6,6 +6,8 @@
 
 import { decodeGitPath, unquoteGitPath } from "@statewalker/vcs-utils/encoding";
 
+import { prefixPathGently } from "./git-paths.js";
+
 /**
  * `--stdin`'s records: `strbuf_getline_lf` lines (only the LF dropped), each starting with
  * `"` unquoted (`unquote_c_style`, anything after the closing quote ignored), or with `nul`
@@ -34,26 +36,16 @@ export function inputRecords(
 }
 
 /**
- * git's `prefix_path`: `path` read against the current directory `prefix` (`""` at the
- * top, else ending with `/`) and normalized (`//`, `.` and `..` resolved; a trailing `/`
- * kept); undefined when it climbs above the top.
+ * git's `prefix_path`: `path` read against the current directory `prefix` (`""` at the top,
+ * else ending with `/`) and normalized, an absolute path against `top` (the worktree's host
+ * directory, `prefixPathGently`); undefined when it leaves the worktree.
  */
-export function prefixPath(prefix: string, path: string): string | undefined {
-  const full = path.startsWith("/") ? path : prefix + path;
-  const out: string[] = [];
-  const parts = full.split("/");
-  const trailing = parts.length > 1 && parts[parts.length - 1] === "";
-  for (const part of parts) {
-    if (part === "" || part === ".") continue;
-    if (part === "..") {
-      if (out.length === 0) return undefined;
-      out.pop();
-      continue;
-    }
-    out.push(part);
-  }
-  const joined = out.join("/");
-  return trailing && joined !== "" ? `${joined}/` : joined;
+export function prefixPath(
+  prefix: string,
+  path: string,
+  top: string | undefined,
+): string | undefined {
+  return prefixPathGently(prefix, path, top);
 }
 
 /** A current directory as `prefixPath` takes it: `""`, or the path with one trailing `/`. */

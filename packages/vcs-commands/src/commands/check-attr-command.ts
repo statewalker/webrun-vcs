@@ -197,12 +197,13 @@ export class CheckAttrCommand extends GitCommand<PlumbingTextOutput> {
     const worktree = this.worktreeIfAny();
     const reader = this.reader(worktree, sourceTree, warn);
     const order = new Set<string>();
+    // a bare repository has no worktree to read absolute paths against
+    const top = worktree ? await worktreeHostPath(this._workingCopy) : undefined;
     const run = async () => {
       for (const file of paths) {
-        const full = prefixPath(this.prefix, file);
+        const full = prefixPath(this.prefix, file, top);
         if (full === undefined) {
-          const top = (await worktreeHostPath(this._workingCopy)) ?? "";
-          return die(`'${file}' is outside repository at '${top}'`);
+          return die(`'${file}' is outside repository at '${top ?? ""}'`);
         }
         const names = this.all ? undefined : this.attributes;
         const values = await reader.get(full, names);

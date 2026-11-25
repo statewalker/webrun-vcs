@@ -224,6 +224,9 @@ describeGit("git check-attr against native git", () => {
     for (const p of ["./f", "./a/g", "a/./g", "a/c/../b/g"]) await check(p);
     for (const p of ["../f", "f", "i", "g", "b/g"]) await check(p, { cwd: "a" });
     for (const p of ["../a/f", "../a/g", "../a/b/g"]) await check(p, { cwd: "b" });
+    // absolute paths: against the worktree, or git's death outside it
+    for (const p of [join(repo, "a/b/g"), join(repo, "f"), join(root, "elsewhere")]) await check(p);
+    await check(join(repo, "a/g"), { cwd: "b" });
   });
 
   it('t0003-attributes.sh: "core.attributesfile"', async () => {

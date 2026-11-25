@@ -147,6 +147,10 @@ describeGit("git check-ignore against native git", () => {
     await multi(["-z"]);
     await multi(["-z", "foo"]);
     await twin({ args: ["-n", "foo"] });
+    // absolute paths: against the worktree, or git's death outside it
+    await twin({ args: ["-v", join(repo, "a/one"), join(repo, "one")] });
+    await twin({ args: [join(root, "elsewhere")] });
+    await twin({ args: ["-v", join(repo, "one")], cwd: "a" });
   });
 
   // t0008-ignores.sh's test_expect_success_multi cases: non-existent file at top-level (not)

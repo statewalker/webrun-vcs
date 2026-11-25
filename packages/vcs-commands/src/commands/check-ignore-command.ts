@@ -132,11 +132,11 @@ export class CheckIgnoreCommand extends GitCommand<PlumbingTextOutput> {
     const sources = await this.sourceNames();
     let ignored = 0;
 
+    const top = await worktreeHostPath(this._workingCopy);
     const checkOne = async (original: string): Promise<string | undefined> => {
-      const full = prefixPath(this.prefix, original);
+      const full = prefixPath(this.prefix, original, top);
       if (full === undefined) {
-        const top = (await worktreeHostPath(this._workingCopy)) ?? "";
-        return `${original}: '${original}' is outside repository at '${top}'`;
+        return `${original}: '${original}' is outside repository at '${top ?? ""}'`;
       }
       const path = full.replace(/\/+$/, "");
       // PATHSPEC_SYMLINK_LEADING_PATH
