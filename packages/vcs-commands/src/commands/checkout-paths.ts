@@ -796,6 +796,7 @@ async function checkoutMerged(
       attributes: (await config.attributes?.(path)) ?? {},
       ...(config.drivers ? { drivers: config.drivers } : {}),
       ...(config.defaultDriver ? { defaultDriver: config.defaultDriver } : {}),
+      ...(config.driverCommand ? { driverCommand: config.driverCommand } : {}),
       style: o.conflictStyle ?? conflictStyleOf(ctx.workingCopy),
       ...(config.bigFileThreshold !== undefined
         ? { bigFileThreshold: config.bigFileThreshold }
@@ -803,6 +804,11 @@ async function checkoutMerged(
       algorithm: "myers",
     },
   );
+  // checkout_merged: a driver that failed to run (LL_MERGE_ERROR) leaves the file alone
+  if (merged.status === "error") {
+    out.errors.push(`error: path '${path}': cannot merge`);
+    return undefined;
+  }
   if (merged.status === "binary") {
     out.warnings.push(`warning: Cannot merge binary files: ${path} (ours vs. theirs)`);
   }

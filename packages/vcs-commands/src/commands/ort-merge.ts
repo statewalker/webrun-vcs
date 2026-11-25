@@ -32,6 +32,7 @@ import {
 import {
   lowLevelMerge,
   type MergeAttributeValue,
+  MergeDriverFailedError,
   type MergeDriverRegistry,
 } from "./merge-drivers.js";
 import type { CheckedEntry } from "./worktree-overwrite-checks.js";
@@ -113,6 +114,8 @@ export interface OrtMergeOptions {
   defaultDriver?: string;
   /** merge.<driver>.recursive: the driver used in merges of merge bases */
   recursiveDriver?: (name: string) => string | undefined;
+  /** merge.<driver>.driver: the command a registered driver is given */
+  driverCommand?: (name: string) => string | undefined;
   /**
    * The trees given as {@link prunedFlatTrees} reads them (directories all three hold alike
    * stand as one TREE entry): per tree (base, ours, theirs), the id of each directory, so a
@@ -1303,7 +1306,7 @@ class OrtMerge {
     b: CheckedEntry,
     pathnames: [string, string, string],
     extraMarkerSize: number,
-  ): Promise<{ status: "ok" | "conflict" | "binary"; content: Uint8Array }> {
+  ): Promise<{ status: "ok" | "conflict" | "binary" | "error"; content: Uint8Array }> {
     const same = pathnames[0] === pathnames[1] && pathnames[1] === pathnames[2];
     const baseLabel = same ? this.ancestor : `${this.ancestor}:${pathnames[0]}`;
     const oursLabel = same ? this.branch1 : `${this.branch1}:${pathnames[1]}`;
@@ -1320,6 +1323,7 @@ class OrtMerge {
         ...(this.options.drivers ? { drivers: this.options.drivers } : {}),
         ...(this.options.defaultDriver ? { defaultDriver: this.options.defaultDriver } : {}),
         ...(this.options.recursiveDriver ? { recursiveDriver: this.options.recursiveDriver } : {}),
+        ...(this.options.driverCommand ? { driverCommand: this.options.driverCommand } : {}),
         virtualAncestor: this.depth > 0,
         ...(this.options.favor ? { favor: this.options.favor } : {}),
         ...(this.options.style ? { style: this.options.style } : {}),
@@ -1363,6 +1367,8 @@ class OrtMerge {
         pathnames,
         extraMarkerSize,
       );
+      // merge_3way's failure: handle_content_merge's error, the merge's result `clean < 0`
+      if (merged.status === "error") throw new MergeDriverFailedError(path, this.depth > 0);
       const objectId = await this.blobs.store([merged.content]);
       if (merged.status === "binary") {
         const [, n1, n2] =

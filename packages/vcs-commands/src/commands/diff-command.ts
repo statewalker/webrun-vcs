@@ -97,7 +97,7 @@ import {
   readDiffColorSettings,
   whitespaceRuleError,
 } from "./diff-color-config.js";
-import { textconvRunnerOf } from "./diff-textconv.js";
+import { type TextconvRequest, type TextconvRunner, textconvRunnerOf } from "./diff-textconv.js";
 import {
   DO_MATCH_DIRECTORY,
   DO_MATCH_LEADING_PATHSPEC,
@@ -120,6 +120,7 @@ import {
   showSubmoduleDiffSummary,
   submoduleHeader,
 } from "./submodule-summary.js";
+import { TextconvCache } from "./textconv-cache.js";
 
 /** An index without in-tree attributes files: the attribute stack of a diff of two trees. */
 const WITHOUT_INDEX_ATTRIBUTES: { direction: "checkin"; index: AttributesIndex } = {
@@ -2070,12 +2071,14 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
    * the path's `diff.<driver>.textconv` over the blob as checkout writes it, or undefined
    * when no textconv applies (not a regular file, no driver, no command or no runner
    * installed, `textconv: false`). The attributes are the worktree's alone (git show reads
-   * no index).
+   * no index). With the blob's `id`, the driver's textconv cache applies
+   * (`diff.<driver>.cachetextconv`).
    */
   async textconvBlob(
     path: string,
     mode: number,
     read: () => Promise<Uint8Array>,
+    id?: string,
   ): Promise<Uint8Array | undefined> {
     if ((mode & S_IFMT) !== 0o100000) return undefined;
     const runner =
@@ -2094,13 +2097,44 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const driver = diffDriverOf(attrs?.get("diff"), (key) => this.config.value(key));
     const command = driver?.textconvCommand;
     if (!driver || command === undefined) return undefined;
-    return runner({
-      driver: driver.name ?? "",
-      command,
-      path,
-      content: await this.smudged(path, mode, read),
-      cache: driver.cacheTextconv ?? false,
-    });
+    return this.runTextconv(
+      runner,
+      {
+        driver: driver.name ?? "",
+        command,
+        path,
+        content: await this.smudged(path, mode, read),
+        cache: driver.cacheTextconv ?? false,
+      },
+      id,
+    );
+  }
+
+  /** The textconv caches of this command, by driver and command (git's per-process caches) */
+  private textconvCaches = new Map<string, Promise<TextconvCache | undefined>>();
+
+  /**
+   * diff.c's fill_textconv: the runner's output, through the driver's notes cache
+   * (`diff.<driver>.cachetextconv`) when the content has an id git knows.
+   */
+  private async runTextconv(
+    runner: TextconvRunner,
+    request: TextconvRequest,
+    id: string | undefined,
+  ): Promise<Uint8Array> {
+    if (!request.cache || id === undefined) return runner(request);
+    const key = `${request.driver}\0${request.command}`;
+    let opened = this.textconvCaches.get(key);
+    if (!opened) {
+      opened = TextconvCache.open(this.notesContext(), request.driver, request.command);
+      this.textconvCaches.set(key, opened);
+    }
+    const cache = await opened;
+    const cached = await cache?.get(id);
+    if (cached) return cached;
+    const output = await runner(request);
+    await cache?.put(id, output);
+    return output;
   }
 
   /** A blob's content as checkout writes it to the worktree (the worktree's smudge filter) */
@@ -2276,7 +2310,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       const cache = found.cacheTextconv ?? false;
       return {
         ...found,
-        textconv: (content, path) => runner({ driver: name, command, path, content, cache }),
+        textconv: (content, path, id) =>
+          this.runTextconv(runner, { driver: name, command, path, content, cache }, id),
       };
     };
     const driver = filter?.attributes

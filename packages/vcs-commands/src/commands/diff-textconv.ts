@@ -30,7 +30,11 @@ export interface TextconvRequest {
   path: string;
   /** The content to convert: the blob's, or the worktree file's as `git add` would store it */
   content: Uint8Array;
-  /** `diff.<driver>.cachetextconv`: git may keep the output; it does not change it */
+  /**
+   * `diff.<driver>.cachetextconv`: the command keeps the output of a stored blob in git's
+   * notes cache (`refs/notes/textconv/<driver>`, `textconv-cache.ts`) and asks the runner
+   * only for blobs not cached yet under the same command
+   */
   cache: boolean;
 }
 

@@ -8,12 +8,22 @@
 export interface FilterDriverContext {
   /** The path of the file in the worktree, relative to its root */
   path: string;
+  /**
+   * The command git would run for this direction (`filter.<driver>.clean` /
+   * `filter.<driver>.smudge`), when the configuration has one: a host that runs commands
+   * runs it (its `%f` the path, quoted), others ignore it
+   */
+  command?: string;
 }
 
 /**
  * A filter driver the host registers (git-lfs is one: `createLfsFilterDriver` in
- * `@statewalker/vcs-transport-lfs`). A missing direction passes content through, as git
- * does for a driver without that command.
+ * `@statewalker/vcs-transport-lfs`). A missing direction, a direction whose command the
+ * configuration sets empty (`git -c filter.<driver>.smudge= ...`) and a direction that
+ * throws pass content through, as git does for a driver without that command or whose
+ * command fails, unless the driver is required (`filter.<driver>.required`): then the
+ * conversion fails with git's message ({@link FilterDriverError}), never passing the content
+ * through.
  *
  * @example
  * ```typescript
