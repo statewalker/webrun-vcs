@@ -18,6 +18,7 @@
  *  - thin packs: deltas against `haves` the receiver has, which are not written;
  *  - a base is always written before its deltas, whatever the order of `ids`.
  */
+import { type ProgressMonitor, startProgress } from "@statewalker/vcs-utils";
 import { deflate, deflatePako } from "@statewalker/vcs-utils/compression";
 import {
   createGitDeltaIndex,
@@ -140,6 +141,12 @@ export interface WritePackOptions {
    * hash and the width of REF_DELTA base ids
    */
   objectFormat?: ObjectFormat;
+  /**
+   * pack-objects' progress (`--progress`): "Counting objects" over the objects to pack,
+   * "Compressing objects" over the delta search's targets (shown only when there are some),
+   * "Writing objects" over the entries written. A monitor that throws ends the stream.
+   */
+  progress?: ProgressMonitor;
 }
 
 /** One entry as written. */
@@ -294,8 +301,22 @@ export async function* writePack(
     limitReusedChains(order, search?.depth ?? DEFAULT_DEPTH);
   }
 
+  // get_object_details: one unit per object to pack
+  const counting = startProgress(options.progress, "Counting objects", order.length);
+  for (let i = 0; i < order.length; i++) counting.update(i + 1);
+  counting.stop();
+
   if (search) {
-    await searchDeltas(objects, order, haves, search, bigFileThreshold, format.rawLength, islands);
+    await searchDeltas(
+      objects,
+      order,
+      haves,
+      search,
+      bigFileThreshold,
+      format.rawLength,
+      islands,
+      options.progress,
+    );
   }
 
   // pack.islandCore: the core island's objects are written first (compute_pack_layers; the
@@ -359,6 +380,7 @@ export async function* writePack(
   new DataView(head.buffer).setUint32(8, order.length);
   emit(head);
 
+  const writing = startProgress(options.progress, "Writing objects", order.length);
   for (const p of writeOrder) {
     const start = offset;
     crc = onEntry ? new CRC32() : undefined;
@@ -413,8 +435,10 @@ export async function* writePack(
       reused,
     });
     crc = undefined;
+    writing.tick();
     while (full.length) yield full.shift() as Uint8Array;
   }
+  writing.stop();
   if (used > 0) yield take();
   yield hasher.digest();
 }
@@ -632,6 +656,7 @@ async function searchDeltas(
   bigFileThreshold: number,
   rawLength: number,
   islands?: DeltaIslandRules,
+  progress?: ProgressMonitor,
 ) {
   const windowSize = o.window ?? 10;
   const maxDepth = o.depth ?? 50;
@@ -664,6 +689,13 @@ async function searchDeltas(
       (rank.get(a) as number) - (rank.get(b) as number),
   );
 
+  // prepare_pack: "Compressing objects" over the targets (not the receiver's objects), shown
+  // only when there are targets and more than one candidate
+  const targets = candidates.reduce((n, p) => n + (p.have ? 0 : 1), 0);
+  const compressing =
+    targets > 0 && candidates.length > 1
+      ? startProgress(progress, "Compressing objects", targets)
+      : startProgress(undefined, "");
   const window: WindowEntry[] = [];
   let held = 0;
   /** An entry's content, read the first time a delta is tried with it (git's try_delta). */
@@ -731,12 +763,14 @@ async function searchDeltas(
           cacheLeft -= best.delta.length;
         }
       }
+      compressing.tick();
     }
     window.push(me);
     while (window.length > windowSize || (held > windowMemory && window.length > 1)) {
       held -= (window.shift() as WindowEntry).bytes;
     }
   }
+  compressing.stop();
 }
 
 async function* once(d: Uint8Array): AsyncGenerator<Uint8Array> {

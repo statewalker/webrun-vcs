@@ -14,6 +14,7 @@ import {
   parsePackMtimes,
   sweepPackTemporaries,
 } from "@statewalker/vcs-core";
+import type { ProgressMonitor } from "@statewalker/vcs-utils";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
 import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
@@ -54,6 +55,11 @@ const ORPHAN_PACK_MIN_AGE_MS = 60 * 60 * 1000;
  * Options for garbage collection.
  */
 export interface GcOptions {
+  /**
+   * Progress of the repack (a `git gc` whose stderr is a terminal): the phases of
+   * `RepackOptions.progress`. A monitor that throws stops gc where it is.
+   */
+  progress?: ProgressMonitor;
   /** History of the repository: its refs are roots; its `objects` and `packs` are repacked */
   history: History;
   /** FilesApi for filesystem operations */
@@ -588,6 +594,7 @@ async function collect(options: GcOptions): Promise<GcResult> {
             : { unpackUnreachable: true, unpackUnreachableExpireMs: pruneExpireMs }),
         // git gc: repack -d -l, what alternates hold stays theirs
         local: true,
+        ...(options.progress ? { progress: options.progress } : {}),
         compatibility,
         // a bare repository's gc writes a bitmap (git's repack default for -a in a bare one);
         // --auto's incremental repack never does
