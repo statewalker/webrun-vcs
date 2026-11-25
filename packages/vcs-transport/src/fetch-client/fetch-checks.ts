@@ -551,7 +551,15 @@ export async function checkReceivedPack(
 export async function checkUnpackedObjects(
   repository: RepositoryFacade,
   received: ReceivedObjects,
-  options: { fsck: ReceivedObjectsFsck; shallow: ReadonlySet<string> },
+  options: {
+    fsck: ReceivedObjectsFsck;
+    shallow: ReadonlySet<string>;
+    /**
+     * Called with each received commit, tree and tag once checked (git's write_cached_object:
+     * what unpack-objects has written when a later check dies)
+     */
+    onWritten?: (id: string) => void;
+  },
 ): Promise<string[]> {
   const { fsck, shallow } = options;
   const lines: string[] = [];
@@ -615,6 +623,7 @@ export async function checkUnpackedObjects(
       await check((tag as TagTargetInfo).object, undefined);
     }
     written.add(id);
+    options.onWritten?.(id);
   };
   for (const id of order) await check(id, undefined);
   for (const id of fsck.pendingBlobs()) {

@@ -512,8 +512,11 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
           const limited = limitPackInput(state.packStream, receivePackConfig(ctx).maxInputSize);
           state.limitedPack = limited;
           // kept aside until the push is accepted (when the repository can quarantine)
+          // receive.unpackLimit: unpack-objects below it, index-pack from it on
+          const unpackLimit = receivePackConfig(ctx).unpackLimit;
           const { quarantine, ...result } = await repository.importPack(limited.stream, {
             quarantine: true,
+            ...(unpackLimit !== undefined ? { unpackLimit } : {}),
             ...(received ? { onObject: (id, type, entry) => received.add(id, type, entry) } : {}),
           });
           state.quarantine = quarantine;
@@ -1009,7 +1012,7 @@ function pushView(ctx: ProcessContext): RepositoryFacade {
 /**
  * The fsck of a push's objects (`receive.fsckObjects`), as the child git's receive-pack runs:
  * unpack-objects `--strict` for a pack it unpacked, index-pack `--strict` for one it kept (git's
- * choice by `receive.unpackLimit`; ours is the store's: a kept pack has a `packId`). Their
+ * choice by `receive.unpackLimit`, which ours passes to the store: a kept pack has a `packId`). Their
  * messages (fsck errors and warnings, the death) reach the client on the progress channel.
  * Returns the unpack status of a refused pack (`unpack-objects abnormal exit`, `index-pack
  * abnormal exit`), undefined when it passed.

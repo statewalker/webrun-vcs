@@ -241,9 +241,11 @@ export interface ReceivePackConfig {
    */
   maxInputSize?: number;
   /**
-   * git's `receive.unpackLimit` (else `transfer.unpackLimit`) as far as receive-pack's messages
-   * go: which child it names when it refuses a pack (index-pack from this many objects on).
-   * Default 100. The store's own choice to keep or unpack a pack is not changed by it.
+   * git's `receive.unpackLimit` (else `transfer.unpackLimit`; see
+   * `ServerConfigSettings.unpackLimit`): a pushed pack of at least this many objects is kept
+   * as a pack (index-pack), a smaller one unpacked into loose objects (unpack-objects); 0 keeps
+   * every pack. It also names the child receive-pack reports when it refuses a pack. Default
+   * 100 for the messages; the store's own choice (100 for the files backend) for the pack.
    */
   unpackLimit?: number;
   /**

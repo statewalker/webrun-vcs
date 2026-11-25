@@ -39,6 +39,15 @@ import type { NegotiatorSource } from "./negotiator.js";
 /** git's default `transfer.unpackLimit`: a fetched pack of this many objects is kept as is. */
 const DEFAULT_UNPACK_LIMIT = 100;
 
+/**
+ * Whether fetch-pack keeps (locks) a pack of `count` objects by its size: at least `limit`
+ * objects (default 100), never with a limit of 0 (fetch-pack then leaves `do_keep` to
+ * `--keep`).
+ */
+function keepsBySize(count: number, limit = DEFAULT_UNPACK_LIMIT): boolean {
+  return limit > 0 && count >= limit;
+}
+
 import {
   applyRefUpdates,
   type FetchRefUpdate,
@@ -125,6 +134,13 @@ export interface FetchClientOptions {
    * pack, where a fetch below `transfer.unpackLimit` objects unpacks it)
    */
   keepPack?: boolean;
+  /**
+   * fetch-pack's unpack limit (`fetch.unpackLimit`, else `transfer.unpackLimit`; default 100,
+   * see `unpackLimitOf`): a pack of at least this many objects is kept, a smaller one unpacked
+   * into loose objects; 0 unpacks every pack. A filtered or fsck-checked fetch
+   * (`fsckObjects`) keeps its pack whatever its size, as git's index-pack takes those.
+   */
+  unpackLimit?: number;
   /** Shallow fetch: at most this many commits from each fetched tip (`--depth`) */
   depth?: number;
   /** `--deepen-relative`: `depth` counts from the current shallow boundary */
@@ -568,8 +584,16 @@ export async function fetchFromConnection(
       // a dry run stores the objects too (git's fetch_refs runs; only the refs are left)
       importPack: (pack) =>
         repository.importPack(pack, {
-          // a filtered pack goes through index-pack (`--promisor`): kept, never unpacked
-          ...(options.keepPack || filter ? { keepPack: true } : {}),
+          // a filtered or checked pack goes through index-pack (`--promisor`, `--strict`):
+          // kept, never unpacked; otherwise fetch.unpackLimit decides (0: always unpacked)
+          ...(options.keepPack || filter || options.fsckObjects
+            ? { keepPack: true }
+            : options.unpackLimit !== undefined
+              ? {
+                  unpackLimit:
+                    options.unpackLimit === 0 ? Number.POSITIVE_INFINITY : options.unpackLimit,
+                }
+              : {}),
           ...(options.progress ? { progress: options.progress } : {}),
           // checked before anything sees them: a refused pack leaves no object behind
           ...(received
@@ -618,7 +642,13 @@ export async function fetchFromConnection(
           links,
           ...(receivedLinks ? { receivedLinks } : {}),
           shallow: grafts(),
-          kept: imported.packId !== undefined,
+          // fetch-pack's do_keep (its lock on the pack), not whether index-pack ran: a
+          // checked pack under the limit is index-pack's without --keep
+          kept:
+            imported.packId !== undefined &&
+            (!!options.keepPack ||
+              !!filter ||
+              keepsBySize(fetched.packObjects, options.unpackLimit)),
         });
         packMessages.push(...checked.messages);
         if (links && checked.selfContained) selfContained.push(received);
@@ -635,7 +665,7 @@ export async function fetchFromConnection(
       // objects reached) when it locks the pack itself: not the `git fetch-pack` remote-curl
       // runs for smart HTTP v0, which is given no lock file
       const kept =
-        (options.keepPack || fetched.packObjects >= DEFAULT_UNPACK_LIMIT) &&
+        (options.keepPack || keepsBySize(fetched.packObjects, options.unpackLimit)) &&
         !(connection.stateless && connection.version !== 2);
       const content = kept ? promisorSought.map((r) => `${r.oid} ${r.name}\n`).join("") : "";
       await repository.markPromisorPack?.(imported.packId, content);
@@ -1035,6 +1065,11 @@ export interface FetchPromisedOptions {
   url?: string;
   /** git 2.43 prints an empty line after that error */
   compatibility?: "2.43" | "2.56";
+  /**
+   * The child fetch's `fetch.unpackLimit` (else `transfer.unpackLimit`; default 100): whether
+   * fetch-pack keeps the promisor pack itself, which decides what its `.promisor` names
+   */
+  unpackLimit?: number;
 }
 
 /** What {@link fetchPromisedObjects} did. */
@@ -1095,7 +1130,7 @@ export async function fetchPromisedObjects(
   // fetch-pack keeps (locks) the pack itself at transfer.unpackLimit's 100 objects, not for the
   // `git fetch-pack` remote-curl runs for smart HTTP v0 (given no lock file)
   const kept =
-    fetched.packObjects >= DEFAULT_UNPACK_LIMIT &&
+    keepsBySize(fetched.packObjects, options.unpackLimit) &&
     !(connection.stateless && connection.version !== 2);
   let committed = false;
   try {
