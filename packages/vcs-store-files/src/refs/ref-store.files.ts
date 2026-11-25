@@ -130,6 +130,13 @@ export class FileRefStore implements Refs {
     return text + decoder.decode();
   }
 
+  /** Removes `info/grafts` (`git replace --convert-graft-file`); whether there was one. */
+  async removeGrafts(): Promise<boolean> {
+    if (!(await this.atomic.exists(GRAFTS_FILE))) return false;
+    await this.atomic.remove(GRAFTS_FILE);
+    return true;
+  }
+
   /**
    * Replace the `shallow` file under `shallow.lock`, as git does; an empty list removes it.
    * Throws when another writer holds the lock, and, with `expected`, when the file no longer

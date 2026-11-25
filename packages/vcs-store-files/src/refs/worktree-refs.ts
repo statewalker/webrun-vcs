@@ -338,6 +338,11 @@ class WorktreeRefs implements Refs {
     return this.common.readGrafts?.() ?? Promise.resolve(undefined);
   }
 
+  /** Removes the common directory's `info/grafts`. */
+  removeGrafts(): Promise<boolean> {
+    return this.common.removeGrafts?.() ?? Promise.resolve(false);
+  }
+
   async setShallow(commits: Iterable<ObjectId>, expected?: Iterable<ObjectId>): Promise<void> {
     if (!this.common.setShallow) throw new Error("this repository cannot be shallow");
     await this.common.setShallow(commits, expected);
