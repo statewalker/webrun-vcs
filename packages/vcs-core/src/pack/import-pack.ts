@@ -4,6 +4,7 @@
  * exploded into loose objects (`unpack-objects`). The decision reads only the pack header; the
  * stream is never buffered.
  */
+import type { ProgressMonitor } from "@statewalker/vcs-utils";
 import type { ObjectId } from "../common/id/index.js";
 import type { GitObjects, ObjectQuarantine } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
@@ -41,6 +42,11 @@ export interface ImportPackOptions extends UnpackObjectsOptions {
    * has no `quarantine`: the caller sees that the objects are already published.
    */
   quarantine?: boolean;
+  /**
+   * index-pack's progress for a kept pack ("Receiving objects", "Resolving deltas"; see
+   * `InstallPackOptions.progress`). A pack unpacked into loose objects reports none.
+   */
+  progress?: ProgressMonitor;
 }
 
 export interface ImportPackResult {
@@ -192,6 +198,7 @@ async function importStream(
       baseCacheBytes: options.baseCacheBytes,
       ...(options.onObject ? { onObject: options.onObject } : {}),
       ...(options.onContent ? { onContent: options.onContent } : {}),
+      ...(options.progress ? { progress: options.progress } : {}),
     });
     return { count: kept.count, types: kept.types, kept };
   }

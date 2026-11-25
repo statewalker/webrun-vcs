@@ -11,6 +11,7 @@
  * - Pack file format: For efficient transport and storage
  */
 
+import type { ProgressMonitor } from "@statewalker/vcs-utils";
 import type { ObjectId } from "../common/id/index.js";
 import type { ObjectQuarantine } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
@@ -73,6 +74,8 @@ export interface PackImportOptions {
    * links of. An object too large to hold (streamed into a store) is not reported.
    */
   onContent?: (id: ObjectId, type: ObjectTypeString, content: Uint8Array) => void;
+  /** index-pack's progress of a kept pack ("Receiving objects", "Resolving deltas") */
+  progress?: ProgressMonitor;
 }
 
 /**

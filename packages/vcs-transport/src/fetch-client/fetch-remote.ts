@@ -4,6 +4,7 @@
  */
 
 import { outgoingLinks } from "@statewalker/vcs-core";
+import type { ProgressMonitor } from "@statewalker/vcs-utils";
 import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import type { PackImportResult, RepositoryFacade } from "../api/repository-facade.js";
 import type { RefStore } from "../context/process-context.js";
@@ -168,6 +169,11 @@ export interface FetchClientOptions {
   dryRun?: boolean;
   /** Progress messages from the server */
   onProgress?: (message: string) => void;
+  /**
+   * The local side's progress: index-pack's "Receiving objects" and "Resolving deltas" of a
+   * kept pack (`git fetch --progress`, `git clone --progress`)
+   */
+  progress?: ProgressMonitor;
   /** Reflog message of the ref updates */
   reflogMessage?: string;
   /**
@@ -538,6 +544,7 @@ export async function fetchFromConnection(
         repository.importPack(pack, {
           // a filtered pack goes through index-pack (`--promisor`): kept, never unpacked
           ...(options.keepPack || filter ? { keepPack: true } : {}),
+          ...(options.progress ? { progress: options.progress } : {}),
           // checked before anything sees them: a refused pack leaves no object behind
           ...(received
             ? { quarantine: true, onObject: (id, type, entry) => received.add(id, type, entry) }

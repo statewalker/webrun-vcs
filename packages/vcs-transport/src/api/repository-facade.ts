@@ -33,6 +33,7 @@ import type {
   PackImportResult as CorePackImportResult,
   PackEntryInfo,
 } from "@statewalker/vcs-core";
+import type { ProgressMonitor } from "@statewalker/vcs-utils";
 import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 
 /** Options of {@link RepositoryFacade.importPack}. */
@@ -59,6 +60,8 @@ export interface PackImportOptions {
    * fetch reads the objects' links from it, as index-pack does, instead of reading them back
    */
   onContent?: (id: string, type: GitObjectTypeName, content: Uint8Array) => void;
+  /** index-pack's progress of a kept pack ("Receiving objects", "Resolving deltas") */
+  progress?: ProgressMonitor;
 }
 
 /**

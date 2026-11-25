@@ -29,6 +29,7 @@ import {
   verifyReverseIndexFile,
 } from "@statewalker/vcs-core";
 import { multiPackIndexVerify } from "@statewalker/vcs-store-files";
+import { type ProgressMonitor, startProgress } from "@statewalker/vcs-utils";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { readFile } from "@statewalker/vcs-utils/files";
 import { isNullObjectId, type ObjectFormat } from "@statewalker/vcs-utils/hash";
@@ -466,6 +467,7 @@ export class FsckCommand extends GitCommand<FsckResult> {
     const run = new FsckRun(stores, objects, types, {
       ...(loadPromised ? { loadPromised } : {}),
       connectivityOnly: this._connectivityOnly,
+      ...(this.progress ? { progress: this.progress } : {}),
       dangling: this._dangling,
       unreachable: this._unreachable,
       reflogs: this._reflogs && !this._lostFound,
@@ -543,6 +545,8 @@ interface RunOptions {
    * no set then)
    */
   loadPromised?: (skipUnreadable?: boolean) => Promise<ReadonlySet<string>>;
+  /** `--progress`: git's phases (see `GitCommand.setProgress`) */
+  progress?: ProgressMonitor;
   connectivityOnly: boolean;
   dangling: boolean;
   unreachable: boolean;
@@ -851,6 +855,14 @@ class FsckRun {
     }
     if (this.o.connectivityOnly) this.graph = await this.loadCommitGraph();
     if (packed) await this.scanPacks(packed, loose ?? []);
+    // 2.43's check_pack_rev_indexes, then verify_bitmap_files, after the indexes and before
+    // the connectivity walk, --connectivity-only too (ERROR_PACK_REV_INDEX 0100, ERROR_BITMAP
+    // 0200)
+    if (this.files && this.o.compatibility === "2.43") {
+      if (await this.verifyReverseIndexes(this.packs))
+        this.errorsFound |= FSCK_ERROR_PACK_REV_INDEX_243;
+      if (await this.verifyBitmapFiles(this.packs)) this.errorsFound |= FSCK_ERROR_BITMAP_243;
+    }
     try {
       await this.checkConnectivity();
       // the walk reads through the midx what it parses again (every object but blobs when
@@ -868,20 +880,6 @@ class FsckRun {
         }
       }
       await this.verifyCommitGraph();
-      // 2.43's check_pack_rev_indexes, --connectivity-only too (ERROR_PACK_REV_INDEX, 0100)
-      if (
-        this.files &&
-        this.o.compatibility === "2.43" &&
-        (await this.verifyReverseIndexes(this.packs))
-      )
-        this.errorsFound |= FSCK_ERROR_PACK_REV_INDEX_243;
-      // 2.43 checks every pack's bitmap last, --connectivity-only too (ERROR_BITMAP, 0200)
-      if (
-        this.files &&
-        this.o.compatibility === "2.43" &&
-        (await this.verifyBitmapFiles(this.packs))
-      )
-        this.errorsFound |= FSCK_ERROR_BITMAP_243;
       // 2.43 runs `git multi-pack-index verify` for every source last (ERROR_MULTI_PACK_INDEX)
       if (this.files && this.o.compatibility === "2.43") {
         for (const dir of this.sourceDirs())
@@ -1576,7 +1574,7 @@ class FsckRun {
    */
   private async *looseEntries(
     objectsDir = this.looseDir(),
-  ): AsyncIterable<{ id?: string; path: string; name: string }> {
+  ): AsyncIterable<{ id?: string; path: string; name: string; fanout: number }> {
     const files = this.files as FilesApi;
     for (let i = 0; i < 256; i++) {
       const sub = i.toString(16).padStart(2, "0");
@@ -1588,8 +1586,8 @@ class FsckRun {
       for (const e of entries) {
         const path = pathOf(dir, e.name);
         yield this.looseName.test(e.name)
-          ? { id: sub + e.name, path, name: e.name }
-          : { path, name: e.name };
+          ? { id: sub + e.name, path, name: e.name, fanout: i }
+          : { path, name: e.name, fanout: i };
       }
     }
   }
@@ -2089,7 +2087,14 @@ class FsckRun {
   /** git's `fsck_object_dir`: every loose object file of `objectsDir`. */
   private async fsckLooseObjects(objectsDir: string): Promise<void> {
     const files = this.files as FilesApi;
+    // fsck_source: "Checking object directories", one unit per fan-out directory, 256 at the end
+    const progress = startProgress(this.o.progress, "Checking object directories", 256);
+    let directory = -1;
     for await (const e of this.looseEntries(objectsDir)) {
+      if (e.fanout > directory) {
+        if (directory >= 0) progress.update(directory + 1);
+        directory = e.fanout;
+      }
       if (!e.id) {
         if (!e.name.startsWith("tmp_obj_")) {
           this.emit({ kind: "notice", stream: "stderr", text: `bad sha1 file: ${e.path}` });
@@ -2121,6 +2126,9 @@ class FsckRun {
       );
       if (r > 0) this.errorsFound |= FSCK_ERROR_OBJECT;
     }
+    if (directory >= 0) progress.update(directory + 1);
+    progress.update(256);
+    progress.stop();
   }
 
   /**
@@ -2130,6 +2138,7 @@ class FsckRun {
   private async verifyReverseIndexes(packs: readonly RepoPack[]): Promise<boolean> {
     const files = this.files as FilesApi;
     let bad = false;
+    const progress = startProgress(this.o.progress, "Verifying reverse pack-indexes", packs.length);
     for (const p of packs) {
       const lines = await verifyReverseIndexFile(
         files,
@@ -2138,10 +2147,12 @@ class FsckRun {
         (i) => p.idx.getOffset(i),
         this.format,
       );
+      progress.tick();
       if (!lines) continue;
       for (const line of lines) this.error(line.replace(/^error: /, ""));
       bad = true;
     }
+    progress.stop();
     return bad;
   }
 
@@ -2191,6 +2202,12 @@ class FsckRun {
   /** git's `verify_pack` for each of `packs`, with `fsck_obj_buffer` for each object. */
   private async fsckPacks(packs: readonly RepoPack[]): Promise<void> {
     const files = this.files as FilesApi;
+    // verify_packs: "Checking objects" over every object of the packs
+    const progress = startProgress(
+      this.o.progress,
+      "Checking objects",
+      packs.reduce((n, p) => n + p.idx.objectCount, 0),
+    );
     for (const p of packs) {
       let err = 0;
       // git prints the pack checksum errors before any entry's output
@@ -2213,6 +2230,7 @@ class FsckRun {
             });
           },
           entry: (entry, unpacked) => {
+            progress.tick();
             if (p.idx.version > 1 && !entry.crcOk) {
               this.error(
                 `index CRC mismatch for object ${entry.id} from ${p.packPath} at offset ${entry.offset}`,
@@ -2260,6 +2278,7 @@ class FsckRun {
         this.errorsFound |= this.o.compatibility === "2.56" ? FSCK_ERROR_OBJECT : FSCK_ERROR_PACK;
       }
     }
+    progress.stop();
   }
 
   /** Every object of a store without files: read, hash-checked and checked. */
@@ -3341,8 +3360,11 @@ class FsckRun {
     const t = this.t;
     const pending = this.pending;
     const scanAt = this.scanAt;
+    // traverse_reachable: one unit per object popped, no total
+    const progress = startProgress(this.o.progress, "Checking connectivity");
     while (pending.length > 0) {
       const n = pending.pop() as number;
+      progress.tick();
       // fsck_walk returns at once for a blob
       if (t.type(n) === OBJ_BLOB) continue;
       // a tree the scan kept, walked without steps while it needs no await
@@ -3363,6 +3385,7 @@ class FsckRun {
       const r = runSteps(this.traverseOne(n));
       if (r instanceof Promise) await r;
     }
+    progress.stop();
     if (this.o.connectivityOnly && (this.o.dangling || this.o.lostFound)) {
       await this.forEachStored((raw, at) => this.markUnreachableReferents(raw, at));
     }
