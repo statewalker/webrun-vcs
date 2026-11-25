@@ -51,7 +51,7 @@ import {
   reflogInChain,
   symrefReflogWrites,
 } from "@statewalker/vcs-core";
-import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
+import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import type { AtomicFiles } from "@statewalker/vcs-utils/files";
 import {
   nullObjectIdLike,
@@ -60,8 +60,19 @@ import {
 } from "@statewalker/vcs-utils/hash";
 import { parseReflogLine } from "./reflog-reader.js";
 
-const enc = new TextEncoder();
-const dec = new TextDecoder();
+/** `chunks` as one buffer. */
+function concatBytes(chunks: Uint8Array[]): Uint8Array {
+  let length = 0;
+  for (const c of chunks) length += c.length;
+  const out = new Uint8Array(length);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.length;
+  }
+  return out;
+}
+
 const PACKED = "packed-refs";
 /** git's temporary for a packed-refs rewrite (packed-backend.c write_with_updates). */
 const PACKED_NEW = "packed-refs.new";
@@ -299,7 +310,7 @@ async function serializePacked(
     : tags
       ? "# pack-refs with: peeled sorted \n"
       : "# pack-refs with: sorted \n";
-  return enc.encode(header + body);
+  return encodeGitPath(header + body);
 }
 
 /** Thrown when `packed-refs.lock` stays held by another writer past the timeout. */
@@ -484,14 +495,16 @@ export function createFilesRefOps(
   async function readOnce(path: string): Promise<string | undefined> {
     // a FilesApi that throws for an absent file is asked whether the file is there, as
     // files-staging-store
-    let text = "";
+    // git's bytes: a ref name that is not UTF-8 (packed-refs, a symref target, a reflog
+    // message) keeps its bytes as decodeGitPath's escapes
+    const chunks: Uint8Array[] = [];
     try {
-      for await (const chunk of files.read(path)) text += dec.decode(chunk, { stream: true });
+      for await (const chunk of files.read(path)) chunks.push(chunk);
     } catch (e) {
       if (await files.exists(path)) throw e;
       return undefined;
     }
-    return text + dec.decode();
+    return decodeGitPath(chunks.length === 1 ? (chunks[0] as Uint8Array) : concatBytes(chunks));
   }
   /** As git's parse_loose_ref_contents: `ref:` with optional spaces, or an id then whitespace/end. */
   async function readLoose(name: string): Promise<Loose | undefined> {
@@ -599,7 +612,7 @@ export function createFilesRefOps(
   async function lock(
     path: string,
     timeoutMs: number,
-    content = new Uint8Array(0),
+    content: Uint8Array = new Uint8Array(0),
   ): Promise<"ok" | "held" | "conflict"> {
     // git's lock_file_timeout: a negative timeout retries forever
     const until = timeoutMs < 0 ? Number.POSITIVE_INFINITY : Date.now() + timeoutMs;
@@ -904,7 +917,7 @@ export function createFilesRefOps(
     hook: RefTransactionHook | undefined,
     after: AfterLocks,
   ): Promise<BatchResult> {
-    const content = u.newValue === null ? new Uint8Array(0) : enc.encode(`${u.newValue}\n`);
+    const content = u.newValue === null ? new Uint8Array(0) : encodeGitPath(`${u.newValue}\n`);
     // The refs that log this update too (HEAD, symbolic refs on the way) are locked as
     // git locks them (REF_LOG_ONLY updates), so their log lines are appended under a lock.
     const extra = [...new Set(u.reflogAlso)].filter((n) => n !== u.name);
@@ -1080,7 +1093,7 @@ export function createFilesRefOps(
         // the batch with every ref unchanged), then each lock renamed over its ref
         await writeLogs(updates, at, o, true);
         for (const u of updates) {
-          await files.write(`${u.name}.lock`, enc.encode(`${u.newValue}\n`));
+          await files.write(`${u.name}.lock`, encodeGitPath(`${u.newValue}\n`));
         }
         for (const u of updates) {
           if (!(await commit(u.name))) return fail([{ name: u.requested, reason: "df-conflict" }]);
@@ -1494,7 +1507,7 @@ export function createFilesRefOps(
     /** Run once the lock is held and checked, before the rename; throwing gives the write up */
     beforeCommit?: () => Promise<void>,
   ): Promise<void> {
-    const r = await lock(name, refLockTimeout, enc.encode(content));
+    const r = await lock(name, refLockTimeout, encodeGitPath(content));
     if (r !== "ok") {
       throw new RefUpdateRejectedError([{ name, reason: r === "held" ? "locked" : "df-conflict" }]);
     }
@@ -1596,7 +1609,7 @@ export function createFilesRefOps(
         throw refused;
       }
     }
-    const r = await lock(name, refLockTimeout, enc.encode(`${id}\n`));
+    const r = await lock(name, refLockTimeout, encodeGitPath(`${id}\n`));
     if (r !== "ok") {
       throw new RefUpdateRejectedError([{ name, reason: r === "held" ? "locked" : "df-conflict" }]);
     }
@@ -1841,14 +1854,14 @@ export function createFilesRefOps(
       const kept = deleteReflogLine(lines, index, o.rewrite);
       if (!kept) throw new ReflogEntryNotFoundError(name, index);
       const out = kept.map((l) => `${l.oldId} ${l.newId}${l.rest}\n`).join("");
-      await files.write(`${log}.lock`, enc.encode(out)); // ours: we hold the lock
+      await files.write(`${log}.lock`, encodeGitPath(out)); // ours: we hold the lock
       // git: the ref is updated only when an entry is kept and the ref is not symbolic
       const top = kept.at(-1);
       let updateRef = false;
       if (o.updateRef && top) {
         const current = await readLoose(name).catch(() => undefined);
         if (!current || !("target" in current)) {
-          await files.write(`${name}.lock`, enc.encode(`${top.newId}\n`));
+          await files.write(`${name}.lock`, encodeGitPath(`${top.newId}\n`));
           updateRef = true;
         }
       }

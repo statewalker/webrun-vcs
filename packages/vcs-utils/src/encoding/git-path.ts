@@ -76,22 +76,92 @@ export function decodeGitPath(bytes: Uint8Array): string {
   } catch {
     // not valid UTF-8: decoded sequence by sequence below
   }
-  let out = "";
-  let start = 0;
+  return decodeEscaping(bytes);
+}
+
+/** UTF-16 units gathered before they become a string (String.fromCharCode's argument limit). */
+const UNITS_PER_CALL = 4096;
+/** Runs at least this long go through the native decoder, or `repeat` for one escaped byte. */
+const LONG_RUN = 64;
+
+/**
+ * {@link decodeGitPath} of bytes that are not valid UTF-8, in time linear in their length
+ * (a reftable key or a packed-refs file may be megabytes of such bytes): a long run of valid
+ * UTF-8 decoded natively, a long run of one escaped byte as `repeat`, everything else
+ * gathered as UTF-16 units (each byte outside a sequence as U+DC00 + byte) and turned into a
+ * string in chunks. (A UTF-16 TextDecoder would make the escapes U+FFFD.)
+ */
+function decodeEscaping(bytes: Uint8Array): string {
+  const parts: string[] = [];
+  const units = new Uint16Array(UNITS_PER_CALL + 2);
+  let n = 0;
+  const flush = () => {
+    if (n > 0)
+      parts.push(String.fromCharCode.apply(null, units.subarray(0, n) as unknown as number[]));
+    n = 0;
+  };
+  const length = bytes.length;
   let i = 0;
-  while (i < bytes.length) {
-    const len = sequenceLength(bytes, i);
-    if (len > 0) {
-      i += len;
+  while (i < length) {
+    if (n >= UNITS_PER_CALL) flush();
+    const b0 = bytes[i];
+    // a byte below 0xc2 (not ASCII) or above 0xf4 starts no sequence
+    const len = b0 < 0x80 ? 1 : b0 < 0xc2 || b0 > 0xf4 ? 0 : sequenceLength(bytes, i);
+    if (len === 0) {
+      // a run of one byte that never starts a sequence (a lead byte might, further on)
+      let end = i + 1;
+      if (b0 < 0xc2 || b0 > 0xf4) while (end < length && bytes[end] === b0) end++;
+      if (end - i >= LONG_RUN) {
+        flush();
+        parts.push(String.fromCharCode(0xdc00 + b0).repeat(end - i));
+        i = end;
+      } else {
+        units[n++] = 0xdc00 + b0;
+        i++;
+      }
       continue;
     }
-    if (i > start) out += fatalDecoder.decode(bytes.subarray(start, i));
-    out += String.fromCharCode(0xdc00 + bytes[i]);
-    i++;
-    start = i;
+    // the valid run starting here: decoded natively when long
+    let end = i;
+    for (;;) {
+      const l = end < length ? (bytes[end] < 0x80 ? 1 : sequenceLength(bytes, end)) : 0;
+      if (l === 0 || end - i >= LONG_RUN) break;
+      end += l;
+    }
+    if (end - i >= LONG_RUN) {
+      while (end < length) {
+        const l = bytes[end] < 0x80 ? 1 : sequenceLength(bytes, end);
+        if (l === 0) break;
+        end += l;
+      }
+      flush();
+      parts.push(fatalDecoder.decode(bytes.subarray(i, end)));
+      i = end;
+      continue;
+    }
+    if (len === 1) {
+      units[n++] = b0;
+      i++;
+    } else if (len === 2) {
+      units[n++] = ((b0 & 0x1f) << 6) | (bytes[i + 1] & 0x3f);
+      i += 2;
+    } else if (len === 3) {
+      units[n++] = ((b0 & 0x0f) << 12) | ((bytes[i + 1] & 0x3f) << 6) | (bytes[i + 2] & 0x3f);
+      i += 3;
+    } else {
+      const cp =
+        (((b0 & 0x07) << 18) |
+          ((bytes[i + 1] & 0x3f) << 12) |
+          ((bytes[i + 2] & 0x3f) << 6) |
+          (bytes[i + 3] & 0x3f)) -
+        0x10000;
+      units[n++] = 0xd800 + (cp >> 10);
+      units[n++] = 0xdc00 + (cp & 0x3ff);
+      i += 4;
+    }
   }
-  if (i > start) out += fatalDecoder.decode(bytes.subarray(start, i));
-  return out;
+  flush();
+  return parts.join("");
 }
 
 /**
