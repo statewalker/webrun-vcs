@@ -11,7 +11,7 @@ import { join } from "node:path";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { MergeStatus } from "../src/index.js";
+import { MergeOperation, MergeStatus } from "../src/index.js";
 import { git, gitOk, INTEROP_IDENT, openOurs, put, snapshot } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { buildT4200, copyRrCache, rerereState, rrMtime } from "./rerere-native-support.js";
@@ -434,5 +434,41 @@ describeGit("rerere as native git (t4200-rerere.sh)", () => {
     const actual = await (await openOurs(t.ours)).rerere().setSubcommand("bogus").call();
     expect(actual.exitCode).toBe(expected.status);
     expect(actual.stderr.split("\n")[0]).toBe(expected.stderr.split("\n")[0]);
+  });
+
+  it("merge --abort forgets MERGE_RR: a later commit records nothing, the merge conflicts again", async () => {
+    const t = twins({ "rerere.enabled": "true" });
+    await merge(t, "first");
+    git(root, t.native, "merge", "--abort");
+    const aborted = await (await openOurs(t.ours))
+      .merge()
+      .setOperation(MergeOperation.ABORT)
+      .call();
+    expect(aborted.status).toBe(MergeStatus.ABORTED);
+    same(t);
+    writeBoth(t, "other", "other\n");
+    both(t, "add", "other");
+    await commitAll(t, "unrelated");
+    same(t);
+    const again = await merge(t, "first");
+    expect(again.rerereOutput).toEqual(["Recorded preimage for 'a1'"]);
+    same(t);
+  });
+
+  it("merge --continue records the resolution", async () => {
+    const t = twins({ "rerere.enabled": "true" });
+    await merge(t, "first");
+    for (const dir of [t.native, t.ours]) put(dir, "a1", FIRST_RESOLUTION(dir));
+    both(t, "add", "a1");
+    const expected = git(root, t.native, "merge", "--continue");
+    const result = await (await openOurs(t.ours))
+      .merge()
+      .setOperation(MergeOperation.CONTINUE)
+      .setAuthor(INTEROP_IDENT)
+      .setCommitter(INTEROP_IDENT)
+      .call();
+    expect(result.rerereOutput).toEqual(rerereLines(expected.stderr));
+    expect(result.rerereOutput).toEqual(["Recorded resolution for 'a1'."]);
+    same(t);
   });
 });

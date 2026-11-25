@@ -1621,6 +1621,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
         newHead: made.id,
         mergedCommits: made.parents,
         output: await this.popAutostash(state, this.worktreeAccess),
+        ...(made.rerereOutput ? { rerereOutput: made.rerereOutput } : {}),
       };
     }
     const headId = await this.resolveHead();
@@ -1639,11 +1640,14 @@ export class MergeCommand extends GitCommand<MergeResult> {
     await this.updateHead(head, newCommitId, undefined, reflogMessages.commit("merge", message));
     await state.removeRef("MERGE_HEAD", "AUTO_MERGE");
     await state.remove("MERGE_MSG", "MERGE_MODE", "SQUASH_MSG");
+    // git commit's repo_rerere: the resolutions recorded
+    const rerereOutput = await this.rerere();
     return {
       status: MergeStatus.MERGED,
       newHead: newCommitId,
       mergedCommits: [headId, ...heads],
       output: await this.popAutostash(state, this.worktreeAccess),
+      ...(rerereOutput.length > 0 ? { rerereOutput } : {}),
     };
   }
 
@@ -1673,7 +1677,9 @@ export class MergeCommand extends GitCommand<MergeResult> {
       : reflogMessages.reset("HEAD");
     await updateHead(this.refsStore, headId, this.reflogLine(message));
     await state.removeRef("MERGE_HEAD", "AUTO_MERGE");
-    await state.remove("MERGE_MSG", "MERGE_MODE", "SQUASH_MSG");
+    // reset --merge's remove_branch_state: MERGE_RR too (a stale one would make the next
+    // commit record HEAD's file as the conflict's resolution)
+    await state.remove("MERGE_MSG", "MERGE_MODE", "SQUASH_MSG", "MERGE_RR");
     return {
       status: MergeStatus.ABORTED,
       newHead: headId,
