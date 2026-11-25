@@ -149,6 +149,40 @@ export interface ReceivePackHooks {
   procReceive?(
     ctx: ReceivePackHookContext,
   ): ProcReceiveProcess | undefined | Promise<ProcReceiveProcess | undefined>;
+  /**
+   * git master's receive-report hook (not in git 2.56): handed the whole report as pkt-lines
+   * (`unpack <status>`, an `ok`/`ng` line per command, report-status-v2's options, a flush)
+   * once every ref is updated, before the client gets it. Bytes returned replace the report
+   * (written to the client as they are); undefined keeps it; `false` or a throw is the hook
+   * failing: every command is reported `ng <ref> receive-report hook failed` (git's
+   * `override_cmds_error`) and post-receive sees none. Refs already updated stay updated.
+   * Runs only when the client asked for a report (`report-status`).
+   */
+  receiveReport?(
+    report: Uint8Array,
+    ctx: ReceivePackHookContext,
+  ): Uint8Array | false | undefined | Promise<Uint8Array | false | undefined>;
+  /**
+   * Called for every refused command before the report is written, with the reason receive-pack
+   * gives (`hook declined`, `non-fast-forward`, ...): a string returned replaces the reason the
+   * client sees (JGit's `ReceiveCommandErrorHandler`); undefined keeps it. A throw is logged.
+   */
+  commandError?(
+    command: ReceiveCommand,
+    reason: string,
+    ctx: ReceivePackHookContext,
+  ): string | undefined | Promise<string | undefined>;
+  /**
+   * Called when the pushed pack cannot be stored (corrupt, refused by `receive.fsckObjects`,
+   * over `receive.maxInputSize`), with the unpack status git reports (`index-pack abnormal
+   * exit`, ...) and the error: a string returned replaces the status the client sees after
+   * `unpack ` (JGit's `UnpackErrorHandler`); undefined keeps it. A throw is logged.
+   */
+  unpackError?(
+    status: string,
+    error: unknown,
+    ctx: ReceivePackHookContext,
+  ): string | undefined | Promise<string | undefined>;
 }
 
 /** A logger for receive-pack (hook failures after the report). */
@@ -198,6 +232,29 @@ export interface ReceivePackConfig {
    * applied (git's `receive.keepAlive`, default 5 s; 0: none).
    */
   keepAliveMs?: number;
+  /**
+   * git's `receive.maxInputSize` in bytes: a pack larger than this is refused as git's
+   * index-pack and unpack-objects refuse it (`fatal: pack exceeds maximum allowed size` on the
+   * progress channel, the unpack status `index-pack abnormal exit` or `unpack-objects abnormal
+   * exit` by {@link unpackLimit}, every command `unpacker error`), nothing of it stored.
+   * Absent, 0 or negative: no limit.
+   */
+  maxInputSize?: number;
+  /**
+   * git's `receive.unpackLimit` (else `transfer.unpackLimit`; see
+   * `ServerConfigSettings.unpackLimit`): a pushed pack of at least this many objects is kept
+   * as a pack (index-pack), a smaller one unpacked into loose objects (unpack-objects); 0 keeps
+   * every pack. It also names the child receive-pack reports when it refuses a pack. Default
+   * 100 for the messages; the store's own choice (100 for the files backend) for the pack.
+   */
+  unpackLimit?: number;
+  /**
+   * Runs once a push is done, after post-receive (git's `receive.autogc` auto maintenance and
+   * `receive.updateServerInfo`), for every push that sent commands; with
+   * awaited before receive-pack ends and the side-band closes (its `ctx.message` text reaching
+   * the client), whether post-receive is relayed or detached. What it throws is logged.
+   */
+  afterPush?: (ctx: ReceivePackHookContext) => unknown;
   /**
    * A hook (`authorize`, `preReceive`, `update`) still running after this long (ms) counts as
    * failed: logged, and its commands refused as when it throws ("authorization failed",
@@ -337,13 +394,6 @@ export interface ReceivePackConfig {
    * command `unpacker error`.
    */
   fsckObjects?: () => ReceivedObjectsFsck | undefined | Promise<ReceivedObjectsFsck | undefined>;
-  /**
-   * git's `receive.unpackLimit` (else `transfer.unpackLimit`; see
-   * `ServerConfigSettings.unpackLimit`): a pushed pack of at least this many objects is kept
-   * as a pack (index-pack), a smaller one unpacked into loose objects (unpack-objects); 0 keeps
-   * every pack. Default: the repository's own choice (100 for the files backend).
-   */
-  unpackLimit?: number;
   /**
    * What receive-pack prints as it dies on a setting it cannot read (see
    * `ServerConfigSettings.receivePackConfigError`): it dies before the advertisement, the

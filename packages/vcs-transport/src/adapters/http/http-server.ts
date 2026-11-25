@@ -51,7 +51,7 @@ import {
   type ReceivePackLogger,
 } from "../../fsm/push/receive-pack-types.js";
 import {
-  RECEIVE_PACK_CAPABILITIES,
+  receivePackCapabilitiesOf,
   releaseReceivePack,
   serverPushHandlers,
   serverPushTransitions,
@@ -286,10 +286,18 @@ export interface ReceivePackServerOptions {
   receivePackConfigError?: string;
   /** git's `receive.advertisePushOptions` (default: advertised; see `ServeOverDuplexOptions`) */
   advertisePushOptions?: boolean;
+  /** git's `receive.advertiseAtomic` (default: advertised; see `ServeOverDuplexOptions`) */
+  advertiseAtomic?: boolean;
+  /** git's `receive.maxInputSize` (see `ReceivePackConfig.maxInputSize`) */
+  maxInputSize?: number;
+  /** git's `receive.keepAlive` in ms, over {@link keepAliveMs} (see `ServeOverDuplexOptions`) */
+  receiveKeepAliveMs?: number;
+  /** git's `receive.unpackLimit` (see `ReceivePackConfig.unpackLimit`) */
+  unpackLimit?: number;
+  /** What runs once a push is done (see `ReceivePackConfig.afterPush`) */
+  afterPush?: ReceivePackConfig["afterPush"];
   /** `receive.fsckObjects`: the fsck of each push's objects (see `ReceivePackConfig.fsckObjects`) */
   fsckObjects?: ReceivePackConfig["fsckObjects"];
-  /** `receive.unpackLimit`: keep or unpack a pushed pack (see `ReceivePackConfig.unpackLimit`) */
-  unpackLimit?: number;
 }
 
 /**
@@ -935,12 +943,12 @@ function concatBytes(chunks: Uint8Array[]): Uint8Array {
   return body;
 }
 
-/** receive-pack's capabilities: `push-options` only while `receive.advertisePushOptions` allows. */
+/**
+ * receive-pack's capabilities: `push-options` only while `receive.advertisePushOptions` allows,
+ * `atomic` unless `receive.advertiseAtomic` is false.
+ */
 function receivePackCapabilities(options: HttpServerOptions): string[] {
-  const capabilities = [...(options.capabilities ?? RECEIVE_PACK_CAPABILITIES)];
-  return options.receivePack?.advertisePushOptions === false
-    ? capabilities.filter((c) => c !== "push-options")
-    : capabilities;
+  return receivePackCapabilitiesOf(options.capabilities, options.receivePack ?? {});
 }
 
 /**
@@ -1112,7 +1120,10 @@ export async function handleReceivePack(
     receivePack: {
       hooks: rp.hooks,
       maxCommands: rp.maxCommands,
-      keepAliveMs: rp.keepAliveMs,
+      keepAliveMs: rp.receiveKeepAliveMs ?? rp.keepAliveMs,
+      ...(rp.maxInputSize ? { maxInputSize: rp.maxInputSize } : {}),
+      ...(rp.unpackLimit !== undefined ? { unpackLimit: rp.unpackLimit } : {}),
+      ...(rp.afterPush ? { afterPush: rp.afterPush } : {}),
       hookTimeoutMs: rp.hookTimeoutMs,
       bare: rp.bare,
       denyDeleteCurrent: rp.denyDeleteCurrent,
@@ -1130,7 +1141,6 @@ export async function handleReceivePack(
         ? { configError: rp.receivePackConfigError }
         : {}),
       ...(rp.fsckObjects ? { fsckObjects: rp.fsckObjects } : {}),
-      ...(rp.unpackLimit !== undefined ? { unpackLimit: rp.unpackLimit } : {}),
       logger: options.logger,
       request: {
         method: request.method,

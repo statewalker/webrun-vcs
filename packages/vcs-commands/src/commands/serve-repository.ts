@@ -51,11 +51,14 @@ const CONFIG_KEYS = [
   "denyDeleteCurrent",
   "shallowUpdate",
   "advertisePushOptions",
+  "advertiseAtomic",
+  "maxInputSize",
+  "receiveKeepAliveMs",
+  "unpackLimit",
   "uploadPackHideRefs",
   "receivePackHideRefs",
   "procReceiveRefs",
   "receivePackConfigError",
-  "unpackLimit",
 ] as const;
 
 /** A repository without a config reads as one with nothing set: git's defaults. */

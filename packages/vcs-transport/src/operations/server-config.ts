@@ -54,6 +54,28 @@ export interface ServerConfigSettings {
   shallowUpdate: boolean;
   /** `receive.advertisePushOptions` (git's default: false) */
   advertisePushOptions: boolean;
+  /**
+   * `receive.advertiseAtomic` (git's default: true): false leaves `atomic` out of the
+   * advertisement, and a client's `atomic` is then ignored (git's `use_atomic` needs both)
+   */
+  advertiseAtomic?: boolean;
+  /**
+   * `receive.maxInputSize` in bytes: a pushed pack larger than this is refused (index-pack and
+   * unpack-objects `--max-input-size`); absent, 0 or negative: no limit (git's default)
+   */
+  maxInputSize?: number;
+  /**
+   * `receive.keepAlive` in milliseconds (git's setting is in seconds, default 5): the side-band
+   * keep-alive interval while a push is checked; 0 turns keep-alives off (git: 0 or less)
+   */
+  receiveKeepAliveMs?: number;
+  /**
+   * `receive.unpackLimit`, else `transfer.unpackLimit` (a negative value counts as unset;
+   * git's default 100 when neither): a pushed pack of at least this many objects is kept
+   * (index-pack), a smaller one unpacked (unpack-objects), 0 keeping every pack; also the child
+   * receive-pack names when it refuses a pack
+   */
+  unpackLimit?: number;
   /** upload-pack's hidden ref patterns: `transfer.hideRefs` and `uploadpack.hideRefs` */
   uploadPackHideRefs: string[];
   /** receive-pack's hidden ref patterns: `transfer.hideRefs` and `receive.hideRefs` */
@@ -69,12 +91,6 @@ export interface ServerConfigSettings {
    * hook takes (absent: none set)
    */
   procReceiveRefs?: string[];
-  /**
-   * receive-pack's `receive.unpackLimit`, else `transfer.unpackLimit` (a negative value
-   * counts as unset): a pushed pack of at least this many objects is kept (index-pack), a
-   * smaller one unpacked (unpack-objects); 0 keeps every pack. Absent: neither set, git's 100.
-   */
-  unpackLimit?: number;
   /**
    * A receive-pack setting git cannot read (`receive.procReceiveRefs` without a value,
    * config_error_nonbool): what receive-pack prints as it dies reading its config, before it
@@ -157,6 +173,56 @@ function denyAction(values: unknown[]): ReceiveDenyAction {
   return configBool(value, true) ? "refuse" : "ignore";
 }
 
+/** git_parse_int64's unit factors (`k`, `m`, `g`, any case). */
+const INT64_UNITS: Record<string, bigint> = { "": 1n, k: 1024n, m: 1024n ** 2n, g: 1024n ** 3n };
+
+/**
+ * git's `git_config_int64`: a decimal (or `0x` hex, `0` octal) number with an optional `k`,
+ * `m` or `g` unit; undefined where git dies (`bad numeric config value`).
+ */
+function configInt64(value: unknown): number | undefined {
+  if (value === null || value === true) return undefined; // git: config_error_nonbool... dies
+  const text = String(value);
+  const m = /^\s*([+-]?)(0[xX][0-9a-fA-F]+|[0-9]+)([kKmMgG]?)$/.exec(text);
+  if (!m) return undefined;
+  const digits = m[2] as string;
+  const n = /^0[xX]/.test(digits)
+    ? BigInt(digits)
+    : digits.length > 1 && digits.startsWith("0")
+      ? /[89]/.test(digits)
+        ? undefined
+        : BigInt(`0o${digits.slice(1)}`)
+      : BigInt(digits);
+  if (n === undefined) return undefined;
+  const magnitude = n * (INT64_UNITS[(m[3] as string).toLowerCase()] ?? 1n);
+  if (magnitude > 2n ** 63n - 1n) return undefined;
+  return Number(m[1] === "-" ? -magnitude : magnitude);
+}
+
+/** git's `git_config_int` (32 bits, units as {@link configInt64}). */
+function configInt(value: unknown): number | undefined {
+  const n = configInt64(value);
+  return n !== undefined && n >= -(2 ** 31) && n <= 2 ** 31 - 1 ? n : undefined;
+}
+
+/**
+ * The death of git's config reader on a value that is no number of the unit it takes
+ * (`die_bad_number`): `fatal: bad numeric config value '<v>' for '<key>' in file <file>: invalid
+ * unit`, the place where the config tells it.
+ */
+function badNumeric(config: ServerConfigReader, key: string, value: unknown): string {
+  // git_parse_int64 sets EINVAL ("invalid unit") or ERANGE ("out of range")
+  const text = value === null || value === true ? "" : String(value);
+  const range = /^\s*[+-]?(0[xX][0-9a-fA-F]+|[0-9]+)[kKmMgG]?$/.test(text);
+  let place = "";
+  for (const entry of config.listWithOrigin?.() ?? []) {
+    if (entry.key.toLowerCase() !== key || entry.value !== value) continue;
+    if (entry.file !== undefined) place = ` in file ${entry.file}`;
+    break;
+  }
+  return `fatal: bad numeric config value '${text}' for '${key}'${place}: ${range ? "out of range" : "invalid unit"}`;
+}
+
 /** The last value of `key`, or undefined. */
 function last(config: ServerConfigReader, key: string): unknown {
   const all = config.getAll(key);
@@ -198,6 +264,20 @@ function nonBoolError(config: ServerConfigReader, key: string): string {
   return error;
 }
 
+/**
+ * Of the deaths `errors` (each naming its key as `for '<key>'`), the one whose key comes first in
+ * the configuration (receive_pack_config dies at the first value it cannot read).
+ */
+function firstInConfigOrder(config: ServerConfigReader, errors: string[]): string {
+  if (errors.length === 1 || !config.list) return errors[0] as string;
+  const keyOf = (e: string) => /for '([^']+)'/.exec(e)?.[1];
+  for (const { key } of config.list()) {
+    const hit = errors.find((e) => keyOf(e) === key.toLowerCase());
+    if (hit) return hit;
+  }
+  return errors[0] as string;
+}
+
 /** git's defaults: what {@link serverSettingsFromConfig} gives for an empty configuration. */
 export const GIT_SERVER_SETTINGS_DEFAULTS: Readonly<ServerConfigSettings> = Object.freeze({
   allowDeletes: true,
@@ -237,6 +317,37 @@ export function explicitServerSettingsFromConfig(
   if (shallow !== undefined) out.shallowUpdate = configBool(shallow, false);
   const pushOptions = last(config, "receive.advertisePushOptions");
   if (pushOptions !== undefined) out.advertisePushOptions = configBool(pushOptions, false);
+  const atomic = last(config, "receive.advertiseAtomic");
+  if (atomic !== undefined) out.advertiseAtomic = configBool(atomic, true);
+  // receive_pack_config reads in config order: the first value git cannot read kills it
+  const numberErrors: string[] = [];
+  // every value is read (git dies at a bad one even when a later one overrides it)
+  const numeric = (key: string, parse: (v: unknown) => number | undefined) => {
+    let result: number | undefined;
+    for (const value of config.getAll(key)) {
+      const n = parse(value);
+      if (n === undefined) {
+        numberErrors.push(badNumeric(config, key.toLowerCase(), value));
+        return undefined;
+      }
+      result = n;
+    }
+    return result;
+  };
+  const maxInput = numeric("receive.maxInputSize", configInt64);
+  if (maxInput !== undefined) out.maxInputSize = maxInput;
+  const keepAlive = numeric("receive.keepAlive", configInt);
+  if (keepAlive !== undefined) out.receiveKeepAliveMs = Math.max(0, keepAlive) * 1000;
+  // receive_pack_config: receive.unpackLimit wins over transfer.unpackLimit, in any order
+  const receiveLimit = numeric("receive.unpackLimit", configInt);
+  const transferLimit = numeric("transfer.unpackLimit", configInt);
+  const unpackLimit =
+    receiveLimit !== undefined && receiveLimit >= 0
+      ? receiveLimit
+      : transferLimit !== undefined && transferLimit >= 0
+        ? transferLimit
+        : undefined;
+  if (unpackLimit !== undefined) out.unpackLimit = unpackLimit;
   const upload = hideRefs(config, "uploadpack");
   if (upload.length > 0) out.uploadPackHideRefs = upload;
   const receive = hideRefs(config, "receive");
@@ -250,8 +361,9 @@ export function explicitServerSettingsFromConfig(
   if (procReceive.length < procReceiveValues.length) {
     out.receivePackConfigError = nonBoolError(config, "receive.procreceiverefs");
   }
-  const unpackLimit = unpackLimitOf(config, "receive");
-  if (unpackLimit !== undefined) out.unpackLimit = unpackLimit;
+  if (out.receivePackConfigError === undefined && numberErrors.length > 0) {
+    out.receivePackConfigError = firstInConfigOrder(config, numberErrors);
+  }
   return out;
 }
 
@@ -323,6 +435,10 @@ export function httpServerSettings(settings: ServerConfigSettings): {
     denyDeleteCurrent: ReceiveDenyAction;
     shallowUpdate: boolean;
     advertisePushOptions: boolean;
+    advertiseAtomic?: boolean;
+    maxInputSize?: number;
+    receiveKeepAliveMs?: number;
+    unpackLimit?: number;
     hideRefs: string[];
   };
   uploadPack: { hideRefs: string[] };
@@ -335,6 +451,14 @@ export function httpServerSettings(settings: ServerConfigSettings): {
       denyDeleteCurrent: settings.denyDeleteCurrent,
       shallowUpdate: settings.shallowUpdate,
       advertisePushOptions: settings.advertisePushOptions,
+      ...(settings.advertiseAtomic !== undefined
+        ? { advertiseAtomic: settings.advertiseAtomic }
+        : {}),
+      ...(settings.maxInputSize !== undefined ? { maxInputSize: settings.maxInputSize } : {}),
+      ...(settings.receiveKeepAliveMs !== undefined
+        ? { receiveKeepAliveMs: settings.receiveKeepAliveMs }
+        : {}),
+      ...(settings.unpackLimit !== undefined ? { unpackLimit: settings.unpackLimit } : {}),
       hideRefs: settings.receivePackHideRefs,
     },
     uploadPack: { hideRefs: settings.uploadPackHideRefs },
