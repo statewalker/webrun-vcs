@@ -4,6 +4,7 @@ export { ApplyEngine } from "./apply-engine.js";
 export type { FilePatch, PatchFragment, WsErrorAction } from "./apply-types.js";
 export {
   bytesToLatin1,
+  cUnquote,
   latin1ToBytes,
   latin1ToPath,
   latin1ToText,
