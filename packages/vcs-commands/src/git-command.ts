@@ -533,7 +533,9 @@ export abstract class GitCommand<T> {
    * "Compressing objects", "Writing objects", "Removing duplicate objects"), a clone's or
    * fetch's index-pack ("Receiving objects", "Resolving deltas") and fsck ("Checking object
    * directories", "Checking objects", "Verifying reverse pack-indexes", "Checking
-   * connectivity"). Commands without such phases report nothing.
+   * connectivity"). Commands without such phases report nothing. One total differs from git's:
+   * "Compressing objects" counts our delta search's targets, which are not pack-objects'
+   * (`prepare_pack`); gc's commit-graph phases and cruft packs report nothing.
    *
    * A monitor that throws cancels the command: the error propagates out of `call()`, and the
    * repository is left as git leaves the command interrupted there (no temporary pack, no

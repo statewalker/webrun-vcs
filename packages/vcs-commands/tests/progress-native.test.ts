@@ -494,4 +494,68 @@ describeGit("progress callbacks against native git's --progress", () => {
       "Updating files",
     ]);
   });
+
+  it('t5301-sliding-window.sh: "setup": a monitor that throws in gc\'s repack', async () => {
+    const caseDir = newCase(root, "gc-cancel");
+    const repo = slidingWindowRepo(caseDir);
+    repo.git(["repack", "-a", "-d", "-q"]);
+    repo.commit("three", { f: "f\n" });
+    const oursTwin = copyTwin(caseDir, "ours");
+    const dir = join(oursTwin, "repo");
+    const before = packFiles(dir);
+    const refs = spawnSync("git", ["show-ref"], { cwd: dir, env: gcEnv(root) }).stdout.toString();
+    const git = await openOursGc(root, oursTwin);
+    await expect(git.gc().setProgress(cancelAt("Writing objects", 2)).call()).rejects.toThrow(
+      "cancelled in Writing objects",
+    );
+    // as an interrupted git gc: no new pack nor temporary, the lock released, refs kept
+    expect(packFiles(dir)).toEqual(before);
+    expect(existsSync(join(dir, ".git", "gc.pid"))).toBe(false);
+    expect(spawnSync("git", ["show-ref"], { cwd: dir, env: gcEnv(root) }).stdout.toString()).toBe(
+      refs,
+    );
+    const fsck = spawnSync("git", ["fsck", "--strict", "--no-progress"], {
+      cwd: dir,
+      env: gcEnv(root),
+    });
+    expect(fsck.status, fsck.stderr.toString()).toBe(0);
+  });
+
+  for (const phase of ["Receiving objects", "Resolving deltas", "Updating files"]) {
+    it(`t5601-clone.sh: "clone checks out files": a clone cancelled in ${phase}`, async () => {
+      const caseDir = newCase(root, `clone-cancel-${phase.replace(/ /g, "-")}`);
+      const repo = slidingWindowRepo(caseDir);
+      repo.git(["repack", "-a", "-d", "-q"]);
+      const src = join(caseDir, "src", "repo");
+      const dest = join(caseDir, "ours");
+      mkdirSync(dest);
+      spawnSync("git", ["init", "-q", "-b", "main"], { cwd: dest, env: gcEnv(root) });
+      const git: Git = await openOurs(
+        caseDir,
+        createNodeGitHostEnvironment({ env: gcEnv(root) }),
+        undefined,
+        "ours",
+      );
+      await expect(
+        git.clone().setURI(src).setLocal(false).setProgress(cancelAt(phase, 2)).call(),
+      ).rejects.toThrow(`cancelled in ${phase}`);
+      // no pack or temporary left half-written; a pack is only there once fully installed
+      for (const name of packFiles(dest))
+        expect(name).toMatch(/^pack-[0-9a-f]{40}\.(pack|idx|rev)$/);
+      if (phase !== "Updating files") {
+        // the fetch failed before any ref was written
+        expect(packFiles(dest)).toEqual([]);
+        const refs = spawnSync("git", ["for-each-ref"], { cwd: dest, env: gcEnv(root) });
+        expect(refs.stdout.toString()).toBe("");
+      } else {
+        // the repository is kept (git's JUNK_LEAVE_REPO): its objects and refs are whole
+        const fsck = spawnSync("git", ["fsck", "--strict", "--no-progress"], {
+          cwd: dest,
+          env: gcEnv(root),
+        });
+        expect(fsck.status, fsck.stderr.toString()).toBe(0);
+        expect(existsSync(join(dest, ".git", "index.lock"))).toBe(false);
+      }
+    });
+  }
 });
