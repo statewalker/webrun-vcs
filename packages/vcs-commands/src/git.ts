@@ -48,6 +48,7 @@ import {
   ListBranchCommand,
   ListTagCommand,
   LogCommand,
+  LsFilesCommand,
   LsRemoteCommand,
   MergeBaseCommand,
   MergeCommand,
@@ -1360,6 +1361,21 @@ export class Git implements Disposable {
   lsRemote(): LsRemoteCommand {
     this.checkClosed();
     return this.withTransports(new LsRemoteCommand(this._workingCopy));
+  }
+
+  /**
+   * Create an LsFilesCommand (`git ls-files`): the index's entries and the untracked,
+   * ignored, deleted, modified and killed files, printed as git prints them.
+   *
+   * @example
+   * ```typescript
+   * // git ls-files -s
+   * const { stdout } = await git.lsFiles().setStage(true).callOutput();
+   * ```
+   */
+  lsFiles(): LsFilesCommand {
+    this.checkClosed();
+    return new LsFilesCommand(this._workingCopy);
   }
 
   // ============ Remote Configuration Operations ============

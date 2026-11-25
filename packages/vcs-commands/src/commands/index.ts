@@ -49,6 +49,7 @@ export { httpBackendEnv, quarantineEnv, remoteHookSession } from "./local-transp
 export * from "./log-command.js";
 export * from "./log-graph.js";
 export * from "./log-output.js";
+export * from "./ls-files-command.js";
 export * from "./ls-remote-command.js";
 export * from "./mailmap.js";
 export * from "./merge-base-command.js";

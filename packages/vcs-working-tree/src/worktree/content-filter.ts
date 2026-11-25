@@ -153,6 +153,11 @@ export interface WorktreeContentFilter {
    * `keepAttributes`, the attributes read stay as read until `fn` ends, nested or not.
    */
   batch?<T>(fn: () => Promise<T>, options?: OperationOptions): Promise<T>;
+  /**
+   * git's `get_convert_attr_ascii`: the `attr/` column of `git ls-files --eol` for `path`
+   * (`text`, `-text`, `text=auto`, `text eol=crlf`, ... ; "" when nothing is set)
+   */
+  eolAttribute?(path: string): Promise<string>;
 }
 
 /** How a worktree operation ({@link WorktreeContentFilter.batch}) reads attributes. */
