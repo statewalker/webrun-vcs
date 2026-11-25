@@ -15,7 +15,12 @@ import {
 } from "../protocol/index.js";
 import { formatOf, mismatchedAlgorithms } from "../protocol/object-format.js";
 import type { UploadPackConnection } from "./connection.js";
-import { Negotiator, type NegotiatorSource } from "./negotiator.js";
+import {
+  createNegotiator,
+  type FetchNegotiator,
+  type NegotiationAlgorithm,
+  type NegotiatorSource,
+} from "./negotiator.js";
 import { type PktStream, readSidebandPack } from "./pkt-stream.js";
 
 /** git's first batch of haves */
@@ -47,6 +52,10 @@ export interface FetchPackRequest {
   localTips: Iterable<string>;
   /** Remote ref tips already here: offered once, their ancestors never */
   knownCommon?: Iterable<string>;
+  /** `fetch.negotiationAlgorithm` (default `consecutive`) */
+  negotiationAlgorithm?: NegotiationAlgorithm;
+  /** The commits git has parsed before negotiating (the skipping negotiator's dates) */
+  parsedCommits?: Iterable<string>;
   /** The client's shallow commits (its shallow file) */
   shallow?: Iterable<string>;
   /** `deepen <depth>`: at most `depth` commits from the wants */
@@ -155,7 +164,10 @@ export async function fetchPack(
     request = { ...request, filter: undefined };
   }
   const shallow = [...(request.shallow ?? [])];
-  const negotiator = new Negotiator(source, { shallow });
+  const negotiator = createNegotiator(request.negotiationAlgorithm, source, {
+    shallow,
+    ...(request.parsedCommits ? { parsed: request.parsedCommits } : {}),
+  });
   for (const oid of request.knownCommon ?? []) await negotiator.knownCommon(oid);
   for (const oid of request.localTips) await negotiator.addTip(oid);
   const deepen =
@@ -252,7 +264,7 @@ function shallowLines(request: FetchPackRequest, shallow: string[]): string[] {
 
 async function fetchPackV0(
   connection: UploadPackConnection,
-  negotiator: Negotiator,
+  negotiator: FetchNegotiator,
   request: FetchPackRequest,
   shallow: string[],
   deepen: boolean,
@@ -325,6 +337,11 @@ async function fetchPackV0(
   let gotContinue = false;
   let gotReady = false;
   let plainAck = false;
+  /** git's retval: whether any commit was acknowledged */
+  let found = false;
+  /** Batches whose answers are not read yet (git's flushes) */
+  let flushes = 0;
+  let pkts: PktStream | undefined;
   while (!plainAck) {
     const have = await negotiator.next();
     if (!have) break;
@@ -333,21 +350,27 @@ async function fetchPackV0(
     inVain++;
     count++;
     if (count < flushAt) continue;
-    const pkts = await send([...pending, encodeFlush()]);
+    pkts = await send([...pending, encodeFlush()]);
     pending = [];
+    flushes++;
     flushAt = nextFlush(stateless, count);
+    // a stateful exchange keeps one batch ahead: the first batch's answer is read once the
+    // second is sent (find_common's "give another chance")
+    if (!stateless && count === INITIAL_FLUSH) continue;
     await readShallowList(pkts);
-    // the acknowledgments of this batch, up to the NAK that ends them
+    // the acknowledgments of one batch, up to the NAK that ends them
     while (true) {
       const line = await pkts.readLine();
       if (line === undefined) throw new TransportError("Expected ACK/NAK, got a flush");
       if (line === "NAK") break;
       const ack = parseAck(line);
       if (!ack) throw new TransportError(`Expected ACK/NAK, got ${line}`);
+      found = true;
       if (!ack.status) {
         // plain ACK (no multi_ack): the server found a common commit and stops negotiating
         await negotiator.ack(ack.oid);
         plainAck = true;
+        flushes = 0;
         break;
       }
       const wasCommon = await negotiator.ack(ack.oid);
@@ -361,26 +384,38 @@ async function fetchPackV0(
       gotContinue = true;
       if (ack.status === "ready") gotReady = true;
     }
+    if (plainAck) break;
+    flushes--;
     if (gotContinue && inVain > MAX_IN_VAIN) break;
     if (gotReady) break;
   }
 
   // done: the haves not sent yet go with it
-  const pkts = await send([...pending, encodePacketLine("done")]);
+  pkts = await send([...pending, encodePacketLine("done")]);
   await readShallowList(pkts);
-  // the last acknowledgments: up to the final ACK or NAK before the pack (after a plain ACK,
-  // without multi_ack, the server sends none: the pack follows "done")
-  while (!plainAck) {
+  // the answers left: those of the batches not read yet and of "done", up to the final ACK
+  // (multi_ack) or NAK before the pack (after a plain ACK, without multi_ack, the server
+  // sends none: the pack follows "done")
+  let multiAcking = !plainAck && multiAck > 0;
+  if (!found) {
+    multiAcking = false;
+    flushes++;
+  }
+  while (flushes > 0 || multiAcking) {
     const p = await pkts.read();
     if (!p) throw new TransportError("The response ends before the pack");
     if (p.type === "flush") continue; // between acknowledgments
     if (p.type !== "data") throw new TransportError(`Unexpected ${p.type} packet`);
     const line = p.text;
     if (line.startsWith("ERR ")) throw new ServerError(line.slice(4));
-    if (line === "NAK") break;
+    if (line === "NAK") {
+      flushes--;
+      continue;
+    }
     const ack = parseAck(line);
     if (!ack) throw new TransportError(`Expected ACK/NAK, got ${line}`);
     if (!ack.status) break;
+    multiAcking = true;
   }
   await request.onShallowUpdate?.(shallowUpdate);
   return receivePack(pkts, request, shallowUpdate, stats);
@@ -402,24 +437,11 @@ function parseAck(line: string): { oid: string; status?: string } | undefined {
 
 async function fetchPackV2(
   connection: UploadPackConnection,
-  negotiator: Negotiator,
+  negotiator: FetchNegotiator,
   request: FetchPackRequest,
   shallow: string[],
 ): Promise<FetchPackResult> {
-  const caps = connection.capabilities;
-  const head: Uint8Array[] = [encodePacketLine("command=fetch")];
-  if (caps.has("agent")) head.push(encodePacketLine(`agent=${CLIENT_AGENT}`));
-  // transfer.advertiseSID (write_fetch_command_and_capabilities)
-  if (request.sessionId !== undefined && caps.has("session-id")) {
-    head.push(encodePacketLine(`session-id=${request.sessionId}`));
-  }
-  for (const line of serverOptionLines(connection, request.serverOptions)) head.push(line);
-  // write_command_and_capabilities: the client's own format, once checked against the
-  // server's (checkObjectFormat)
-  if (caps.has("object-format")) {
-    head.push(encodePacketLine(`object-format=${formatOf(request).name}`));
-  }
-  head.push(encodeDelim());
+  const head = fetchCommandHead(connection, request);
   head.push(encodePacketLine("thin-pack"));
   if (!request.onProgress) head.push(encodePacketLine("no-progress"));
   if (request.includeTag) head.push(encodePacketLine("include-tag"));
@@ -544,6 +566,186 @@ async function fetchPackV2(
     const received = await receivePack(pkts, request, shallowUpdate, stats);
     return wantedRefs ? { ...received, wantedRefs } : received;
   }
+}
+
+/**
+ * write_fetch_command_and_capabilities: `command=fetch`, the agent, the session id, the server
+ * options, the client's object format (once checked against the server's), the delimiter.
+ */
+function fetchCommandHead(
+  connection: UploadPackConnection,
+  request: Pick<FetchPackRequest, "sessionId" | "serverOptions" | "objectFormat">,
+): Uint8Array[] {
+  const caps = connection.capabilities;
+  const head: Uint8Array[] = [encodePacketLine("command=fetch")];
+  if (caps.has("agent")) head.push(encodePacketLine(`agent=${CLIENT_AGENT}`));
+  // transfer.advertiseSID (write_fetch_command_and_capabilities)
+  if (request.sessionId !== undefined && caps.has("session-id")) {
+    head.push(encodePacketLine(`session-id=${request.sessionId}`));
+  }
+  for (const line of serverOptionLines(connection, request.serverOptions)) head.push(line);
+  if (caps.has("object-format")) {
+    head.push(encodePacketLine(`object-format=${formatOf(request).name}`));
+  }
+  head.push(encodeDelim());
+  return head;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// --negotiate-only (negotiate_using_fetch)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** What `git fetch --negotiate-only` negotiates. */
+export interface NegotiateOnlyRequest {
+  /** The `--negotiation-tip` commits: the only tips the negotiator walks from */
+  tips: readonly string[];
+  /** `fetch.negotiationAlgorithm` (default `consecutive`) */
+  negotiationAlgorithm?: NegotiationAlgorithm;
+  /** The local shallow commits */
+  shallow?: Iterable<string>;
+  /** The commits git has parsed before negotiating (the skipping negotiator's dates) */
+  parsedCommits?: Iterable<string>;
+  objectFormat?: ObjectFormat;
+  serverOptions?: readonly string[];
+  sessionId?: string;
+}
+
+/**
+ * Why `--negotiate-only` gave up before negotiating: transport.c's warnings
+ * (`--negotiate-only requires protocol v2`, `server does not support wait-for-done`), after
+ * which git exits 1.
+ */
+export class NegotiateOnlyUnsupportedError extends TransportError {
+  constructor(readonly warning: string) {
+    super(`warning: ${warning}`);
+    this.name = "NegotiateOnlyUnsupportedError";
+  }
+}
+
+/**
+ * `git fetch --negotiate-only` (fetch-pack.c negotiate_using_fetch): protocol v2 `fetch`
+ * requests with `wait-for-done` and no wants, the negotiator walking from the given tips
+ * only, until every tip reaches a commit known to be common, nothing is left to offer, or
+ * {@link MAX_IN_VAIN} haves went unacknowledged after an ACK. Returns the acknowledged
+ * commits (git prints them in its object set's hash order: sort to compare).
+ */
+export async function negotiateUsingFetch(
+  connection: UploadPackConnection,
+  source: NegotiatorSource,
+  request: NegotiateOnlyRequest,
+): Promise<string[]> {
+  if (connection.version !== 2) {
+    throw new NegotiateOnlyUnsupportedError("--negotiate-only requires protocol v2");
+  }
+  if (!fetchFeatures(connection).has("wait-for-done")) {
+    throw new NegotiateOnlyUnsupportedError("server does not support wait-for-done");
+  }
+  checkObjectFormat(connection, formatOf(request));
+  const negotiator = createNegotiator(request.negotiationAlgorithm, source, {
+    shallow: [...(request.shallow ?? [])],
+    ...(request.parsedCommits ? { parsed: request.parsedCommits } : {}),
+  });
+  for (const tip of request.tips) await negotiator.addTip(tip);
+  const head = fetchCommandHead(connection, request);
+  const acked = new Set<string>();
+  let havesToSend = INITIAL_FLUSH;
+  let inVain = 0;
+  let seenAck = false;
+  let last = false;
+  while (!last) {
+    const batch: string[] = [];
+    while (true) {
+      const have = await negotiator.next();
+      if (!have) break;
+      batch.push(have);
+      if (batch.length >= havesToSend) break;
+    }
+    havesToSend = nextFlush(true, havesToSend);
+    inVain += batch.length;
+    if (batch.length === 0 || (seenAck && inVain >= MAX_IN_VAIN)) last = true;
+    const pkts = await connection.request([
+      ...head,
+      encodePacketLine("wait-for-done"),
+      ...batch.map((oid) => encodePacketLine(`have ${oid}`)),
+      encodeFlush(),
+    ]);
+    const section = await pkts.readLine();
+    if (section !== "acknowledgments") {
+      throw new TransportError(`expected 'acknowledgments', received '${section ?? ""}'`);
+    }
+    let ready = false;
+    while (true) {
+      const p = await pkts.read();
+      if (!p) throw new TransportError("The fetch response ends early");
+      if (p.type === "flush" || p.type === "delim") break;
+      if (p.type !== "data") throw new TransportError(`Unexpected ${p.type} packet`);
+      const line = p.text;
+      if (line.startsWith("ERR ")) throw new ServerError(line.slice(4));
+      if (line === "NAK") continue;
+      if (line === "ready") {
+        ready = true;
+        continue;
+      }
+      if (!line.startsWith("ACK ")) {
+        throw new TransportError(`unexpected acknowledgment line: '${line}'`);
+      }
+      const rest = line.slice(4);
+      const oid = rest.includes(" ") ? rest.slice(0, rest.indexOf(" ")) : rest;
+      await negotiator.ack(oid);
+      acked.add(oid);
+      inVain = 0;
+      seenAck = true;
+    }
+    if (ready) throw new TransportError("unexpected 'ready' from remote");
+    if (
+      // fetch-pack.c's own COMMON bit: set on acknowledged commits only, never on the
+      // ancestors the negotiator counts as common
+      await allReachCommon(source, request.tips, (oid) => acked.has(oid))
+    ) {
+      last = true;
+    }
+  }
+  return [...acked];
+}
+
+/**
+ * can_all_from_reach_with_flag over fetch-pack's COMMON: whether every tip (tags peeled)
+ * reaches a commit the server acknowledged.
+ */
+async function allReachCommon(
+  source: NegotiatorSource,
+  tips: readonly string[],
+  common: (oid: string) => boolean,
+): Promise<boolean> {
+  const reaches = new Map<string, boolean>();
+  for (const tip of tips) {
+    let id = tip;
+    for (let i = 0; i < 16; i++) {
+      const target = await source.peelTag?.(id);
+      if (!target || target === id) break;
+      id = target;
+    }
+    const seen = new Set<string>([id]);
+    const queue = [id];
+    let found = false;
+    while (queue.length > 0 && !found) {
+      const oid = queue.pop() as string;
+      if (common(oid) || reaches.get(oid)) {
+        found = true;
+        break;
+      }
+      const info = await source.getCommitInfo(oid);
+      for (const parent of info?.parents ?? []) {
+        if (!seen.has(parent)) {
+          seen.add(parent);
+          queue.push(parent);
+        }
+      }
+    }
+    if (!found) return false;
+    reaches.set(id, true);
+  }
+  return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
