@@ -2895,7 +2895,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         },
       ];
     }
-    if (side.id === stage.objectId && side.mode === stage.mode && !side.dirty && !side.rawNull) {
+    const statDirty = side.rawNull && this.plumbingWorktree;
+    if (side.id === stage.objectId && side.mode === stage.mode && !side.dirty && !statDirty) {
       return [];
     }
     return [
@@ -2992,7 +2993,11 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       } else if (
         a &&
         b &&
-        (a.id !== b.id || a.mode !== b.mode || b.dirty || b.unknownId || b.rawNull)
+        (a.id !== b.id ||
+          a.mode !== b.mode ||
+          b.dirty ||
+          b.unknownId ||
+          (b.rawNull && this.plumbingWorktree))
       ) {
         // show_modified: a side of the null id differs from any (`M sub` even where the
         // submodule is back at the tree's commit)
@@ -3647,7 +3652,10 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         !basicStatMatches(entry, result.worktreeEntry, trust);
       if (!result.kind && !entry.intentToAdd && !statDirty) return indexSide;
       const id = result.hashedId ?? (await worktree.computeHash(path));
-      const rawNull = this.plumbingWorktree && !entry.intentToAdd;
+      // run_diff_files / run_diff_index: the worktree side is not hashed (its raw id is the
+      // null id), porcelain included; only the porcelain's intent-to-add entry, shown as a
+      // new file, gets its content's id
+      const rawNull = this.plumbingWorktree || !entry.intentToAdd;
       if (!entry.intentToAdd && id === entry.objectId && mode === entry.mode && !statDirty) {
         return indexSide;
       }
@@ -3690,7 +3698,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           side.id === entry.objectId &&
           side.mode === entry.mode &&
           !side.dirty &&
-          !side.rawNull
+          !(side.rawNull && this.plumbingWorktree)
         ) {
           continue;
         }

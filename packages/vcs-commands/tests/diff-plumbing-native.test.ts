@@ -250,6 +250,37 @@ describeGit("plumbing diffs against native git", () => {
     });
   });
 
+  describe("intent-to-add entries and porcelain --raw", () => {
+    it("shows the worktree side's null id, as git never hashes it", async () => {
+      const dir = join(root, "ita");
+      git(root, "init", "-q", "-b", "main", dir);
+      sh(dir, "echo a >a && echo b >b && git add . && git commit -q -m 1");
+      sh(dir, "echo n >new && git add -N new && echo changed >a && rm b");
+      for (const args of [
+        ["diff-files"],
+        ["diff-files", "-z"],
+        ["diff-files", "-R"],
+        ["diff-index", "HEAD"],
+        ["diff-index", "-R", "HEAD"],
+        ["diff-index", "--abbrev", "HEAD"],
+        ["diff-index", "--cached", "HEAD"],
+      ]) {
+        await same(dir, args);
+      }
+      const ours = await openOurs(dir);
+      const native = (args: string[]) => runNative(dir, env(), args).stdout;
+      const raw = async (prepare: (d: ReturnType<typeof ours.diff>) => void) => {
+        const d = ours.diff();
+        prepare(d);
+        const shown = await d.callFormats(["raw"]);
+        return Buffer.from(shown.bytes ?? new Uint8Array(0)).toString("latin1");
+      };
+      expect(await raw(() => {})).toBe(native(["diff", "--raw"]));
+      expect(await raw((d) => d.setOldTree("HEAD"))).toBe(native(["diff", "--raw", "HEAD"]));
+      expect(await raw((d) => d.setCached(true))).toBe(native(["diff", "--raw", "--cached"]));
+    });
+  });
+
   describe("t4044-diff-index-unique-abbrev.sh", () => {
     it('t4044-diff-index-unique-abbrev.sh: "diff does not produce ambiguous index line"', async () => {
       const dir = join(root, "t4044");
