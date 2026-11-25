@@ -148,7 +148,8 @@ export class LfsEndpointCommand extends GitCommand<LfsEndpointResult> {
         this.operation,
         this.remote ?? mine.remoteChoice(this.operation).name,
       );
-      const origin = own.url ? strictUrlOrigin(own.url) : undefined;
+      // FETCH_HEAD is no configuration: it names whatever was fetched last (`git pull <url>`)
+      const origin = own.url && own.source !== "fetch-head" ? strictUrlOrigin(own.url) : undefined;
       origins = origin !== undefined ? [origin] : [];
     }
     const policy = createSubmoduleAuthPolicy({

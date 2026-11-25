@@ -128,7 +128,10 @@ export const LFS_DEFAULT_COMPATIBILITY = "3.8.1";
 
 /** `version` is at least `min` (dotted numbers). */
 function atLeast(version: string, min: string): boolean {
-  const a = version.split(".").map((n) => Number.parseInt(n, 10) || 0);
+  const a = version
+    .replace(/^v/, "")
+    .split(".")
+    .map((n) => Number.parseInt(n, 10) || 0);
   const b = min.split(".").map((n) => Number.parseInt(n, 10) || 0);
   for (let i = 0; i < Math.max(a.length, b.length); i++) {
     const d = (a[i] ?? 0) - (b[i] ?? 0);

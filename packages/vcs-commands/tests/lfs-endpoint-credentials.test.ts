@@ -218,4 +218,103 @@ describe.skipIf(!nativeGitAvailable())("LFS endpoint credentials", () => {
     expect(ep.url).toBe("http://git.example.com/team/repo.git/info/lfs");
     expect(ep.auth).toEqual({});
   });
+
+  it("a URL FETCH_HEAD names is no user configuration: no credentials", async () => {
+    const dir = join(root, `r${counter++}`);
+    mkdirSync(dir);
+    git(dir, "init", "-q", "-b", "main");
+    git(dir, "config", "remote.up.url", "https://git.example.com/team/repo.git");
+    git(dir, "config", "remote.up2.url", "https://git.example.com/team/other.git");
+    writeFileSync(
+      join(dir, ".git/FETCH_HEAD"),
+      `${"a".repeat(40)}\t\tbranch 'main' of https://attacker.example/fork\n`,
+    );
+    const g = await openOurs(dir, createNodeGitHostEnvironment({ env: testEnv(root) }));
+    for (const operation of ["download", "upload"] as const) {
+      const ep = await g
+        .lfsEndpoint()
+        .setOperation(operation)
+        .setCredentials(credentials)
+        .setHeaders(headers)
+        .call();
+      expect(ep).toMatchObject({
+        url: "https://attacker.example/fork.git/info/lfs",
+        source: "fetch-head",
+        trusted: false,
+        auth: {},
+      });
+    }
+  });
+});
+
+describe.skipIf(!nativeGitAvailable())("LFS endpoint across git-lfs versions", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "lfs-endpoint-versions-"));
+  });
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  async function lfsOf(
+    setup: (dir: string) => void,
+    compatibility: string,
+  ): Promise<Awaited<ReturnType<Git["lfsConfig"]>>> {
+    const dir = join(root, `v${counter++}`);
+    mkdirSync(dir);
+    git(dir, "init", "-q", "-b", "main");
+    setup(dir);
+    const g = await openOurs(dir, createNodeGitHostEnvironment({ env: testEnv(root) }));
+    return g.lfsConfig({ compatibility });
+  }
+
+  it("FETCH_HEAD: git-lfs 3.5+ reads it for origin, 3.4 does not", async () => {
+    const setup = (dir: string) =>
+      writeFileSync(
+        join(dir, ".git/FETCH_HEAD"),
+        `${"b".repeat(40)}\tnot-for-merge\ttag 'v1' of http://h.example/r\n`,
+      );
+    expect((await (await lfsOf(setup, "3.5.0")).endpoint("download")).url).toBe(
+      "http://h.example/r.git/info/lfs",
+    );
+    expect((await (await lfsOf(setup, "v3.8.1")).endpoint("upload", "origin")).url).toBe(
+      "http://h.example/r.git/info/lfs",
+    );
+    expect((await (await lfsOf(setup, "3.8.1")).endpoint("download", "other")).url).toBe(
+      "http://h.example/r.git/info/lfs",
+    );
+    expect((await (await lfsOf(setup, "3.4.1")).endpoint("download")).url).toBe("");
+  });
+
+  it(".lfsconfig keys: 3.8.1 keeps only remote.*.lfsurl and lfs.*.access", async () => {
+    const setup = (dir: string) => {
+      writeFileSync(
+        join(dir, ".lfsconfig"),
+        '[remote]\n\tlfsdefault = up\n[remote "a.b"]\n\turl = https://x/y\n[remote "origin"]\n\tlfsurl = https://l/o\n[http "https://h/"]\n\taccess = basic\n[lfs "https://h/"]\n\taccess = basic\n',
+      );
+    };
+    const strict = await lfsOf(setup, "3.8.1");
+    expect(strict.warnings).toEqual([
+      "warning: These unsafe '.lfsconfig' keys were ignored:",
+      "",
+      "  remote.lfsdefault",
+      "  remote.a.b.url",
+      "  http.https://h/.access",
+    ]);
+    expect(strict.remote()).toBe("origin");
+    expect((await strict.endpoint("download")).url).toBe("https://l/o");
+    const old = await lfsOf(setup, "3.4.1");
+    expect(old.warnings).toEqual([]);
+    expect(old.remote()).toBe("up");
+  });
+
+  it("ssh fallback path: escaped from 3.8.1 on", async () => {
+    const setup = (dir: string) =>
+      git(dir, "config", "remote.origin.url", "ssh://git@example.com/a b/ü");
+    expect((await (await lfsOf(setup, "3.8.1")).endpoint("download")).url).toBe(
+      "https://example.com/a%20b/%C3%BC.git/info/lfs",
+    );
+    expect((await (await lfsOf(setup, "3.4.1")).endpoint("download")).url).toBe(
+      "https://example.com/a b/ü.git/info/lfs",
+    );
+  });
 });
