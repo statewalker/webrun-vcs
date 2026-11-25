@@ -130,7 +130,7 @@ export interface DiffDriver {
   name?: string;
   /** `diff.<name>.textconv`: the command git would run to turn the content into text */
   textconvCommand?: string;
-  /** `diff.<name>.cachetextconv` (output is the same with or without the cache) */
+  /** `diff.<name>.cachetextconv`: outputs kept in `refs/notes/textconv/<name>` */
   cacheTextconv?: boolean;
   /**
    * Turns a side's content into the text the patch compares (git's `fill_textconv`): set
@@ -140,8 +140,16 @@ export interface DiffDriver {
   textconv?: TextconvFunction;
 }
 
-/** A textconv conversion: the text of `content`, the content of the file `path` */
-export type TextconvFunction = (content: Uint8Array, path: string) => Promise<Uint8Array>;
+/**
+ * A textconv conversion: the text of `content`, the content of the file `path`; `id` is the
+ * content's object id when git knows it (`oid_valid`: a stored blob, never a worktree
+ * file), the key of the textconv cache (`diff.<driver>.cachetextconv`)
+ */
+export type TextconvFunction = (
+  content: Uint8Array,
+  path: string,
+  id?: string,
+) => Promise<Uint8Array>;
 
 /** Options of the diff output */
 export interface DiffOutputOptions
@@ -309,6 +317,11 @@ export class LoadedSide {
   read(): Promise<Uint8Array> {
     this.content ??= this.spec ? this.spec.read() : Promise.resolve(new Uint8Array(0));
     return this.content;
+  }
+
+  /** The id the textconv cache knows this side by: a valid side's stored object id */
+  get textconvId(): string | undefined {
+    return this.spec && this.spec.idValid !== false ? this.spec.id : undefined;
   }
 
   /** The bytes textconv converts ({@link DiffSideSpec.readTextconvInput}) */
@@ -588,10 +601,10 @@ async function builtinDiff(
       (textconvTwo || options.text || !(await two.isBinary(threshold)))
     ) {
       const a = textconvOne
-        ? await textconvOne(await one.textconvInput(), attrOne)
+        ? await textconvOne(await one.textconvInput(), attrOne, one.textconvId)
         : await one.read();
       const b = textconvTwo
-        ? await textconvTwo(await two.textconvInput(), attrTwo)
+        ? await textconvTwo(await two.textconvInput(), attrTwo, two.textconvId)
         : await two.read();
       sink.text(header);
       writeRewriteDiff(sink, a, b, lbl0, lbl1, options.colors);
@@ -643,10 +656,10 @@ async function builtinDiff(
   const driver = one.driver?.findFunction ? one.driver : two.driver;
   const algorithm = oneDriver?.algorithm ?? options.algorithm;
   const textOne = textconvOne
-    ? await textconvOne(await one.textconvInput(), attrOne)
+    ? await textconvOne(await one.textconvInput(), attrOne, one.textconvId)
     : await one.read();
   const textTwo = textconvTwo
-    ? await textconvTwo(await two.textconvInput(), attrTwo)
+    ? await textconvTwo(await two.textconvInput(), attrTwo, two.textconvId)
     : await two.read();
   // `git log -L`: the context widened to the widest range, the hunks then cut to the ranges
   const lineRanges = pair.lineRanges;

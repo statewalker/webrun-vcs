@@ -43,7 +43,7 @@ import {
   fmtMergeMsgConfigOf,
 } from "./fmt-merge-msg-command.js";
 import { configBool, conflictStyleOf } from "./merge-config.js";
-import { ortConfigOptions } from "./merge-drivers.js";
+import { MergeDriverFailedError, ortConfigOptions } from "./merge-drivers.js";
 import { parseStrategyOptions, strategyOrtOptions } from "./merge-strategy-options.js";
 import {
   conflictsComment,
@@ -1144,33 +1144,47 @@ export class MergeCommand extends GitCommand<MergeResult> {
         ...(subtreeShift !== undefined ? { subtreeShift } : {}),
       };
 
-      // several merge bases: merge-ort's virtual merge base, built in memory
-      const base = await mergeBaseTree(
-        {
-          commits: this.commits,
-          trees: this.trees,
-          blobs: this.blobs,
-          abbreviate: (id) => this.abbreviateObjectId(id),
-        },
-        headId,
-        srcId,
-        mergeBases,
-        common,
-      );
-      merge = await mergeStoredTrees(
-        { trees: this.trees, blobs: this.blobs },
-        base,
-        headCommit.tree,
-        srcCommit.tree,
-        {
-          ...common,
-          oursLabel: "HEAD",
-          theirsLabel: srcName,
-          baseLabel: base.label,
-          favor: favorOf(this.contentStrategy) ?? xopts.favor,
-        },
-      );
-      target = await ortResultEntries(this.blobs, merge);
+      try {
+        // several merge bases: merge-ort's virtual merge base, built in memory
+        const base = await mergeBaseTree(
+          {
+            commits: this.commits,
+            trees: this.trees,
+            blobs: this.blobs,
+            abbreviate: (id) => this.abbreviateObjectId(id),
+          },
+          headId,
+          srcId,
+          mergeBases,
+          common,
+        );
+        merge = await mergeStoredTrees(
+          { trees: this.trees, blobs: this.blobs },
+          base,
+          headCommit.tree,
+          srcCommit.tree,
+          {
+            ...common,
+            oursLabel: "HEAD",
+            theirsLabel: srcName,
+            baseLabel: base.label,
+            favor: favorOf(this.contentStrategy) ?? xopts.favor,
+          },
+        );
+        target = await ortResultEntries(this.blobs, merge);
+      } catch (error) {
+        // merge-ort's result `clean < 0` (a merge driver failed to run): try_merge_strategy
+        // returns 2 and the state saved is restored
+        if (!(error instanceof MergeDriverFailedError)) throw error;
+        const restored = await this.restoreStateQuirk(state, headCommit.tree, worktree);
+        return {
+          status: MergeStatus.FAILED,
+          newHead: headId,
+          ...(baseId ? { mergeBase: baseId } : {}),
+          mergedCommits: [headId, srcId],
+          message: [...error.lines, `${restored}Merge with strategy ort failed.`].join("\n"),
+        };
+      }
     }
     // only the directories the merge changes are stored again
     const treeId = merge
