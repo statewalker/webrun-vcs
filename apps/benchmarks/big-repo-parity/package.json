@@ -1,0 +1,25 @@
+{
+  "name": "@statewalker/vcs-benchmark-big-repo-parity",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Big-repository parity prototype: git.git through the files, S3 (RustFS) and SQLite backends, checked against native git",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/statewalker/webrun-vcs.git",
+    "directory": "apps/benchmarks/big-repo-parity"
+  },
+  "scripts": {
+    "parity": "node --max-old-space-size=8192 scripts/parity.mjs",
+    "worktree": "node --max-old-space-size=8192 scripts/worktree.mjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "catalog:",
+    "@statewalker/vcs-commands": "workspace:^",
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-store-files": "workspace:^",
+    "@statewalker/vcs-store-sql": "workspace:^",
+    "@statewalker/vcs-utils-node": "workspace:^",
+    "@statewalker/webrun-files-s3": "catalog:"
+  }
+}

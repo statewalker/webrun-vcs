@@ -47,6 +47,8 @@ catalog:
   "@statewalker/webrun-files-browser": "^0.12.0"
   "@statewalker/webrun-files-mem": "^0.12.0"
   "@statewalker/webrun-files-node": "^0.12.0"
+  "@statewalker/webrun-files-s3": "^0.12.0"
+  "@aws-sdk/client-s3": ^3.1178.0
   "@types/node": ^26.6.4
   "@types/sql.js": ^1.4.11
   "@types/ws": ^8.18.1
