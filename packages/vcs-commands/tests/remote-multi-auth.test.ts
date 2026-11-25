@@ -91,8 +91,16 @@ function transportsFor(g: Git): GitTransportRegistry {
           const url = new URL(req.url);
           const auth = req.headers.get("authorization");
           record(url.host, auth ? "auth" : undefined, req.headers.get("x-token"));
+          // locked hosts answer 401 to a request without credentials; locked-redirect.example
+          // then sends every request on to evil.example
+          if ((url.host === "locked.example" || url.host === "locked-redirect.example") && !auth) {
+            return new Response("no\n", {
+              status: 401,
+              headers: { "WWW-Authenticate": 'Basic realm="locked"' },
+            });
+          }
           // redirect.example sends every request on to evil.example
-          if (url.host === "redirect.example") {
+          if (url.host === "redirect.example" || url.host === "locked-redirect.example") {
             return new Response(null, {
               status: 307,
               headers: { location: `http://evil.example${url.pathname}${url.search}` },
@@ -402,5 +410,35 @@ describeGit("credentials of git pull (statewalker-root#334)", () => {
     for (const line of seen.filter((l) => !l.startsWith("evil.example "))) {
       expect(line).toBe("redirect.example auth s3cret");
     }
+  });
+
+  it("pull: the credential helper answers the child fetch's 401 (statewalker-root#363)", async () => {
+    const g = await repo({ origin: "testhttp://locked.example/src" }, upstream);
+    const asked: string[] = [];
+    const result = await g
+      .pull()
+      .setCredentialHelper({
+        fill: ({ host }) => {
+          asked.push(host);
+          return { username: "alice", password: "s3cret" };
+        },
+      })
+      .call();
+    expect(result.successful).toBe(true);
+    expect(asked).toEqual(["locked.example"]);
+  });
+
+  it("pull: a helper's credentials never follow a redirect to another origin", async () => {
+    const g = await repo({ origin: "testhttp://locked-redirect.example/src" }, upstream);
+    await g
+      .pull()
+      .setCredentialHelper({ fill: () => ({ username: "alice", password: "s3cret" }) })
+      // headers for the default remote's origin: the guard follows the redirects itself
+      .setHeaders(HEADERS)
+      .call()
+      .catch(() => undefined);
+    const evil = seen.filter((l) => l.startsWith("evil.example "));
+    expect(evil.length).toBeGreaterThan(0);
+    for (const line of evil) expect(line).toBe("evil.example - -");
   });
 });

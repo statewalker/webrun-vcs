@@ -10,10 +10,10 @@
 import { SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import type { Credentials } from "../api/credentials.js";
 import { type Duplex, endDuplex } from "../api/duplex.js";
-import { authorizationHeader } from "../operations/http-auth.js";
-import { AuthenticationError, ServerError, TransportError } from "../protocol/index.js";
+import type { HttpClientSettings, HttpCredentialHelper } from "../http-client/index.js";
+import { httpRefsErrorOf, SmartHttpClient } from "../http-client/index.js";
+import { ServerError, TransportError } from "../protocol/index.js";
 import { isObjectIdOf, remoteObjectFormat } from "../protocol/object-format.js";
-import { anonymizeUrl } from "./fetch-head.js";
 import { abortErrorOf, IdleTimer } from "./idle-timer.js";
 import { type Pkt, PktStream } from "./pkt-stream.js";
 
@@ -80,6 +80,10 @@ export interface HttpConnectionOptions {
    * behind a CORS proxy that does not allow it fails the preflight.
    */
   gzipRequests?: boolean;
+  /** git's `http.*` settings for the URL (extra headers, user agent, redirects, retries) */
+  http?: HttpClientSettings;
+  /** Asked for credentials after a 401, told whether they worked */
+  credentialHelper?: HttpCredentialHelper;
 }
 
 /**
@@ -90,34 +94,31 @@ export interface HttpConnectionOptions {
 export async function openHttpConnection(
   options: HttpConnectionOptions,
 ): Promise<UploadPackConnection> {
-  const baseUrl = options.url.replace(/\/+$/, "");
   const doFetch = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
   const asked = options.protocolVersion ?? 2;
   const protocolHeader: Record<string, string> =
     asked > 0 ? { "Git-Protocol": `version=${asked}` } : {};
-  const headers: Record<string, string> = { ...options.headers };
-  if (options.auth) headers.Authorization = authorizationHeader(options.auth);
 
   const controller = new AbortController();
   const onAbort = () => controller.abort(options.signal?.reason);
   options.signal?.addEventListener("abort", onAbort, { once: true });
   const wait = <T>(next: () => Promise<T>): Promise<T> =>
     withTimeout(next, options.timeout, controller);
+  const client = new SmartHttpClient({
+    url: options.url,
+    fetchImpl: doFetch,
+    ...(options.headers ? { headers: options.headers } : {}),
+    ...(options.auth ? { auth: options.auth } : {}),
+    ...(options.http ? { settings: options.http } : {}),
+    ...(options.credentialHelper ? { credentialHelper: options.credentialHelper } : {}),
+    signal: controller.signal,
+  });
 
-  const response = await wait(() =>
-    doFetch(
-      new Request(`${baseUrl}/info/refs?service=git-upload-pack`, {
-        method: "GET",
-        headers: {
-          ...headers,
-          Accept: "application/x-git-upload-pack-advertisement",
-          ...protocolHeader,
-        },
-        signal: controller.signal,
-      }),
-    ),
+  const response = await client.discover(
+    "git-upload-pack",
+    { Accept: "application/x-git-upload-pack-advertisement", ...protocolHeader },
+    wait,
   );
-  if (!response.ok) throw await httpRefsError(response, baseUrl);
   if (!response.body) throw new TransportError("Empty response from info/refs");
   const advert = new PktStream(response.body, wait);
   let first = await advert.read();
@@ -142,27 +143,22 @@ export async function openHttpConnection(
         options.gzipRequests === false
           ? { bytes: concat(body), gzip: false }
           : await gzipLargeBody(concat(body));
-      const res = await wait(() =>
-        doFetch(
-          new Request(`${baseUrl}/git-upload-pack`, {
-            method: "POST",
-            headers: {
-              ...headers,
-              "Content-Type": "application/x-git-upload-pack-request",
-              Accept: "application/x-git-upload-pack-result",
-              // the version spoken: v2 as answered, v1 as asked (git's remote-curl sends its
-              // protocol header with every request)
-              ...(greeting.version === 2
-                ? { "Git-Protocol": "version=2" }
-                : asked === 1
-                  ? protocolHeader
-                  : {}),
-              ...(payload.gzip ? { "Content-Encoding": "gzip" } : {}),
-            },
-            body: payload.bytes,
-            signal: controller.signal,
-          }),
-        ),
+      const res = await client.post(
+        "git-upload-pack",
+        {
+          "Content-Type": "application/x-git-upload-pack-request",
+          Accept: "application/x-git-upload-pack-result",
+          // the version spoken: v2 as answered, v1 as asked (git's remote-curl sends its
+          // protocol header with every request)
+          ...(greeting.version === 2
+            ? { "Git-Protocol": "version=2" }
+            : asked === 1
+              ? protocolHeader
+              : {}),
+          ...(payload.gzip ? { "Content-Encoding": "gzip" } : {}),
+        },
+        { body: payload.bytes },
+        wait,
       );
       if (!res.ok) {
         await res.body?.cancel().catch(() => {});
@@ -182,35 +178,12 @@ export async function openHttpConnection(
 /**
  * The error git's remote-curl dies with when `info/refs` fails (`discover_refs`): a 404 is
  * "repository '<url>/' not found", a 401 "Authentication failed for '<url>/'" (an
- * {@link AuthenticationError}, as is a 403), any other "unable to access '<url>/': The
+ * `AuthenticationError`, as is a 403), any other "unable to access '<url>/': The
  * requested URL returned error: <code>"; a `text/plain` body comes first as `remote: ` lines
  * (`show_http_message`). The URL ends with a slash and carries no credentials, as git prints it.
  */
-export async function httpRefsError(response: Response, baseUrl: string): Promise<TransportError> {
-  let body = "";
-  const type = (response.headers.get("content-type") ?? "").split(";")[0]?.trim().toLowerCase();
-  if (type === "text/plain") {
-    body = await response.text().catch(() => "");
-  } else {
-    await response.body?.cancel().catch(() => {});
-  }
-  const text = body.trim();
-  const lines = text
-    ? text
-        .split("\n")
-        .map((line) => `remote: ${line}\n`)
-        .join("")
-    : "";
-  const url = `${anonymizeUrl(baseUrl.replace(/\/+$/, ""))}/`;
-  if (response.status === 404) {
-    return new TransportError(`${lines}fatal: repository '${url}' not found`);
-  }
-  const unable = `fatal: unable to access '${url}': The requested URL returned error: ${response.status}`;
-  if (response.status === 401) {
-    return new AuthenticationError(`${lines}fatal: Authentication failed for '${url}'`);
-  }
-  if (response.status === 403) return new AuthenticationError(`${lines}${unable}`);
-  return new TransportError(`${lines}${unable}`);
+export function httpRefsError(response: Response, baseUrl: string): Promise<TransportError> {
+  return httpRefsErrorOf(response, baseUrl);
 }
 
 /** Options of {@link openDuplexConnection}. */

@@ -350,23 +350,26 @@ export function compareUrlMatches(a: UrlMatch, b: UrlMatch): number {
 const NO_URL_MATCH: UrlMatch = { hostLength: 0, pathLength: 0, userMatched: false };
 
 /**
- * git's `urlmatch_config_entry` over a whole configuration: for each `<section>.<key>` and
- * `<section>.<url>.<key>` entry (canonical keys, in the configuration's order) whose URL
- * matches, the entry chosen for its key, keyed by `<section>.<key>` in byte order (git's
- * sorted string list). A later entry replaces an earlier one unless its match is worse.
+ * git's `urlmatch_config_entry` as a callback sees it: each `<section>.<key>` and
+ * `<section>.<url>.<key>` entry of `entries` (canonical keys, in the configuration's order)
+ * whose URL matches `url` and whose match is not worse than the best one seen so far for its
+ * key, with that key (lower case, without the URL). git hands each to its config callback in
+ * turn, so a multi-valued key (`http.extraHeader`) collects every such value, and a single
+ * one keeps the last.
  *
- * @param entries the configuration's entries, keys canonical (`http.https://Example.com.sslverify`)
- * @param section the section, lower case (`http`)
- * @param url the URL, normalized with {@link normalizeUrl}
- * @param key only this key (lower case), or every key of the section
+ * @example
+ * ```ts
+ * const url = normalizeUrl("https://example.com/repo.git") as NormalizedUrl;
+ * for (const { name, entry } of urlMatchedEntries(entries, "http", url)) apply(name, entry);
+ * ```
  */
-export function selectUrlMatches<E extends { key: string }>(
+export function* urlMatchedEntries<E extends { key: string }>(
   entries: Iterable<E>,
   section: string,
   url: NormalizedUrl,
   key?: string,
-): Map<string, E> {
-  const best = new Map<string, { entry: E; match: UrlMatch }>();
+): Generator<{ name: string; entry: E; match: UrlMatch }> {
+  const best = new Map<string, UrlMatch>();
   for (const entry of entries) {
     const var_ = entry.key;
     if (!var_.startsWith(section) || var_[section.length] !== ".") continue;
@@ -383,11 +386,35 @@ export function selectUrlMatches<E extends { key: string }>(
     }
     if (key !== undefined && rest !== key) continue;
     const previous = best.get(rest);
-    if (previous && compareUrlMatches(match, previous.match) < 0) continue;
-    best.set(rest, { entry, match });
+    if (previous && compareUrlMatches(match, previous) < 0) continue;
+    best.set(rest, match);
+    yield { name: rest, entry, match };
+  }
+}
+
+/**
+ * git's `urlmatch_config_entry` over a whole configuration: for each `<section>.<key>` and
+ * `<section>.<url>.<key>` entry (canonical keys, in the configuration's order) whose URL
+ * matches, the entry chosen for its key, keyed by `<section>.<key>` in byte order (git's
+ * sorted string list). A later entry replaces an earlier one unless its match is worse.
+ *
+ * @param entries the configuration's entries, keys canonical (`http.https://Example.com.sslverify`)
+ * @param section the section, lower case (`http`)
+ * @param url the URL, normalized with {@link normalizeUrl}
+ * @param key only this key (lower case), or every key of the section
+ */
+export function selectUrlMatches<E extends { key: string }>(
+  entries: Iterable<E>,
+  section: string,
+  url: NormalizedUrl,
+  key?: string,
+): Map<string, E> {
+  const best = new Map<string, E>();
+  for (const { name, entry } of urlMatchedEntries(entries, section, url, key)) {
+    best.set(name, entry);
   }
   const names = [...best.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   const out = new Map<string, E>();
-  for (const name of names) out.set(`${section}.${name}`, (best.get(name) as { entry: E }).entry);
+  for (const name of names) out.set(`${section}.${name}`, best.get(name) as E);
   return out;
 }
