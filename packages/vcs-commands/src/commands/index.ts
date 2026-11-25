@@ -54,6 +54,7 @@ export {
 } from "./index-host.js";
 export * from "./init-command.js";
 export * from "./interpret-trailers-command.js";
+export * from "./lfs/index.js";
 export { httpBackendEnv, quarantineEnv, remoteHookSession } from "./local-transport.js";
 export * from "./log-command.js";
 export * from "./log-graph.js";
@@ -69,6 +70,7 @@ export {
   installMergeDrivers,
   type MergeAttributeValue,
   type MergeDriver,
+  MergeDriverFailedError,
   type MergeDriverInput,
   type MergeDriverRegistry,
   type MergeDriverResult,

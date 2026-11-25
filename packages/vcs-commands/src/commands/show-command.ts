@@ -315,7 +315,7 @@ export class ShowCommand extends GitCommand<ShowResult> {
       const where = await this.blobPath(name);
       if (where) {
         const diff = new DiffCommand(this._workingCopy).setOptions(this.diffOptions);
-        const converted = await diff.textconvBlob(where.path, where.mode, read);
+        const converted = await diff.textconvBlob(where.path, where.mode, read, id);
         if (converted) return converted;
       }
     }
