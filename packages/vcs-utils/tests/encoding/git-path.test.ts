@@ -154,3 +154,58 @@ describe("decodeGitPath of bytes that are not UTF-8 (statewalker/webrun-vcs#376)
     expect(Date.now() - started).toBeLessThan(5000);
   });
 });
+
+describe("decodeGitPath on random bytes: runs short and long, valid and not", () => {
+  it("decodes every valid sequence as UTF-8 and escapes every other byte, round-tripping", () => {
+    // a reference decoder: each valid UTF-8 sequence through TextDecoder, else U+DC00 + byte
+    const fatal = new TextDecoder("utf-8", { fatal: true });
+    const reference = (b: Uint8Array): string => {
+      let out = "";
+      let i = 0;
+      while (i < b.length) {
+        let decoded: string | undefined;
+        for (const len of [1, 2, 3, 4]) {
+          if (i + len > b.length) break;
+          try {
+            decoded = fatal.decode(b.subarray(i, i + len));
+            i += len;
+            break;
+          } catch {}
+        }
+        if (decoded === undefined) out += String.fromCharCode(0xdc00 + (b[i++] as number));
+        else out += decoded;
+      }
+      return out;
+    };
+    const pieces = [
+      [0x61],
+      [0x80],
+      [0xe9],
+      [0xc3, 0xa9],
+      [0xe2, 0x82, 0xac],
+      [0xe2, 0x82],
+      [0xf0, 0x9f, 0x98, 0x80],
+      [0xed, 0xa0, 0x80],
+      [0xc0, 0xaf],
+      [0xff],
+    ];
+    let seed = 7;
+    const next = (n: number) => {
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      return seed % n;
+    };
+    for (let round = 0; round < 120; round++) {
+      const out: number[] = [];
+      const count = next(30);
+      for (let k = 0; k < count; k++) {
+        const piece = pieces[next(pieces.length)] as number[];
+        const repeat = next(4) === 0 ? 1 + next(100) : 1; // long runs too
+        for (let r = 0; r < repeat; r++) out.push(...piece);
+      }
+      const input = new Uint8Array(out);
+      const text = decodeGitPath(input);
+      expect(text).toBe(reference(input));
+      expect([...encodeGitPath(text)]).toEqual(out);
+    }
+  });
+});
