@@ -15,6 +15,7 @@ import {
 import { compareGitPaths, decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
   type AttributesIndex,
+  basicStatMatches,
   collectChunks,
   compareWithWorktree,
   expandUserPath,
@@ -73,6 +74,7 @@ import {
   formatNameOnly,
   formatNameStatus,
   formatNumstat,
+  formatRawPair,
   formatShortstat,
   formatStat,
   formatSummary,
@@ -96,7 +98,13 @@ import {
   whitespaceRuleError,
 } from "./diff-color-config.js";
 import { textconvRunnerOf } from "./diff-textconv.js";
-import { matchPathspec, type PathspecItem, parsePathspecItem } from "./pathspec.js";
+import {
+  DO_MATCH_DIRECTORY,
+  DO_MATCH_LEADING_PATHSPEC,
+  matchPathspec,
+  type PathspecItem,
+  parsePathspecItem,
+} from "./pathspec.js";
 import { PathspecAttributes } from "./pathspec-attributes.js";
 import { revisionMergeBases } from "./rev-parse-command.js";
 import { readSubmoduleDirt, type SubmoduleDirt } from "./status-command.js";
@@ -152,6 +160,11 @@ function prefetchIds(entries: readonly DiffEntry[]): ObjectId[] {
 }
 
 export type DiffOutputFormat =
+  /**
+   * `--raw` (diff.c's `diff_flush_raw`): `:<old mode> <new mode> <old id> <new id> <status>`,
+   * a tab and the path(s); ids abbreviated unless {@link DiffTextOptions.rawFullIds}
+   */
+  | "raw"
   | "patch"
   | "stat"
   | "numstat"
@@ -208,6 +221,16 @@ export interface DiffTextOptions
   abbrev?: number;
   /** `--stat=...` widths (default width 80, as git without a terminal) */
   stat?: DiffstatOptions;
+  /**
+   * `-z`: the `raw`, `name-only`, `name-status` and `numstat` outputs end each field with a
+   * NUL instead of a tab or a newline, paths unquoted; the separator before a patch is a NUL
+   */
+  nullTerminated?: boolean;
+  /**
+   * The `raw` output's ids in full, as the plumbing commands print them (`opt->abbrev = 0`)
+   * unless `--abbrev` is given ({@link abbrev}); default false (`git diff --raw` abbreviates)
+   */
+  rawFullIds?: boolean;
   /**
    * Score renames counting a last line without a newline, as git 2.50 and later (default
    * true); false scores them as older git
@@ -524,6 +547,8 @@ function reverseEntry(entry: DiffEntry): DiffEntry {
   if (entry.readOld) out.readNew = entry.readOld;
   if (entry.score !== undefined) out.score = entry.score;
   if (entry.lineRanges) out.lineRanges = entry.lineRanges;
+  if (entry.newIdNull || entry.newIdUnknown) out.oldIdNull = true;
+  if (entry.oldIdNull) out.newIdNull = true;
   return out;
 }
 
@@ -557,6 +582,25 @@ interface Side {
    * side holds (`show_modified`), and no exact rename pairs with it.
    */
   unknownId?: boolean;
+  /**
+   * Plumbing (`diff-files`, `diff-index`): a file whose stat differs from its entry, which
+   * git takes as changed without hashing it (`ie_match_stat`): its raw id is the null id
+   */
+  rawNull?: boolean;
+}
+
+/** What {@link DiffCommand.setQueue} runs over a queue given */
+export interface PresetQueueOptions {
+  /**
+   * Run diffcore's rename and break detection over it as over a comparison's queue
+   * (`diffcore_std`), with `-M`/`-C`/`-B` as the text options give them (no `diff.renames`)
+   */
+  diffcore?: boolean;
+  /**
+   * `--find-copies-harder`'s sources besides the queue's: every file of the old side (the
+   * old tree, the index of `diff-files`)
+   */
+  copySources?: () => Promise<Map<string, { mode: number; id: ObjectId }>>;
 }
 
 /** diffcore's settings of one run (see `DiffCommand.diffcoreSettings`) */
@@ -1114,13 +1158,70 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
    *
    * @internal
    */
-  setQueue(entries: DiffEntry[]): this {
+  setQueue(entries: DiffEntry[], options: PresetQueueOptions = {}): this {
     this.checkCallable();
     this.presetQueue = entries;
+    this.presetQueueOptions = options;
     return this;
   }
 
   private presetQueue?: DiffEntry[];
+  private presetQueueOptions: PresetQueueOptions = {};
+
+  /**
+   * How a comparison of trees walks them (tree-diff.c): `recursive` lists the blobs below the
+   * subtrees that differ (`-r`, the porcelain's default), `flat` the differing entries of the
+   * top tree, subtrees as entries of mode 040000 (plumbing's default without `-r`), and
+   * `show-trees` the blobs and the subtrees on the way to them (`-t`)
+   *
+   * @internal
+   */
+  setTreeWalk(walk: "recursive" | "flat" | "show-trees"): this {
+    this.checkCallable();
+    this.treeWalk = walk;
+    return this;
+  }
+
+  private treeWalk: "recursive" | "flat" | "show-trees" = "recursive";
+
+  /**
+   * Compare the worktree as the plumbing commands do (`diff-files`, `diff-index` without
+   * `--cached`): no refresh, a file whose stat differs from its entry is a change even when
+   * its content is the same, and its raw id is the null id (not hashed); an unmerged path's
+   * raw line gives the worktree file's mode
+   *
+   * @internal
+   */
+  setPlumbingWorktree(plumbing: boolean): this {
+    this.checkCallable();
+    this.plumbingWorktree = plumbing;
+    return this;
+  }
+
+  private plumbingWorktree = false;
+
+  /** The sides an unmerged path's raw line shows (diff_unmerge's pair), by path */
+  private readonly unmergedRaw = new Map<
+    string,
+    { oldMode?: number; oldId?: ObjectId; newMode?: number }
+  >();
+
+  /** {@link setQueue}'s diffcore run, when asked */
+  private async presetDiffcore(entries: DiffEntry[]): Promise<DiffEntry[]> {
+    const options = this.presetQueueOptions;
+    if (!options.diffcore) return entries;
+    const core = this.diffcoreSettings(false);
+    if (this.textOptions.diffFilter !== undefined) parseDiffFilter(this.textOptions.diffFilter);
+    if (!core.breaks && !core.detect) return entries;
+    const queue = [...entries];
+    const sources = options.copySources;
+    await this.diffcore(queue, core, async () => {
+      const out = new Map<string, Side>();
+      if (sources) for (const [path, side] of await sources()) out.set(path, side);
+      return out;
+    });
+    return queue;
+  }
 
   /**
    * diffcore's filtering stages over a queue a caller found (the pickaxe, `-O`,
@@ -1229,7 +1330,13 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     this.setCallable(false);
     this.dirtyThisCall = this.dirtySubmodules ?? true;
     const run = async () => {
-      const { entries } = await this.collect(this.renames ?? false, false, this.pickaxeReads);
+      let entries: DiffEntry[];
+      if (this.presetQueue) {
+        await this.preparePickaxe();
+        entries = await this.presetDiffcore(this.presetQueue);
+      } else {
+        entries = (await this.collect(this.renames ?? false, false, this.pickaxeReads)).entries;
+      }
       // diffcore_pickaxe, diffcore_apply_filter (the entries stay in path order, unswapped)
       const picked = await this.picked(entries);
       const filter = this.textOptions.diffFilter;
@@ -1383,7 +1490,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       let collected: { entries: DiffEntry[]; combined: CombinedEntry[] };
       if (this.presetQueue) {
         await this.preparePickaxe();
-        collected = { entries: this.presetQueue, combined: [] };
+        collected = { entries: await this.presetDiffcore(this.presetQueue), combined: [] };
       } else if (follow !== undefined) {
         const spec = this.pathspecItems;
         this.pathspecItems = [parsePathspecItem(`:(literal)${follow}`)];
@@ -1492,6 +1599,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const unmerged = new Set<DiffFilePair>();
     /** The pairs with their full paths, for what git does not shorten (`--summary`) */
     const fullPairs = new Map<DiffFilePair, DiffFilePair>();
+    /** The entry of each pair (an unmerged path's sides, for the raw output) */
+    const entryOfPair = new Map<DiffFilePair, DiffEntry>();
     const prefix = this.relativePrefix;
     for (const entry of entries) {
       // an unmerged path: only its name is printed
@@ -1532,12 +1641,15 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
                 : {}),
             };
       fullPairs.set(shown, pair);
+      entryOfPair.set(shown, entry);
       if (entry.unmerged) unmerged.add(shown);
       pairs.push(shown);
     }
     const full = (pair: DiffFilePair) => fullPairs.get(pair) ?? pair;
     const quote = options.quotePath;
+    const z = this.textOptions.nullTerminated === true;
     const order: DiffOutputFormat[] = [
+      "raw",
       "name-only",
       "name-status",
       "numstat",
@@ -1589,7 +1701,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     for (const format of order) {
       if (!formats.includes(format)) continue;
       if (format === "patch" && separator) {
-        sink.text("\n");
+        // DIFF_SYMBOL_SEPARATOR: the line termination (a NUL under -z)
+        sink.text(z ? "\0" : "\n");
         // attach the patch instead of inlining it
         if (this.textOptions.statSep) sink.text(this.textOptions.statSep);
       }
@@ -1653,11 +1766,45 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           }
           break;
         }
+        case "raw": {
+          // flush_one_pair: --name-status wins over --raw (diff_flush_raw prints the
+          // status alone), and --raw over --name-only
+          // diff_setup_done: the name formats and --check turn --raw off
+          if (formats.some((f) => f === "name-status" || f === "name-only" || f === "check")) {
+            continue;
+          }
+          if (pairs.length > 0) this.changesFound = true;
+          const abbreviate = await this.rawAbbreviator(pairs);
+          const raw = {
+            quotePath: quote,
+            nullTerminated: z,
+            abbreviate,
+            nullId: this.objectFormat.nullId,
+          };
+          for (const pair of pairs) {
+            const entry = entryOfPair.get(pair);
+            if (unmerged.has(pair) && entry) {
+              // diff_unmerge: the null ids, the sides' modes as the comparison knew them
+              const path = entry.newPath ?? entry.oldPath ?? "";
+              const side = (mode: number | undefined, id: string | undefined) =>
+                contentSide(path, mode ?? 0, id ?? this.objectFormat.nullId, async () => NO_BYTES);
+              const u: DiffFilePair = {
+                status: "M",
+                old: side(entry.oldMode, entry.oldId),
+                new: side(entry.newMode, undefined),
+              };
+              sink.text(formatRawPair(u, raw, "U"));
+            } else sink.text(formatRawPair(pair, raw));
+          }
+          break;
+        }
         case "name-only": {
           const names = await this.shownNames(pairs, unmerged, options);
           // flush_one_pair: found_changes for each name listed
           if (names.length > 0) this.changesFound = true;
-          sink.text(formatNameOnly(names, { quotePath: quote }));
+          if (z) {
+            for (const p of names) sink.text(`${p.new?.path ?? p.old?.path ?? ""}\0`);
+          } else sink.text(formatNameOnly(names, { quotePath: quote }));
           break;
         }
         case "name-status": {
@@ -1665,7 +1812,15 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           // flush_one_pair: found_changes for each name listed
           if (names.length > 0) this.changesFound = true;
           for (const pair of names) {
-            if (unmerged.has(pair)) {
+            if (z) {
+              const raw = {
+                nullTerminated: true,
+                nameStatus: true,
+                abbreviate: (id: string) => id,
+                nullId: this.objectFormat.nullId,
+              };
+              sink.text(formatRawPair(pair, raw, unmerged.has(pair) ? "U" : undefined));
+            } else if (unmerged.has(pair)) {
               sink.text(`U\t${quotePath(pair.new?.path ?? pair.old?.path ?? "", quote)}\n`);
             } else sink.text(formatNameStatus([pair], { quotePath: quote }));
           }
@@ -1703,6 +1858,25 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       }
     }
     return pairs.length;
+  }
+
+  /**
+   * The raw output's ids: full under {@link DiffTextOptions.rawFullIds} without `--abbrev`,
+   * else each abbreviated as git's `diff_aligned_abbrev` (unique, at least `--abbrev` digits)
+   */
+  private async rawAbbreviator(pairs: DiffFilePair[]): Promise<(id: string) => string> {
+    const o = this.textOptions;
+    if (o.rawFullIds && o.abbrev === undefined) return (id) => id;
+    const nullId = this.objectFormat.nullId;
+    const ids = new Set<string>([nullId]);
+    for (const p of pairs) {
+      if (p.old && !p.old.rawNullId) ids.add(p.old.id);
+      if (p.new && !p.new.rawNullId) ids.add(p.new.id);
+    }
+    const min = abbrevOption(o.abbrev);
+    if (min !== undefined && min >= this.objectFormat.hexLength) return (id) => id;
+    const lengths = await this.idAbbreviator().lengths(ids, min);
+    return (id) => id.slice(0, lengths.get(id) ?? min ?? 7);
   }
 
   /**
@@ -2419,7 +2593,9 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const unmerged = new Map<string, DiffEntry[]>();
     const combined: CombinedEntry[] = [];
     if (this.newTree) {
-      if (this.pickaxe && !this.pickaxe.readsContent) this.treeSides = new Map();
+      if ((this.pickaxe && !this.pickaxe.readsContent) || this.treeWalk === "show-trees") {
+        this.treeSides = new Map();
+      }
       [oldSide, newSide] = await this.treePairSides(
         this.oldTree ?? "HEAD",
         this.oldTree === undefined,
@@ -2429,7 +2605,12 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       oldSide = await this.treeSide(this.oldTree ?? "HEAD", this.oldTree === undefined);
       const index = await this.indexSide();
       newSide = index.sides;
-      for (const path of index.unmerged.keys()) unmerged.set(path, []);
+      for (const path of index.unmerged.keys()) {
+        unmerged.set(path, []);
+        // diff_unmerge's raw line: the tree's side, nothing for the index
+        const side = oldSide.get(path);
+        if (side) this.unmergedRaw.set(path, { oldMode: side.mode, oldId: side.id });
+      }
     } else if (worktree) {
       const run = async () => {
         if (this.oldTree) {
@@ -2450,6 +2631,12 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
             continue;
           }
           unmerged.set(path, ours ? await this.againstStage(ours, wt.compare) : []);
+          if (this.plumbingWorktree) {
+            // run_diff_files: the unmerged line gives the worktree file's mode
+            const lowest = ours ?? stages.get(1) ?? stages.get(3);
+            const file = lowest ? await wt.compare(lowest) : undefined;
+            if (file) this.unmergedRaw.set(path, { newMode: file.mode });
+          }
         }
         return [indexSides, wt.sides] as const;
       };
@@ -2519,6 +2706,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       sides.get(oldSide) ?? new Map(),
       sides.get(newSide) ?? new Map(),
       new Map(),
+      this.treeWalk === "show-trees",
     );
     if (trees.length === 0) return entries;
     const keyOf = (e: DiffEntry) => e.newPath ?? e.oldPath ?? "";
@@ -2707,7 +2895,9 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         },
       ];
     }
-    if (side.id === stage.objectId && side.mode === stage.mode && !side.dirty) return [];
+    if (side.id === stage.objectId && side.mode === stage.mode && !side.dirty && !side.rawNull) {
+      return [];
+    }
     return [
       {
         changeType: ChangeType.MODIFY,
@@ -2720,6 +2910,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         ...(side.read ? { readNew: side.read } : {}),
         ...(side.dirty ? { newDirtySubmodule: true } : {}),
         ...(side.dirt ? { newSubmoduleDirt: side.dirt } : {}),
+        ...(side.rawNull ? { newIdNull: true } : {}),
       },
     ];
   }
@@ -2730,12 +2921,15 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     return typeof relative === "string" && relative !== "" ? relative : undefined;
   }
 
-  private matches(path: string): boolean {
+  private matches(path: string, tree = false): boolean {
     if (this.pathFilter && !path.startsWith(this.pathFilter)) return false;
     // diff_queue_addremove / diff_change / diff_unmerge: outside the prefix, nothing is queued
     const prefix = this.relativePrefix;
     if (prefix !== undefined && !path.startsWith(prefix)) return false;
-    return !this.pathspecItems || matchPathspec(this.pathspecItems, path, 0) > 0;
+    // tree_entry_interesting: a subtree shown (`-t`, without `-r`) is one the pathspec
+    // matches or leads to
+    const flags = tree ? DO_MATCH_DIRECTORY | DO_MATCH_LEADING_PATHSPEC : 0;
+    return !this.pathspecItems || matchPathspec(this.pathspecItems, path, flags) > 0;
   }
 
   /**
@@ -2746,24 +2940,36 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     oldSide: Map<string, Side>,
     newSide: Map<string, Side>,
     unmerged: Map<string, DiffEntry[]>,
+    trees = false,
   ): DiffEntry[] {
     const paths = new Set<string>([...oldSide.keys(), ...newSide.keys(), ...unmerged.keys()]);
-    const sorted = [...paths].filter((p) => this.matches(p)).sort(compareBytes);
+    // a subtree listed as an entry (`flat`) is keyed `<path>/`: it sorts as tree-diff.c
+    // walks it and pairs with no blob of its name
+    const sorted = [...paths]
+      .filter((p) =>
+        p.endsWith("/") ? this.matches(p.slice(0, -1), true) : this.matches(p, trees),
+      )
+      .sort(compareBytes);
     const entries: DiffEntry[] = [];
-    for (const path of sorted) {
-      const extra = unmerged.get(path);
+    for (const key of sorted) {
+      const path = key.endsWith("/") ? key.slice(0, -1) : key;
+      const extra = unmerged.get(key);
       if (extra) {
+        const raw = this.unmergedRaw.get(path);
         entries.push({
           changeType: ChangeType.MODIFY,
           oldPath: path,
           newPath: path,
           unmerged: true,
+          ...(raw?.oldMode !== undefined ? { oldMode: raw.oldMode as FileModeValue } : {}),
+          ...(raw?.oldId !== undefined ? { oldId: raw.oldId } : {}),
+          ...(raw?.newMode !== undefined ? { newMode: raw.newMode as FileModeValue } : {}),
         });
         entries.push(...extra);
         continue;
       }
-      const a = oldSide.get(path);
-      const b = newSide.get(path);
+      const a = oldSide.get(key);
+      const b = newSide.get(key);
       if (a && !b) {
         entries.push({
           changeType: ChangeType.DELETE,
@@ -2781,8 +2987,13 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           ...(b.dirty ? { newDirtySubmodule: true } : {}),
           ...(b.dirt ? { newSubmoduleDirt: b.dirt } : {}),
           ...(b.unknownId ? { newIdUnknown: true } : {}),
+          ...(b.rawNull ? { newIdNull: true } : {}),
         });
-      } else if (a && b && (a.id !== b.id || a.mode !== b.mode || b.dirty || b.unknownId)) {
+      } else if (
+        a &&
+        b &&
+        (a.id !== b.id || a.mode !== b.mode || b.dirty || b.unknownId || b.rawNull)
+      ) {
         // show_modified: a side of the null id differs from any (`M sub` even where the
         // submodule is back at the tree's commit)
         entries.push({
@@ -2797,6 +3008,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           ...(b.dirty ? { newDirtySubmodule: true } : {}),
           ...(b.dirt ? { newSubmoduleDirt: b.dirt } : {}),
           ...(b.unknownId ? { newIdUnknown: true } : {}),
+          ...(b.rawNull ? { newIdNull: true } : {}),
         });
       }
     }
@@ -3231,6 +3443,11 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         // them (100664 is 100644)
         if (xe.id === ye.id && xe.mode === ye.mode) continue;
         const path = prefix ? `${prefix}/${xe.name}` : xe.name;
+        if (isTreeMode(xe.mode) && isTreeMode(ye.mode) && this.treeWalk === "flat") {
+          oldSide.set(`${path}/`, { mode: xe.mode, id: xe.id });
+          newSide.set(`${path}/`, { mode: ye.mode, id: ye.id });
+          continue;
+        }
         if (isTreeMode(xe.mode) && isTreeMode(ye.mode)) {
           this.addTreeSide(path, xe.mode, xe.id, oldSide);
           this.addTreeSide(path, ye.mode, ye.id, newSide);
@@ -3274,7 +3491,10 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       } else {
         if (!x.sameAs(y)) {
           const path = pathOf(x.name());
-          if (x.isTree && y.isTree) {
+          if (x.isTree && y.isTree && this.treeWalk === "flat") {
+            oldSide.set(`${path}/`, { mode: x.mode, id: x.id() });
+            newSide.set(`${path}/`, { mode: y.mode, id: y.id() });
+          } else if (x.isTree && y.isTree) {
             this.addTreeSide(path, x.mode, x.id(), oldSide);
             this.addTreeSide(path, y.mode, y.id(), newSide);
             await this.diffRawTrees(x.id(), y.id(), path, oldSide, newSide);
@@ -3295,7 +3515,9 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     path: string,
     side: Map<string, Side>,
   ): Promise<void> {
-    if (c.isTree) {
+    if (c.isTree && this.treeWalk === "flat") {
+      side.set(`${path}/`, { mode: c.mode, id: c.id() });
+    } else if (c.isTree) {
       this.addTreeSide(path, c.mode, c.id(), side);
       await this.collectTreeEntries(c.id(), path, side);
     } else side.set(path, { mode: c.mode, id: c.id() });
@@ -3303,7 +3525,9 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
 
   /** A tree entry on one side: a blob as itself, a subtree as its blobs */
   private async addSide(e: TreeEntry, path: string, side: Map<string, Side>): Promise<void> {
-    if (isTreeMode(e.mode)) {
+    if (isTreeMode(e.mode) && this.treeWalk === "flat") {
+      side.set(`${path}/`, { mode: e.mode, id: e.id });
+    } else if (isTreeMode(e.mode)) {
       this.addTreeSide(path, e.mode, e.id, side);
       await this.collectTreeEntries(e.id, path, side);
     } else side.set(path, { mode: e.mode, id: e.id });
@@ -3411,16 +3635,28 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         const content = encoder.encode(`Subproject commit ${id}-dirty\n`);
         return { mode, id, dirty, dirt, ...unknown, read: async () => content };
       }
-      if (!result.kind && !entry.intentToAdd) return indexSide;
       const path = entry.path;
+      // plumbing's ie_match_stat: a stat that differs is a change, the file not hashed
+      // (a racily clean entry's content is compared)
+      const statDirty =
+        this.plumbingWorktree &&
+        !entry.intentToAdd &&
+        !result.kind &&
+        result.hashedId !== undefined &&
+        !!result.worktreeEntry &&
+        !basicStatMatches(entry, result.worktreeEntry, trust);
+      if (!result.kind && !entry.intentToAdd && !statDirty) return indexSide;
       const id = result.hashedId ?? (await worktree.computeHash(path));
-      if (!entry.intentToAdd && id === entry.objectId && mode === entry.mode) return indexSide;
+      const rawNull = this.plumbingWorktree && !entry.intentToAdd;
+      if (!entry.intentToAdd && id === entry.objectId && mode === entry.mode && !statDirty) {
+        return indexSide;
+      }
       let content: Promise<Uint8Array> | undefined;
       const read = () => {
         content ??= readCleanContent(worktree, path);
         return content;
       };
-      return { mode, id, read };
+      return { mode, id, read, ...(rawNull ? { rawNull: true } : {}) };
     };
     const compare: WorktreeCompare = (entry) => compareWith(entry);
     // the stat pass: the files of the stage-0 entries compared, stat'ed a chunk at a time
@@ -3449,7 +3685,13 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       if (changedOnly && (!entry.intentToAdd || this.intentToAddVisible)) {
         // diff-files: an entry its file still holds is no change on either side, left out
         // of both (the index side is the entry, as `indexSide` gives it)
-        if (side && side.id === entry.objectId && side.mode === entry.mode && !side.dirty) {
+        if (
+          side &&
+          side.id === entry.objectId &&
+          side.mode === entry.mode &&
+          !side.dirty &&
+          !side.rawNull
+        ) {
           continue;
         }
         changedOnly.set(entry.path, { mode: entry.mode, id: entry.objectId });

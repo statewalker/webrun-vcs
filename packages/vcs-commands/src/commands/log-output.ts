@@ -136,6 +136,23 @@ export interface LogOutputOptions {
   summary?: boolean;
   /** `--numstat` */
   numstat?: boolean;
+  /**
+   * `--raw`: each pair as `:<modes> <ids> <status>\t<path>` (ids abbreviated, as `git log`
+   * prints them, unless the diff options' `rawFullIds`); a merge's combined diff as
+   * `::<modes> <ids> <statuses>\t<path>`
+   */
+  raw?: boolean;
+  /**
+   * `git diff-tree`'s log_tree_commit: a commit whose diff is empty is not shown
+   * (`always_show_header` off), and without `pretty` the header is the commit's id alone,
+   * ended by the diff's line termination (`verbose_header` off), with no blank line before
+   * the diff
+   *
+   * @internal
+   */
+  diffTree?: boolean;
+  /** `git diff-tree --no-commit-id`: no header before a commit's diff */
+  noCommitId?: boolean;
   /** `--name-only` */
   nameOnly?: boolean;
   /** `--name-status` */
@@ -361,7 +378,7 @@ export interface LogOutputHost {
     entry: LogOutputEntry,
     options: {
       dense: boolean;
-      names?: "name-only" | "name-status";
+      names?: "name-only" | "name-status" | "raw";
       patch: boolean;
       follow?: string;
       /** With `follow`: the path each parent has it under (a rename or copy found) */
@@ -893,6 +910,7 @@ export class LogPrinter {
     },
   ) {
     const prettyGiven = options.pretty !== undefined || !!options.oneline;
+    this.verboseHeader = !options.diffTree || prettyGiven;
     const pretty = options.oneline ? "oneline" : (options.pretty ?? host.config("format.pretty"));
     this.format = parseCommitFormat(pretty, host);
     const dateSpec = options.date ?? host.config("log.date");
@@ -927,6 +945,7 @@ export class LogPrinter {
     this.decorate = decorate;
     // diffs
     const formats: DiffOutputFormat[] = [];
+    if (options.raw) formats.push("raw");
     if (options.nameOnly) formats.push("name-only");
     else if (options.nameStatus) formats.push("name-status");
     else if (options.check) formats.push("check");
@@ -1012,7 +1031,15 @@ export class LogPrinter {
 
   /** Whether a commit whose diff is empty is still shown (git's `always_show_header`) */
   get alwaysShowHeader(): boolean {
-    return !this.follow && !this.diffFiltered;
+    return !this.follow && !this.diffFiltered && !this.options.diffTree;
+  }
+
+  /** git's `verbose_header`: the log message is shown (not `diff-tree` without `--pretty`) */
+  private readonly verboseHeader: boolean;
+
+  /** The diff's line termination (`-z`: NUL), which ends a `diff-tree` header too */
+  private lineTermination(): string {
+    return this.options.diff?.nullTerminated ? "\0" : "\n";
   }
 
   /**
@@ -1272,7 +1299,12 @@ export class LogPrinter {
     if (!result.bytes) return;
     if (log.pending) {
       await this.showLog(entry, log);
-      if (this.formats.length > 0 && this.format.fmt !== "oneline" && !this.formatIsEmpty()) {
+      if (
+        this.verboseHeader &&
+        this.formats.length > 0 &&
+        this.format.fmt !== "oneline" &&
+        !this.formatIsEmpty()
+      ) {
         this.out.text(this.padding());
         if (!this.shownDashes && this.formats.includes("stat") && this.formats.includes("patch")) {
           this.out.text("---");
@@ -1291,7 +1323,7 @@ export class LogPrinter {
   ): Promise<void> {
     if (log.pending) {
       await this.showLog(entry, log);
-      if (this.formats.length > 0 && !this.formatIsEmpty()) {
+      if (this.verboseHeader && this.formats.length > 0 && !this.formatIsEmpty()) {
         this.out.text(`${this.padding()}\n`);
       }
     }
@@ -1315,7 +1347,9 @@ export class LogPrinter {
       ? "name-only"
       : this.formats.includes("name-status")
         ? "name-status"
-        : undefined;
+        : this.formats.includes("raw")
+          ? "raw"
+          : undefined;
     const patch = this.formats.includes("patch");
     const parents = this.diffParents(entry);
     // --follow: find_paths_generic diffs the parents in order with one set of options, whose
@@ -1371,6 +1405,22 @@ export class LogPrinter {
   ): Promise<void> {
     log.pending = false;
     const { fmt } = this.format;
+    if (this.options.noCommitId) return;
+    if (!this.verboseHeader) {
+      // show_log without verbose_header: the id (and parents), the line termination
+      if (this.graph) this.out.text(this.graph.showCommit());
+      else {
+        const mark = this.revisionMark(entry, true);
+        if (mark) this.out.text(mark);
+      }
+      this.out.text(await this.abbrevId(entry.id, this.abbrevCommit));
+      if (this.options.parents) {
+        for (const p of entry.parents)
+          this.out.text(` ${await this.abbrevId(p, this.abbrevCommit)}`);
+      }
+      this.out.text(this.lineTermination());
+      return;
+    }
     if (this.shownOne && !this.format.useTerminator) {
       if (!this.missingNewline) this.out.text(this.padding());
       this.out.text("\n");
