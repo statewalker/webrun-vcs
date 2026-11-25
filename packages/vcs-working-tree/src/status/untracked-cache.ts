@@ -44,6 +44,11 @@ export const DIR_SHOW_OTHER_DIRECTORIES = 1 << 1;
 export const DIR_HIDE_EMPTY_DIRECTORIES = 1 << 2;
 /** Report ignored paths too, in their own list (`--ignored`) */
 export const DIR_SHOW_IGNORED_TOO = 1 << 5;
+/**
+ * Only what `git ls-files -k` asks for: an untracked directory is entered only where the index
+ * has a file of its name or entries below it (`treat_path`'s three cases)
+ */
+export const DIR_COLLECT_KILLED_ONLY = 1 << 6;
 /** With {@link DIR_SHOW_IGNORED_TOO}: only paths an exclude pattern matches (`--ignored=matching`) */
 export const DIR_SHOW_IGNORED_TOO_MODE_MATCHING = 1 << 8;
 
