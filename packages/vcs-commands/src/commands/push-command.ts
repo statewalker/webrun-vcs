@@ -1159,6 +1159,8 @@ export class PushCommand extends TransportCommand<PushResult> {
     // directory, its directory as cwd), their output relayed where the child prints it
     child.setTransports(this.submoduleTransports());
     if (this.timeout !== undefined) child.setTimeout(this.timeout);
+    if (this.credentialHelper) child.setCredentialHelper(this.credentialHelper);
+    if (this.warningCallback) child.setWarningCallback(this.warningCallback);
     if (this.dryRun) child.setDryRun(true);
     if (pushOptions.length > 0) child.setPushOptions([...pushOptions]);
     if (configured) {
