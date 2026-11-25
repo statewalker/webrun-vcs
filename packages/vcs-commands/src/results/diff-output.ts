@@ -83,6 +83,8 @@ export interface DiffSideSpec {
    * the diffstat then compares the contents even when the ids are equal
    */
   idValid?: boolean;
+  /** The raw output (`--raw`) shows the null id for this side (see `DiffEntry.newIdNull`) */
+  rawNullId?: boolean;
   /**
    * Size and binary probe without reading everything (big files): when absent, the content
    * is read
@@ -1153,6 +1155,48 @@ export function formatNumstat(
     out += file.isBinary ? "-\t-\t" : `${file.added}\t${file.deleted}\t`;
     out += file.isRenamed ? printName(file, quote) : quotePath(file.name, quote);
     out += "\n";
+  }
+  return out;
+}
+
+/** How {@link formatRawPair} writes a pair */
+export interface RawFormatOptions {
+  quotePath?: boolean;
+  /** `-z`: NULs after the status and each path, paths unquoted */
+  nullTerminated?: boolean;
+  /** An id as printed (full, or abbreviated as `--abbrev` asks) */
+  abbreviate: (id: string) => string;
+  /** The null id of the repository's object format */
+  nullId: string;
+  /** `--name-status`: the status and the paths only */
+  nameStatus?: boolean;
+}
+
+/**
+ * One pair of `--raw` (diff.c's `diff_flush_raw`): `:<old mode> <new mode> <old id> <new id>
+ * <status>[<score>]`, then the path, or the two paths of a rename or copy; a side git does not
+ * hash (`rawNullId`) and a missing side show the null id. `status` overrides the pair's (`U`).
+ */
+export function formatRawPair(p: DiffFilePair, options: RawFormatOptions, status?: string): string {
+  const z = options.nullTerminated === true;
+  const inter = z ? "\0" : "\t";
+  const term = z ? "\0" : "\n";
+  const quote = options.quotePath ?? true;
+  const name = (path: string) => (z ? path : quotePath(path, quote));
+  const mode6 = (mode: number) => mode.toString(8).padStart(6, "0");
+  let out = "";
+  if (!options.nameStatus) {
+    const oldId = !p.old || p.old.rawNullId ? options.nullId : p.old.id;
+    const newId = !p.new || p.new.rawNullId ? options.nullId : p.new.id;
+    out += `:${mode6(p.old?.mode ?? 0)} ${mode6(p.new?.mode ?? 0)} `;
+    out += `${options.abbreviate(oldId)} ${options.abbreviate(newId)} `;
+  }
+  const letter = status ?? p.status;
+  out += p.score ? `${letter}${String(p.score).padStart(3, "0")}${inter}` : `${letter}${inter}`;
+  if (p.status === "R" || p.status === "C") {
+    out += `${name(p.old?.path ?? "")}${inter}${name(p.new?.path ?? "")}${term}`;
+  } else {
+    out += `${name(p.old?.mode ? p.old.path : (p.new?.path ?? p.old?.path ?? ""))}${term}`;
   }
   return out;
 }

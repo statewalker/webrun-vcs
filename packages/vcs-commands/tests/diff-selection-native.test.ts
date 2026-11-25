@@ -190,6 +190,7 @@ function differs(label: string, theirs: Outcome, mine: Outcome): string | undefi
 }
 
 const FORMAT_ARGS: Record<DiffOutputFormat, string[]> = {
+  raw: ["--raw"],
   patch: [],
   stat: ["--stat"],
   numstat: ["--numstat"],

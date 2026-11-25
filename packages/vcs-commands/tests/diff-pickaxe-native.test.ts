@@ -187,6 +187,7 @@ async function twinDiff(
   format: DiffOutputFormat = "patch",
 ): Promise<void> {
   const formatArgs: Record<DiffOutputFormat, string[]> = {
+    raw: ["--raw"],
     patch: [],
     stat: ["--stat"],
     numstat: ["--numstat"],
