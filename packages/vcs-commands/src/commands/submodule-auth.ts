@@ -19,7 +19,9 @@
  *   the commands: a native connector gets them for the URL just checked, and every smart-HTTP
  *   request carries them only when `new URL(request.url).origin` is the approved origin;
  *   redirects are followed by hand (`redirect: "manual"`) so a redirect to another origin
- *   goes out without them, and an opaque redirect (a browser's) is refused.
+ *   goes out without them; an opaque redirect (a browser's, whose target cannot be read) is
+ *   asked again following it with none of them, and they go to where it ended only when
+ *   that is the approved origin.
  *
  * @example
  * ```typescript
@@ -217,6 +219,37 @@ function guardConnector(
 }
 
 const REDIRECTS = new Set([301, 302, 303, 307, 308]);
+
+/**
+ * A response the guard reached by following redirects itself, telling where it ended
+ * (`response.url`, which the client re-roots its later requests at) when the `fetch` that
+ * answered left it empty.
+ */
+function landedAt(response: Response, url: string): Response {
+  if (response.url) return response;
+  Object.defineProperty(response, "url", { value: url });
+  Object.defineProperty(response, "redirected", { value: true });
+  return response;
+}
+
+/** Headers that identify the user: never carried to another origin (curl's rule). */
+const CREDENTIAL_HEADERS = ["authorization", "cookie", "proxy-authorization"];
+
+/**
+ * The caller's headers for the next hop of a redirect: whatever identifies the user (an
+ * `Authorization` from a credential helper or `http.extraHeader`, cookies) is dropped when
+ * the hop changes origin, as curl drops it when the host changes.
+ */
+function hopHeaders(headers: Headers, from: URL, to: URL): Headers {
+  const out = new Headers(headers);
+  if (from.origin !== to.origin) for (const name of CREDENTIAL_HEADERS) out.delete(name);
+  return out;
+}
+
+/** A redirect as the response shows it (a browser's `opaqueredirect` included). */
+function isRedirect(response: Response): boolean {
+  return response.type === "opaqueredirect" || REDIRECTS.has(response.status);
+}
 const MAX_REDIRECTS = 20;
 
 /**
@@ -239,14 +272,36 @@ function guardedFetch(
       for (const name of added.keys()) headers.delete(name);
       if (target.origin === origin) for (const [name, value] of added) headers.set(name, value);
       const kept = current.clone();
+      const probe = current.clone();
       const response = await fetchImpl(new Request(current, { headers, redirect: "manual" }));
+      // a request that follows no redirect (`http.followRedirects`) gets the redirect itself
+      if (request.redirect !== "follow" && isRedirect(response)) return response;
       if (response.type === "opaqueredirect") {
-        throw new TransportError(
-          `redirect refused: its target cannot be checked before credentials are sent (${target.origin})`,
-        );
+        // a browser hides where it leads: ask again, following, with none of the guard's
+        // headers; the credentials go only to where that ended, on the approved origin
+        if (hops >= MAX_REDIRECTS) throw new TransportError("too many redirects");
+        const followed = await fetchImpl(new Request(probe, { redirect: "follow" }));
+        let landed: URL | undefined;
+        try {
+          landed = followed.url ? new URL(followed.url) : undefined;
+        } catch {
+          landed = undefined;
+        }
+        if (!landed || landed.href === target.href || landed.origin !== origin) return followed;
+        await followed.body?.cancel().catch(() => undefined);
+        const body = kept.method === "GET" || kept.method === "HEAD" ? null : kept.body;
+        current = new Request(landed, {
+          method: kept.method,
+          headers: hopHeaders(kept.headers, target, landed),
+          ...(body ? { body, duplex: "half" } : {}),
+          signal: kept.signal,
+        } as RequestInit);
+        continue;
       }
       const location = response.headers.get("location");
-      if (!REDIRECTS.has(response.status) || location === null) return response;
+      if (!REDIRECTS.has(response.status) || location === null) {
+        return hops > 0 ? landedAt(response, current.url) : response;
+      }
       if (hops >= MAX_REDIRECTS) throw new TransportError("too many redirects");
       await response.body?.cancel().catch(() => undefined);
       const next = new URL(location, target);
@@ -257,7 +312,7 @@ function guardedFetch(
       const body = toGet || method === "GET" || method === "HEAD" ? null : kept.body;
       current = new Request(next, {
         method,
-        headers: kept.headers,
+        headers: hopHeaders(kept.headers, target, next),
         ...(body ? { body, duplex: "half" } : {}),
         signal: kept.signal,
       } as RequestInit);

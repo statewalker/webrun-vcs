@@ -15,6 +15,8 @@ import {
   type GitTransportConnector,
   type GitTransportRegistry,
   type GitUrl,
+  type HttpClientSettings,
+  type HttpCredentialHelper,
   isGitUrl,
   openReceivePack,
   openUploadPack,
@@ -326,6 +328,10 @@ export interface RemoteSessionOptions {
   streamRequestBody?: boolean;
   /** `protocol.version` ({@link protocolVersionOf}) */
   protocolVersion: 0 | 1 | 2;
+  /** git's `http.*` settings for a remote's URL (`http.<url>.*`) */
+  httpSettings?: (url: string) => HttpClientSettings;
+  /** Asked for HTTP credentials after a 401 */
+  credentialHelper?: HttpCredentialHelper;
   /**
    * The program the remote runs for the service (git's `--upload-pack` / `--receive-pack`,
    * `remote.<name>.uploadpack` / `receivepack`); connectors that run one (ssh, git://) use it
@@ -349,6 +355,8 @@ function connectRequest(
     ...(options.headers ? { headers: options.headers } : {}),
     ...(options.timeout !== undefined ? { timeout: options.timeout } : {}),
     ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.httpSettings ? { http: options.httpSettings(remote.url) } : {}),
+    ...(options.credentialHelper ? { credentialHelper: options.credentialHelper } : {}),
   };
 }
 

@@ -2,9 +2,13 @@ import {
   type Credentials,
   createDefaultTransports,
   type GitTransportRegistry,
+  type HttpClientSettings,
+  type HttpCredentialHelper,
   type ProgressInfo,
 } from "@statewalker/vcs-transport";
 import type { WorkingCopy } from "@statewalker/vcs-working-tree";
+import { hostEnvironmentOf } from "./commands/git-ident.js";
+import { httpClientSettingsOf } from "./commands/http-config.js";
 import { createPromisorFetcher, promisorOf } from "./commands/promisor-remote.js";
 import {
   openResolvedRemote,
@@ -65,6 +69,10 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
   protected progressMessageCallback?: (message: string) => void;
   /** The transports remote URLs are reached through (undefined: the defaults) */
   private transportRegistry?: GitTransportRegistry;
+  /** Asked for HTTP credentials after a 401 (git's credential helpers) */
+  protected credentialHelper?: HttpCredentialHelper;
+  /** git's `warning:` lines of the HTTP client */
+  protected warningCallback?: (line: string) => void;
 
   constructor(workingCopy: WorkingCopy) {
     super(workingCopy);
@@ -195,6 +203,52 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
   }
 
   /**
+   * A credential helper, as git's `credential.helper`: asked for credentials when an HTTP
+   * server answers 401 (with the `WWW-Authenticate` challenges; three tries in all), told
+   * when they worked (`approve`, git's `store`) and when the server refused them (`reject`,
+   * git's `erase`). Credentials from {@link setCredentials} go out with every request and are
+   * never handed to it.
+   *
+   * @example
+   * ```ts
+   * await git.fetch().setCredentialHelper({
+   *   fill: ({ host, wwwAuthenticate }) => vault.lookup(host, wwwAuthenticate),
+   *   approve: (credentials, { host }) => vault.save(host, credentials),
+   *   reject: (_credentials, { host }) => vault.forget(host),
+   * }).call();
+   * ```
+   */
+  setCredentialHelper(helper: HttpCredentialHelper): this {
+    this.checkCallable();
+    this.credentialHelper = helper;
+    return this;
+  }
+
+  /**
+   * Receives the `warning:` lines git's HTTP client prints on stderr (`rate limited, waiting
+   * <n> seconds before retry`).
+   */
+  setWarningCallback(callback: (line: string) => void): this {
+    this.checkCallable();
+    this.warningCallback = callback;
+    return this;
+  }
+
+  /**
+   * git's `http.*` settings for a remote URL (`http.<url>.*` matched against it, the
+   * `GIT_HTTP_*` variables over them), with this command's warning sink.
+   */
+  protected httpSettingsFor(url: string): HttpClientSettings {
+    const settings = httpClientSettingsOf(
+      RemoteConfigStore.from(this._workingCopy),
+      url,
+      hostEnvironmentOf(this._workingCopy),
+      { compatibility: this.hooks.compatibility },
+    );
+    return this.warningCallback ? { ...settings, onWarning: this.warningCallback } : settings;
+  }
+
+  /**
    * Set progress callback.
    *
    * @param callback Progress callback function
@@ -246,6 +300,8 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
       ...(this.timeout !== undefined ? { timeout: this.timeout } : {}),
       ...(this.gzipRequests !== undefined ? { gzipRequests: this.gzipRequests } : {}),
       protocolVersion: protocolVersionOf(RemoteConfigStore.from(this._workingCopy)),
+      httpSettings: (url) => this.httpSettingsFor(url),
+      ...(this.credentialHelper ? { credentialHelper: this.credentialHelper } : {}),
     };
   }
 
@@ -271,6 +327,8 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
     if (this.headers) child.setHeaders(this.headers);
     if (this.timeout) child.setTimeout(this.timeout);
     if (this.gzipRequests !== undefined) child.setGzipRequests(this.gzipRequests);
+    if (this.credentialHelper) child.setCredentialHelper(this.credentialHelper);
+    if (this.warningCallback) child.setWarningCallback(this.warningCallback);
     if (this.progressCallback) child.setProgressMonitor(this.progressCallback);
     if (this.progressMessageCallback)
       child.setProgressMessageCallback(this.progressMessageCallback);

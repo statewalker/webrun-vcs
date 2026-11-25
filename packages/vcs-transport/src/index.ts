@@ -5,6 +5,7 @@ export * from "./context/index.js";
 export * from "./factories/index.js";
 export * from "./fetch-client/index.js";
 export * from "./fsm/index.js";
+export * from "./http-client/index.js";
 export * from "./operations/index.js";
 export * from "./protocol/index.js";
 export * from "./push-client/index.js";
