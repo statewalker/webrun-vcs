@@ -1298,6 +1298,17 @@ export class CloneCommand extends TransportCommand<CloneResult> {
         headCommit = id;
         if (!this.bare && !this.noCheckout) checkoutId = id;
       }
+    } else if (
+      defaultBranch === undefined &&
+      remoteHeadRef?.oid !== undefined &&
+      !result.isEmpty &&
+      (await history.commits.has(remoteHeadRef.oid).catch(() => false))
+    ) {
+      // update_head's `else if (remote)`: a remote HEAD no branch matches (a bundle made from
+      // `HEAD topic`) detaches HEAD at its commit
+      await this.refsStore.set("HEAD", remoteHeadRef.oid, cloneLog);
+      headCommit = remoteHeadRef.oid;
+      if (!this.bare && !this.noCheckout) checkoutId = remoteHeadRef.oid;
     } else if (defaultBranch && !this.bare) {
       // The local branch starts at the tracking ref the clone just wrote
       const localRef = `refs/heads/${defaultBranch}`;
@@ -1362,8 +1373,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       ...(messages.length > 0 ? { messages } : {}),
     };
 
-    // clone.c's checkout(): a HEAD that names no commit (a remote without HEAD, a bundle
-    // whose HEAD no branch matches) leaves nothing to check out
+    // clone.c's checkout(): a HEAD that names no commit (a remote without HEAD, such as a
+    // bundle without one) leaves nothing to check out
     if (
       checkoutId === undefined &&
       !this.bare &&

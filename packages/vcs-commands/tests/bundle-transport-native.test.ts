@@ -7,7 +7,15 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -282,5 +290,37 @@ git checkout -q main; m tags/v2 "Merge commit O"; c "Commit P" main.txt`,
     expect(failure?.exitCode).toBe(expected.status);
     expect(`${failure?.message}\n`).toBe(expected.stderr);
     expect(existsSync(copy)).toBe(true);
+  });
+
+  it("a clone of a bundle whose HEAD no branch matches detaches HEAD there (update_head)", async () => {
+    const ht = bundle("head-topic.bdl", ["HEAD", "topic/1"]);
+    const native = join(home, "head-topic-native");
+    gitOk(home, ["clone", "-q", ht, native]);
+    const mine = join(home, "head-topic-ours");
+    const result = await ourClone(home, mine, (c) => c.setURI(ht));
+    expect(run(mine, ["rev-parse", "HEAD"]).stdout).toBe(run(native, ["rev-parse", "HEAD"]).stdout);
+    expect(run(mine, ["symbolic-ref", "-q", "HEAD"]).status).toBe(
+      run(native, ["symbolic-ref", "-q", "HEAD"]).status,
+    );
+    expect(run(mine, ["for-each-ref"]).stdout).toBe(run(native, ["for-each-ref"]).stdout);
+    expect(run(mine, ["status", "--porcelain"]).stdout).toBe("");
+    expect(existsSync(join(mine, "main.txt"))).toBe(existsSync(join(native, "main.txt")));
+    expect((result.messages ?? []).join("")).not.toContain("nonexistent ref");
+  });
+
+  it("a symbolic link to a bundle is a bundle remote (git's is_file follows it)", async () => {
+    const link = join(home, "link.bundle");
+    symlinkSync(b1, link);
+    const expected = run(repo, ["ls-remote", link])
+      .stdout.split("\n")
+      .filter((l) => l && !l.endsWith("\tHEAD"));
+    const listed = await (await openWorktree(repo)).lsRemote().setRemote(link).call();
+    expect(listed.refs.map((r) => `${r.objectId}\t${r.name}`)).toEqual(expected);
+    // `git clone link` finds `link.bundle` (get_repo_path's suffix)
+    const native = join(home, "link-native.git");
+    gitOk(home, ["clone", "-q", "--mirror", join(home, "link"), native]);
+    const mine = join(home, "link-ours.git");
+    await ourClone(home, mine, (c) => c.setURI(join(home, "link")).setMirror(true), { bare: true });
+    expect(showRef(mine)).toBe(showRef(native));
   });
 });
