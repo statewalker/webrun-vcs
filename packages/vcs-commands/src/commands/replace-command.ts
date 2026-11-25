@@ -15,13 +15,14 @@
  * ```
  */
 
-import { type ObjectId, parseGraftFile } from "@statewalker/vcs-core";
+import { type ObjectId, overlayMethods, parseGraftFile } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils";
 import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { computeObjectId } from "@statewalker/vcs-utils/pack";
 import { wildmatch } from "@statewalker/vcs-working-tree";
 
 import { GitApiError } from "../errors/index.js";
+import type { CommandCommits } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { quotePath } from "../results/quote-path.js";
 import { cUnquote } from "./apply/latin1.js";
@@ -166,6 +167,24 @@ export class ReplaceCommand extends PlumbingCommand {
   /** git replace reads every object as stored (`disable_replace_refs`). */
   protected override readsReplacedObjects(): boolean {
     return false;
+  }
+
+  /**
+   * The commits revisions are resolved through (`HEAD~1`, `HEAD^{tree}`): as stored, with
+   * the grafts file's parents, each load being git's commit parse, which loads the grafts
+   * file and gives its advice on the first one (prepare_commit_graft).
+   */
+  protected override get walkCommits(): CommandCommits {
+    const stored = this.storedCommits;
+    return overlayMethods(stored, {
+      load: async (id: ObjectId) => {
+        const commit = await stored.load(id);
+        if (!commit) return commit;
+        await this.commitParsed(id);
+        const grafted = (await this.graftsLoad)?.get(id);
+        return grafted ? { ...commit, parents: [...grafted] } : commit;
+      },
+    });
   }
 
   private get replaceRefBase(): string {
