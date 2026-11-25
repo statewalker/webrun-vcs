@@ -57,7 +57,7 @@ export interface WorktreeAdmin {
    */
   readonly bareRepository?: Pick<
     Worktree,
-    "openRepository" | "getFiles" | "getGitDir" | "getRoot"
+    "openRepository" | "readLocalFile" | "getFiles" | "getGitDir" | "getRoot"
   > &
     Pick<Checkout, "readFetchHead" | "writeFetchHead">;
 }
