@@ -311,3 +311,217 @@ export class PatchIds<K> {
     });
   }
 }
+
+/** How `git patch-id` hashes a patch: `--unstable`, `--stable`, `--verbatim`. */
+export interface PatchIdTextOptions {
+  /** Each file's hash summed apart, so the files' order does not matter (`--stable`) */
+  stable?: boolean;
+  /** Whitespace kept (`--verbatim`, which git makes stable too) */
+  verbatim?: boolean;
+  /** The hash (git's `the_hash_algo`: the repository's, SHA-1 outside one) */
+  objectFormat?: ObjectFormat;
+}
+
+const isAlpha = (c: number) => (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a);
+const isHex = (c: number) =>
+  (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x46) || (c >= 0x61 && c <= 0x66);
+
+function startsWith(line: Uint8Array, prefix: string, at = 0): boolean {
+  if (line.length - at < prefix.length) return false;
+  for (let i = 0; i < prefix.length; i++) if (line[at + i] !== prefix.charCodeAt(i)) return false;
+  return true;
+}
+
+/** `strspn(digits)` then `atoi` from `at`: [value, digits read]. */
+function digitsAt(line: Uint8Array, at: number): [number, number] {
+  let n = 0;
+  let value = 0;
+  while (at + n < line.length && (line[at + n] as number) >= 0x30 && (line[at + n] as number) <= 0x39) {
+    value = value * 10 + ((line[at + n] as number) - 0x30);
+    n++;
+  }
+  return [value, n];
+}
+
+/**
+ * builtin/patch-id.c's `scan_hunk_header` over `@@ -a,b +c,d @@`: the counts it set, which
+ * on a malformed header may be the old count alone (git ignores its failure).
+ */
+function scanHunkHeader(line: Uint8Array): { before: number; after?: number } {
+  let q = 4;
+  let [, n] = digitsAt(line, q);
+  let before = 1;
+  if (line[q + n] === 0x2c /* , */) {
+    q += n + 1;
+    [before, n] = digitsAt(line, q);
+  }
+  if (n === 0 || line[q + n] !== 0x20 || line[q + n + 1] !== 0x2b /* + */) return { before };
+  let r = q + n + 2;
+  let after = 1;
+  [, n] = digitsAt(line, r);
+  if (line[r + n] === 0x2c) {
+    r += n + 1;
+    [after, n] = digitsAt(line, r);
+  }
+  return { before, after };
+}
+
+/** `remove_space`: the line without git's isspace bytes. */
+function withoutSpace(line: Uint8Array): Uint8Array {
+  const out = new Uint8Array(line.length);
+  let n = 0;
+  for (const c of line) if (c !== 0x20 && c !== 0x09 && c !== 0x0a && c !== 0x0d) out[n++] = c;
+  return out.subarray(0, n);
+}
+
+/**
+ * `git patch-id`'s output for a patch (or several, as `git log -p` and `git format-patch`
+ * write them): a `<patch-id> <commit>` line for each commit whose diff is not empty, the
+ * commit read from its `commit <id>` or `From <id>` line (the null id before the first). The
+ * diff text is hashed as builtin/patch-id.c reads it: the commit message and hunk headers
+ * skipped, whitespace dropped unless `verbatim`, the `index` line's ids standing for a
+ * binary diff, each file's hash summed apart when `stable`.
+ *
+ * @example
+ * ```typescript
+ * patchIdsOfPatchText(new TextEncoder().encode(logOutput), { stable: true });
+ * // "f0b2a1... 3d4e5f...\n"
+ * ```
+ */
+export function patchIdsOfPatchText(input: Uint8Array, options: PatchIdTextOptions = {}): string {
+  const format = options.objectFormat ?? SHA1_OBJECT_FORMAT;
+  const verbatim = options.verbatim === true;
+  const stable = options.stable === true || verbatim;
+  const hexLength = format.rawLength * 2;
+  let pos = 0;
+  /** strbuf_getwholeline, then the line as C sees it: up to its first NUL */
+  const nextLine = (): Uint8Array | undefined => {
+    if (pos >= input.length) return undefined;
+    const nl = input.indexOf(0x0a, pos);
+    const end = nl < 0 ? input.length : nl + 1;
+    let line = input.subarray(pos, end);
+    pos = end;
+    const nul = line.indexOf(0);
+    if (nul >= 0) line = line.subarray(0, nul);
+    return line;
+  };
+  const hexAt = (line: Uint8Array, at: number): string | undefined => {
+    if (line.length - at < hexLength) return undefined;
+    for (let i = 0; i < hexLength; i++) if (!isHex(line[at + i] as number)) return undefined;
+    return new TextDecoder().decode(line.subarray(at, at + hexLength)).toLowerCase();
+  };
+  const addInto = (result: Uint8Array, h: Hasher) => {
+    const digest = h.digest();
+    let carry = 0;
+    for (let i = 0; i < result.length; i++) {
+      carry += (result[i] as number) + (digest[i] as number);
+      result[i] = carry & 0xff;
+      carry >>= 8;
+    }
+  };
+
+  /** get_one_patchid: [patch length, patch-id, the next commit] */
+  const getOne = (): [number, string, string] => {
+    let patchlen = 0;
+    let next = format.nullId;
+    let before = -1;
+    let after = -1;
+    let binary = false;
+    let preId = new Uint8Array(0);
+    let postId = new Uint8Array(0);
+    let h = format.createHasher();
+    const result = new Uint8Array(format.rawLength);
+    const flush = () => {
+      addInto(result, h);
+      h = format.createHasher();
+    };
+    for (let line = nextLine(); line !== undefined; line = nextLine()) {
+      let p = 0;
+      if (startsWith(line, "commit ")) p = 7;
+      else if (startsWith(line, "From ")) p = 5;
+      else if (startsWith(line, "\\ ") && line.length > 12) {
+        // "\ No newline at end of file"
+        if (verbatim) h.update(line);
+        continue;
+      }
+      const id = hexAt(line, p);
+      if (id !== undefined) {
+        next = id;
+        break;
+      }
+      // the commit message
+      if (!patchlen && !startsWith(line, "diff ")) continue;
+      // a diff header
+      if (before === -1) {
+        if (startsWith(line, "GIT binary patch") || startsWith(line, "Binary files")) {
+          binary = true;
+          before = 0;
+          h.update(preId);
+          h.update(postId);
+          if (stable) flush();
+          continue;
+        }
+        if (startsWith(line, "index ")) {
+          // the ids around `..`, up to a space or the line's last byte (64 at most)
+          let dots = -1;
+          for (let i = 0; i + 1 < line.length; i++) {
+            if (line[i] === 0x2e && line[i + 1] === 0x2e) {
+              dots = i;
+              break;
+            }
+          }
+          if (dots >= 0) {
+            const space = line.indexOf(0x20, dots);
+            const end = space >= 0 ? space : line.length - 1;
+            preId = line.slice(6, Math.min(dots, 6 + 64));
+            postId = line.slice(dots + 2, Math.min(Math.max(end, dots + 2), dots + 2 + 64));
+          }
+          continue;
+        }
+        if (startsWith(line, "--- ")) {
+          before = 1;
+          after = 1;
+        } else if (!isAlpha(line[0] ?? 0)) break;
+      }
+      if (binary) {
+        if (startsWith(line, "diff ")) {
+          binary = false;
+          before = -1;
+        }
+        continue;
+      }
+      // looking for a hunk header
+      if (before === 0 && after === 0) {
+        if (startsWith(line, "@@ -")) {
+          const counts = scanHunkHeader(line);
+          before = counts.before;
+          if (counts.after !== undefined) after = counts.after;
+          continue;
+        }
+        // the end of the patch
+        if (!startsWith(line, "diff ")) break;
+        // another file's header
+        if (stable) flush();
+        before = -1;
+        after = -1;
+      }
+      // a line of a hunk
+      if (line[0] === 0x2d /* - */ || line[0] === 0x20) before--;
+      if (line[0] === 0x2b /* + */ || line[0] === 0x20) after--;
+      const hashed = verbatim ? line : withoutSpace(line);
+      patchlen += hashed.length;
+      h.update(hashed);
+    }
+    flush();
+    return [patchlen, bytesToHex(result), next];
+  };
+
+  let out = "";
+  let commit = format.nullId;
+  while (pos < input.length) {
+    const [patchlen, id, next] = getOne();
+    if (patchlen) out += `${id} ${commit}\n`;
+    commit = next;
+  }
+  return out;
+}

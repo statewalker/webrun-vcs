@@ -24,6 +24,10 @@ import {
   BundleUnbundleCommand,
   BundleVerifyCommand,
   CheckMailmapCommand,
+  PatchIdCommand,
+  UrlParseCommand,
+  StripspaceCommand,
+  CheckRefFormatCommand,
   CheckoutCommand,
   CherryCommand,
   CherryPickCommand,
@@ -967,6 +971,63 @@ export class Git implements Disposable {
   checkMailmap(): CheckMailmapCommand {
     this.checkClosed();
     return new CheckMailmapCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a PatchIdCommand (`git patch-id`): the patch-ids of the patches given as text
+   * (`git log -p`, `git format-patch`), `--stable`, `--unstable` or `--verbatim`.
+   *
+   * @example
+   * ```typescript
+   * await git.patchId().setInput(logText).setMode("stable").call(); // stdout "<patch-id> <commit>\\n"
+   * ```
+   */
+  patchId(): PatchIdCommand {
+    this.checkClosed();
+    return new PatchIdCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a UrlParseCommand (`git url-parse`, git 2.5x): URLs parsed as git reads remote URLs,
+   * one component of each printed (`-c scheme|user|password|host|port|path`).
+   *
+   * @example
+   * ```typescript
+   * await git.urlParse().setComponent("path").addUrl("host:~user/repo").call(); // stdout "~user/repo\\n"
+   * ```
+   */
+  urlParse(): UrlParseCommand {
+    this.checkClosed();
+    return new UrlParseCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a StripspaceCommand (`git stripspace`): a message with its whitespace cleaned up,
+   * its comment lines dropped (`-s`) or every line commented out (`-c`).
+   *
+   * @example
+   * ```typescript
+   * await git.stripspace().setInput("a  \\n\\n\\nb").call(); // { exitCode: 0, stdout: "a\\n\\nb\\n", stderr: "" }
+   * ```
+   */
+  stripspace(): StripspaceCommand {
+    this.checkClosed();
+    return new StripspaceCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a CheckRefFormatCommand (`git check-ref-format`): whether a name is a valid ref
+   * name (`--normalize`, `--allow-onelevel`, `--refspec-pattern`), or `--branch`'s branch.
+   *
+   * @example
+   * ```typescript
+   * await git.checkRefFormat().setNormalize(true).setRefName("refs///heads/foo").call();
+   * // { exitCode: 0, stdout: "refs/heads/foo\n", stderr: "" }
+   * ```
+   */
+  checkRefFormat(): CheckRefFormatCommand {
+    this.checkClosed();
+    return new CheckRefFormatCommand(this._workingCopy);
   }
 
   /**
