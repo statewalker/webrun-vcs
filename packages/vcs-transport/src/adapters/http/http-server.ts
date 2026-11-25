@@ -1019,9 +1019,7 @@ function concatBytes(chunks: Uint8Array[]): Uint8Array {
  * `atomic` unless `receive.advertiseAtomic` is false.
  */
 function receivePackCapabilities(options: HttpServerOptions): string[] {
-  const offered = [
-    ...receivePackCapabilitiesOf(options.capabilities, options.receivePack ?? {}),
-  ];
+  const offered = [...receivePackCapabilitiesOf(options.capabilities, options.receivePack ?? {})];
   // transfer.advertiseSID: after push-options (show_ref)
   const sid = advertisedSessionId(options);
   if (sid !== undefined && !offered.some((c) => c.startsWith("session-id="))) {
