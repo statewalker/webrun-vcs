@@ -11,7 +11,7 @@
 import { spawn } from "node:child_process";
 import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createDefaultTransports } from "@statewalker/vcs-transport";
 import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -111,6 +111,18 @@ async function ourFetch(
       ),
   ).call();
   return havesIn(trace);
+}
+
+/**
+ * Transports reaching `git daemon --inetd` over `base` (`git://localhost/<name>`): our client
+ * against native upload-pack, whose acknowledgments differ by version (2.45+ skips a have
+ * whose child it acknowledged)
+ */
+function nativeServer(base: string) {
+  return createDefaultTransports({
+    openSocket: async () =>
+      childDuplex(spawn("git", daemonArgs(base, false), { env: testEnv(root) })),
+  });
 }
 
 /** A copy of `client` for ours (the native fetch changes the original). */
@@ -380,7 +392,8 @@ describeGit("fetch negotiators and negotiation tips (native twins)", () => {
     const ours = await oursAt(client);
     const result = await ours
       .fetch()
-      .setRemote("origin")
+      .setRemote("git://localhost/server")
+      .setTransports(nativeServer(dirname(server)))
       .setNegotiationTips(head)
       .setNegotiateOnly(true)
       .call();
@@ -431,7 +444,8 @@ describeGit("fetch negotiators and negotiation tips (native twins)", () => {
     const ours = await oursAt(client);
     const result = await ours
       .fetch()
-      .setRemote("origin")
+      .setRemote("git://localhost/server")
+      .setTransports(nativeServer(dir))
       .setNegotiationTips(...tips)
       .setNegotiateOnly(true)
       .call();
