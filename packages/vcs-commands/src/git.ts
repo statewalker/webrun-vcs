@@ -60,6 +60,9 @@ import {
   HookRunCommand,
   InitCommand,
   InterpretTrailersCommand,
+  LfsConfig,
+  type LfsConfigLoadOptions,
+  LfsEndpointCommand,
   ListBranchCommand,
   ListTagCommand,
   LogCommand,
@@ -1252,6 +1255,26 @@ export class Git implements Disposable {
    * await git.var().setVariable("GIT_DEFAULT_BRANCH").call(); // { exitCode: 0, stdout: "master\\n", stderr: "" }
    * ```
    */
+  /**
+   * The Git LFS endpoint git-lfs would use (`lfs.url`, `remote.<name>.lfsurl`, `.lfsconfig`,
+   * the remote's URL), with the credentials the caller may send there.
+   *
+   * @example
+   * ```typescript
+   * const { url, auth } = await git.lfsEndpoint().setRemote("origin").call();
+   * ```
+   */
+  lfsEndpoint(): LfsEndpointCommand {
+    this.checkClosed();
+    return new LfsEndpointCommand(this._workingCopy);
+  }
+
+  /** The Git LFS configuration (`.lfsconfig` and the git configuration, as git-lfs merges them). */
+  async lfsConfig(options: LfsConfigLoadOptions = {}): Promise<LfsConfig> {
+    this.checkClosed();
+    return LfsConfig.load(this._workingCopy, options);
+  }
+
   var(): VarCommand {
     this.checkClosed();
     return new VarCommand(this._workingCopy);
