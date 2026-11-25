@@ -48,10 +48,18 @@ function put(dir: string, path: string, content: string | Buffer): void {
 async function twins(
   dir: string,
   args: string[],
-  options: { cwd?: string; compare?: (out: Buffer) => unknown } = {},
+  options: {
+    cwd?: string;
+    env?: Record<string, string>;
+    compare?: (out: Buffer) => unknown;
+  } = {},
 ): Promise<ArchiveOutcome> {
-  const n = nativeArchive(home, dir, args, options.cwd ? { cwd: options.cwd } : {});
-  const o = await oursArchive(home, dir, args, options.cwd ? { cwd: options.cwd } : {});
+  const run = {
+    ...(options.cwd ? { cwd: options.cwd } : {}),
+    ...(options.env ? { env: options.env } : {}),
+  };
+  const n = nativeArchive(home, dir, args, run);
+  const o = await oursArchive(home, dir, args, run);
   const view = (r: ArchiveOutcome, bytes: boolean) => ({
     status: r.status,
     err: r.err,
@@ -631,6 +639,151 @@ describeGit("git archive conversions and settings, native", () => {
       expect(ours).toEqual(native);
     }
   });
+});
+
+describeGit("git archive edge cases, native", () => {
+  let root = "";
+  let repo = "";
+  let bare = "";
+
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "archive-edge-native-"));
+    home = root;
+    repo = join(root, "repo");
+    mkdirSync(repo);
+    git(repo, ["init", "-q", "-b", "main"]);
+    put(repo, "plain.txt", "plain\n");
+    git(repo, ["add", "."]);
+    git(repo, ["commit", "-q", "-m", "plain"]);
+    git(repo, ["tag", "plain"]);
+    put(
+      repo,
+      ".gitattributes",
+      "*.crlf eol=crlf\n*.id ident\nignored export-ignore\nsub/*.txt eol=crlf\nx.bin -diff\n",
+    );
+    put(repo, "a.crlf", "one\ntwo\n");
+    put(repo, "b.id", "$Id$\n");
+    put(repo, "ignored", "gone\n");
+    put(repo, "sub/x.txt", "x\ny\n");
+    put(repo, "sub/y.id", "$Id$\n");
+    put(repo, "x.bin", "text\n");
+    git(repo, ["add", "."]);
+    git(repo, ["commit", "-q", "-m", "attributes"]);
+    bare = join(root, "bare.git");
+    git(root, ["clone", "-q", "--bare", repo, bare]);
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  it("t5001-archive-attr.sh: a bare repository converts (eol, ident) by the archived tree", async () => {
+    await twins(bare, ["HEAD"]);
+    await twins(bare, ["--format=zip", "-0", "HEAD"]);
+  });
+
+  it("t5001-archive-attr.sh: attr.tree and GIT_ATTR_SOURCE give way to the archived tree", async () => {
+    for (const dir of [repo, bare]) {
+      git(dir, ["config", "attr.tree", "plain"]);
+      try {
+        await twins(dir, ["HEAD"]);
+      } finally {
+        git(dir, ["config", "--unset", "attr.tree"]);
+      }
+      await twins(dir, ["HEAD"], { env: { GIT_ATTR_SOURCE: "plain" } });
+      await twins(dir, ["plain"], { env: { GIT_ATTR_SOURCE: "HEAD" } });
+    }
+  });
+
+  it("t5000-tar-tree.sh: a subdirectory's run converts by the path below it", async () => {
+    await twins(repo, ["HEAD"], { cwd: "sub" });
+  });
+
+  it("t5003-archive-zip.sh: an added file's text flag follows the diff attribute", async () => {
+    await twins(repo, ["--format=zip", "-0", "--prefix=p/", "--add-file=x.bin", "HEAD"]);
+  });
+
+  it("t5000-tar-tree.sh: --add-file with .. from a subdirectory", async () => {
+    await twins(repo, ["--add-file=../x.bin", "HEAD"], { cwd: "sub" });
+    await twins(repo, ["--add-file=nosuch", "HEAD"]);
+  });
+
+  it("t5003-archive-zip.sh: a C-quoted virtual path with octal escapes", async () => {
+    await twins(repo, ['--add-virtual-file="\\303\\251t\\303\\251":caf\u00e9', "HEAD"]);
+    await twins(repo, ["--add-virtual-file=caf\u00e9.txt:x", "HEAD"]);
+  });
+
+  it("t5000-tar-tree.sh: tgz levels zlib refuses", async () => {
+    await twins(repo, ["--format=tgz", "-10", "HEAD"]);
+  });
+
+  it('t5000-tar-tree.sh: "invalid filter is reported only once"', async () => {
+    git(repo, ["config", "tar.invalid.command", ""]);
+    try {
+      const n = await twins(repo, ["--format=invalid", "HEAD"]);
+      expect(n.err.trim().split("\n")).toHaveLength(1);
+    } finally {
+      git(repo, ["config", "--unset", "tar.invalid.command"]);
+    }
+  });
+
+  it("checkout's verify_path: trees with paths git refuses", async () => {
+    const blob = execFileSync("git", ["hash-object", "-w", "--stdin"], {
+      cwd: repo,
+      env: archiveEnv(home),
+      input: "hi\n",
+      encoding: "latin1",
+    }).trim();
+    const mktree = (input: string) =>
+      execFileSync("git", ["mktree"], {
+        cwd: repo,
+        env: archiveEnv(home),
+        input,
+        encoding: "latin1",
+      }).trim();
+    const dotGit = mktree(`100644 blob ${blob}\t.git\n100644 blob ${blob}\tok\n`);
+    const nested = mktree(`040000 tree ${mktree(`100644 blob ${blob}\t.git\n`)}\td\n`);
+    const ntfs = mktree(`040000 tree ${mktree(`100644 blob ${blob}\tconfig\n`)}\tgit~1\n`);
+    for (const tree of [dotGit, nested, ntfs]) {
+      const n = await twins(repo, [tree]);
+      expect(n.status).toBe(255);
+      await twins(repo, ["--worktree-attributes", tree]);
+    }
+  });
+});
+
+describeGit("git archive with many entries, native (t5004-archive-corner-cases)", () => {
+  let root = "";
+
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "archive-many-native-"));
+    home = root;
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  it('t5004-archive-corner-cases.sh: "zip archive with many entries"', async () => {
+    const repo = join(root, "repo");
+    mkdirSync(repo);
+    git(repo, ["init", "-q", "-b", "main"]);
+    const blob = execFileSync("git", ["hash-object", "-w", "--stdin"], {
+      cwd: repo,
+      env: archiveEnv(home),
+      input: "",
+      encoding: "latin1",
+    }).trim();
+    const mktree = (input: string) =>
+      execFileSync("git", ["mktree"], {
+        cwd: repo,
+        env: archiveEnv(home),
+        input,
+        encoding: "latin1",
+      }).trim();
+    // 256 directories of 256 empty files: more entries than a zip's 16-bit counts hold
+    const hex = [...Array(256).keys()].map((i) => i.toString(16).padStart(2, "0"));
+    const inner = mktree(hex.map((h) => `100644 blob ${blob}\t${h}\n`).join(""));
+    const outer = mktree(hex.map((h) => `040000 tree ${inner}\t${h}\n`).join(""));
+    await twins(repo, ["--format=zip", "--mtime=2002-02-02T02:02:02-0200", outer], {
+      compare: (out) => normalizeZip(out),
+    });
+    await twins(repo, ["--format=zip", "-0", "--mtime=2002-02-02T02:02:02-0200", outer]);
+  }, 120000);
 });
 
 describeGit("git archive, JGit ArchiveCommandTest inputs (native oracle)", () => {

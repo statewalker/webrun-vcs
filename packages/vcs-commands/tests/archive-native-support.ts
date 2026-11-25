@@ -41,7 +41,7 @@ export function nativeArchive(
       "archive",
       ...args,
     ],
-    { cwd: dir, env: archiveEnv(home, options.env) },
+    { cwd: dir, env: archiveEnv(home, options.env), maxBuffer: 1 << 30 },
   );
   let out = r.stdout;
   if (output !== undefined) {
@@ -63,8 +63,12 @@ function outputOf(args: string[]): string | undefined {
 }
 
 /** Our repository in `dir`, with the test environment (bare when it has no `.git`). */
-export async function openArchiveRepo(home: string, dir: string): Promise<Git> {
-  const environment = createNodeGitHostEnvironment({ env: archiveEnv(home) });
+export async function openArchiveRepo(
+  home: string,
+  dir: string,
+  env: Record<string, string> = {},
+): Promise<Git> {
+  const environment = createNodeGitHostEnvironment({ env: archiveEnv(home, env) });
   if (existsSync(join(dir, ".git"))) return openOurs(dir, environment);
   const files = createNodeFilesApi({ rootDir: dir });
   const { history } = await createGitFilesBackend({ files, gitDir: "." });
@@ -84,9 +88,9 @@ export async function oursArchive(
   home: string,
   dir: string,
   args: string[],
-  options: { cwd?: string } = {},
+  options: { cwd?: string; env?: Record<string, string> } = {},
 ): Promise<ArchiveOutcome> {
-  const git = await openArchiveRepo(home, dir);
+  const git = await openArchiveRepo(home, dir, options.env);
   const cmd = git
     .archive()
     .setFilterRunner(shellFilter)

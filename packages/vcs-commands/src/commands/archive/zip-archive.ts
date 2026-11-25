@@ -24,7 +24,6 @@ const ZIP_STREAM = 1 << 3;
 const ZIP_UTF8 = 1 << 11;
 const METHOD_STORE = 0;
 const METHOD_DEFLATE = 8;
-const _LOCAL_HEADER_SIZE = 30;
 const EXTRA_MTIME_SIZE = 9;
 const ZIP64_EXTRA_SIZE = 20;
 const MAX32 = 0xffffffff;
@@ -70,14 +69,15 @@ function onlyAscii(path: Uint8Array): boolean {
 
 const utf8 = new TextDecoder("utf-8", { fatal: true });
 
-/** git's `is_utf8`. */
+/** git's `is_utf8`: valid UTF-8 without the noncharacters U+FFFE and U+FFFF. */
 function isUtf8(path: Uint8Array): boolean {
+  let text: string;
   try {
-    utf8.decode(path);
-    return true;
+    text = utf8.decode(path);
   } catch {
     return false;
   }
+  return !text.includes("\ufffe") && !text.includes("\uffff");
 }
 
 /** git's `dos_time`: the DOS date and time of `time` in local time. */

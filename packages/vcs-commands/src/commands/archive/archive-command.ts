@@ -21,13 +21,19 @@ import {
   type AttributeValue,
   attributesIndexOfTree,
   type ContentAttributesContext,
+  type ConversionSettings,
+  convAttrsOf,
+  crlfToWorktree,
+  identToWorktree,
+  readConversionSettings,
+  reencode,
   smudgeContent,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
-import { GitApiError } from "../../errors/index.js";
+import { GitApiError, InvalidPathError } from "../../errors/index.js";
 import { GitCommand } from "../../git-command.js";
 import { RemoteConfigStore } from "../../remote-config/index.js";
-import { cUnquote } from "../apply/index.js";
+import { cUnquote, latin1ToBytes, latin1ToPath, pathToLatin1 } from "../apply/index.js";
 import { bareAttributesResolver } from "../attributes-source.js";
 import { createIdAbbreviator } from "../core-config.js";
 import { createDescriber } from "../git-describe.js";
@@ -40,11 +46,13 @@ import {
   parsePathspec,
 } from "../pathspec.js";
 import { formatCommitPretty } from "../pretty-format.js";
+import { treePathRefusal, worktreePathRules } from "../worktree-path-rules.js";
 import {
   type ArchiveEntry,
   type ArchiveWriter,
   isDirMode,
   isGitlinkMode,
+  isLinkMode,
   isRegMode,
 } from "./archive-entry.js";
 import { TarArchiveWriter } from "./tar-archive.js";
@@ -90,6 +98,8 @@ const USAGE =
 const DEFAULT_BIG_FILE_THRESHOLD = 512 * 1024 * 1024;
 
 const EXPORT_ATTRS = ["export-ignore", "export-subst"] as const;
+/** The attributes convert.c's `convert_attrs` reads. */
+const CONVERT_ATTRS = ["crlf", "ident", "filter", "eol", "text", "working-tree-encoding"] as const;
 
 /**
  * `git archive <tree-ish> [<path>...]`: the archive's bytes. Messages git prints on stderr
@@ -167,27 +177,29 @@ export class ArchiveCommand extends GitCommand<Uint8Array> {
   /** `--add-virtual-file=<path>:<content>` (a C-quoted path allowed, as git reads it). */
   addVirtualFile(spec: string): this {
     this.checkCallable();
+    // parsed over the argument's bytes, as git does (`\\303\\251` is one character)
+    const raw = pathToLatin1(spec);
     let path: string;
     let rest: string;
-    if (spec.startsWith('"')) {
-      const unquoted = cUnquote(spec);
+    if (raw.startsWith('"')) {
+      const unquoted = cUnquote(raw);
       if (!unquoted) throw new GitApiError(`fatal: unclosed quote: '${spec}'`);
-      path = unquoted.name;
-      rest = spec.slice(unquoted.end);
+      path = latin1ToPath(unquoted.name);
+      rest = raw.slice(unquoted.end);
       if (!rest.startsWith(":")) throw new GitApiError(`fatal: missing colon: '${spec}'`);
     } else {
-      const colon = spec.indexOf(":");
+      const colon = raw.indexOf(":");
       if (colon < 0) throw new GitApiError(`fatal: missing colon: '${spec}'`);
       if (colon === 0) throw new GitApiError(`fatal: empty file name: '${spec}'`);
-      path = spec.slice(0, colon);
-      rest = spec.slice(colon);
+      path = latin1ToPath(raw.slice(0, colon));
+      rest = raw.slice(colon);
     }
     // xstrdup: the content ends at a NUL
     const content = rest.slice(1).split("\0")[0] as string;
     this.extraFiles.push({
       path,
       base: this.base,
-      content: encodeGitPath(content),
+      content: latin1ToBytes(content),
       virtual: true,
     });
     return this;
@@ -210,6 +222,10 @@ export class ArchiveCommand extends GitCommand<Uint8Array> {
   /** `-<n>`: the compression level (zip: 0 to 9, tar filters: any). */
   setCompressionLevel(level: number): this {
     this.checkCallable();
+    // git's `-<digits>`: a non-negative number
+    if (!Number.isInteger(level) || level < 0) {
+      throw new RangeError(`bad compression level ${level}`);
+    }
     this.compressionLevel = level;
     return this;
   }
@@ -372,9 +388,15 @@ export class ArchiveCommand extends GitCommand<Uint8Array> {
 
   private async filter(command: string, archive: Uint8Array, level: number): Promise<Uint8Array> {
     if (command === INTERNAL_GZIP_COMMAND) {
+      // zlib refuses the levels the tar filters' option parsing lets through
+      if (level > 9) {
+        throw new GitApiError("fatal: deflateInit2: stream consistency error (no message)");
+      }
       return deflateSync([archive], { format: "gzip", level });
     }
     const cmd = level >= 0 ? `${command} -${level}` : command;
+    // an empty command: start_command finds nothing to run
+    if (!cmd) throw new GitApiError("fatal: unable to start '' filter: No such file or directory");
     if (!this.filterRunner) throw new GitApiError(`fatal: unable to start '${cmd}' filter`);
     try {
       return await this.filterRunner(cmd, archive);
@@ -399,13 +421,18 @@ export class ArchiveCommand extends GitCommand<Uint8Array> {
         continue;
       }
       const worktree = this.worktreeAccess;
-      const entry = await worktree?.getEntry(path).catch(() => undefined);
+      // prefix_filename: `..` resolved against the current directory, the worktree's top kept
+      const resolved = normalizeWorktreePath(path);
+      const entry =
+        resolved === undefined
+          ? undefined
+          : await worktree?.getEntry(resolved).catch(() => undefined);
       if (!entry) throw new GitApiError(`fatal: File not found: ${path}`);
       if (entry.isDirectory || (entry.mode & 0o170000) !== 0o100000) {
         throw new GitApiError(`fatal: Not a regular file: ${path}`);
       }
       const chunks: Uint8Array[] = [];
-      for await (const c of (worktree as Worktree).readContent(path)) chunks.push(c);
+      for await (const c of (worktree as Worktree).readContent(resolved as string)) chunks.push(c);
       out.push({
         path,
         base: extra.base,
@@ -433,6 +460,14 @@ export class ArchiveCommand extends GitCommand<Uint8Array> {
     if (this.mtime !== undefined) time = approxidateCareful(this.mtime, this.clock()).timestamp;
     const tree = await resolver.peelToType(id, "tree").catch(() => undefined);
     if (tree === undefined) throw new GitApiError(`fatal: not a tree object: ${id}`);
+    if (!this.worktreeAttributes) {
+      // the tree is unpacked into an index first: verify_path refuses what git refuses
+      const refusal = await treePathRefusal(this.trees, tree, worktreePathRules(this._workingCopy));
+      if (refusal instanceof InvalidPathError) {
+        throw new GitApiError(refusal.message, { exitCode: 255 });
+      }
+      if (refusal) throw refusal;
+    }
     return { tree, time, ...(commitId ? { commitId } : {}) };
   }
 
@@ -471,6 +506,11 @@ export class ArchiveCommand extends GitCommand<Uint8Array> {
       return undefined;
     }
     return join(chunks);
+  }
+
+  /** @internal */
+  archiveConfigObject() {
+    return this._workingCopy.config;
   }
 
   /** @internal */
@@ -565,6 +605,23 @@ function join(chunks: Uint8Array[]): Uint8Array {
   return out;
 }
 
+/**
+ * A worktree path with `.`, `..` and empty components resolved; undefined when it climbs
+ * above the top (reached only through the host's file system, which the worktree does not
+ * give: pass such files to `addFile` with their content).
+ */
+function normalizeWorktreePath(path: string): string | undefined {
+  const out: string[] = [];
+  for (const part of path.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (out.length === 0) return undefined;
+      out.pop();
+    } else out.push(part);
+  }
+  return out.join("/");
+}
+
 /** The base name of a path (`basename`). */
 function baseName(path: string): string {
   const trimmed = path.replace(/\/+$/, "");
@@ -598,6 +655,7 @@ class ArchiveRun {
   private filterContext?: ContentAttributesContext;
   private bigFileThreshold = DEFAULT_BIG_FILE_THRESHOLD;
   private describeBudget = 1;
+  private conversionSettings?: ConversionSettings;
   private readonly base: Uint8Array;
   private readonly baseText: string;
 
@@ -761,13 +819,23 @@ class ArchiveRun {
     }
     await this.walk(this.target.tree, "", []);
     const hexLength = this.target.commitId?.length ?? this.target.tree.length;
+    const entries: ArchiveEntry[] = [];
+    const binaries: Promise<boolean | undefined>[] = [];
     this.extras.forEach((extra, i) => {
       const id = (i + 1).toString(16).padStart(16, "0").padEnd(hexLength, "0");
       const text = extra.virtual ? extra.path : `${extra.base}${baseName(extra.path)}`;
       const path = encodeGitPath(text);
+      const entry: ArchiveEntry = { path, mode: extra.mode, id, content: extra.content };
       // zip asks the diff driver of the path less the prefix's length (archive-zip.c)
-      this.emit({ path, mode: extra.mode, id, content: extra.content });
+      binaries.push(this.binaryOf(decodeGitPath(path.subarray(this.base.length))));
+      entries.push(entry);
     });
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i] as ArchiveEntry;
+      const binary = await binaries[i];
+      if (binary !== undefined) entry.binary = binary;
+      this.emit(entry);
+    }
   }
 
   /** `read_tree` with `queue_or_write_archive_entry`. */
@@ -811,6 +879,9 @@ class ArchiveRun {
       rel = rel.slice(prefix.length);
     }
     const archivePath = encodeGitPath(`${this.baseText}${rel}`);
+    // git converts and asks the diff driver by the path less the prefix (`path_without_prefix`
+    // after the current directory's rewrite)
+    const convertPath = rel;
     this.report(archivePath);
     if (isDir) {
       this.emit({ path: archivePath, mode, id, content: new Uint8Array(0) });
@@ -820,13 +891,13 @@ class ArchiveRun {
     if (!content) throw new GitApiError(`error: cannot read '${id}'`, { exitCode: 255 });
     const streamed = isRegMode(mode) && !convert && content.length > this.bigFileThreshold;
     if (isRegMode(mode) && !streamed) {
-      content = await this.smudge(path, content, mode);
+      content = await this.smudge(convertPath, id, content, mode);
       if (convert && this.target.commitId) content = await this.substitute(content);
     }
     const entry: ArchiveEntry = { path: archivePath, mode, id, content };
     if (streamed) entry.streamed = true;
-    if (isRegMode(mode) || (mode & 0o170000) === 0o120000) {
-      const binary = await this.binaryOf(path);
+    if (this.writer instanceof ZipArchiveWriter && (isRegMode(mode) || isLinkMode(mode))) {
+      const binary = await this.binaryOf(convertPath);
       if (binary !== undefined) entry.binary = binary;
     }
     this.emit(entry);
@@ -834,6 +905,7 @@ class ArchiveRun {
 
   /** zip's `entry_is_binary`: the diff driver's `binary`, undefined to look at the content. */
   private async binaryOf(path: string): Promise<boolean | undefined> {
+    if (!(this.writer instanceof ZipArchiveWriter)) return undefined;
     const value = (await this.attributes(path, ["diff"])).get("diff");
     // userdiff.c's driver_false and driver_true
     if (value === false) return true;
@@ -844,9 +916,27 @@ class ArchiveRun {
   }
 
   /** `convert_to_working_tree` with the archive's attributes. */
-  private async smudge(path: string, content: Uint8Array, mode: number): Promise<Uint8Array> {
+  private async smudge(
+    path: string,
+    id: ObjectId,
+    content: Uint8Array,
+    mode: number,
+  ): Promise<Uint8Array> {
+    if (this.bareResolver) {
+      // no worktree: eol, ident and encoding from the archive's attributes (no filter drivers)
+      const attrs = await this.bareResolver.get(path, CONVERT_ATTRS);
+      this.conversionSettings ??= readConversionSettings(this.cmd.archiveConfigObject(), "lf");
+      const ca = convAttrsOf(new Map(attrs), this.conversionSettings);
+      let out = content;
+      if (ca.ident) out = identToWorktree(out, id);
+      out = crlfToWorktree(out, ca.crlfAction, this.conversionSettings);
+      if (ca.workingTreeEncoding && out.length > 0) {
+        out = reencode(out, ca.workingTreeEncoding, "UTF-8") ?? out;
+      }
+      return out;
+    }
     const filter = this.worktree?.contentFilter;
-    if (!filter || this.bareResolver) return content;
+    if (!filter) return content;
     const out = await smudgeContent(filter, path, content, mode, this.filterContext);
     if (out instanceof Uint8Array) return out;
     const chunks: Uint8Array[] = [];

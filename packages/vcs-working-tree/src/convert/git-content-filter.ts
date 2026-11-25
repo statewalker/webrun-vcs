@@ -565,10 +565,11 @@ export class GitContentFilter implements WorktreeContentFilter {
       ...this.outerSources(scope),
       inTree: async (dir) => {
         const path = dir ? `${dir}/.gitattributes` : ".gitattributes";
+        // attr.c's read_attr: GIT_ATTR_INDEX reads the index whatever the attribute source
+        if (context.direction === "index") return fromIndex(path);
         // an attribute source replaces the worktree's and the index's files, either way
         const source = await this.attributesSource(scope);
         if (source) return this.sourceAttributes(source, path);
-        if (context.direction === "index") return fromIndex(path);
         if (context.direction === "checkout") {
           return (await fromIndex(path)) ?? (await fromWorktree(path));
         }

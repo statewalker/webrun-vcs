@@ -52,8 +52,8 @@ export function bareAttributesResolver(o: {
   blobs: Blobs;
   revisions: () => RevisionResolver;
   /**
-   * The tree read as the index when no attribute source applies (git's `GIT_ATTR_INDEX`
-   * over an index unpacked from it, as `git archive` reads one)
+   * The tree read as the index (git's `GIT_ATTR_INDEX` over an index unpacked from it, as
+   * `git archive` reads one): its files replace any attribute source
    */
   indexTree?: string;
 }): AttributesResolver {
@@ -77,16 +77,19 @@ export function bareAttributesResolver(o: {
       info: async () => read(gitDir ? `${gitDir.replace(/\/+$/, "")}/info/attributes` : undefined),
       // from an attribute source (`$GIT_ATTR_SOURCE`, `attr.tree`), else the index's tree
       inTree: async (dir) => {
-        source ??= (async () => {
-          const setting = attributesSourceSetting(
-            environment?.attrSource,
-            configValue(workingCopy, "attr.tree"),
-          );
-          if (!setting) return undefined;
-          return resolveAttributesSource(setting, attributesSourceResolver(o.revisions));
-        })();
-        const found = await source;
-        const tree = found ? found.tree : o.indexTree;
+        if (!o.indexTree) {
+          source ??= (async () => {
+            const setting = attributesSourceSetting(
+              environment?.attrSource,
+              configValue(workingCopy, "attr.tree"),
+            );
+            if (!setting) return undefined;
+            return resolveAttributesSource(setting, attributesSourceResolver(o.revisions));
+          })();
+        }
+        // GIT_ATTR_INDEX (an index tree given) wins over the attribute source (attr.c's read_attr)
+        const found = o.indexTree ? undefined : await source;
+        const tree = o.indexTree ?? found?.tree;
         if (!tree) return undefined;
         const file = await readTreeAttributesFile(
           o.trees,
