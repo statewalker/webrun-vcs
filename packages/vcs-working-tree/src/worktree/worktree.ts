@@ -18,6 +18,7 @@
 import type { History, ObjectId } from "@statewalker/vcs-core";
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import type { GitHostEnvironment } from "../convert/host-environment.js";
+import type { IgnoreMatch } from "../ignore/index.js";
 import type { LinkedWorktrees } from "../linked-worktrees/index.js";
 import type { UntrackedScanHost } from "../status/untracked-scan.js";
 import type { WorkingCopy } from "../working-copy.js";
@@ -320,6 +321,14 @@ export interface Worktree {
    * `is_excluded` judges it).
    */
   isIgnored(path: string, asDirectory?: boolean): Promise<boolean>;
+
+  /**
+   * The pattern deciding whether `path` is ignored (git's `last_matching_pattern`, what `git
+   * check-ignore -v` prints): an excluded leading directory's, else the path's last matching
+   * one, negated or not; undefined when none matches. The path is judged as a directory when
+   * one is there (never through a link), or with `asDirectory`.
+   */
+  ignoreMatch?(path: string, asDirectory?: boolean): Promise<IgnoreMatch | undefined>;
 
   // ========== Writing ==========
 

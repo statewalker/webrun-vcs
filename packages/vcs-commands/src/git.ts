@@ -24,9 +24,12 @@ import {
   BundleUnbundleCommand,
   BundleVerifyCommand,
   CatFileCommand,
+  CheckAttrCommand,
+  CheckIgnoreCommand,
   CheckMailmapCommand,
   CheckoutCommand,
   CheckoutIndexCommand,
+  CheckRefFormatCommand,
   CherryCommand,
   CherryPickCommand,
   CleanCommand,
@@ -39,6 +42,10 @@ import {
   DeleteTagCommand,
   DescribeCommand,
   DiffCommand,
+  DiffFilesCommand,
+  DiffIndexCommand,
+  DiffPairsCommand,
+  DiffTreeCommand,
   EditBranchDescriptionCommand,
   FetchCommand,
   FetchMultipleCommand,
@@ -65,6 +72,7 @@ import {
   NameRevCommand,
   NotesCommands,
   PackRefsCommand,
+  PatchIdCommand,
   PullCommand,
   PushCommand,
   RangeDiffCommand,
@@ -105,6 +113,7 @@ import {
   StashShowCommand,
   StashStoreCommand,
   StatusCommand,
+  StripspaceCommand,
   SubmoduleAbsorbGitDirsCommand,
   SubmoduleAddCommand,
   SubmoduleDeinitCommand,
@@ -120,6 +129,8 @@ import {
   TagCommand,
   UnsetUpstreamBranchCommand,
   UpdateIndexCommand,
+  UrlParseCommand,
+  VarCommand,
   VerifyCommitCommand,
   VerifyPackCommand,
   VerifyTagCommand,
@@ -1047,6 +1058,105 @@ export class Git implements Disposable {
   }
 
   /**
+   * Create a CheckIgnoreCommand (`git check-ignore`): which paths the ignore rules exclude, with
+   * `-v` the deciding pattern (`-n`, `--no-index`, `--stdin`, `-z`, `-q`).
+   *
+   * @example
+   * ```typescript
+   * await git.checkIgnore().setVerbose(true).addPath("build/x.o").call(); // stdout ".gitignore:1:build/\\tbuild/x.o\\n"
+   * ```
+   */
+  checkIgnore(): CheckIgnoreCommand {
+    this.checkClosed();
+    return new CheckIgnoreCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a CheckAttrCommand (`git check-attr`): the attributes of paths, from the worktree's
+   * `.gitattributes` files, the index's (`--cached`) or a tree's (`--source`); `--all`, `--stdin`, `-z`.
+   *
+   * @example
+   * ```typescript
+   * await git.checkAttr().addAttribute("text").addPath("a.txt").call(); // stdout "a.txt: text: set\\n"
+   * ```
+   */
+  checkAttr(): CheckAttrCommand {
+    this.checkClosed();
+    return new CheckAttrCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a VarCommand (`git var`): one of git's logical variables (`GIT_AUTHOR_IDENT`,
+   * `GIT_EDITOR`, `GIT_PAGER`, `GIT_DEFAULT_BRANCH`, ...), or the configuration and all of them (`-l`).
+   *
+   * @example
+   * ```typescript
+   * await git.var().setVariable("GIT_DEFAULT_BRANCH").call(); // { exitCode: 0, stdout: "master\\n", stderr: "" }
+   * ```
+   */
+  var(): VarCommand {
+    this.checkClosed();
+    return new VarCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a PatchIdCommand (`git patch-id`): the patch-ids of the patches given as text
+   * (`git log -p`, `git format-patch`), `--stable`, `--unstable` or `--verbatim`.
+   *
+   * @example
+   * ```typescript
+   * await git.patchId().setInput(logText).setMode("stable").call(); // stdout "<patch-id> <commit>\\n"
+   * ```
+   */
+  patchId(): PatchIdCommand {
+    this.checkClosed();
+    return new PatchIdCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a UrlParseCommand (`git url-parse`, git 2.5x): URLs parsed as git reads remote URLs,
+   * one component of each printed (`-c scheme|user|password|host|port|path`).
+   *
+   * @example
+   * ```typescript
+   * await git.urlParse().setComponent("path").addUrl("host:~user/repo").call(); // stdout "~user/repo\\n"
+   * ```
+   */
+  urlParse(): UrlParseCommand {
+    this.checkClosed();
+    return new UrlParseCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a StripspaceCommand (`git stripspace`): a message with its whitespace cleaned up,
+   * its comment lines dropped (`-s`) or every line commented out (`-c`).
+   *
+   * @example
+   * ```typescript
+   * await git.stripspace().setInput("a  \\n\\n\\nb").call(); // { exitCode: 0, stdout: "a\\n\\nb\\n", stderr: "" }
+   * ```
+   */
+  stripspace(): StripspaceCommand {
+    this.checkClosed();
+    return new StripspaceCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a CheckRefFormatCommand (`git check-ref-format`): whether a name is a valid ref
+   * name (`--normalize`, `--allow-onelevel`, `--refspec-pattern`), or `--branch`'s branch.
+   *
+   * @example
+   * ```typescript
+   * await git.checkRefFormat().setNormalize(true).setRefName("refs///heads/foo").call();
+   * // { exitCode: 0, stdout: "refs/heads/foo\n", stderr: "" }
+   * ```
+   */
+  checkRefFormat(): CheckRefFormatCommand {
+    this.checkClosed();
+    return new CheckRefFormatCommand(this._workingCopy);
+  }
+
+  /**
    * Create a FmtMergeMsgCommand that writes the message of a merge (`git fmt-merge-msg`),
    * from FETCH_HEAD-style lines or the heads `git merge` would be given, with the `merge.*`
    * configuration (`merge.log`, `merge.suppressDest`, `merge.branchdesc`).
@@ -1320,6 +1430,61 @@ export class Git implements Disposable {
   }
 
   // ============ Diff Operations ============
+
+  /**
+   * Create a DiffTreeCommand (`git diff-tree`): two trees compared, or a commit against its
+   * parents, in the raw format unless another is asked for.
+   *
+   * @example
+   * ```typescript
+   * await git.diffTree().addArgument("HEAD").setRecursive(true).callText();
+   * ```
+   */
+  diffTree(): DiffTreeCommand {
+    this.checkClosed();
+    return new DiffTreeCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a DiffIndexCommand (`git diff-index`): a tree against the index (`--cached`) or
+   * the worktree.
+   *
+   * @example
+   * ```typescript
+   * await git.diffIndex().setTree("HEAD").setCached(true).callText();
+   * ```
+   */
+  diffIndex(): DiffIndexCommand {
+    this.checkClosed();
+    return new DiffIndexCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a DiffFilesCommand (`git diff-files`): the index against the worktree, by stat.
+   *
+   * @example
+   * ```typescript
+   * await git.diffFiles().setFormats(["name-status"]).callText();
+   * ```
+   */
+  diffFiles(): DiffFilesCommand {
+    this.checkClosed();
+    return new DiffFilesCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a DiffPairsCommand (`git diff-pairs -z`): the pairs of a NUL-terminated raw diff
+   * shown in any format (a patch by default).
+   *
+   * @example
+   * ```typescript
+   * await git.diffPairs().setNullTerminated(true).setInput(rawZ).callText();
+   * ```
+   */
+  diffPairs(): DiffPairsCommand {
+    this.checkClosed();
+    return new DiffPairsCommand(this._workingCopy);
+  }
 
   /**
    * Create a DiffCommand for comparing trees/commits.

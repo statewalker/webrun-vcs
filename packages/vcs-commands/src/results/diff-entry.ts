@@ -103,6 +103,18 @@ export interface DiffEntry {
   newIdUnknown?: boolean;
 
   /**
+   * The raw output (`--raw`) shows the null id for the old side: a worktree file the
+   * plumbing diffs do not hash (git's `oid_valid` unset), on the old side of a `-R` diff
+   */
+  oldIdNull?: boolean;
+
+  /**
+   * The raw output shows the null id for the new side: a worktree file whose stat differs
+   * from its entry (`diff-files`, `diff-index`), which git does not hash
+   */
+  newIdNull?: boolean;
+
+  /**
    * `git log -L`: the line ranges of the new side the patch is cut to (0-based, end
    * exclusive, sorted and apart; line-log.c's `line_ranges` of the pair)
    */

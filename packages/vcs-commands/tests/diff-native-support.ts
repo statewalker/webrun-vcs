@@ -171,6 +171,7 @@ export function differs(label: string, theirs: Outcome, mine: Outcome): string |
 
 /** The command-line options of each output format */
 export const FORMAT_ARGS: Record<DiffOutputFormat, string[]> = {
+  raw: ["--raw"],
   patch: [],
   stat: ["--stat"],
   numstat: ["--numstat"],
