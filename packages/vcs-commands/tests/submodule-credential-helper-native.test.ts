@@ -308,7 +308,7 @@ describeGit("the credential helper on the submodule paths, as native git", () =>
     expect(head(join(dirs.ours, "sub"))).toBe(head(join(dirs.native, "sub")));
   });
 
-  it("submodule update (fetch of a commit the submodule lacks) and fetch --recurse-submodules: the helper answers", async () => {
+  it("fetch --recurse-submodules: the submodule's child fetch asks the helper", async () => {
     // both sides populated by native git with the helper, then sub and super move on
     const url = `${serverA.baseUrl}/open/super-locked-sub.git`;
     const native = join(fresh("native"), "dest");
@@ -377,5 +377,40 @@ describeGit("the credential helper on the submodule paths, as native git", () =>
     expect(result.submodules?.exitCode, result.submodules?.stderr).toBe(0);
     expect(helper.log.some((l) => l.includes(`host=${hostOf(serverB)}`))).toBe(true);
     expect(head(join(mine, "sub"))).toBe(moved);
+  });
+
+  it("submodule add: the child clone asks the helper for the submodule's host", async () => {
+    const url = `${serverB.baseUrl}/auth/sub.git`;
+    const dirs = { native: fresh("native"), ours: fresh("ours") };
+    for (const dir of Object.values(dirs)) {
+      git(dir, "init", "-q", "-b", "main");
+      git(dir, "commit", "-q", "--allow-empty", "-m", "root");
+    }
+    const helper = nativeHelper();
+    seen = [];
+    const nativeRun = await gitAsync(root, dirs.native, [
+      ...helper.config,
+      "submodule",
+      "add",
+      "-q",
+      url,
+      "sub",
+    ]);
+    expect(nativeRun.status, nativeRun.stderr).toBe(0);
+    const nativeSeen = shape(seen);
+
+    const g = await ours(dirs.ours);
+    const mine = ourHelper();
+    seen = [];
+    const result = await g
+      .submoduleAdd()
+      .setURI(url)
+      .setPath("sub")
+      .setCredentialHelper(mine.helper)
+      .call();
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(mine.log).toEqual(sortedLog(helper.log()));
+    expect(shape(seen)).toEqual(nativeSeen);
+    expect(head(join(dirs.ours, "sub"))).toBe(head(join(dirs.native, "sub")));
   });
 });

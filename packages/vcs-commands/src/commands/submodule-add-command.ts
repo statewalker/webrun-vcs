@@ -4,7 +4,7 @@
  * `submodule-model.ts` and the clone, checkout and add commands.
  */
 import { FileMode } from "@statewalker/vcs-core";
-import type { GitTransportRegistry } from "@statewalker/vcs-transport";
+import type { GitTransportRegistry, HttpCredentialHelper } from "@statewalker/vcs-transport";
 import { wildmatch } from "@statewalker/vcs-working-tree";
 
 import { GitApiError } from "../errors/index.js";
@@ -154,6 +154,8 @@ export class SubmoduleAddCommand extends SubmoduleCommandBase {
   private reference?: string;
   private depth?: number;
   private transports?: GitTransportRegistry;
+  private credentialHelper?: HttpCredentialHelper;
+  private warningCallback?: (line: string) => void;
 
   /** `<repository>`: the URL to clone (absolute, or `./`/`../` relative to the remote). */
   setURI(uri: string): this {
@@ -208,6 +210,23 @@ export class SubmoduleAddCommand extends SubmoduleCommandBase {
   setTransports(transports: GitTransportRegistry): this {
     this.checkCallable();
     this.transports = transports;
+    return this;
+  }
+
+  /**
+   * A credential helper, as git's `credential.helper` read by the child clone: asked with the
+   * submodule URL's host when its server answers 401.
+   */
+  setCredentialHelper(helper: HttpCredentialHelper): this {
+    this.checkCallable();
+    this.credentialHelper = helper;
+    return this;
+  }
+
+  /** Receives the `warning:` lines of the clone's HTTP client. */
+  setWarningCallback(callback: (line: string) => void): this {
+    this.checkCallable();
+    this.warningCallback = callback;
     return this;
   }
 
@@ -425,6 +444,8 @@ export class SubmoduleAddCommand extends SubmoduleCommandBase {
       ...(this.depth !== undefined ? { depth: this.depth } : {}),
       ...(this.reference !== undefined ? { references: [this.reference] } : {}),
       ...(this.transports ? { transports: this.transports } : {}),
+      ...(this.credentialHelper ? { credentialHelper: this.credentialHelper } : {}),
+      ...(this.warningCallback ? { warningCallback: this.warningCallback } : {}),
     });
 
     const inner = await worktree.openGitlink?.(path).catch(() => undefined);
