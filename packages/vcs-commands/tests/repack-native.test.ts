@@ -262,6 +262,50 @@ describeGit("repack twins", () => {
     });
   });
 
+  describe("options", () => {
+    it("t7701-repack-unpack-unreachable '-A with -d option leaves unreachable objects unpacked' (as -a -d --unpack-unreachable=<date>)", async () => {
+      const { caseDir, r } = history("unpack-date");
+      r.git(["repack", "-q", "-a", "-d"]);
+      r.git(["branch", "-D", "topic"]);
+      r.git(["tag", "-d", "v1"]);
+      r.git(["reset", "-q", "--hard", "HEAD~1"]);
+      r.git(["reflog", "expire", "--expire=all", "--all"]);
+      const { ours } = await repackTwins(
+        caseDir,
+        ["-a", "-d", "--unpack-unreachable=1.week.ago"],
+        (c) => c.setAll(true).setDeleteRedundant(true).setUnpackUnreachable("1.week.ago"),
+      );
+      expect(ours.loose.length).toBeGreaterThan(0);
+    });
+
+    it("t7703-repack-geometric: --geometric=0 is no geometric repack", async () => {
+      const { caseDir, r } = history("geo-zero");
+      r.blob("unreachable\n");
+      await repackTwins(caseDir, ["--geometric=0", "-d"], (c) =>
+        c.setGeometric(0).setDeleteRedundant(true),
+      );
+    });
+
+    it("t7701-repack-unpack-unreachable: -k and --unpack-unreachable cannot be used together", async () => {
+      const { caseDir } = history("k-unpack");
+      const git = await openOursGc(root, join(caseDir, "src"));
+      const native = spawnSync("git", ["repack", "-a", "-d", "-k", "--unpack-unreachable=now"], {
+        cwd: join(caseDir, "src/repo"),
+        env: gcEnv(root),
+      });
+      expect(native.status).toBe(128);
+      await expect(
+        git
+          .repack()
+          .setAll(true)
+          .setDeleteRedundant(true)
+          .setKeepUnreachable(true)
+          .setUnpackUnreachable("now")
+          .call(),
+      ).rejects.toThrow(native.stderr.toString().trim());
+    });
+  });
+
   describe("-k", () => {
     it("t7701-repack-unpack-unreachable 'repack -k keeps unreachable packed objects'", async () => {
       const { caseDir, r } = history("k-packed");

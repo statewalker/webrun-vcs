@@ -484,7 +484,7 @@ export async function repack(options: RepackOptions): Promise<RepackResult | nul
 /** The filter of a repack, parsed and resolved (a `sparse:oid` one must come resolved). */
 async function repackFilterOf(options: RepackOptions): Promise<ResolvedObjectFilter | undefined> {
   if (options.filter === undefined) return undefined;
-  if (!(options.all ?? true)) throw new Error("repack --filter needs -a");
+  if (!(options.all ?? true)) throw new Error("repack --filter without -a is not supported");
   if (typeof options.filter !== "string") return options.filter;
   return resolveObjectFilter(parseObjectFilter(options.filter), async (name) => {
     throw new Error(`unable to access sparse blob in '${name}'`);
@@ -567,6 +567,8 @@ export async function repackListed(
     const add = async (id: ObjectId) => {
       if (seen.has(id)) return;
       seen.add(id);
+      // a partial clone's promisor objects went into the promisor pack (git's --keep-pack of it)
+      if (exclusions?.excluded.has(id)) return;
       if (keptOnDisk.some((p) => p.has(id))) return;
       if (options.local) for (const alt of alternates) if (await alt.objects.has(id)) return;
       const o = await objects.get(id);

@@ -267,15 +267,36 @@ export class RepackCommand extends GitCommand<RepackCommandResult> {
   async call(): Promise<RepackCommandResult> {
     this.checkCallable();
     this.setCallable(false);
-    if (this._keepUnreachable && (this._loosen || this._cruft))
+    // die_for_incompatible_opt3: --unpack-unreachable counts as -A there
+    const loosenAsked = this._loosen || this._unpackUnreachable !== undefined;
+    const incompatible = [
+      ...(loosenAsked ? ["-A"] : []),
+      ...(this._keepUnreachable ? ["-k/--keep-unreachable"] : []),
+      ...(this._cruft ? ["--cruft"] : []),
+    ];
+    // 2.43 checks the pairs one by one, in its own words
+    if (this.hooks.compatibility === "2.43") {
+      const pair = (x: string, y: string) =>
+        new GitApiError(`fatal: options '${x}' and '${y}' cannot be used together`);
+      if (this._keepUnreachable && loosenAsked) throw pair("--keep-unreachable", "-A");
+      if (this._cruft && loosenAsked) throw pair("--cruft", "-A");
+      if (this._cruft && this._keepUnreachable) throw pair("--cruft", "-k");
+    }
+    if (incompatible.length === 3)
       throw new GitApiError(
-        this._cruft && this._loosen
-          ? "fatal: options '-A', '-k/--keep-unreachable', and '--cruft' cannot be used together"
-          : `fatal: options '${this._loosen ? "-A" : "-k/--keep-unreachable"}' and '${this._loosen ? "-k/--keep-unreachable" : "--cruft"}' cannot be used together`,
+        "fatal: options '-A', '-k/--keep-unreachable', and '--cruft' cannot be used together",
+      );
+    if (incompatible.length === 2)
+      throw new GitApiError(
+        `fatal: options '${incompatible[0]}' and '${incompatible[1]}' cannot be used together`,
       );
     const all = this._all || this._loosen || this._cruft;
-    if (this._geometric !== undefined && all)
+    // git's split_factor 0 is no geometric repack
+    const geometric = this._geometric ? this._geometric : undefined;
+    if (geometric !== undefined && all)
       throw new GitApiError("fatal: options '--geometric' and '-A/-a' cannot be used together");
+    if (this._filter !== undefined && !all)
+      throw new GitApiError("repack --filter without -a is not supported");
     if (this._cruft && !this._delete)
       throw new GitApiError("repack --cruft without -d is not supported");
 
@@ -303,42 +324,48 @@ export class RepackCommand extends GitCommand<RepackCommandResult> {
         ? undefined
         : parseExpiryDate(this._cruftExpiration, nowSeconds, "--cruft-expiration");
 
-    const result = await storeRepack({
-      history,
-      objects: history.objects as NonNullable<History["objects"]>,
-      packs: history.packs as NonNullable<History["packs"]>,
-      looseStorage: new FileRawStorage(files, `${gitDir}/objects`),
-      files,
-      gitDir,
-      ...(environment ? { environment } : {}),
-      compatibility: this.hooks.compatibility,
-      all,
-      deleteRedundant: this._delete,
-      local: this._local,
-      reuseDeltas: this._reuseDeltas,
-      reuseObjects: this._reuseObjects,
-      ...(deltaSearch ? { deltaSearch } : {}),
-      ...(this._loosen
-        ? { unpackUnreachable: true, unpackUnreachableExpireMs: unpackExpireMs }
-        : {}),
-      ...(this._keepUnreachable ? { keepUnreachable: true } : {}),
-      ...(this._cruft
-        ? {
-            cruft: true,
-            ...(cruftExpiration !== undefined && cruftExpiration > 0 ? { cruftExpiration } : {}),
-            ...(this._maxCruftSize !== undefined ? { maxCruftSize: this._maxCruftSize } : {}),
-          }
-        : {}),
-      ...(this._writeBitmaps !== undefined ? { writeBitmaps: this._writeBitmaps } : {}),
-      ...(this._writeMidx ? { writeMidx: true } : {}),
-      ...(this._geometric !== undefined ? { geometric: this._geometric } : {}),
-      ...(this._filter !== undefined ? { filter: this._filter } : {}),
-      ...(this._keepPacks.length ? { keepPacks: this._keepPacks } : {}),
-      ...(this._packKeptObjects !== undefined ? { packKeptObjects: this._packKeptObjects } : {}),
-      updateServerInfo: this._updateServerInfo ?? this.configBool("repack.updateServerInfo", true),
-      deltaIslands: this._deltaIslands ?? this.configBool("repack.useDeltaIslands", false),
-      ...(noDelta ? { noDelta } : {}),
-    });
+    const worktree = "worktree" in this.workingCopy ? this.worktreeAccess : undefined;
+    // one worktree batch: the attribute files the delta attribute reads are read once
+    const run = () =>
+      storeRepack({
+        history,
+        objects: history.objects as NonNullable<History["objects"]>,
+        packs: history.packs as NonNullable<History["packs"]>,
+        looseStorage: new FileRawStorage(files, `${gitDir}/objects`),
+        files,
+        gitDir,
+        ...(environment ? { environment } : {}),
+        compatibility: this.hooks.compatibility,
+        all,
+        deleteRedundant: this._delete,
+        local: this._local,
+        reuseDeltas: this._reuseDeltas,
+        reuseObjects: this._reuseObjects,
+        ...(deltaSearch ? { deltaSearch } : {}),
+        // inside an all-into-one repack with -d, --unpack-unreachable=<date> loosens as -A does
+        ...(this._loosen || (all && this._unpackUnreachable !== undefined)
+          ? { unpackUnreachable: true, unpackUnreachableExpireMs: unpackExpireMs }
+          : {}),
+        ...(this._keepUnreachable ? { keepUnreachable: true } : {}),
+        ...(this._cruft
+          ? {
+              cruft: true,
+              ...(cruftExpiration !== undefined && cruftExpiration > 0 ? { cruftExpiration } : {}),
+              ...(this._maxCruftSize !== undefined ? { maxCruftSize: this._maxCruftSize } : {}),
+            }
+          : {}),
+        ...(this._writeBitmaps !== undefined ? { writeBitmaps: this._writeBitmaps } : {}),
+        ...(this._writeMidx ? { writeMidx: true } : {}),
+        ...(geometric !== undefined ? { geometric } : {}),
+        ...(this._filter !== undefined ? { filter: this._filter } : {}),
+        ...(this._keepPacks.length ? { keepPacks: this._keepPacks } : {}),
+        ...(this._packKeptObjects !== undefined ? { packKeptObjects: this._packKeptObjects } : {}),
+        updateServerInfo:
+          this._updateServerInfo ?? this.configBool("repack.updateServerInfo", true),
+        deltaIslands: this._deltaIslands ?? this.configBool("repack.useDeltaIslands", false),
+        ...(noDelta ? { noDelta } : {}),
+      });
+    const result = noDelta && worktree?.batch ? await worktree.batch(run) : await run();
     const output: string[] = [];
     if (!result && !this._quiet) output.push("Nothing new to pack.");
     return {
