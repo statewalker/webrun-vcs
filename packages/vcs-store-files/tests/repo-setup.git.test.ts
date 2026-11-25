@@ -203,7 +203,9 @@ describeGit("repository setup (t1510, t1501 native twins)", () => {
     const gitfile = (n & 8) !== 0;
     const bare = (n & 16) !== 0;
     it(`t1510-repo-setup.sh: "${TITLES[n]}"`, async () => {
-      const cfgChoices = wtCfg ? ["..", "TOP", "../wt", "TOP/wt"] : [undefined];
+      const cfgChoices: Array<string | undefined> = wtCfg
+        ? ["..", "TOP", "../wt", "TOP/wt"]
+        : [undefined];
       for (const cfgChoice of cfgChoices) {
         const name = `${n}-${cfgChoices.indexOf(cfgChoice)}`;
         const top = join(here, name);
