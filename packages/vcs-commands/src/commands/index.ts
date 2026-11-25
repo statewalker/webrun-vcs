@@ -93,6 +93,7 @@ export {
   combineNotesOverwrite,
   NotesTree,
 } from "./notes-tree.js";
+export * from "./object-store/index.js";
 export * from "./pack-refs-command.js";
 export { type PatchIdTextOptions, patchIdsOfPatchText } from "./patch-id.js";
 export * from "./patch-id-command.js";

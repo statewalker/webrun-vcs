@@ -174,6 +174,11 @@ export interface LinkStats {
    * git records of a directory in the untracked cache (`stat_data.sd_size`)
    */
   statSize?: number;
+  /**
+   * The 512-byte blocks the entry takes on disk (`st_blocks`), where the storage reports
+   * them: git's `on_disk_bytes` (`count-objects`' sizes) is `st_blocks * 512`
+   */
+  blocks?: number;
 }
 
 /** Options of {@link PosixFilesApi.listKinds}. */

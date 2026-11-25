@@ -932,6 +932,8 @@ describe("a stack read while a compaction deletes its tables (webrun-vcs#232)", 
     });
     const read = createReftableStackReader(files, ".git/reftable", undefined, 20).read();
     await expect(read).rejects.toThrow(/kept changing/);
-    expect(round).toBeGreaterThan(3);
+    // at least the three tries git always makes; a slow machine is past the 20 ms deadline
+    // by then and stops at exactly three
+    expect(round).toBeGreaterThanOrEqual(3);
   });
 });
