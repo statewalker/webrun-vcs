@@ -41,6 +41,7 @@ import { endOfSymbolicChain, installTracking, pushTrackingPlan } from "./branch-
 import { hostEnvironmentOf } from "./git-ident.js";
 import { remoteHookSession } from "./local-transport.js";
 import { withRemoteReceivePack } from "./remote-transport.js";
+import { clientSessionIdOf } from "./session-id.js";
 import { SIGNING_FAILED_LINES, SigningFailedError } from "./signing.js";
 import {
   createSubmoduleAuthPolicy,
@@ -728,7 +729,9 @@ export class PushCommand extends TransportCommand<PushResult> {
     const recurseOnPush =
       recurse !== undefined && new SubmoduleFetchRepository(this.workingCopy).hasWorktree();
     const submoduleOutput = { text: submoduleWarnings.map((w) => `${w}\n`).join("") };
+    const sessionId = clientSessionIdOf(this.workingCopy);
     const pushOptions: TransportPushOptions = {
+      ...(sessionId !== undefined ? { sessionId } : {}),
       url: remoteUrl,
       auth: this.credentials,
       headers: this.headers,
@@ -992,6 +995,7 @@ export class PushCommand extends TransportCommand<PushResult> {
     return {
       uri: remoteUrl,
       remoteUpdates,
+      ...(result.serverSessionId !== undefined ? { serverSessionId: result.serverSessionId } : {}),
       bytesSent: result.bytesSent,
       objectCount: result.packObjects,
       messages,

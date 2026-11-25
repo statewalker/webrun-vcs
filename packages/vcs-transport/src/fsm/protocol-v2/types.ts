@@ -97,18 +97,52 @@ export function serverV2Capabilities(
   advertiseObjectInfo = false,
   repository?: Pick<RepositoryFacade, "getObjectSize" | "getObjectType" | "objectFormat">,
   uploadPackFilter?: UploadPackFilterPolicy,
+  options: ServerV2CapabilityOptions = {},
 ): string[] {
-  // `fetch=... filter` with uploadpack.allowFilter; `object-format=` names the repository's
-  // hash (serve.c's object_format_advertise)
+  // `fetch=... filter` with uploadpack.allowFilter, `ref-in-want` with
+  // uploadpack.allowRefInWant (upload_pack_advertise's order); `object-format=` names the
+  // repository's hash (serve.c's object_format_advertise)
   const list = v2ObjectFormatCapabilities(
-    withFilterFeature(capabilities, uploadPackFilter),
+    withRefInWantFeature(
+      withFilterFeature(capabilities, uploadPackFilter),
+      options.allowRefInWant === true,
+    ),
     formatOf(repository),
   );
+  // serve.c's order: ... object-format, session-id, object-info
+  if (options.sessionId !== undefined && !list.some((c) => c.startsWith("session-id="))) {
+    const objectInfo = list.findIndex((c) => c === "object-info" || c.startsWith("object-info="));
+    list.splice(objectInfo >= 0 ? objectInfo : list.length, 0, `session-id=${options.sessionId}`);
+  }
   const named = list.some((c) => c === "object-info" || c.startsWith("object-info="));
   if (!advertiseObjectInfo || named) return list;
   const attributes = objectInfoAttributes(repository);
   if (attributes.length > 0) list.push(`object-info=${attributes.join(" ")}`);
   return list;
+}
+
+/** What else {@link serverV2Capabilities} advertises. */
+export interface ServerV2CapabilityOptions {
+  /** `fetch=... ref-in-want` (git's `uploadpack.allowRefInWant`) */
+  allowRefInWant?: boolean;
+  /** `session-id=<id>` (git's `transfer.advertiseSID`) */
+  sessionId?: string;
+}
+
+/**
+ * The `fetch=` capability with `ref-in-want` added (after `filter`, as git's
+ * upload_pack_advertise) when `allow`; the capabilities as they are otherwise.
+ */
+export function withRefInWantFeature(capabilities: readonly string[], allow: boolean): string[] {
+  if (!allow) return [...capabilities];
+  return capabilities.map((c) => {
+    if (c !== "fetch" && !c.startsWith("fetch=")) return c;
+    const features = c === "fetch" ? [] : c.slice("fetch=".length).split(" ").filter(Boolean);
+    if (features.includes("ref-in-want")) return c;
+    const after = Math.max(features.indexOf("filter"), features.indexOf("wait-for-done"));
+    features.splice(after >= 0 ? after + 1 : features.length, 0, "ref-in-want");
+    return `fetch=${features.join(" ")}`;
+  });
 }
 
 /** The object-info attributes a facade can answer (both without a facade to look at). */

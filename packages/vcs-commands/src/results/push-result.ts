@@ -80,6 +80,11 @@ export interface RemoteRefReport {
 export interface PushResult {
   /** URI of the remote that was pushed to */
   uri: string;
+  /**
+   * receive-pack's session id, advertised under its `transfer.advertiseSID` (git's trace2
+   * `server-sid`); this side sends its own (`processSessionId()`) under its own setting
+   */
+  serverSessionId?: string;
   /** Results for each ref update */
   remoteUpdates: RemoteRefUpdate[];
   /** Total bytes sent */

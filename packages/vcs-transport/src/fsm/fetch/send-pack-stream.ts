@@ -159,14 +159,17 @@ export async function sendPackStream(
       if (error instanceof PackObjectsError) {
         // create_pack_file: pack-objects' stderr (its warnings, then its death) on the
         // progress band, then the abort
-        for (const line of error.lines) {
-          await transport.writeSideband(2, textEncoder.encode(`${line}\n`));
+        if (!error.abortOnly) {
+          for (const line of error.lines) {
+            await transport.writeSideband(2, textEncoder.encode(`${line}\n`));
+          }
+          await transport.writeSideband(2, textEncoder.encode(`fatal: ${error.message}\n`));
         }
-        await transport.writeSideband(2, textEncoder.encode(`fatal: ${error.message}\n`));
         // sent with its NUL, as git's sizeof(abort_msg)
         await transport.writeSideband(3, textEncoder.encode(`${PACK_OBJECTS_ABORT}\0`));
         await transport.writeFlush();
-        return { ok: false, error: `fatal: ${error.message}`, inBand: true };
+        const reported = error.abortOnly ? error.message : `fatal: ${error.message}`;
+        return { ok: false, error: reported, inBand: true };
       }
       await transport.writeSideband(3, textEncoder.encode(`ERR ${error}`));
       await transport.writeFlush();

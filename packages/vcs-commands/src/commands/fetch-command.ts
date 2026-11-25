@@ -63,6 +63,7 @@ import {
   registerPartialClone,
 } from "./promisor-remote.js";
 import { withRemoteUploadPack } from "./remote-transport.js";
+import { clientSessionIdOf } from "./session-id.js";
 import {
   createSubmoduleAuthPolicy,
   guardSubmoduleTransports,
@@ -915,8 +916,10 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       this.checkFetchedObjects,
     );
 
+    const sessionId = clientSessionIdOf(this.workingCopy);
     const unpackLimit = unpackLimitOf({ getAll: (key) => store.values(key) }, "fetch");
     const fetchOptions: TransportFetchOptions = {
+      ...(sessionId !== undefined ? { sessionId } : {}),
       url: remoteUrl,
       auth: this.credentials,
       headers: this.headers,
@@ -1112,6 +1115,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
 
     return {
       uri: remoteUrl,
+      ...(result.serverSessionId !== undefined ? { serverSessionId: result.serverSessionId } : {}),
       advertisedRefs,
       trackingRefUpdates: trackingUpdates,
       ...(commitGraphHashes ? { commitGraph: commitGraphHashes } : {}),

@@ -12,6 +12,7 @@ import type {
   ReceivePackLogger,
   ReceivePackRequestInfo,
 } from "../push/receive-pack-types.js";
+import type { PackObjectsHook } from "./pack-objects-hook.js";
 
 /** What a fetch asks for, as upload-pack's hooks see it. */
 export interface UploadPackRequest {
@@ -120,6 +121,11 @@ export interface UploadPackConfig {
   repoPath?: string;
   /** Logs hook failures (default: console.error) */
   logger?: ReceivePackLogger;
+  /**
+   * git's `uploadpack.packObjectsHook`, as the host runs it (see `PackObjectsHook`): the pack
+   * comes from it instead of the repository facade's `exportPack`
+   */
+  packObjectsHook?: PackObjectsHook;
 }
 
 /** The reason given when the authorize hook throws (details: the log). */

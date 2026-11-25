@@ -433,6 +433,8 @@ async function serveRaw(
     service: "git-upload-pack",
     protocolVersion: "2",
     capabilities,
+    // want-ref lines need git's uploadpack.allowRefInWant
+    allowRefInWant: true,
   });
   return concat(out);
 }

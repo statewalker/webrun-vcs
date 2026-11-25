@@ -31,4 +31,9 @@ export interface ServeResult {
   error?: string;
   /** Number of objects sent */
   objectsSent?: number;
+  /**
+   * The `session-id` the client sent (only to a server advertising one: git's
+   * `transfer.advertiseSID`), as git's trace2 `client-sid`
+   */
+  clientSessionId?: string;
 }

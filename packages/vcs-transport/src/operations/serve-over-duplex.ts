@@ -14,6 +14,7 @@ import type { ProcessConfiguration, UploadPackRequestPolicy } from "../context/p
 import type { ProcessContext, RefStore } from "../context/process-context.js";
 import { ProtocolState } from "../context/protocol-state.js";
 import { createTransportApi } from "../factories/transport-api-factory.js";
+import type { PackObjectsHook } from "../fsm/fetch/pack-objects-hook.js";
 import { serverFetchHandlers, serverFetchTransitions } from "../fsm/fetch/server-fetch-fsm.js";
 import type { UploadPackFilterPolicy } from "../fsm/fetch/upload-pack-filter.js";
 import type { UploadPackHooks } from "../fsm/fetch/upload-pack-hooks.js";
@@ -33,6 +34,7 @@ import {
   serverPushTransitions,
 } from "../fsm/push/server-push-fsm.js";
 import { encodePacketLine } from "../protocol/pkt-line-codec.js";
+import { processSessionId, validSessionId } from "../protocol/session-id.js";
 import type { ServiceType } from "../protocol/types.js";
 import { withIdleTimeout, withWriteTimeout } from "../utils/idle-timeout.js";
 
@@ -165,6 +167,34 @@ export interface ServeOverDuplexOptions {
    */
   requestPolicy?: UploadPackRequestPolicy;
   /**
+   * upload-pack over protocol v0/v1: which objects a client may want by id, as git's
+   * `uploadpack.allowTipSHA1InWant` / `allowReachableSHA1InWant` / `allowAnySHA1InWant` set it
+   * (`uploadPackRequestPolicyOf`; advertised as `allow-tip-sha1-in-want` and
+   * `allow-reachable-sha1-in-want`). Ignored over v2, which serves any object as git does, and
+   * when `requestPolicy` is given. Default "ADVERTISED"
+   */
+  uploadPackRequestPolicy?: UploadPackRequestPolicy;
+  /**
+   * Protocol v2: advertise `fetch=... ref-in-want` and take `want-ref` lines (git's
+   * `uploadpack.allowRefInWant`). Default false, as git: a `want-ref` line ends the
+   * connection as an unexpected line
+   */
+  allowRefInWant?: boolean;
+  /**
+   * git's `transfer.advertiseSID`: upload-pack and receive-pack advertise `session-id=<id>`
+   * (v0 capability, v2 capability line), the id {@link sessionId} names; the client's own
+   * session id comes back as `ServeResult.clientSessionId`. Default false
+   */
+  advertiseSID?: boolean;
+  /** The session id {@link advertiseSID} advertises (default: one per process, `processSessionId()`) */
+  sessionId?: string;
+  /**
+   * upload-pack: git's `uploadpack.packObjectsHook`, run by the host (see `PackObjectsHook`):
+   * the pack comes from its stdout. git reads the setting only from protected configuration,
+   * so a served repository's config never sets it (`serverSettingsFromConfig` does not read it)
+   */
+  packObjectsHook?: PackObjectsHook;
+  /**
    * Protocol v2: advertise and serve `object-info` (`object-info=size type`, as git with
    * `transfer.advertiseObjectInfo`). Default false, as git: not advertised, and refused.
    */
@@ -267,7 +297,13 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
       service === "git-receive-pack"
         ? receivePackCapabilitiesOf(options.capabilities, options)
         : options.capabilities,
-    requestPolicy: options.requestPolicy,
+    requestPolicy:
+      options.requestPolicy ??
+      (useV2 || service === "git-receive-pack" ? undefined : options.uploadPackRequestPolicy),
+    ...(options.allowRefInWant ? { allowRefInWant: true } : {}),
+    ...(options.advertiseSID
+      ? { sessionId: validSessionId(options.sessionId) ?? processSessionId() }
+      : {}),
     advertiseObjectInfo: options.advertiseObjectInfo,
     ...(options.uploadPackFilter ? { uploadPackFilter: options.uploadPackFilter } : {}),
     hiddenRefs: [
@@ -276,7 +312,11 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
         ? options.receivePackHideRefs
         : options.uploadPackHideRefs) ?? []),
     ],
-    uploadPack: { hooks: options.uploadPackHooks, logger: options.logger },
+    uploadPack: {
+      hooks: options.uploadPackHooks,
+      logger: options.logger,
+      ...(options.packObjectsHook ? { packObjectsHook: options.packObjectsHook } : {}),
+    },
     allowDeletes: options.allowDeletes ?? true,
     allowNonFastForward: options.allowNonFastForward ?? false,
     denyCurrentBranch: options.denyCurrentBranch ?? true,
@@ -337,18 +377,24 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
       await (write ?? ((data: Uint8Array) => duplex.write(data)))(encodePacketLine("version 1\n"));
     }
     const success = await fsm.run(ctx);
+    const clientSid =
+      ctx.output.clientSessionId !== undefined
+        ? { clientSessionId: ctx.output.clientSessionId }
+        : {};
     for (const task of afterReport) setTimeout(() => void task(), 0);
 
     if (!success || ctx.output.error) {
       return {
         success: false,
         error: ctx.output.error ?? "FSM did not complete successfully",
+        ...clientSid,
       };
     }
 
     return {
       success: true,
       objectsSent: ctx.output.objectCount,
+      ...clientSid,
     };
   } catch (error) {
     return {

@@ -81,6 +81,18 @@ export interface FetchPackRequest {
    * `server-option` is refused as git's `ensure_server_supports_v2` refuses it
    */
   serverOptions?: readonly string[];
+  /**
+   * The client's session id, sent as `session-id=<id>` to a server advertising one (git's
+   * `transfer.advertiseSID` on the client); undefined: none sent
+   */
+  sessionId?: string;
+  /**
+   * Refs to ask for by name, `want-ref <name>`, when the server takes them (v2
+   * `fetch=... ref-in-want`, git's add_wants): each name's id is then left out of the `want`
+   * lines, and the ids the server answers come back as {@link FetchPackResult.wantedRefs}.
+   * Ignored by a server without `ref-in-want`
+   */
+  wantRefs?: ReadonlyArray<{ name: string; oid: string }>;
   /** Stores the pack as it arrives (never buffered whole) */
   importPack(pack: AsyncIterable<Uint8Array>): Promise<PackImportResult>;
   /**
@@ -114,6 +126,11 @@ export interface FetchPackResult {
   /** Bytes of the pack */
   packBytes: number;
   stats: NegotiationStats;
+  /**
+   * The server's `wanted-refs` section (v2 with `want-ref`): each ref asked for by name and the
+   * id the server sent for it, which may differ from the one listed before (it moved)
+   */
+  wantedRefs?: Map<string, string>;
 }
 
 /**
@@ -262,6 +279,10 @@ async function fetchPackV0(
   // the filter capability asked for with the request's filter (find_common)
   if (request.filter) wanted.push("filter");
   if (caps.has("agent")) wanted.push(`agent=${CLIENT_AGENT}`);
+  // transfer.advertiseSID: only to a server that advertises its own (find_common)
+  if (request.sessionId !== undefined && caps.has("session-id")) {
+    wanted.push(`session-id=${request.sessionId}`);
+  }
 
   // the request's "state": wants (capabilities on the first), shallow and deepen lines, filter
   const state: Uint8Array[] = [];
@@ -388,6 +409,10 @@ async function fetchPackV2(
   const caps = connection.capabilities;
   const head: Uint8Array[] = [encodePacketLine("command=fetch")];
   if (caps.has("agent")) head.push(encodePacketLine(`agent=${CLIENT_AGENT}`));
+  // transfer.advertiseSID (write_fetch_command_and_capabilities)
+  if (request.sessionId !== undefined && caps.has("session-id")) {
+    head.push(encodePacketLine(`session-id=${request.sessionId}`));
+  }
   for (const line of serverOptionLines(connection, request.serverOptions)) head.push(line);
   // write_command_and_capabilities: the client's own format, once checked against the
   // server's (checkObjectFormat)
@@ -401,7 +426,20 @@ async function fetchPackV2(
   head.push(encodePacketLine("ofs-delta"));
   for (const line of shallowLines(request, shallow)) head.push(encodePacketLine(line));
   if (request.filter) head.push(encodePacketLine(`filter ${request.filter}`));
-  for (const oid of request.wants) head.push(encodePacketLine(`want ${oid}`));
+  // add_wants: `want-ref <name>` for the refs asked for by name when the server takes them,
+  // `want <id>` for the rest
+  const byName = fetchFeatures(connection).has("ref-in-want") ? (request.wantRefs ?? []) : [];
+  const named = new Set(byName.map((r) => r.oid));
+  for (const oid of request.wants) {
+    if (!named.has(oid)) head.push(encodePacketLine(`want ${oid}`));
+  }
+  const asked = new Set<string>();
+  for (const { name } of byName) {
+    if (asked.has(name)) continue;
+    asked.add(name);
+    head.push(encodePacketLine(`want-ref ${name}`));
+  }
+  let wantedRefs: Map<string, string> | undefined;
 
   const stats: NegotiationStats = { rounds: 0, haves: 0 };
   const commons: string[] = [];
@@ -484,13 +522,27 @@ async function fetchPackV2(
           else if (line.startsWith("unshallow ")) shallowUpdate.unshallow.push(line.slice(10));
           else throw new TransportError(`Unexpected ${line} in shallow-info`);
         }
-      } else if (section !== "wanted-refs") {
+      } else if (section === "wanted-refs") {
+        // receive_wanted_refs: `<id> <name>` of a ref asked for
+        wantedRefs = new Map();
+        for (const line of lines) {
+          const space = line.indexOf(" ");
+          const name = space < 0 ? "" : line.slice(space + 1);
+          if (space < 0 || !asked.has(name)) {
+            throw new TransportError(
+              space < 0 ? `expected wanted-ref, got '${line}'` : `unexpected wanted-ref: '${line}'`,
+            );
+          }
+          wantedRefs.set(name, line.slice(0, space));
+        }
+      } else {
         throw new TransportError(`Unexpected section ${section}`);
       }
       section = await pkts.readLine();
     }
     await request.onShallowUpdate?.(shallowUpdate);
-    return receivePack(pkts, request, shallowUpdate, stats);
+    const received = await receivePack(pkts, request, shallowUpdate, stats);
+    return wantedRefs ? { ...received, wantedRefs } : received;
   }
 }
 

@@ -490,10 +490,12 @@ describeGit("Interop · server parity with native git", { timeout: TIMEOUT }, ()
 
     it("v2: a want-ref of a hidden ref is an unknown ref, as git", async () => {
       const body = v2Fetch([], [], ["want-ref refs/hidden/secret"]);
-      const [native, our] = await bothUploadPack(body, true, OUR_HIDE, [
-        ...GIT_HIDE_CONFIG,
-        ["uploadpack.allowRefInWant", "true"],
-      ]);
+      const [native, our] = await bothUploadPack(
+        body,
+        true,
+        { ...OUR_HIDE, allowRefInWant: true },
+        [...GIT_HIDE_CONFIG, ["uploadpack.allowRefInWant", "true"]],
+      );
       expect(parseResponse(our).lines[0]).toBe(parseResponse(native).lines[0]);
       expect(parseResponse(our).lines[0]).toBe("ERR unknown ref refs/hidden/secret");
     });
@@ -638,6 +640,7 @@ describeGit("Interop · server parity with native git", { timeout: TIMEOUT }, ()
       const seen: UploadPackRequest[] = [];
       const h = handler({
         ...OUR_HIDE,
+        allowRefInWant: true,
         uploadPack: {
           ...OUR_HIDE.uploadPack,
           hooks: {

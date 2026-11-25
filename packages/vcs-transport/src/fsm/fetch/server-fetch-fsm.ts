@@ -23,6 +23,7 @@ import {
 import { visibleRefs } from "../../protocol/hidden-refs.js";
 import { formatOf, v0ObjectFormatCapabilities } from "../../protocol/object-format.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
+import { packFromHook, packObjectsHookInput } from "./pack-objects-hook.js";
 import { sendPackStream } from "./send-pack-stream.js";
 import { checkUploadPackFilter, withFilterCapability } from "./upload-pack-filter.js";
 import {
@@ -262,6 +263,10 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
         if (headTarget && !offered.some((c) => c.startsWith("symref="))) {
           offered.push(`symref=HEAD:${headTarget}`);
         }
+        // transfer.advertiseSID: `session-id=<id>` after `filter` (write_v0_ref)
+        if (config.sessionId !== undefined && !offered.some((c) => c.startsWith("session-id="))) {
+          offered.push(`session-id=${config.sessionId}`);
+        }
         const capabilities = v0ObjectFormatCapabilities(offered, format);
 
         let first = true;
@@ -348,6 +353,9 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
               );
               // v0 asks for a relative deepen with a capability (v2 with an argument line)
               if (state.capabilities.has("deepen-relative")) state.deepenRelative = true;
+              // the client's session id (receive_needs' trace2 `client-sid`)
+              const sid = parts.slice(2).find((c) => c.startsWith("session-id="));
+              if (sid !== undefined) output.clientSessionId = sid.slice("session-id=".length);
             }
             state.wants.add(oid);
           } else if (line.startsWith("shallow ")) {
@@ -773,22 +781,50 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
         // own); the parents of unshallowed commits are tips of their own
         const wants = new Set(state.wants);
         for (const oid of state.extraWants ?? []) if (!state.commonBase.has(oid)) wants.add(oid);
-        const packStream = repository.exportPack(wants, state.commonBase, {
-          thin,
-          ofsDelta: state.capabilities.has("ofs-delta"),
-          includeTag,
-          // git's pack-objects --include-tag: the visible annotated tags of packed objects
-          includeTags: includeTag
-            ? await includeTagCandidates(config, getRefStore(ctx))
-            : undefined,
-          filterSpec: state.filterSpec,
-          shallow: state.packShallow ?? state.serverShallow,
-        });
+        const hook = config.uploadPack?.packObjectsHook;
+        const packShallow = state.packShallow ?? state.serverShallow;
+        const packStream = hook
+          ? // uploadpack.packObjectsHook: the host's command builds the pack (create_pack_file);
+            // its stderr is the progress band
+            packFromHook(
+              hook,
+              {
+                shallow: (packShallow?.size ?? 0) > 0,
+                thin,
+                progress: !noProgress,
+                ofsDelta: state.capabilities.has("ofs-delta"),
+                includeTag,
+                ...(state.filterSpec ? { filter: state.filterSpec } : {}),
+              },
+              packObjectsHookInput({
+                shallow: packShallow ?? [],
+                wants: state.wants,
+                haves: state.commonBase,
+                extraEdges: [...(state.extraWants ?? [])].filter(
+                  (oid) => !state.commonBase.has(oid),
+                ),
+              }),
+              (chunk) => {
+                if (useSideband) void transport.writeSideband(2, chunk).catch(() => {});
+              },
+            )
+          : repository.exportPack(wants, state.commonBase, {
+              thin,
+              ofsDelta: state.capabilities.has("ofs-delta"),
+              includeTag,
+              // git's pack-objects --include-tag: the visible annotated tags of packed objects
+              includeTags: includeTag
+                ? await includeTagCandidates(config, getRefStore(ctx))
+                : undefined,
+              filterSpec: state.filterSpec,
+              shallow: packShallow,
+            });
 
         // Band 1 with keep-alives until the first byte and errors on band 3; raw otherwise
         const sent = await sendPackStream(transport, packStream, {
           sideband: useSideband,
-          progress: !noProgress,
+          // with the hook, pack-objects' own progress is on its stderr
+          progress: !noProgress && !hook,
           keepAliveMs: config.keepAliveMs,
         });
         if (sent.ok) {

@@ -5,10 +5,13 @@
  */
 
 import { historyWithoutLazyFetch } from "@statewalker/vcs-core";
+import { readProtectedConfig } from "@statewalker/vcs-store-files";
 import {
   createRepositoryFacade,
   createTransportRefStore,
   type GitServeSettings,
+  type PackObjectsHook,
+  packObjectsHookArgs,
   type ServedRepository,
   type ServedRequestContext,
   type ServerConfigReader,
@@ -41,6 +44,13 @@ export interface ServedRepositoryOptions {
    * read confined to its own git directories (`confineFiles`), never from the host
    */
   host?: ReceivePackHost;
+  /**
+   * git's `uploadpack.packObjectsHook`: by default (`"protected"`) the last value of the
+   * host's protected configuration (system, global, command line: `readProtectedConfig` of
+   * the hooks' host environment), never the served repository's own config, run through the
+   * host's hook runner in the git directory (`packObjectsHookOf`); `false` runs none
+   */
+  packObjectsHook?: "protected" | false;
 }
 
 /** What the served repository's config decides: left to `serveGitService`'s layering. */
@@ -51,6 +61,7 @@ const CONFIG_KEYS = [
   "denyDeleteCurrent",
   "shallowUpdate",
   "advertisePushOptions",
+  "advertiseSID",
   "advertiseAtomic",
   "maxInputSize",
   "receiveKeepAliveMs",
@@ -111,6 +122,10 @@ export async function servedRepositoryOf(
     settings.receivePackConfigError = fsckError;
   }
   const hooks = options.hooks;
+  if (options.packObjectsHook !== false && hooks) {
+    const hook = await packObjectsHookOf(hooks);
+    if (hook) settings.packObjectsHook = hook;
+  }
   return {
     repository: createRepositoryFacade({
       history: historyWithoutLazyFetch(remote.history),
@@ -141,4 +156,41 @@ export async function servedRepositoryOf(
       return withReceiveTransactionHook(remote, session, serve);
     },
   };
+}
+
+/**
+ * upload-pack's `uploadpack.packObjectsHook` as the host runs it: the last value of the
+ * protected configuration of the session's host environment (upload_pack_protected_config:
+ * system, global, command line; a key without a value is git's `config_error_nonbool`, no
+ * hook here), started through the session's runner as git starts it (`<hook> git
+ * pack-objects ...` through the shell, in the git directory). Undefined when none is set or
+ * no runner can start it.
+ *
+ * @example
+ * ```ts
+ * // ~/.gitconfig: [uploadpack] packObjectsHook = /srv/bin/pack-cache
+ * const hook = await packObjectsHookOf(remoteHookSession(workingCopy, opened));
+ * ```
+ */
+export async function packObjectsHookOf(
+  hooks: HookSession | undefined,
+): Promise<PackObjectsHook | undefined> {
+  const environment = hooks?.hostEnvironment;
+  if (!hooks?.enabled || !environment) return undefined;
+  let command: string | undefined;
+  for (const entry of await readProtectedConfig(environment)) {
+    if (entry.key.toLowerCase() === "uploadpack.packobjectshook") command = entry.value;
+  }
+  if (!command) return undefined;
+  const hookCommand = command;
+  // git before 2.56 (create_pack_file's own argv) orders the arguments otherwise
+  const legacy = hooks.compatibility === "2.43";
+  return ({ args, options, stdin, onStderr }) =>
+    hooks.startShellCommand(
+      "pack-objects-hook",
+      hookCommand,
+      legacy ? packObjectsHookArgs(options, "2.43") : args,
+      stdin,
+      onStderr,
+    );
 }

@@ -3,6 +3,7 @@
  */
 
 export * from "./pack-objects-error.js";
+export * from "./pack-objects-hook.js";
 export * from "./send-pack-stream.js";
 export * from "./server-fetch-fsm.js";
 export * from "./types.js";

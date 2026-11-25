@@ -20,6 +20,7 @@ import {
   TransportError,
 } from "../protocol/index.js";
 import { formatOf, isNullId } from "../protocol/object-format.js";
+import { validSessionId } from "../protocol/session-id.js";
 import { type AbbrevLengths, abbrevLengthsOf, transportSummaryWidth } from "../summary/index.js";
 import type { ReceivePackConnection } from "./connection.js";
 import {
@@ -42,6 +43,11 @@ import { resolveRevision } from "./revision.js";
 export interface PushClientOptions {
   /** Where the objects come from (the pack) and the ancestry checks read */
   repository: RepositoryFacade;
+  /**
+   * The client's session id (git's `transfer.advertiseSID`): sent as `session-id=<id>` to a
+   * receive-pack that advertises its own; undefined: none sent
+   */
+  sessionId?: string;
   /** The local refs (the refspec sources) */
   refStore: RefStore;
   /**
@@ -149,6 +155,8 @@ export class PushRefusedByHookError extends TransportError {
 export interface PushClientResult {
   /** The remote refs advertised (before the push) */
   remoteRefs: RemoteRef[];
+  /** receive-pack's `session-id` (its `transfer.advertiseSID`), as git's trace2 `server-sid` */
+  serverSessionId?: string;
   /** Each remote ref the refspecs matched, with its status */
   updates: PushRefUpdate[];
   /** Whether every update succeeded (`ok` or `up-to-date`) and the pack was unpacked */
@@ -429,9 +437,15 @@ async function sendPack(
   if (options.pushOptions?.length) requested.push("push-options");
   if (serverFormat !== undefined) requested.push(`object-format=${format.name}`);
   if (caps.has("agent")) requested.push(`agent=${CLIENT_AGENT}`);
+  // transfer.advertiseSID, only to a server advertising its own (send_pack)
+  if (options.sessionId !== undefined && caps.has("session-id")) {
+    requested.push(`session-id=${options.sessionId}`);
+  }
+  const serverSid = validSessionId(caps.get("session-id"));
 
   const result: PushClientResult = {
     remoteRefs,
+    ...(serverSid !== undefined ? { serverSessionId: serverSid } : {}),
     updates,
     ok: false,
     capabilities: requested,
