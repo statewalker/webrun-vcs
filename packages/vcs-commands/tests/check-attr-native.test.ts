@@ -49,7 +49,7 @@ interface Run {
 }
 
 function envOf(run: Run): Record<string, string> {
-  const base = plumbingEnv(root, run.env);
+  const base: Record<string, string> = plumbingEnv(root, run.env);
   const config = run.config ?? [];
   const count = Number(base.GIT_CONFIG_COUNT ?? "0");
   const env: Record<string, string> = { ...base, GIT_CONFIG_COUNT: String(count + config.length) };
