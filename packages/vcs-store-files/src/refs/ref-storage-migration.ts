@@ -27,14 +27,15 @@
  */
 
 import type { FilesApi } from "@statewalker/vcs-core";
-import { compareRefNames, isSymbolicRef, isValidRefName, joinPath } from "@statewalker/vcs-core";
+import { compareRefNames, isValidRefName, joinPath } from "@statewalker/vcs-core";
 import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
+import type { PosixFilesApi } from "@statewalker/vcs-utils/files";
 import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 
 import { readRepositoryFormat } from "../repository-format.js";
 import { editConfigFile } from "../workspace/working-copy/config-file-edit.js";
 import { isRootRefName } from "./files-ref-batch.js";
-import { readAllRefs, readLooseRef } from "./ref-reader.js";
+import { readPackedRefs } from "./packed-refs-reader.js";
 import { createReftableStackReader } from "./reftable/reftable-stack.js";
 import { createReftableStackWriter } from "./reftable/reftable-stack-writer.js";
 import type { ReftableLogWrite, ReftableWriteOptions } from "./reftable/reftable-writer.js";
@@ -71,16 +72,13 @@ export interface MigrateRefStorageResult {
 }
 
 /**
- * A refused or failed migration; the message is git's (`error: <message>` once printed). A
- * failure after the new storage was written names the migration directory as git does
- * (`migrated refs can be found at '<dir>'`) while it still holds the refs.
+ * A refused or failed migration; the message is git's (`error: <message>` once printed).
+ * Every such failure comes before the commit point and leaves the repository in its old
+ * format with the migration directory removed (git's `migrated refs can be found at` is never
+ * needed: problems after the commit point are {@link MigrateRefStorageResult.warnings}).
  */
 export class RefMigrationError extends Error {
-  constructor(
-    message: string,
-    /** The migration directory, when it holds the migrated refs */
-    readonly migrationDir?: string,
-  ) {
+  constructor(message: string) {
     super(message);
     this.name = "RefMigrationError";
   }
@@ -136,6 +134,12 @@ async function listNames(files: FilesApi, dir: string): Promise<string[]> {
   const names: string[] = [];
   for await (const entry of files.list(dir)) names.push(entry.name);
   return names;
+}
+
+async function kindOf(files: FilesApi, path: string): Promise<string | undefined> {
+  const posix = files as PosixFilesApi;
+  if (posix.lstat) return (await posix.lstat(path))?.kind;
+  return (await files.stats(path))?.kind;
 }
 
 /** git's copy_reflog_msg (normalize_reflog_message): whitespace runs to one space, trimmed. */
@@ -228,6 +232,70 @@ interface SourceContent {
   logs: { name: string; entries: MigratedLogEntry[] }[];
 }
 
+/**
+ * A loose ref file as files_read_raw_ref reads it: a symbolic link naming `refs/...` is a
+ * symbolic ref, any other link is followed (inside the FilesApi); content is an object id
+ * (a line starting with one) or `ref: <target>`. Content git cannot parse (REF_ISBROKEN), a
+ * file that cannot be read, or a link leading outside the storage throws: the migration
+ * stops before anything of the old storage is touched. (git 2.56.1 migrates a repository
+ * holding a broken loose ref into an empty storage and deletes the old one, losing every ref;
+ * ours refuses instead.)
+ */
+async function readLooseRefFile(
+  files: FilesApi,
+  path: string,
+  hexLength: number,
+): Promise<{ objectId?: string; target?: string } | undefined> {
+  const posix = files as PosixFilesApi;
+  let at = path;
+  for (let depth = 0; depth < 5; depth++) {
+    const kind = posix.lstat ? (await posix.lstat(at))?.kind : (await files.stats(at))?.kind;
+    if (kind !== "symlink") break;
+    const raw = await posix.readlink?.(at);
+    if (!raw) throw new Error(`cannot read symbolic link '${at}'`);
+    const link = decodeGitPath(raw);
+    if (depth === 0 && link.startsWith("refs/") && isValidRefName(link)) return { target: link };
+    if (link.startsWith("/")) throw new Error(`cannot follow symbolic link '${at}' to '${link}'`);
+    const resolved = normalizeRelative(`${at.slice(0, at.lastIndexOf("/") + 1)}${link}`);
+    if (resolved === undefined) throw new Error(`cannot follow symbolic link '${at}' to '${link}'`);
+    at = resolved;
+  }
+  const bytes = await readBytes(files, at);
+  if (bytes === undefined) throw new Error(`cannot read ref file '${path}'`);
+  const text = decodeGitPath(bytes);
+  if (text.startsWith("ref:")) {
+    const target = text
+      .slice(4)
+      .replace(/^[ \t\n\v\f\r]+/, "")
+      .replace(/[ \t\n\v\f\r]+$/, "");
+    return { target };
+  }
+  const id = text.slice(0, hexLength);
+  const next = text[hexLength];
+  const broken =
+    !new RegExp(`^[0-9a-fA-F]{${hexLength}}$`).test(id) ||
+    (next !== undefined && !/[ \t\n\v\f\r]/.test(next));
+  if (broken) throw new Error(`cannot migrate the broken ref '${shownRef(path)}'`);
+  return { objectId: id.toLowerCase() };
+}
+
+/** A ref file's path as its ref name (its path below the git directory). */
+const shownRef = (path: string) => path.replace(/^.*?\/(refs\/|(?=[A-Z_-]+$))/, "$1");
+
+/** `a/b/../c` as `a/c`; undefined when it climbs above the root. */
+function normalizeRelative(path: string): string | undefined {
+  const lead = path.startsWith("/") ? "/" : "";
+  const out: string[] = [];
+  for (const part of path.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (out.length === 0) return undefined;
+      out.pop();
+    } else out.push(part);
+  }
+  return lead + out.join("/");
+}
+
 async function readFilesSource(
   files: FilesApi,
   gitDir: string,
@@ -235,27 +303,45 @@ async function readFilesSource(
   skipReflog: boolean,
 ): Promise<SourceContent> {
   const refs: MigratedRef[] = [];
+  const hex = objectFormat.hexLength;
+  const add = (name: string, value: { objectId?: string; target?: string } | undefined) => {
+    if (value?.target !== undefined) refs.push({ name, target: value.target });
+    else if (value?.objectId !== undefined) refs.push({ name, objectId: value.objectId });
+  };
   // refs_for_each_ref_ext with REFS_FOR_EACH_INCLUDE_ROOT_REFS: the root refs git finds in
   // the git directory (HEAD among them; FETCH_HEAD and MERGE_HEAD stay files), then refs/
   for (const name of (await listNames(files, gitDir)).sort(compareRefNames)) {
     if (name.startsWith(".") || name.endsWith(".lock")) continue;
     if (name !== "HEAD" && !isRootRefName(name)) continue;
-    if ((await files.stats(joinPath(gitDir, name)))?.kind !== "file") continue;
-    const ref = await readLooseRef(files, gitDir, name).catch(() => undefined);
-    if (!ref) continue;
-    refs.push(
-      isSymbolicRef(ref)
-        ? { name, target: ref.target }
-        : { name, objectId: (ref as { objectId: string }).objectId },
-    );
+    const path = joinPath(gitDir, name);
+    if ((await kindOf(files, path)) === "directory") continue;
+    add(name, await readLooseRefFile(files, path, hex));
   }
-  for (const ref of await readAllRefs(files, gitDir, "refs/")) {
-    refs.push(
-      isSymbolicRef(ref)
-        ? { name: ref.name, target: ref.target }
-        : { name: ref.name, objectId: (ref as { objectId: string }).objectId },
-    );
+  // the loose refs (every listing error stops the migration), then the packed ones they do
+  // not shadow, in name order
+  const loose = new Map<string, { objectId?: string; target?: string } | undefined>();
+  const walk = async (dir: string, prefix: string) => {
+    for (const name of await listNames(files, joinPath(gitDir, dir))) {
+      const path = joinPath(gitDir, dir, name);
+      const kind = await kindOf(files, path);
+      if (kind === "directory") {
+        await walk(`${dir}/${name}`, `${prefix}${name}/`);
+        continue;
+      }
+      if (name.endsWith(".lock")) continue;
+      const refName = `${prefix}${name}`;
+      if (!isValidRefName(refName)) continue;
+      loose.set(refName, await readLooseRefFile(files, path, hex));
+    }
+  };
+  if ((await files.stats(joinPath(gitDir, "refs")))?.kind === "directory") {
+    await walk("refs", "refs/");
   }
+  const all = new Map(loose);
+  for (const ref of (await readPackedRefs(files, gitDir, { strict: true })).refs) {
+    if (!all.has(ref.name)) all.set(ref.name, { objectId: ref.objectId as string });
+  }
+  for (const name of [...all.keys()].sort(compareRefNames)) add(name, all.get(name));
   const logs: SourceContent["logs"] = [];
   if (!skipReflog) {
     for (const name of await filesReflogNames(files, gitDir)) {
@@ -546,7 +632,8 @@ async function rootRefFiles(files: FilesApi, gitDir: string): Promise<string[]> 
   const out: string[] = [];
   for (const name of await listNames(files, gitDir)) {
     if (name.startsWith(".") || name.endsWith(".lock") || !isRootRefName(name)) continue;
-    if ((await files.stats(joinPath(gitDir, name)))?.kind === "file") out.push(name);
+    const kind = await kindOf(files, joinPath(gitDir, name));
+    if (kind !== undefined && kind !== "directory") out.push(name);
   }
   return out;
 }

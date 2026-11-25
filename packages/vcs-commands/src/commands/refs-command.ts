@@ -119,10 +119,7 @@ export class RefsMigrateCommand extends PlumbingCommand {
       for (const warning of result.warnings) this.warn(`warning: ${warning}`);
     } catch (error) {
       if (!(error instanceof RefMigrationError)) throw error;
-      const where = error.migrationDir
-        ? `\nmigrated refs can be found at '${shownIn(gitDir, error.migrationDir)}'`
-        : "";
-      this.warn(`error: ${error.message}${where}`);
+      this.warn(`error: ${error.message}`);
       return 255;
     }
     if (this.dryRun) {

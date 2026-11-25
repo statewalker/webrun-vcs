@@ -525,6 +525,36 @@ describe.skipIf(!canMigrate)("git refs migrate", () => {
     });
   }
 
+  it('files -> reftable with symbolic-link refs (t0602-reffiles-fsck.sh: "symlink symref content should be checked")', async () => {
+    // files_read_raw_ref: a link naming refs/... is a symbolic ref, any other is followed
+    const dir = repository("files");
+    commit(dir, "initial");
+    const git = join(dir, ".git");
+    rmSync(join(git, "HEAD"));
+    symlinkSync("refs/heads/main", join(git, "HEAD"));
+    symlinkSync("main", join(git, "refs", "heads", "alias"));
+    const { ours } = await checkMigrate(dir, { format: "reftable" });
+    expect(ok(ours, "symbolic-ref", "HEAD")).toBe("refs/heads/main\n");
+    expect(ok(ours, "rev-parse", "refs/heads/alias")).toBe(ok(ours, "rev-parse", "main"));
+  });
+
+  it('t1460-refs-migrate.sh: "$from_format -> $to_format: broken ref" (unparsable content, files)', async () => {
+    // a deliberate divergence: git 2.56.1 migrates this repository into an empty storage
+    // (every ref lost, exit 0); ours refuses and leaves it untouched
+    const dir = repository("files");
+    commit(dir, "initial");
+    writeFileSync(join(dir, ".git", "refs", "heads", "bad"), "garbage\n");
+    const before = refListing(dir);
+    const ours = await oursMigrate(dir, { format: "reftable" });
+    expect(ours).toEqual({
+      status: 255,
+      stdout: "",
+      stderr: "error: cannot migrate the broken ref 'refs/heads/bad'\n",
+    });
+    expect(refListing(dir)).toBe(before);
+    expect(readdirSync(join(dir, ".git")).filter((n) => n.startsWith("ref_migration"))).toEqual([]);
+  });
+
   it('t1460-refs-migrate.sh: "multiple reftable blocks with multiple entries"', async () => {
     const dir = repository("files");
     commit(dir, "first");
