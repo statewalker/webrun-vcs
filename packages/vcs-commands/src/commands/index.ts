@@ -12,6 +12,7 @@ export { TrackMode } from "./branch-tracking.js";
 export * from "./branch-upstream-command.js";
 export * from "./bundle/index.js";
 export * from "./check-attr-command.js";
+export * from "./check-ignore-command.js";
 export * from "./check-mailmap-command.js";
 export * from "./check-ref-format-command.js";
 export * from "./checkout-command.js";

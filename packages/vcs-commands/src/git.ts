@@ -24,6 +24,7 @@ import {
   BundleUnbundleCommand,
   BundleVerifyCommand,
   CheckMailmapCommand,
+  CheckIgnoreCommand,
   CheckAttrCommand,
   VarCommand,
   PatchIdCommand,
@@ -973,6 +974,20 @@ export class Git implements Disposable {
   checkMailmap(): CheckMailmapCommand {
     this.checkClosed();
     return new CheckMailmapCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a CheckIgnoreCommand (`git check-ignore`): which paths the ignore rules exclude, with
+   * `-v` the deciding pattern (`-n`, `--no-index`, `--stdin`, `-z`, `-q`).
+   *
+   * @example
+   * ```typescript
+   * await git.checkIgnore().setVerbose(true).addPath("build/x.o").call(); // stdout ".gitignore:1:build/\\tbuild/x.o\\n"
+   * ```
+   */
+  checkIgnore(): CheckIgnoreCommand {
+    this.checkClosed();
+    return new CheckIgnoreCommand(this._workingCopy);
   }
 
   /**

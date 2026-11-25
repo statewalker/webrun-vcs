@@ -221,9 +221,12 @@ function matchGitPattern(
   if (prefix > 0) {
     if (prefix > name.length) return false;
     if (fold(pat.slice(0, prefix)) !== fold(name.slice(0, prefix))) return false;
+    if (pat.length === prefix && name.length === prefix) return true;
+    // git 2.44+: keep one character of the prefix, so the match sees where a component
+    // starts (`foo**/bar` no longer takes `foobar`, as 2.43 did)
+    prefix--;
     pat = pat.slice(prefix);
     name = name.slice(prefix);
-    if (!pat.length && !name.length) return true;
   }
   return wildmatch(pat, name, { pathname: true, casefold: ignoreCase });
 }
@@ -264,9 +267,11 @@ function matchGitPatternBytes(
   if (prefix > 0) {
     if (prefix > name.length) return false;
     if (!sameBytes(pattern, start, name, 0, prefix, ignoreCase)) return false;
+    if (patternlen - start === prefix && name.length === prefix) return true;
+    // keep one byte of the prefix, as the text match keeps one character
+    prefix--;
     start += prefix;
     nameStart = prefix;
-    if (start === patternlen && nameStart === name.length) return true;
   }
   return wildmatchBytes(pattern.subarray(start), name.subarray(nameStart), {
     pathname: true,
