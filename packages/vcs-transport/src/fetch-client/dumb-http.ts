@@ -44,8 +44,11 @@ export interface DumbHttpOptions {
   /** How requests are sent */
   fetchImpl: (request: Request) => Promise<Response>;
   /**
-   * Headers (`Authorization` included) sent only to `credentialOrigin`, never elsewhere (a
-   * redirect to another origin or an alternate gets none)
+   * Headers (`Authorization` included) sent only with requests to `credentialOrigin`: a base
+   * the first request's redirect moved to another origin, and an alternate elsewhere, get none.
+   * Under `followRedirects: "always"` a later request's own redirect is followed by `fetch`,
+   * which drops `Authorization` across origins but carries other headers along (as curl does
+   * under git's `http.followRedirects=true`)
    */
   headers: Record<string, string>;
   /** The origin of the URL as given, before any redirect: the one `headers` are meant for */

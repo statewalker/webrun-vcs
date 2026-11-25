@@ -119,3 +119,27 @@ describe("credentials of a dumb connection", () => {
     expect(seen.slice(1)).toEqual([{ url: "https://evil.example/repo/HEAD", authorization: null }]);
   });
 });
+
+describe("credentials of a dumb connection, not redirected", () => {
+  it("every request to the repository's origin carries them", async () => {
+    const seen: Array<{ url: string; authorization: string | null }> = [];
+    const fetchImpl = async (request: Request): Promise<Response> => {
+      seen.push({ url: request.url, authorization: request.headers.get("authorization") });
+      const body = new URL(request.url).pathname.endsWith("/info/refs")
+        ? `${A}\trefs/heads/main\n`
+        : "ref: refs/heads/main\n";
+      return new Response(body, { headers: { "content-type": "text/plain" } });
+    };
+    const connection = await openHttpConnection({
+      url: "https://good.example/repo",
+      fetchImpl,
+      auth: { username: "u", password: "secret" },
+    });
+    expect(connection.dumb?.baseUrl).toBe("https://good.example/repo");
+    expect(seen.map((s) => s.url)).toEqual([
+      "https://good.example/repo/info/refs?service=git-upload-pack",
+      "https://good.example/repo/HEAD",
+    ]);
+    for (const request of seen) expect(request.authorization).not.toBeNull();
+  });
+});
