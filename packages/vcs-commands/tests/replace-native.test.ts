@@ -337,6 +337,23 @@ describeGit("git replace, native twins (t6050-replace.sh)", () => {
       new TextDecoder().decode(content).replace("\thello", "\tworld");
     await step(t, ["-e", "HEAD^{tree}"], "renamer");
     await step(t, ["--raw", "-e", "HEAD:hello"], "true");
+    // a raw tree whose two entries are swapped: git's strict fsck refuses it (treeNotSorted)
+    for (const dir of [t.native, t.ours]) {
+      writeFileSync(join(dir, "a"), "a\n");
+      shell.ok(dir, "add", "a");
+      shell.tick();
+      shell.ok(dir, "commit", "-q", "-m", "two entries");
+    }
+    writeFileSync(
+      join(t.native, "swapper"),
+      '#!/bin/sh\nnode -e \'const f=process.argv[1],fs=require("fs"),b=fs.readFileSync(f),i=b.indexOf(0)+21;fs.writeFileSync(f,Buffer.concat([b.subarray(i),b.subarray(0,i)]))\' "$1"\n',
+    );
+    chmodSync(join(t.native, "swapper"), 0o755);
+    editors.swapper = async (_p, content) => {
+      const i = content.indexOf(0) + 21;
+      return new Uint8Array([...content.subarray(i), ...content.subarray(0, i)]);
+    };
+    await step(t, ["--raw", "-e", "HEAD^{tree}"], "swapper");
   });
 
   it('t6050-replace.sh: "replace ref cleanup"', async () => {

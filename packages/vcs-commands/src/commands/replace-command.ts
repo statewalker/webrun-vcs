@@ -26,7 +26,7 @@ import { RemoteConfigStore } from "../remote-config/index.js";
 import { quotePath } from "../results/quote-path.js";
 import { cUnquote } from "./apply/latin1.js";
 import { FsckMessageTypes } from "./fsck/fsck-msg-ids.js";
-import { fsckCommit, fsckTag } from "./fsck/fsck-object-checks.js";
+import { fsckCommit, fsckTag, fsckTree } from "./fsck/fsck-object-checks.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { PlumbingCommand, PlumbingError } from "./plumbing-command.js";
 
@@ -424,7 +424,17 @@ export class ReplaceCommand extends PlumbingCommand {
         ? fsckCommit(content, report, shape)
         : type === "tag"
           ? fsckTag(content, report, { shape })
-          : 0;
+          : type === "tree"
+            ? fsckTree(
+                content,
+                types,
+                report,
+                (message) => messages.push(`error: ${message}`),
+                { gitmodules: [], gitattributes: [] },
+                undefined,
+                shape,
+              )
+            : 0; // fsck_blob checks only blobs a tree named .gitmodules/.gitattributes
     if (bad) {
       throw new PlumbingError(
         [...messages, "fatal: refusing to create malformed object"].join("\n"),
