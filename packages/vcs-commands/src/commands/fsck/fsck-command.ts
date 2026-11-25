@@ -190,7 +190,10 @@ export interface FsckRepositoryFiles {
 }
 
 const OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
-const PACK_IDX = /^pack-(?:[0-9a-f]{40}|[0-9a-f]{64})\.idx$/;
+/** every `*.idx` of a pack directory, as git's prepare_packed_git_one (`custom-<id>.idx` too) */
+const PACK_IDX = /^[^/\\]+\.idx$/;
+/** a `pack-<hex>.idx` name, whose id length tells its object format */
+const PACK_ID_IDX = /^pack-[0-9a-f]+\.idx$/;
 /** Refs one worktree has of its own (git's `is_per_worktree_ref`). */
 const PER_WORKTREE = /^(?:refs\/(?:bisect|worktree|rewritten)\/|[A-Z_]+$)/;
 const dec = new TextDecoder();
@@ -1550,7 +1553,8 @@ class FsckRun {
     for await (const e of files.list(dir)) {
       // the repository's format: a pack named in another is not one of its packs
       if (e.kind !== "file" || !PACK_IDX.test(e.name)) continue;
-      if (e.name.length !== "pack-.idx".length + this.format.hexLength) continue;
+      if (PACK_ID_IDX.test(e.name) && e.name.length !== "pack-.idx".length + this.format.hexLength)
+        continue;
       const idxPath = pathOf(dir, e.name);
       const packPath = `${idxPath.slice(0, -4)}.pack`;
       const stats = await files.stats(packPath);
