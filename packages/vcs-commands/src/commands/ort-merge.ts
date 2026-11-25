@@ -132,12 +132,49 @@ export interface OrtMergeResult {
   /** merge-ort's messages (`Auto-merging x`, `CONFLICT (...)`), in git's order */
   messages: string[];
   /**
+   * The same messages with their type and the paths they involve, as
+   * `merge_display_update_messages` gives them under `merge-tree -z`
+   */
+  details?: OrtMessage[];
+  /**
    * The messages by the path they are about, without merge-ort's omittable hints
    * (`Auto-merging`, `Path updated`, ...): `--remerge-diff`'s `remerge` headers
    */
   pathMessages?: Map<string, string[]>;
   /** Whether directory renames were found (paths may move into any directory) */
   directoryRenames?: boolean;
+}
+
+/**
+ * merge-ort's type_short_descriptions: a message's type, "relied upon by external tools"
+ * (`merge-tree -z`).
+ */
+export type OrtMessageType =
+  | "Auto-merging"
+  | "CONFLICT (contents)"
+  | "CONFLICT (binary)"
+  | "CONFLICT (file/directory)"
+  | "CONFLICT (distinct modes)"
+  | "CONFLICT (modify/delete)"
+  | "CONFLICT (rename/rename)"
+  | "CONFLICT (rename involved in collision)"
+  | "CONFLICT (rename/delete)"
+  | "CONFLICT (directory rename suggested)"
+  | "Path updated due to directory rename"
+  | "Directory rename skipped since directory was renamed on both sides"
+  | "CONFLICT (file in way of directory rename)"
+  | "CONFLICT(directory rename collision)"
+  | "CONFLICT(directory rename unclear split)";
+
+/** One of merge-ort's messages (a logical_conflict_info and its text). */
+export interface OrtMessage {
+  /** The path it is listed under (the first of `paths`) */
+  path: string;
+  /** The paths it involves, the primary one first */
+  paths: string[];
+  type: OrtMessageType;
+  /** The message as printed (may hold newlines) */
+  text: string;
 }
 
 const sameEntry = (a: CheckedEntry | undefined, b: CheckedEntry | undefined) =>
@@ -321,7 +358,7 @@ class OrtMerge {
   /** Folded keys of `paths` (core.ignorecase), for unique names */
   private readonly folded = new Set<string>();
   private readonly conflicted = new Map<string, Info>();
-  private readonly notes: { path: string; order: number; text: string; hint: boolean }[] = [];
+  private readonly notes: (OrtMessage & { order: number; hint: boolean })[] = [];
   private order = 0;
   private readonly depth: number;
   private readonly branch1: string;
@@ -385,13 +422,16 @@ class OrtMerge {
   }
 
   /**
-   * path_msg: a message about `path`; `hint` marks merge-ort's omittable hints (`Auto-merging`,
-   * applied or suggested directory renames), which `--remerge-diff` leaves out of its headers
+   * path_msg: a message of `type` about `paths[0]` (the others are the paths it involves).
+   * merge-ort's omittable hints (`Auto-merging`, applied or suggested directory renames:
+   * types not starting with `CONFLICT`, and the suggestion) are left out of `--remerge-diff`'s
+   * headers.
    */
-  private say(path: string, text: string, hint = false): void {
+  private say(type: OrtMessageType, paths: string[], text: string): void {
     // inner merges are silent (path_msg at call_depth > 0)
     if (this.depth > 0) return;
-    this.notes.push({ path, order: this.order++, text, hint });
+    const hint = !type.startsWith("CONFLICT") || type === "CONFLICT (directory rename suggested)";
+    this.notes.push({ path: paths[0], paths, type, order: this.order++, text, hint });
   }
 
   /** A name as git's case-insensitive name hashing sees it (`memihash`: ASCII folded) */
@@ -934,7 +974,8 @@ class OrtMerge {
       if (max === 0) continue;
       if (badMax === max) {
         this.say(
-          sourceDir,
+          "CONFLICT(directory rename unclear split)",
+          [sourceDir],
           `CONFLICT (directory rename split): Unclear where to rename ${sourceDir} to; it was renamed to multiple other directories, with no destination getting a majority of the files.`,
         );
         this.renamesClean = false;
@@ -1015,9 +1056,9 @@ class OrtMerge {
     const [oldDir, newDir] = rename;
     if (exclusions.has(newDir)) {
       this.say(
-        oldDir,
+        "Directory rename skipped since directory was renamed on both sides",
+        [oldDir, path, newDir],
         `WARNING: Avoiding applying ${oldDir} -> ${newDir} rename to ${path}, because ${newDir} itself was renamed.`,
-        true,
       );
       return undefined;
     }
@@ -1031,7 +1072,8 @@ class OrtMerge {
       info.reported = true;
       this.renamesClean = false;
       this.say(
-        newPath,
+        "CONFLICT (file in way of directory rename)",
+        [newPath, ...info.sources],
         `CONFLICT (implicit dir rename): Existing file/dir at ${newPath} in the way of implicit directory rename(s) putting the following path(s) there: ${info.sources.join(", ")}.`,
       );
       return undefined;
@@ -1040,7 +1082,8 @@ class OrtMerge {
       info.reported = true;
       this.renamesClean = false;
       this.say(
-        newPath,
+        "CONFLICT(directory rename collision)",
+        [newPath, ...info.sources],
         `CONFLICT (implicit dir rename): Cannot map more than one path to ${newPath}; implicit directory renames tried to put these paths there: ${info.sources.join(", ")}`,
       );
       return undefined;
@@ -1097,20 +1140,20 @@ class OrtMerge {
     }
     if (this.dirRenamesMode === "true") {
       this.say(
-        newPath,
+        "Path updated due to directory rename",
+        [newPath, oldPath],
         pair.status === "A"
           ? `Path updated: ${oldPath} added in ${withNewPath} inside a directory that was renamed in ${withDirRename}; moving it to ${newPath}.`
           : `Path updated: ${pair.one} renamed to ${oldPath} in ${withNewPath}, inside a directory that was renamed in ${withDirRename}; moving it to ${newPath}.`,
-        true,
       );
     } else {
       ci.pathConflict = true;
       this.say(
-        newPath,
+        "CONFLICT (directory rename suggested)",
+        [newPath, oldPath],
         pair.status === "A"
           ? `CONFLICT (file location): ${oldPath} added in ${withNewPath} inside a directory that was renamed in ${withDirRename}, suggesting it should perhaps be moved to ${newPath}.`
           : `CONFLICT (file location): ${pair.one} renamed to ${oldPath} in ${withNewPath}, inside a directory that was renamed in ${withDirRename}, suggesting it should perhaps be moved to ${newPath}.`,
-        true,
       );
     }
     pair.two = newPath;
@@ -1165,7 +1208,8 @@ class OrtMerge {
         side2.pathConflict = true;
         base.pathConflict = true;
         this.say(
-          pathnames[0],
+          "CONFLICT (rename/rename)",
+          [pathnames[0], pathnames[1], pathnames[2]],
           `CONFLICT (rename/rename): ${pathnames[0]} renamed to ${pathnames[1]} in ${this.branch1} and to ${pathnames[2]} in ${this.branch2}.`,
         );
         i++;
@@ -1201,14 +1245,16 @@ class OrtMerge {
         ni.stages[target] = merged.entry;
         if (!merged.clean) {
           this.say(
-            newPath,
+            "CONFLICT (rename involved in collision)",
+            [newPath, oldPath],
             `CONFLICT (rename involved in collision): rename of ${oldPath} -> ${newPath} has content conflicts AND collides with another path; this may result in nested conflict markers.`,
           );
         }
       } else if (collision && sourceDeleted) {
         ni.pathConflict = true;
         this.say(
-          newPath,
+          "CONFLICT (rename/delete)",
+          [newPath, oldPath],
           `CONFLICT (rename/delete): ${oldPath} renamed to ${newPath} in ${renameBranch}, but deleted in ${deleteBranch}.`,
         );
       } else {
@@ -1222,7 +1268,8 @@ class OrtMerge {
         } else if (sourceDeleted) {
           ni.pathConflict = true;
           this.say(
-            newPath,
+            "CONFLICT (rename/delete)",
+            [newPath, oldPath],
             `CONFLICT (rename/delete): ${oldPath} renamed to ${newPath} in ${renameBranch}, but deleted in ${deleteBranch}.`,
           );
         } else {
@@ -1326,9 +1373,13 @@ class OrtMerge {
                 `${this.branch1}:${pathnames[1]}`,
                 `${this.branch2}:${pathnames[2]}`,
               ];
-        this.say(path, `warning: Cannot merge binary files: ${path} (${n1} vs. ${n2})`);
+        this.say(
+          "CONFLICT (binary)",
+          [path],
+          `warning: Cannot merge binary files: ${path} (${n1} vs. ${n2})`,
+        );
       }
-      this.say(path, `Auto-merging ${path}`, true);
+      this.say("Auto-merging", [path], `Auto-merging ${path}`);
       return { entry: { objectId, mode }, clean: clean && merged.status === "ok" };
     }
     if (isGitlink(a)) {
@@ -1476,7 +1527,8 @@ class OrtMerge {
       moved.dfMoved = true;
       this.put(path, moved);
       this.say(
-        path,
+        "CONFLICT (file/directory)",
+        [path, oldPath],
         `CONFLICT (file/directory): directory in the way of ${oldPath} from ${branch}; moving it to ${path} instead.`,
       );
       ci.filemask = 0;
@@ -1513,7 +1565,8 @@ class OrtMerge {
         const aPath = renameA ? this.uniquePath(path, this.nameOf(1)) : undefined;
         let bPath = renameB ? this.uniquePath(path, this.nameOf(2)) : undefined;
         this.say(
-          path,
+          "CONFLICT (distinct modes)",
+          renameA && renameB ? [path, aPath ?? "", bPath ?? ""] : [path, aPath ?? bPath ?? ""],
           renameA && renameB
             ? `CONFLICT (distinct types): ${path} had different types on each side; renamed both of them so each can be recorded somewhere.`
             : `CONFLICT (distinct types): ${path} had different types on each side; renamed one of them so each can be recorded somewhere.`,
@@ -1571,7 +1624,7 @@ class OrtMerge {
         let reason = "content";
         if (ci.filemask === 6) reason = "add/add";
         if (isGitlink(merged.entry)) reason = "submodule";
-        this.say(path, `CONFLICT (${reason}): Merge conflict in ${path}`);
+        this.say("CONFLICT (contents)", [path], `CONFLICT (${reason}): Merge conflict in ${path}`);
       }
     } else if (ci.filemask === 3 || ci.filemask === 5) {
       // modify/delete
@@ -1597,7 +1650,8 @@ class OrtMerge {
         // a rename/delete of an unchanged file: reported already
       } else {
         this.say(
-          path,
+          "CONFLICT (modify/delete)",
+          [path],
           `CONFLICT (modify/delete): ${path} deleted in ${deleteBranch} and modified in ${modifyBranch}.  Version ${modifyBranch} of ${path} left in tree.`,
         );
       }
@@ -1652,6 +1706,7 @@ class OrtMerge {
     }
     const sorted = this.notes.sort((x, y) => compareStrings(x.path, y.path) || x.order - y.order);
     const messages = sorted.map((n) => n.text);
+    const details = sorted.map(({ path, paths, type, text }) => ({ path, paths, type, text }));
     // merge-ort's priv->conflicts without the omittable hints (record_conflict_msgs_as_headers)
     const pathMessages = new Map<string, string[]>();
     for (const n of sorted) {
@@ -1664,6 +1719,7 @@ class OrtMerge {
       result,
       conflicts,
       messages,
+      details,
       pathMessages,
       clean: this.renamesClean && this.conflicted.size === 0,
       directoryRenames: this.dirRenames[1].size > 0 || this.dirRenames[2].size > 0,
