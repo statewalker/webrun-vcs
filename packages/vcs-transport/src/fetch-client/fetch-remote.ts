@@ -624,10 +624,15 @@ export async function fetchFromConnection(
     });
     // a ref asked for by name that moved since it was listed: its want is the id the server
     // sent (the pack holds that one), for the checks below and the completeness of the tips
-    for (const r of request.wantRefs ?? []) {
-      const now = fetched.wantedRefs?.get(r.name);
-      if (now === undefined || now === r.oid) continue;
-      for (let i = 0; i < wants.length; i++) if (wants[i] === r.oid) wants[i] = now;
+    if (fetched.wantedRefs?.size) {
+      // what the server sent: each name's answered id, and every id asked by `want <id>`;
+      // an id two refs shared stays while one of them still names it
+      const named = new Set((request.wantRefs ?? []).map((r) => r.oid));
+      const sent = new Set(wants.filter((oid) => !named.has(oid)));
+      for (const r of request.wantRefs ?? []) sent.add(fetched.wantedRefs.get(r.name) ?? r.oid);
+      const kept = wants.filter((oid) => sent.has(oid));
+      for (const oid of sent) if (!kept.includes(oid)) kept.push(oid);
+      wants.splice(0, wants.length, ...kept);
     }
     const { quarantine, ...imported } = fetched.imported;
     let committed = false;
@@ -691,6 +696,7 @@ export async function fetchFromConnection(
     for (const [name, oid] of fetched.wantedRefs ?? []) {
       for (const p of planned) if (p.remoteRef === name) p.oid = oid;
       for (const f of result.fetched) if (f.remoteRef === name) f.oid = oid;
+      complete.addTip(oid);
     }
     for (const want of wants) complete.addTip(want);
     result.imports.push(imported);
