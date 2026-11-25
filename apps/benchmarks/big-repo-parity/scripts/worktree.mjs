@@ -50,6 +50,11 @@ const ENV = {
 };
 const git = (cwd, args, input) =>
   execFileSync("git", args, { cwd, env: ENV, input, maxBuffer: 2 ** 31 }).toString();
+// byte-exact output as latin1 text: our callBytes and native stdout compare byte for byte
+// (callText keeps non-UTF-8 bytes as U+DC80..U+DCFF, Node's UTF-8 decoding as U+FFFD)
+const gitBytes = (cwd, args) =>
+  execFileSync("git", args, { cwd, env: ENV, maxBuffer: 2 ** 31 }).toString("latin1");
+const latin1 = (bytes) => Buffer.from(bytes).toString("latin1");
 const gitRo = (cwd, args) => git(cwd, ["--no-optional-locks", ...args]);
 const OURS = join(work, "ours");
 const NATIVE = join(work, "native");
@@ -156,15 +161,16 @@ await step("log", async () => {
   const cases = [
     {
       args: ["log", "--oneline", "-n", "5000"],
-      run: () => g.log().setMaxCount(5000).callText({ oneline: true }),
+      run: async () => latin1(await g.log().setMaxCount(5000).callBytes({ oneline: true })),
     },
     {
       args: ["log", "--stat", "-n", "200"],
-      run: () => g.log().setMaxCount(200).callText({ stat: true }),
+      run: async () => latin1(await g.log().setMaxCount(200).callBytes({ stat: true })),
     },
     {
       args: ["log", "-p", "-n", "30", "--", "Makefile"],
-      run: () => g.log().setMaxCount(30).addPath("Makefile").callText({ patch: true }),
+      run: async () =>
+        latin1(await g.log().setMaxCount(30).addPath("Makefile").callBytes({ patch: true })),
     },
   ];
   for (const c of cases) {
@@ -172,7 +178,7 @@ await step("log", async () => {
     const ours = await c.run();
     const oursMs = Math.round(performance.now() - t);
     const t2 = performance.now();
-    const native = git(NATIVE, c.args);
+    const native = gitBytes(NATIVE, c.args);
     const nativeMs = Math.round(performance.now() - t2);
     same(`git ${c.args.join(" ")}`, ours, native);
     out.push(`${c.args.slice(1).join(" ")}: ${oursMs}/${nativeMs} ms`);
@@ -188,10 +194,10 @@ await step("diff", async () => {
   ]) {
     for (const format of ["stat", "patch"]) {
       const t = performance.now();
-      const ours = await g.diff().setOldTree(from).setNewTree(to).callText(format);
+      const ours = latin1(await g.diff().setOldTree(from).setNewTree(to).callBytes(format));
       const oursMs = Math.round(performance.now() - t);
       const t2 = performance.now();
-      const native = git(NATIVE, ["diff", format === "stat" ? "--stat" : "-p", from, to]);
+      const native = gitBytes(NATIVE, ["diff", format === "stat" ? "--stat" : "-p", from, to]);
       const nativeMs = Math.round(performance.now() - t2);
       same(`diff --${format} ${from} ${to}`, ours, native);
       out.push(`${from}..${to} ${format}: ${oursMs}/${nativeMs} ms`);

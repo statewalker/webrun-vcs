@@ -428,14 +428,17 @@ await step("roundtrip", async () => {
   const rt = join(work, "roundtrip.git");
   rmSync(rt, { recursive: true, force: true });
   git(work, ["init", "-q", "--bare", rt]);
+  git(rt, ["symbolic-ref", "HEAD", headTarget]);
   const packPath = join(rt, "objects/pack/export.pack");
   const ws = createWriteStream(packPath);
   let bytes = 0;
+  const exportStart = performance.now();
   for await (const chunk of ser.exportPack(wants, [], { ofsDelta: true })) {
     bytes += chunk.length;
     if (!ws.write(chunk)) await new Promise((r) => ws.once("drain", r));
   }
   await new Promise((r) => ws.end(r));
+  const exportMs = Math.round(performance.now() - exportStart);
   git(rt, ["index-pack", "objects/pack/export.pack"]);
   const updates = [...nativeRefs].map(([n, id]) => `update ${n} ${id}\n`).join("");
   git(
@@ -460,7 +463,7 @@ await step("roundtrip", async () => {
   const oursCount = count(rt);
   const packed = Number(/in-pack: (\d+)/.exec(git(rt, ["count-objects", "-v"]))[1]);
   // ours has the parity commit, its tree and blob on top of what native has (unless written to source too)
-  return `pack ${(bytes / 1048576).toFixed(0)} MB, ${packed} objects; rev-list --objects: rt=${oursCount} native=${nativeCount}; fsck --strict = native's (${fr.lines.length} known warnings)`;
+  return `export ${exportMs} ms: pack ${(bytes / 1048576).toFixed(0)} MB, ${packed} objects; rev-list --objects: rt=${oursCount} native=${nativeCount}; fsck --strict = native's (${fr.lines.length} known warnings)`;
 });
 
 await close?.();
