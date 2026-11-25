@@ -37,15 +37,15 @@ import {
 import { readRepositoryFormat } from "./repository-format.js";
 import { type RerereGcResult, rerereGc } from "./rerere-gc.js";
 import { updateServerInfo } from "./server-info.js";
-
-/** Moved to cruft-pack.ts (repack walks from recent objects too); kept exported here. */
-export { recentPackedObjects } from "./cruft-pack.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
 import { FileRawStorage } from "./storage/raw/file-raw-storage.js";
 import {
   configFilesApiOf,
   createWorkingCopyConfig,
 } from "./workspace/working-copy/working-copy-config.files.js";
+
+/** Moved to cruft-pack.ts (repack walks from recent objects too); kept exported here. */
+export { recentPackedObjects } from "./cruft-pack.js";
 
 /** A loose object file name, fan-out directory included. */
 /** A pack file name. */
