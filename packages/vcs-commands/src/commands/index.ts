@@ -31,6 +31,7 @@ export * from "./default-branch.js";
 export * from "./describe-command.js";
 export * from "./diff-color-config.js";
 export * from "./diff-command.js";
+export * from "./diff-plumbing/index.js";
 export * from "./diff-textconv.js";
 export * from "./fetch-command.js";
 export * from "./fetch-multiple-command.js";

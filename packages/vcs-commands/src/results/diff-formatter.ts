@@ -128,12 +128,15 @@ export function diffEntryToPair(entry: DiffEntry, blobs: Blobs): DiffFilePair {
           entry.newDirtySubmodule === true && entry.newIdUnknown !== true,
         );
   if (newSide && entry.newSubmoduleDirt) newSide.submoduleDirt = entry.newSubmoduleDirt;
+  if (newSide && (entry.newIdNull || entry.newIdUnknown)) newSide.rawNullId = true;
+  const oldSide =
+    status === "A"
+      ? undefined
+      : side(entry.oldPath ?? entry.newPath, entry.oldMode, entry.oldId, entry.readOld);
+  if (oldSide && entry.oldIdNull) oldSide.rawNullId = true;
   return {
     status,
-    old:
-      status === "A"
-        ? undefined
-        : side(entry.oldPath ?? entry.newPath, entry.oldMode, entry.oldId, entry.readOld),
+    old: oldSide,
     new: newSide,
     ...(entry.score !== undefined ? { score: entry.score } : {}),
     ...(entry.lineRanges ? { lineRanges: entry.lineRanges } : {}),
