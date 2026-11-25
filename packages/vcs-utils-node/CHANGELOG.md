@@ -1,5 +1,19 @@
 # @statewalker/vcs-utils-node
 
+## 0.9.0
+
+### Minor Changes
+
+- dcc865f: `git init` and `git clone` layouts as git writes them (statewalker-root#348): `InitCommand.setSeparateGitDir` (the gitfile as git writes it; re-init moves an existing git directory and repairs its linked worktrees), `setTemplate` (and `$GIT_TEMPLATE_DIR` / `init.templateDir`, copied from a FilesApi directory with git's skip rules), `setShared` and `core.sharedRepository` with git's `adjust_shared_perm` modes on what a shared repository's commands create (objects, packs, refs, reflogs, the index, `info/refs`), new repositories get `objects/info` and `core.logallrefupdates`. vcs-utils: `parseSharedRepository`, `calcSharedPerm`, `adjustSharedPerm` (directories too), `withSharedPerm`; the Node FilesApi's `chmod` keeps setgid on directories.
+
+### Patch Changes
+
+- Updated dependencies [4f01ece]
+- Updated dependencies [dcc865f]
+- Updated dependencies [906ce19]
+- Updated dependencies [fa1b0c4]
+  - @statewalker/vcs-utils@0.9.0
+
 ## 0.8.0
 
 ### Minor Changes

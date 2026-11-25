@@ -1,5 +1,0 @@
----
-"@statewalker/vcs-commands": minor
----
-
-`--recurse-submodules` (and `submodule.recurse`) for checkout, switch, restore, reset and read-tree (statewalker/statewalker-root#333). `setRecurseSubmodules` on `CheckoutCommand`, `SwitchCommand`, `RestoreCommand`, `ResetCommand` and `ReadTreeCommand` runs git's unpack-trees submodule support: before anything is written each active submodule the switch moves is checked by a dry run of its own `read-tree` (`check_submodule_move_head`: local changes the move would lose, a dirty index, a missing commit refuse the switch with git's lines, `Cannot update submodule:` or `Submodule '<path>' cannot checkout new HEAD.`), then the submodules leaving are emptied, their gitfile and `core.worktree` removed (a `.git` directory absorbed first), and the ones staying or arriving are checked out at the recorded commit with HEAD detached (`submodule_move_head`), nested submodules the same way. `ReadTreeCommand` also gets `setDryRun` (`-n`). A file replacing a submodule whose repository is a `.git` directory in its worktree is refused (git removes that directory, history included).

@@ -1,5 +1,21 @@
 # @statewalker/vcs-core
 
+## 0.9.0
+
+### Minor Changes
+
+- Release of the changes since the last published version:
+  
+  - @statewalker/vcs-utils crosses a breaking line
+
+### Patch Changes
+
+- Updated dependencies [4f01ece]
+- Updated dependencies [dcc865f]
+- Updated dependencies [906ce19]
+- Updated dependencies [fa1b0c4]
+  - @statewalker/vcs-utils@0.9.0
+
 ## 0.8.0
 
 ### Minor Changes
