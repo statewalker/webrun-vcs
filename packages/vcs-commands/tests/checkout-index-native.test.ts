@@ -236,7 +236,7 @@ describeGit("git checkout-index against native git", () => {
     await compare(t, ["-a", "--temp"]);
   });
 
-  it("t2004-checkout-cache-temp.sh: the stages of a three-way merge", async () => {
+  it('t2004-checkout-cache-temp.sh: "setup 3-way merge"', async () => {
     let trees = { t1: "", t2: "", t3: "" };
     const t = twins((d) => {
       trees = threeTrees(d);
@@ -355,5 +355,19 @@ describeGit("git checkout-index against native git", () => {
     await compare(t, ["out/y"]);
     await compare(t, ["-f", "-a"]);
     await compare(t, ["--ignore-skip-worktree-bits", "--prefix=all/", "-a"]);
+  });
+
+  it("--prefix through a symbolic link: a refusal, never an exception", async () => {
+    const t = twins((d) => {
+      put(d, "a", "a\n");
+      gitOk(root, d, "add", "a");
+    });
+    const cmd = (await openOurs(t.ours)).checkoutIndex();
+    execFileSync("mkdir", [join(t.ours, "real")]);
+    execFileSync("ln", ["-s", "real", join(t.ours, "out")]);
+    const r = await cmd.setPrefix("out/").addPath("a").call();
+    // git writes through the link (out/a); ours refuses the write: exit 1, an error line
+    expect(r.exitCode).toBe(1);
+    expect(r.errors).toMatch(/^error: unable to create file out\/a/);
   });
 });

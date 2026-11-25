@@ -39,6 +39,7 @@ import {
 import { UpdateIndexFailedError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { worktreeModeTrust } from "./core-config.js";
+import { configBool } from "./merge-config.js";
 import { inputLines, inputPaths, unquoteLine } from "./plumbing-input.js";
 import { worktreePathRules } from "./worktree-path-rules.js";
 
@@ -386,6 +387,7 @@ export class UpdateIndexCommand extends GitCommand<UpdateIndexResult> {
         : { executable: true, symlinks: true },
       pathRules: worktreePathRules(this.workingCopy),
       nullId: this.objectFormat.nullId,
+      ignoreStat: configBool(this.workingCopy, "core.ignoreStat", false),
       hexLength: this.objectFormat.hexLength,
     };
   }
@@ -398,6 +400,8 @@ interface RunContext {
   trust: WorktreeModeTrust;
   pathRules: ReturnType<typeof worktreePathRules>;
   nullId: string;
+  /** `core.ignoreStat` (git's `assume_unchanged`) */
+  ignoreStat: boolean;
   hexLength: number;
 }
 
@@ -800,11 +804,9 @@ class UpdateIndexRun {
       this.stderr.push(`error: ${(error as Error).message}`);
       return false;
     }
-    const known = old ?? this.entries[-this.namePos(path) - 1];
-    const sameName = known && known.path === path ? known : undefined;
     const ce: Entry = {
       path,
-      mode: modeFromWorktree(stat.mode, sameName?.mode, this.ctx.trust) as FileModeValue,
+      mode: modeFromWorktree(stat.mode, old?.mode, this.ctx.trust) as FileModeValue,
       objectId: id,
       stage: 0,
       ...entryStatOf(stat),
@@ -829,7 +831,8 @@ class UpdateIndexRun {
       stage: stage as Entry["stage"],
       size: 0,
       mtime: 0,
-      ...(this.state.markValid === true ? { assumeValid: true } : {}),
+      // add_cacheinfo's CE_VALID is core.ignoreStat's (assume_unchanged), not the option
+      ...(this.ctx.ignoreStat ? { assumeValid: true } : {}),
     };
     if (!this.addEntry(ce)) {
       this.stderr.push(`error: ${path}: cannot add to the index - missing --add option?`);

@@ -436,6 +436,8 @@ class CheckoutIndexRun {
   private async lstatBelow(path: string): Promise<WorktreeEntry | undefined> {
     const worktree = this.o.worktree;
     for (let at = path.indexOf("/"); at > 0; at = path.indexOf("/", at + 1)) {
+      // the prefix's own directories are trusted (has_dirs_only_path's prefix_len)
+      if (at < this.o.prefix.length) continue;
       const dir = await worktree.getEntry(path.slice(0, at)).catch(() => undefined);
       if (!dir?.isDirectory) return undefined;
     }
@@ -501,7 +503,14 @@ class CheckoutIndexRun {
     }
     if (path !== undefined) await this.createDirectories(path);
     const target = path ?? (await this.tempName(link));
-    await worktree.writeContent(target, content, { mode, raw: true, createParents: true });
+    try {
+      await worktree.writeContent(target, content, { mode, raw: true, createParents: true });
+    } catch (error) {
+      // the storage refuses a path through a symbolic link (a prefix that is one, which git
+      // writes through): reported as git reports a file it cannot create
+      this.stderr.push(`error: unable to create file ${target}: ${(error as Error).message}`);
+      return false;
+    }
     if (path === undefined) {
       this.topath[ce.stage] = target;
       this.tempFiles.push({ path: ce.path, stage: ce.stage, file: target });

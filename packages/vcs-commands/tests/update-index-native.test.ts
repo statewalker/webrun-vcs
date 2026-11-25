@@ -372,4 +372,33 @@ describeGit("git update-index against native git", () => {
     await step(dir, ["--add", "in/new"]);
     await step(dir, ["--chmod=+x", "a"]);
   });
+
+  it("--cacheinfo and --index-info flag entries assume-unchanged by core.ignoreStat, not --assume-unchanged", async () => {
+    const dir = fixture((d) => {
+      put(d, "a", "a\n");
+      gitOk(root, d, "add", "a");
+    });
+    const id = gitOk(root, dir, "rev-parse", ":a").trim();
+    await step(dir, ["--add", "--assume-unchanged", "--cacheinfo", `100644,${id},c`]);
+    gitOk(root, dir, "config", "core.ignoreStat", "true");
+    await step(dir, ["--add", "--cacheinfo", `100644,${id},d`]);
+    await step(dir, ["--index-info"], `100644 ${id}\te\n`);
+  });
+
+  it("a path with only conflict stages takes the file's mode, not a stage's", async () => {
+    const dir = fixture((d) => {
+      put(d, "a", "a\n");
+      gitOk(root, d, "add", "a");
+      gitOk(root, d, "config", "core.fileMode", "false");
+    });
+    const id = gitOk(root, dir, "rev-parse", ":a").trim();
+    run(
+      dir,
+      ["update-index", "--index-info"],
+      `0 ${id}\tf\n100755 ${id} 1\tf\n100755 ${id} 2\tf\n100755 ${id} 3\tf\n`,
+    );
+    put(dir, "f", "f\n");
+    settle(dir);
+    await step(dir, ["f"]);
+  });
 });
