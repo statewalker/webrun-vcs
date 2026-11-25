@@ -363,7 +363,6 @@ export class AttributesResolver {
   }
 }
 
-
 /**
  * git's `determine_macros` + `fill` + `fill_one` over frames (lowest precedence first).
  */

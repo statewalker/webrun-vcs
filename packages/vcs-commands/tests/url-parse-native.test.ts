@@ -9,18 +9,12 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-
 import { urlComponent, urlParse } from "@statewalker/vcs-utils";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
-import {
-  git,
-  native,
-  type Outcome,
-  outcomeOf,
-} from "./plumbing-native-support.js";
+import { git, native, type Outcome, outcomeOf } from "./plumbing-native-support.js";
 
 /** Whether the native git has `url-parse` (`-h` prints its usage, exit 129). */
 const hasUrlParse = () =>

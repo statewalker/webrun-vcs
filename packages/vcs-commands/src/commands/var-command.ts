@@ -100,8 +100,9 @@ export class VarCommand extends GitCommand<PlumbingOutput> {
     if (this.list === (this.variable !== undefined)) return usage;
     if (this.list) {
       let stdout = "";
-      for (const { key, text } of RemoteConfigStore.from(this._workingCopy).allEntriesWithOrigin() ??
-        []) {
+      for (const { key, text } of RemoteConfigStore.from(
+        this._workingCopy,
+      ).allEntriesWithOrigin() ?? []) {
         stdout += text === undefined ? `${key}\n` : `${key}=${text}\n`;
       }
       for (const name of GIT_VARIABLES) {
@@ -109,7 +110,8 @@ export class VarCommand extends GitCommand<PlumbingOutput> {
         try {
           value = this.read(name, false);
         } catch (error) {
-          if (error instanceof GitApiError) return { exitCode: 128, stdout, stderr: `${error.message}\n` };
+          if (error instanceof GitApiError)
+            return { exitCode: 128, stdout, stderr: `${error.message}\n` };
           throw error;
         }
         if (value === undefined) continue;
@@ -125,7 +127,8 @@ export class VarCommand extends GitCommand<PlumbingOutput> {
     try {
       value = this.read(name as GitVariable, true);
     } catch (error) {
-      if (error instanceof GitApiError) return { exitCode: 128, stdout: "", stderr: `${error.message}\n` };
+      if (error instanceof GitApiError)
+        return { exitCode: 128, stdout: "", stderr: `${error.message}\n` };
       throw error;
     }
     if (value === undefined) return { exitCode: 1, stdout: "", stderr: "" };
@@ -151,7 +154,12 @@ export class VarCommand extends GitCommand<PlumbingOutput> {
           this.editor(environment, config)
         );
       case "GIT_PAGER": {
-        const pager = programs.GIT_PAGER ?? config.value("core.pager") ?? programs.PAGER ?? environment?.defaultPager ?? "less";
+        const pager =
+          programs.GIT_PAGER ??
+          config.value("core.pager") ??
+          programs.PAGER ??
+          environment?.defaultPager ??
+          "less";
         return pager === "" || pager === "cat" ? "cat" : pager;
       }
       case "GIT_DEFAULT_BRANCH": {

@@ -336,7 +336,11 @@ function startsWith(line: Uint8Array, prefix: string, at = 0): boolean {
 function digitsAt(line: Uint8Array, at: number): [number, number] {
   let n = 0;
   let value = 0;
-  while (at + n < line.length && (line[at + n] as number) >= 0x30 && (line[at + n] as number) <= 0x39) {
+  while (
+    at + n < line.length &&
+    (line[at + n] as number) >= 0x30 &&
+    (line[at + n] as number) <= 0x39
+  ) {
     value = value * 10 + ((line[at + n] as number) - 0x30);
     n++;
   }

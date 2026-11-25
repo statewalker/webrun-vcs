@@ -158,7 +158,11 @@ export function urlParse(input: string): NormalizedUrl | { error: string } {
   }
   // `ssh://host/~user/repo`, `git://host/~user/repo`, `host:~user/repo`: the path is `~user/repo`
   if ((scheme === "ssh" || scheme === "git") && normalized.url[normalized.pathOffset + 1] === "~") {
-    return { ...normalized, pathOffset: normalized.pathOffset + 1, pathLength: normalized.pathLength - 1 };
+    return {
+      ...normalized,
+      pathOffset: normalized.pathOffset + 1,
+      pathLength: normalized.pathLength - 1,
+    };
   }
   return normalized;
 }

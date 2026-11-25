@@ -54,10 +54,18 @@ async function twin(
   args: string[] = [],
   config: [string, string][] = [],
 ): Promise<Outcome> {
-  const n = native(root, repo, [...config.flatMap(([k, v]) => ["-c", `${k}=${v}`]), "stripspace", ...args], {
-    stdin: input,
-  });
-  expect(await ours(args, input, config), JSON.stringify([input.slice(0, 40), args, config])).toEqual(n);
+  const n = native(
+    root,
+    repo,
+    [...config.flatMap(([k, v]) => ["-c", `${k}=${v}`]), "stripspace", ...args],
+    {
+      stdin: input,
+    },
+  );
+  expect(
+    await ours(args, input, config),
+    JSON.stringify([input.slice(0, 40), args, config]),
+  ).toEqual(n);
   return n;
 }
 

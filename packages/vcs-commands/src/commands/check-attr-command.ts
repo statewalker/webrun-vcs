@@ -12,9 +12,9 @@
  */
 
 import {
-  type AttributeValue,
   AttributesMemo,
   AttributesSourceError,
+  type AttributeValue,
   isValidAttributeName,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
@@ -158,14 +158,18 @@ export class CheckAttrCommand extends GitCommand<PlumbingOutput> {
     if (this.stdin === undefined && this.paths.length === 0) return usage("No file specified");
     for (const name of this.attributes) {
       if (!isValidAttributeName(name)) {
-        return { exitCode: 255, stdout: "", stderr: `error: ${name}: not a valid attribute name\n` };
+        return {
+          exitCode: 255,
+          stdout: "",
+          stderr: `error: ${name}: not a valid attribute name\n`,
+        };
       }
     }
     let sourceTree: string | undefined;
     if (this.source !== undefined) {
-      const found = await attributesSourceResolver(() => this.revisionResolver())(this.source).catch(
-        () => undefined,
-      );
+      const found = await attributesSourceResolver(() => this.revisionResolver())(
+        this.source,
+      ).catch(() => undefined);
       if (!found) {
         return {
           exitCode: 128,
@@ -187,7 +191,8 @@ export class CheckAttrCommand extends GitCommand<PlumbingOutput> {
     });
     let paths = this.paths;
     let badlyQuoted = false;
-    if (this.stdin !== undefined) ({ records: paths, badlyQuoted } = inputRecords(this.stdin, this.nul));
+    if (this.stdin !== undefined)
+      ({ records: paths, badlyQuoted } = inputRecords(this.stdin, this.nul));
     const quoteFully = configBool(this._workingCopy, "core.quotePath", true);
     const worktree = this.worktreeIfAny();
     const reader = this.reader(worktree, sourceTree, warn);
@@ -204,12 +209,18 @@ export class CheckAttrCommand extends GitCommand<PlumbingOutput> {
         let items: [string, AttributeValue][];
         if (this.all) {
           await reader.order(full, order);
-          items = [...order].filter((n) => values.get(n) !== undefined).map((n) => [n, values.get(n)]);
+          items = [...order]
+            .filter((n) => values.get(n) !== undefined)
+            .map((n) => [n, values.get(n)]);
         } else {
           items = [];
           for (const name of this.attributes) {
             let value = values.get(name);
-            if (value === undefined && name === "builtin_objectmode" && this.compatibility !== "2.43") {
+            if (
+              value === undefined &&
+              name === "builtin_objectmode" &&
+              this.compatibility !== "2.43"
+            ) {
               const mode = await this.objectMode(full);
               if (typeof mode === "object") return die(mode.error);
               value = mode;
@@ -219,7 +230,13 @@ export class CheckAttrCommand extends GitCommand<PlumbingOutput> {
         }
         for (const [name, value] of items) {
           const text =
-            value === true ? "set" : value === false ? "unset" : value === undefined ? "unspecified" : value;
+            value === true
+              ? "set"
+              : value === false
+                ? "unset"
+                : value === undefined
+                  ? "unspecified"
+                  : value;
           stdout += this.nul
             ? `${file}\0${name}\0${text}\0`
             : `${quotePath(file, quoteFully)}: ${name}: ${text}\n`;
@@ -264,7 +281,10 @@ export class CheckAttrCommand extends GitCommand<PlumbingOutput> {
         }
       | undefined;
     const useFilter =
-      worktree && filter?.attributes && filter.attributeNameOrder && (this.cached || sourceTree === undefined);
+      worktree &&
+      filter?.attributes &&
+      filter.attributeNameOrder &&
+      (this.cached || sourceTree === undefined);
     if (useFilter && filter?.attributes && filter.attributeNameOrder) {
       const context = { direction: this.cached ? ("index" as const) : ("checkin" as const) };
       const attributes = filter.attributes.bind(filter);

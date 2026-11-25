@@ -174,7 +174,14 @@ describeGit("git check-attr against native git", () => {
   afterAll(() => rmSync(root, { recursive: true, force: true }));
 
   it('t0003-attributes.sh: "command line checks"', async () => {
-    for (const args of [[], ["--"], ["test"], ["test", "--"], ["--", "f"], ["--source", "not-a-valid-ref", "test", "--", "f"]]) {
+    for (const args of [
+      [],
+      ["--"],
+      ["test"],
+      ["test", "--"],
+      ["--", "f"],
+      ["--source", "not-a-valid-ref", "test", "--", "f"],
+    ]) {
       await twin({ args });
     }
     await twin({ args: ["--stdin"], stdin: "f\n" });
@@ -185,13 +192,29 @@ describeGit("git check-attr against native git", () => {
   });
 
   it('t0003-attributes.sh: "attribute test", "prefixes are not confused with leading directories", "root subdir attribute test"', async () => {
-    for (const p of [" d ", "e", 'e"', ...ALL_PATHS, "a_plus/g", "a/i", "subdir/a/i"]) await check(p);
+    for (const p of [" d ", "e", 'e"', ...ALL_PATHS, "a_plus/g", "a/i", "subdir/a/i"])
+      await check(p);
     await twin({ args: ["test", "a/g", "a_plus/g"] });
     await twin({ args: ["test", "notest", "--", "no", "a/b/d/yes", "a/b/d/no"] });
   });
 
   it('t0003-attributes.sh: "attribute matching is case sensitive when core.ignorecase=0", "attribute matching is case insensitive when core.ignorecase=1"', async () => {
-    const paths = ["F", "a/F", "a/c/F", "a/G", "a/B/g", "a/b/G", "a/b/H", "a/b/D/g", "oNoFf", "oFfOn", "NO", "a/b/D/NO", "a/b/d/YES", "a/E/f"];
+    const paths = [
+      "F",
+      "a/F",
+      "a/c/F",
+      "a/G",
+      "a/B/g",
+      "a/b/G",
+      "a/b/H",
+      "a/b/D/g",
+      "oNoFf",
+      "oFfOn",
+      "NO",
+      "a/b/D/NO",
+      "a/b/d/YES",
+      "a/E/f",
+    ];
     for (const ic of ["0", "1"]) {
       for (const p of paths) await check(p, { config: [["core.ignorecase", ic]] });
     }
@@ -223,7 +246,14 @@ describeGit("git check-attr against native git", () => {
       await twin({ args: ["--cached", "--stdin", "--all"], stdin });
       await twin({ args: ["--cached", "test", "--", "a/b/d/g"] });
     } finally {
-      git(root, repo, ["rm", "-q", "--cached", ".gitattributes", "a/.gitattributes", "a/b/.gitattributes"]);
+      git(root, repo, [
+        "rm",
+        "-q",
+        "--cached",
+        ".gitattributes",
+        "a/.gitattributes",
+        "a/b/.gitattributes",
+      ]);
     }
   });
 
@@ -247,7 +277,8 @@ describeGit("git check-attr against native git", () => {
     const bare = join(root, "bare.git");
     git(root, root, ["clone", "-q", "--template=", "--bare", repo, bare]);
     writeFiles(bare, { ".gitattributes": "f\ttest=f\na/i test=a/i\n" });
-    for (const p of ["f", "a/f", "a/c/f", "a/i", "subdir/a/i"]) await check(p, { dir: bare, bare: true });
+    for (const p of ["f", "a/f", "a/c/f", "a/i", "subdir/a/i"])
+      await check(p, { dir: bare, bare: true });
     for (const source of ["tag-1", "tag-2"]) {
       for (const p of ["foo/bar/f", "foo/bar/a/i", "foo/bar/g"]) {
         await twin({ args: ["--source", source, "test", "--", p], dir: bare, bare: true });
@@ -255,7 +286,8 @@ describeGit("git check-attr against native git", () => {
       }
     }
     writeFiles(bare, { "info/attributes": "f\ttest=f\na/i test=a/i\n" });
-    for (const p of ["f", "a/f", "a/c/f", "a/i", "subdir/a/i"]) await check(p, { dir: bare, bare: true });
+    for (const p of ["f", "a/f", "a/c/f", "a/i", "subdir/a/i"])
+      await check(p, { dir: bare, bare: true });
   });
 
   it('t0003-attributes.sh: "attr.tree when HEAD is unborn", "bad attr source defaults to reading .gitattributes file", "--attr-source is bad", "precedence of --attr-source, GIT_ATTR_SOURCE, then attr.tree"', async () => {
@@ -282,7 +314,8 @@ describeGit("git check-attr against native git", () => {
     });
   });
 
-  it('t0003-attributes.sh: "negative patterns", "patterns starting with exclamation", "\\"**\\" test", "\\"**\\" with no slashes test"', async () => {
+  // t0003-attributes.sh '"**" test', '"**" with no slashes test'
+  it('t0003-attributes.sh: "negative patterns", "patterns starting with exclamation"', async () => {
     const other = join(root, "other");
     mkdirSync(other);
     git(root, other, ["init", "-q"]);
@@ -291,7 +324,8 @@ describeGit("git check-attr against native git", () => {
     writeFiles(other, { ".gitattributes": "\\!f test=foo\n" });
     await check("!f", { dir: other });
     writeFiles(other, { ".gitattributes": "**/f foo=bar\n" });
-    for (const p of ["f", "a/f", "a/b/f", "a/b/c/f"]) await twin({ args: ["foo", "--", p], dir: other });
+    for (const p of ["f", "a/f", "a/b/f", "a/b/c/f"])
+      await twin({ args: ["foo", "--", p], dir: other });
     writeFiles(other, { ".gitattributes": "a**f foo=bar\n" });
     for (const p of ["f", "af", "axf", "a/f", "a/b/f", "a/b/c/f"]) {
       await twin({ args: ["foo", "--", p], dir: other });
@@ -322,7 +356,12 @@ describeGit("git check-attr against native git", () => {
     for (const p of ["normal", "exec", "dir", "sym", "missing"]) await mode(p);
     git(root, other, ["add", "normal"]);
     const empty = git(root, other, ["rev-parse", ":normal"]).trim();
-    git(root, other, ["update-index", "--index-info"], `100755 ${empty} 0\texec\n120000 ${empty} 0\tsymlink\n`);
+    git(
+      root,
+      other,
+      ["update-index", "--index-info"],
+      `100755 ${empty} 0\texec\n120000 ${empty} 0\tsymlink\n`,
+    );
     for (const p of ["normal", "exec", "symlink", "dir"]) await mode(p, ["--cached"]);
     if (nativeCompatibility() !== "2.43") {
       writeFiles(other, { ".gitattributes": "foo* builtin_objectmode=12345\n", foo_1: "" });

@@ -130,7 +130,9 @@ describeGit("git check-ignore against native git", () => {
   });
   afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-  it('t0008-ignores.sh: ". corner-case", "empty command line", "--stdin with empty STDIN", "-q with multiple args", "--quiet with multiple args", "erroneous use of --", "--stdin with superfluous arg", "--stdin -z with superfluous arg", "-z without --stdin", "-z without --stdin and superfluous arg"', async () => {
+  // t0008's test_expect_success_multi cases too: . corner-case, empty command line, --stdin
+  // with empty STDIN, erroneous use of --, --stdin (-z) with superfluous arg, -z without --stdin
+  it('t0008-ignores.sh: "-q with multiple args", "--quiet with multiple args"', async () => {
     await multi(["."]);
     await multi([]);
     await multi(["--stdin"], { stdin: "" });
@@ -147,9 +149,18 @@ describeGit("git check-ignore against native git", () => {
     await twin({ args: ["-n", "foo"] });
   });
 
-  it('t0008-ignores.sh: "non-existent file at top-level not ignored", "existing tracked file at top-level not ignored", "existing untracked file at top-level ignored", "mix of file types at top-level", "mix of file types in subdir a/"', async () => {
+  // t0008-ignores.sh's test_expect_success_multi cases: non-existent file at top-level (not)
+  // ignored, existing tracked / untracked file at top-level, mix of file types at top-level and
+  // in subdir a/, with and without --no-index
+  it("t0008-ignores.sh: files tracked and untracked, at the top and in a subdirectory", async () => {
     for (const subdir of ["", "a/"]) {
-      for (const name of ["non-existent", "one", "not-ignored", "ignored-but-in-index", "ignored-and-untracked"]) {
+      for (const name of [
+        "non-existent",
+        "one",
+        "not-ignored",
+        "ignored-but-in-index",
+        "ignored-and-untracked",
+      ]) {
         await multi([`${subdir}${name}`]);
       }
       await multi(
@@ -171,7 +182,7 @@ describeGit("git check-ignore against native git", () => {
     await twin({ args: ["-v", "-n", "a/b/one"] });
   });
 
-  it('t0008-ignores.sh: "ignored sub-directory", "multiple files inside ignored sub-directory", "multiple files inside ignored sub-directory with -v", "cd to ignored sub-directory", "cd to ignored sub-directory with -v"', async () => {
+  it('t0008-ignores.sh: "multiple files inside ignored sub-directory", "multiple files inside ignored sub-directory with -v", "cd to ignored sub-directory", "cd to ignored sub-directory with -v"', async () => {
     await multi(["a/b/ignored-dir"]);
     const inside = ["a/b/ignored-dir/foo", "a/b/ignored-dir/twoooo", "a/b/ignored-dir/seven"];
     await twin({ args: inside });
@@ -181,7 +192,9 @@ describeGit("git check-ignore against native git", () => {
     await twin({ args: ["-v", ...rel], cwd: "a/b/ignored-dir" });
   });
 
-  it('t0008-ignores.sh: "symlink", "beyond a symlink", "beyond a symlink from subdirectory", "submodule", "submodule from subdirectory"', async () => {
+  // t0008-ignores.sh's test_expect_success_multi cases: symlink, beyond a symlink (from
+  // subdirectory), submodule (from subdirectory)
+  it("t0008-ignores.sh: symbolic links and submodules", async () => {
     await multi(["a/symlink"]);
     await multi(["a/symlink/foo"]);
     await multi(["symlink/foo"], { cwd: "a" });
@@ -190,14 +203,22 @@ describeGit("git check-ignore against native git", () => {
   });
 
   it('t0008-ignores.sh: "global ignore not yet enabled", "global ignore", "global ignore with -v"', async () => {
-    const paths = ["globalone", "per-repo", "globalthree", "a/globalthree", "a/per-repo", "not-ignored", "globaltwo"];
+    const paths = [
+      "globalone",
+      "per-repo",
+      "globalthree",
+      "a/globalthree",
+      "a/per-repo",
+      "not-ignored",
+      "globaltwo",
+    ];
     await twin({ args: ["-v", ...paths] });
     git(root, repo, ["config", "core.excludesfile", "global-excludes"]);
     await twin({ args: paths });
     await twin({ args: ["-v", ...paths] });
   });
 
-  it('t0008-ignores.sh: "--stdin", "--stdin -q", "--stdin -v", "--stdin -z", "--stdin from subdirectory", "--stdin from subdirectory with -v", "--stdin from subdirectory with -v -n", "--stdin -z from subdirectory with -v"', async () => {
+  it('t0008-ignores.sh: "--stdin", "--stdin -q", "--stdin -v", "--stdin from subdirectory", "--stdin from subdirectory with -v", "--stdin from subdirectory with -v -n", "--stdin -z from subdirectory with -v"', async () => {
     const top = [
       "one",
       "not-ignored",
@@ -245,7 +266,11 @@ describeGit("git check-ignore against native git", () => {
       const stdin = `${lines.join("\n")}\n`;
       for (const opts of [[], ["-q"], ["-v"], ["-v", "-n"]]) {
         await twin({ args: ["--stdin", ...opts], stdin, ...(cwd ? { cwd } : {}) });
-        await twin({ args: ["--stdin", "-z", ...opts], stdin: `${zero(lines)}\0`, ...(cwd ? { cwd } : {}) });
+        await twin({
+          args: ["--stdin", "-z", ...opts],
+          stdin: `${zero(lines)}\0`,
+          ...(cwd ? { cwd } : {}),
+        });
       }
     }
     await twin({ args: ["--stdin"], stdin: 'one\n"bad\\q"\none\n' });
@@ -273,14 +298,26 @@ describeGit("git check-ignore against native git", () => {
       }
       writeFiles(other, { ".gitignore": "data/**\n!data/**/\n!data/**/*.txt\n" });
       await twin({
-        args: ["-v", "-n", "file", "data/file", "data/data1/file1", "data/data1/file1.txt", "data/data2/file2", "data/data2/file2.txt"],
+        args: [
+          "-v",
+          "-n",
+          "file",
+          "data/file",
+          "data/data1/file1",
+          "data/data1/file1.txt",
+          "data/data2/file2",
+          "data/data2/file2.txt",
+        ],
       });
       // git 2.44+ keeps one literal character for wildmatch (2.43 also takes `foobar`)
       if (nativeAtLeast(2, 44)) {
         writeFiles(other, { ".gitignore": "foo**/bar\n" });
         await twin({ args: ["foobar", "foo/bar"] });
       }
-      writeFiles(other, { ".gitignore": "\\#hash\n\\!bang\nsp\\ \ntab\t\n\xe9t\xe9\n", "x/\xe9.gitignore": "" });
+      writeFiles(other, {
+        ".gitignore": "\\#hash\n\\!bang\nsp\\ \ntab\t\n\xe9t\xe9\n",
+        "x/\xe9.gitignore": "",
+      });
       await twin({ args: ["-v", "#hash", "!bang", "sp ", "tab\t", "\xe9t\xe9"] });
     } finally {
       repo = saved;

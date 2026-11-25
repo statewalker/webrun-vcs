@@ -40,10 +40,18 @@ async function ours(args: string[], input: string, config: [string, string][]): 
 }
 
 async function twin(input: string, args: string[] = [], config: [string, string][] = []) {
-  const n = native(root, repo, [...config.flatMap(([k, v]) => ["-c", `${k}=${v}`]), "patch-id", ...args], {
-    stdin: input,
-  });
-  expect(await ours(args, input, config), JSON.stringify([args, config, input.slice(0, 80)])).toEqual(n);
+  const n = native(
+    root,
+    repo,
+    [...config.flatMap(([k, v]) => ["-c", `${k}=${v}`]), "patch-id", ...args],
+    {
+      stdin: input,
+    },
+  );
+  expect(
+    await ours(args, input, config),
+    JSON.stringify([args, config, input.slice(0, 80)]),
+  ).toEqual(n);
   return n;
 }
 
@@ -179,7 +187,9 @@ describeGit("git patch-id against native git", () => {
     await allModes(diffu1.replace(/\n/g, "\r\n"));
     await allModes(diffu1.slice(0, -1));
     await allModes(`commit ${"a".repeat(40)}\nmessage\n${"B".repeat(40)} in it\n${diffu1}`);
-    await allModes(`From ${"c".repeat(40)} Mon Sep 17 00:00:00 2001\n${diffu1}\n-- \n2.0\n\n${diffu1}`);
+    await allModes(
+      `From ${"c".repeat(40)} Mon Sep 17 00:00:00 2001\n${diffu1}\n-- \n2.0\n\n${diffu1}`,
+    );
     await allModes(
       lines(
         "diff --git a/x b/x",

@@ -116,9 +116,18 @@ describeGit("git var against native git", () => {
     );
     await twin(["GIT_COMMITTER_IDENT"]);
     await twin(["GIT_COMMITTER_IDENT"], { GIT_COMMITTER_DATE: "2005-04-07T22:13:13+0200" });
-    await withConfig([["user.name", "Conf Name"], ["user.email", "conf@example.com"]], async () => {
-      await twin(["GIT_AUTHOR_IDENT"], { GIT_AUTHOR_NAME: undefined, GIT_AUTHOR_EMAIL: undefined });
-    });
+    await withConfig(
+      [
+        ["user.name", "Conf Name"],
+        ["user.email", "conf@example.com"],
+      ],
+      async () => {
+        await twin(["GIT_AUTHOR_IDENT"], {
+          GIT_AUTHOR_NAME: undefined,
+          GIT_AUTHOR_EMAIL: undefined,
+        });
+      },
+    );
   });
 
   it('t0007-git-var.sh: "get GIT_DEFAULT_BRANCH without configuration", "get GIT_DEFAULT_BRANCH with configuration"', async () => {
@@ -180,7 +189,10 @@ describeGit("git var against native git", () => {
   it('t0007-git-var.sh: "GIT_CONFIG_SYSTEM points to the correct location", "GIT_CONFIG_GLOBAL points to the correct location"', async () => {
     expect((await twin(["GIT_CONFIG_SYSTEM"], { GIT_CONFIG_NOSYSTEM: "1" })).status).toBe(1);
     await twin(["GIT_CONFIG_SYSTEM"], { GIT_CONFIG_NOSYSTEM: undefined });
-    await twin(["GIT_CONFIG_SYSTEM"], { GIT_CONFIG_NOSYSTEM: undefined, GIT_CONFIG_SYSTEM: "/dev/null" });
+    await twin(["GIT_CONFIG_SYSTEM"], {
+      GIT_CONFIG_NOSYSTEM: undefined,
+      GIT_CONFIG_SYSTEM: "/dev/null",
+    });
     await twin(["GIT_CONFIG_SYSTEM"], {
       GIT_CONFIG_NOSYSTEM: undefined,
       GIT_CONFIG_SYSTEM: `${root}/gitconfig`,
@@ -196,16 +208,22 @@ describeGit("git var against native git", () => {
   });
 
   it('t0007-git-var.sh: "git var -l lists variables", "git var -l lists config", "git var -l lists multiple global configs", "git var -l does not split multiline editors"', async () => {
-    await withConfig([["core.editor", "vim"], ["foo.Bar.baz", "x\ny"]], async () => {
-      await twin(["-l"], { ...NO_EDITORS });
-      await twin(["-l"], {
-        GIT_CONFIG_GLOBAL: undefined,
-        HOME: root,
-        XDG_CONFIG_HOME: `${root}/foo`,
-        ...NO_EDITORS,
-        GIT_EDITOR: '!f() {\n\techo Hello!\n}; f',
-      });
-    });
+    await withConfig(
+      [
+        ["core.editor", "vim"],
+        ["foo.Bar.baz", "x\ny"],
+      ],
+      async () => {
+        await twin(["-l"], { ...NO_EDITORS });
+        await twin(["-l"], {
+          GIT_CONFIG_GLOBAL: undefined,
+          HOME: root,
+          XDG_CONFIG_HOME: `${root}/foo`,
+          ...NO_EDITORS,
+          GIT_EDITOR: "!f() {\n\techo Hello!\n}; f",
+        });
+      },
+    );
   });
 
   it('t0007-git-var.sh: "listing and asking for variables are exclusive"', async () => {

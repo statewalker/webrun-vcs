@@ -105,7 +105,7 @@ export class CheckIgnoreCommand extends GitCommand<PlumbingOutput> {
     this.checkCallable();
     this.setCallable(false);
     let stdout = "";
-    let stderr = "";
+    const stderr = "";
     const die = (message: string, exitCode = 128) => ({
       exitCode,
       stdout,
@@ -160,7 +160,8 @@ export class CheckIgnoreCommand extends GitCommand<PlumbingOutput> {
         match = await worktree.ignoreMatch?.(path);
         if (!this.verbose && match?.negated) match = undefined;
       }
-      if (!this.quiet && (match || this.nonMatching)) stdout += this.line(original, match, sources, quoteFully);
+      if (!this.quiet && (match || this.nonMatching))
+        stdout += this.line(original, match, sources, quoteFully);
       if (match) ignored++;
       return undefined;
     };

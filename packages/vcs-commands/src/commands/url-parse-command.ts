@@ -10,7 +10,7 @@
  * ```
  */
 
-import { type UrlComponent, URL_COMPONENTS, urlComponent, urlParse } from "@statewalker/vcs-utils";
+import { URL_COMPONENTS, type UrlComponent, urlComponent, urlParse } from "@statewalker/vcs-utils";
 
 import { GitCommand } from "../git-command.js";
 import type { PlumbingOutput } from "./check-ref-format-command.js";

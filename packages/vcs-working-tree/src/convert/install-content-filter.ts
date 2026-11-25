@@ -62,7 +62,9 @@ export function installExcludesFile(
     // a relative path is read from the top of the worktree, where git's setup has moved
     const top = (worktree as { hostPath?: string }).hostPath;
     const content = await env.readFile(
-      /^([A-Za-z]:)?[\\/]/.test(path) || top === undefined ? path : `${top.replace(/\/+$/, "")}/${path}`,
+      /^([A-Za-z]:)?[\\/]/.test(path) || top === undefined
+        ? path
+        : `${top.replace(/\/+$/, "")}/${path}`,
     );
     return content ? decodeGitPatternFile(content) : undefined;
   });

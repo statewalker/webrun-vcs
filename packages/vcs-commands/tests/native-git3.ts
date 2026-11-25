@@ -27,7 +27,7 @@ let cached: string | null | undefined;
 /**
  * The git 3.0 binary from `$GIT3`, or undefined when it is unset or is not a build with
  * `WITH_BREAKING_CHANGES` (its `--build-options` report `default-ref-storage-format:
- * reftable`). A `$GIT3` that is set but unusable throws, so a misconfigured CI fails loudly
+ * reftable`, a 2.5x release's `default-ref-format: reftable`). A `$GIT3` that is set but unusable throws, so a misconfigured CI fails loudly
  * instead of skipping the git 3.0 twins.
  */
 export function git3Binary(): string | undefined {
@@ -38,7 +38,8 @@ export function git3Binary(): string | undefined {
     return undefined;
   }
   const options = execFileSync(path, ["version", "--build-options"], { encoding: "utf8" });
-  if (!/^default-ref-storage-format: reftable$/m.test(options)) {
+  // master says `default-ref-storage-format`, 2.5x releases `default-ref-format`
+  if (!/^default-ref(-storage)?-format: reftable$/m.test(options)) {
     throw new Error(`$GIT3 (${path}) is not a git built with WITH_BREAKING_CHANGES:\n${options}`);
   }
   cached = path;

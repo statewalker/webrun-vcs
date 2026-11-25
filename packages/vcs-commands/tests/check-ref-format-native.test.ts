@@ -25,7 +25,8 @@ let repo = "";
 async function ours(dir: string, args: string[]): Promise<Outcome> {
   const g: Git = await openOurs(dir);
   const cmd = g.checkRefFormat();
-  if (args[0] === "--branch") return outcomeOf(await cmd.setBranch(fromBytes(args[1] ?? "")).call());
+  if (args[0] === "--branch")
+    return outcomeOf(await cmd.setBranch(fromBytes(args[1] ?? "")).call());
   for (const a of args.slice(0, -1)) {
     if (a === "--normalize" || a === "--print") cmd.setNormalize(true);
     else if (a === "--allow-onelevel") cmd.setAllowOneLevel(true);
@@ -82,19 +83,29 @@ const T1402: Array<[string, string?]> = [
   ["heads/f*o/bar", "--refspec-pattern"],
   ["heads/f*o*/bar", "--refspec-pattern"],
   ["heads/foo*/bar*", "--refspec-pattern"],
-  ...["foo", "foo/bar", "foo/*", "*/foo", "foo/*/bar", "*", "foo/*/*", "*/foo/*", "*/*/foo", "/foo"]
-    .flatMap((ref) =>
-      [
-        "",
-        "--allow-onelevel",
-        "--refspec-pattern",
-        "--refspec-pattern --allow-onelevel",
-        "--normalize",
-        "--allow-onelevel --normalize",
-        "--refspec-pattern --normalize",
-        "--refspec-pattern --allow-onelevel --normalize",
-      ].map((o): [string, string] => [ref, o]),
-    ),
+  ...[
+    "foo",
+    "foo/bar",
+    "foo/*",
+    "*/foo",
+    "foo/*/bar",
+    "*",
+    "foo/*/*",
+    "*/foo/*",
+    "*/*/foo",
+    "/foo",
+  ].flatMap((ref) =>
+    [
+      "",
+      "--allow-onelevel",
+      "--refspec-pattern",
+      "--refspec-pattern --allow-onelevel",
+      "--normalize",
+      "--allow-onelevel --normalize",
+      "--refspec-pattern --normalize",
+      "--refspec-pattern --allow-onelevel --normalize",
+    ].map((o): [string, string] => [ref, o]),
+  ),
   // valid_ref_normalized / invalid_ref_normalized
   ...[
     "heads/foo",
