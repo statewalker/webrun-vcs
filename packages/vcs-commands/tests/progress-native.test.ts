@@ -7,9 +7,7 @@
  *
  * Phases ours does not report are left out of native's list before the comparison, each
  * named here: the commit-graph's phases of gc (they change with every version), `refs
- * verify`'s "Checking ref database" of 2.5x fsck (ours is fsck `--no-references`), and the
- * delta search's "Compressing objects", whose count is the delta search's candidates (ours
- * and git's pack writers pick them differently: ours only has to finish it).
+ * verify`'s "Checking ref database" of 2.5x fsck (ours is fsck `--no-references`).
  *
  * Every phase also cancels: a monitor that throws mid-phase makes the command fail, leaving
  * the repository as git leaves the command interrupted there (no temporary pack, no index
@@ -65,12 +63,7 @@ interface Phase {
 }
 
 /** Phases ours does not report (see the module comment). */
-const NOT_REPORTED = [
-  /^Checking ref database$/,
-  /commit graph/,
-  /^Collecting referenced commits$/,
-  /^Compressing objects$/,
-];
+const NOT_REPORTED = [/^Checking ref database$/, /commit graph/, /^Collecting referenced commits$/];
 
 /**
  * The phases of git's progress lines, in order: each `<title>: NN% (done/total)` or
@@ -215,6 +208,7 @@ describeGit("progress callbacks against native git's --progress", () => {
     expect(theirs.map((p) => p.phase)).toEqual([
       "Enumerating objects",
       "Counting objects",
+      "Compressing objects",
       "Writing objects",
       "Removing duplicate objects",
     ]);
@@ -241,6 +235,25 @@ describeGit("progress callbacks against native git's --progress", () => {
     expectWellFormed(ours.updates);
     expect(ours.phases()).toEqual(theirs);
   });
+
+  it("repack: a blob over 16 MiB is one of git's delta candidates (should_attempt_deltas)", async () => {
+    // git's should_attempt_deltas tries every object up to core.bigFileThreshold (512 MiB):
+    // "Compressing objects" counts the 17 MiB blob that our delta search does not hold
+    const caseDir = newCase(root, "large");
+    const repo = slidingWindowRepo(caseDir);
+    repo.commit("large", { big: random("big", 17 * 2 ** 20) });
+    const nativeTwin = copyTwin(caseDir, "native");
+    const oursTwin = copyTwin(caseDir, "ours");
+    const theirs = parseNative(
+      native(join(nativeTwin, "repo"), ["repack", "-a", "-d"], { tty: true }),
+    );
+    const ours = recorder();
+    const git = await openOursGc(root, oursTwin);
+    await git.repack().setAll(true).setDeleteRedundant(true).setProgress(ours.monitor).call();
+    expectWellFormed(ours.updates);
+    expect(ours.phases()).toEqual(theirs);
+    expect(theirs.map((p) => p.phase)).toContain("Compressing objects");
+  }, 60_000);
 
   it('t7700-repack.sh: "--quiet disables progress"', async () => {
     const caseDir = newCase(root, "quiet");
