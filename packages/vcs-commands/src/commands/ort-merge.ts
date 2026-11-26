@@ -116,6 +116,8 @@ export interface OrtMergeOptions {
   recursiveDriver?: (name: string) => string | undefined;
   /** merge.<driver>.driver: the command a registered driver is given */
   driverCommand?: (name: string) => string | undefined;
+  /** Whether the configuration names a driver (`merge.<name>.*`; git's user drivers) */
+  configuredDriver?: (name: string) => boolean;
   /**
    * The trees given as {@link prunedFlatTrees} reads them (directories all three hold alike
    * stand as one TREE entry): per tree (base, ours, theirs), the id of each directory, so a
@@ -1324,6 +1326,9 @@ class OrtMerge {
         ...(this.options.defaultDriver ? { defaultDriver: this.options.defaultDriver } : {}),
         ...(this.options.recursiveDriver ? { recursiveDriver: this.options.recursiveDriver } : {}),
         ...(this.options.driverCommand ? { driverCommand: this.options.driverCommand } : {}),
+        ...(this.options.configuredDriver
+          ? { configuredDriver: this.options.configuredDriver }
+          : {}),
         virtualAncestor: this.depth > 0,
         ...(this.options.favor ? { favor: this.options.favor } : {}),
         ...(this.options.style ? { style: this.options.style } : {}),
