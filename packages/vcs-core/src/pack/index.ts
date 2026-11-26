@@ -23,6 +23,7 @@ export * from "./pack-mtimes.js";
 export * from "./pack-order-scan.js";
 export * from "./pack-reverse-index.js";
 export * from "./pack-set.js";
+export * from "./pseudo-merge.js";
 export * from "./random-access-delta.js";
 export * from "./run-steps.js";
 export * from "./types.js";

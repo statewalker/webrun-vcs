@@ -236,6 +236,14 @@ export interface GitHostEnvironment {
    */
   hookRunner?: HookRunner;
   /**
+   * The file system monitor git asks for the paths changed since a token (`core.fsmonitor`,
+   * fsmonitor.c): a host with a watcher of its own answers here, for the hook protocol
+   * (`core.fsmonitor=<program>`) or for git's builtin daemon (`core.fsmonitor=true`).
+   * Absent: a hook is run through {@link hookRunner} (none: the query fails), and the
+   * builtin daemon is never there (git's token `builtin:fake`, every entry checked).
+   */
+  fsmonitor?: FsmonitorProvider;
+  /**
    * Signs what git signs (commits now; tags and push certificates later): the commands
    * resolve what git's `sign_buffer` would run (`gpg.format`, the program, the key) and hand
    * it to this callback with the payload. Absent: every request to sign fails as git fails
@@ -654,4 +662,33 @@ export function withoutCommandLineConfig<T extends GitHostEnvironment | undefine
     commandLineConfig: { value: undefined, enumerable: true },
     commandLineConfigError: { value: undefined, enumerable: true },
   }) as T;
+}
+
+/** A question to the file system monitor: what changed since `token`. */
+export interface FsmonitorQuery {
+  /** `hook`: `core.fsmonitor` names a program; `ipc`: `core.fsmonitor=true` (the daemon) */
+  mode: "hook" | "ipc";
+  /** The program `core.fsmonitor` names (hook mode), run by git through the shell */
+  command?: string;
+  /** The hook protocol version asked (hook mode): its first argument */
+  version?: 1 | 2;
+  /** The token the changes are asked since (the hook's second argument) */
+  token: string;
+}
+
+/**
+ * The monitor's answer, as the hook prints it: exit code 0 for success, stdout the protocol's
+ * bytes (version 2 and the daemon: the new token, a NUL, then the changed paths, each ended
+ * by a NUL, a directory with a trailing `/`, or `/` alone for "everything may have changed";
+ * version 1: the paths alone).
+ */
+export interface FsmonitorAnswer {
+  exitCode: number;
+  stdout: Uint8Array;
+}
+
+/** A host's file system monitor (see {@link GitHostEnvironment.fsmonitor}). */
+export interface FsmonitorProvider {
+  /** Asks the monitor; undefined (or a throw) is a failed query: git checks every entry */
+  query(query: FsmonitorQuery): Promise<FsmonitorAnswer | undefined>;
 }

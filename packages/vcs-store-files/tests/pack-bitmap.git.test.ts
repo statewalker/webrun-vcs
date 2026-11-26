@@ -71,8 +71,8 @@ const gitResult = (cwd: string, args: string[]) => {
 
 const version = execFileSync("git", ["--version"], { encoding: "utf8" });
 const [major = 0, minor = 0] = (/(\d+)\.(\d+)/.exec(version) ?? []).slice(1).map(Number);
-/** 2.5x sorts the entries oldest first; 2.43 keeps them newest first. */
-const compatibility: "2.43" | "2.56" = major > 2 || minor >= 50 ? "2.56" : "2.43";
+/** 2.55+ sorts the entries oldest first; 2.54 and older keep them newest first. */
+const compatibility: "2.43" | "2.56" = major > 2 || minor >= 55 ? "2.56" : "2.43";
 
 const dirs: string[] = [];
 afterAll(() => {

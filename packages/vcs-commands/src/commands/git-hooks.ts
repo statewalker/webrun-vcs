@@ -1041,6 +1041,24 @@ export class HookSession {
     command: string,
     args: string[] = [],
   ): Promise<{ exitCode: number; stdout: string; stderr: string } | undefined> {
+    const outcome = await this.runShellCommandBytes(name, command, args);
+    if (!outcome) return undefined;
+    return {
+      exitCode: outcome.exitCode,
+      stdout: decoder.decode(outcome.stdout),
+      stderr: decoder.decode(outcome.stderr),
+    };
+  }
+
+  /**
+   * {@link runShellCommand} with stdout and stderr as bytes (a program printing paths that
+   * are not UTF-8: the fsmonitor hook).
+   */
+  async runShellCommandBytes(
+    name: string,
+    command: string,
+    args: string[] = [],
+  ): Promise<{ exitCode: number; stdout: Uint8Array; stderr: Uint8Array } | undefined> {
     const runner = this.runner;
     if (!runner) return undefined;
     const layout = await this.host.layout();
@@ -1057,12 +1075,8 @@ export class HookSession {
     } catch {
       outcome = undefined;
     }
-    if (!outcome) return { exitCode: 1, stdout: "", stderr: "" };
-    return {
-      exitCode: outcome.exitCode,
-      stdout: decoder.decode(outcome.stdout),
-      stderr: decoder.decode(outcome.stderr),
-    };
+    if (!outcome) return { exitCode: 1, stdout: new Uint8Array(0), stderr: new Uint8Array(0) };
+    return { exitCode: outcome.exitCode, stdout: outcome.stdout, stderr: outcome.stderr };
   }
 
   /**

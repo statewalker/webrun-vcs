@@ -50,6 +50,12 @@ import {
   storeCacheTree,
 } from "./cache-tree.js";
 import {
+  encodeFsmonitorExtension,
+  FSMONITOR_EXTENSION,
+  FsmonitorState,
+  parseFsmonitorExtension,
+} from "./fsmonitor.js";
+import {
   assertWritableIndexExtensions,
   carryIndexExtensions,
   encodeResolveUndo,
@@ -164,6 +170,11 @@ export interface IndexSettings {
   untrackedIdent?: string;
   /** The dir flags a cache `untrackedCache: "write"` adds is made for (`new_untracked_cache_flags`) */
   untrackedFlags?: number;
+  /**
+   * Whether `core.fsmonitor` turns the monitor on: false writes no `FSMN` extension (git's
+   * `remove_fsmonitor` on every index read with the monitor off); undefined keeps it.
+   */
+  fsmonitor?: boolean;
 }
 
 /**
@@ -204,6 +215,8 @@ interface DecodedIndex {
   split: SplitState | undefined;
   /** The sparse directories of a sparse index (paths with their trailing slash) */
   sparseDirs: string[] | undefined;
+  /** The fsmonitor state the `FSMN` extension gives (none, or one git refuses: undefined) */
+  fsmonitor: FsmonitorState | undefined;
 }
 
 /** What a write puts on disk, and what it does around the index file's rename. */
@@ -471,6 +484,10 @@ export class IndexFile {
   private sparseDirs: string[] | undefined;
   /** What this file reads from the repository (`setHost`) */
   private host: IndexHost | undefined;
+  /** The fsmonitor state (`FSMN`) read or set; written with the index while it is set */
+  private fsmonitor: FsmonitorState | undefined;
+  /** An `FSMN` read was dropped (`setFsmonitor(undefined)`): the index wants a rewrite */
+  private fsmonitorRemoved = false;
 
   constructor(
     private readonly files: FilesApi,
@@ -557,6 +574,8 @@ export class IndexFile {
    */
   async wantsRewrite(options: { untrackedCache?: boolean } = {}): Promise<boolean> {
     if (this.refused || this.checksum === undefined) return false;
+    // git's FSMONITOR_CHANGED: bits set, the extension added or removed
+    if (this.fsmonitor?.changed || this.fsmonitorRemoved) return true;
     if (this.checksum === null && !options.untrackedCache) return false;
     const settings = (await this.host?.settings?.()) ?? {};
     // tweak_untracked_cache marks the index changed (UNTRACKED_CHANGED) when it adds or
@@ -572,6 +591,51 @@ export class IndexFile {
     if (settings.splitIndex === true) return this.split === undefined;
     if (settings.splitIndex === false) return this.split !== undefined;
     return false;
+  }
+
+  /**
+   * The fsmonitor state (`FSMN`) of the index as read, or as set since: the token and the
+   * entries' valid bits, which callers edit in place (`markValid`); undefined when none.
+   */
+  getFsmonitor(): FsmonitorState | undefined {
+    return this.fsmonitor;
+  }
+
+  /**
+   * Sets the fsmonitor state written with the index (git's `add_fsmonitor`), or removes it
+   * (`remove_fsmonitor`: the next write carries no `FSMN`, and the index wants one).
+   */
+  setFsmonitor(state: FsmonitorState | undefined): void {
+    if (!state && this.fsmonitor) this.fsmonitorRemoved = true;
+    if (state) {
+      this.fsmonitorRemoved = false;
+      state.changed = true;
+    }
+    this.fsmonitor = state;
+  }
+
+  /** Takes the fsmonitor state of `other` over (a fresh instance writing for it). */
+  useFsmonitorOf(other: IndexFile): void {
+    this.fsmonitor = other.fsmonitor;
+    this.fsmonitorRemoved = other.fsmonitorRemoved;
+  }
+
+  /** The `FSMN` extension a write of `entries` carries, if any. */
+  private fsmonitorExtension(
+    entries: readonly StagingEntry[],
+    settings: IndexSettings,
+  ): IndexExtension | undefined {
+    if (!this.fsmonitor || settings.fsmonitor === false) return undefined;
+    return {
+      signature: FSMONITOR_EXTENSION,
+      data: encodeFsmonitorExtension(this.fsmonitor, entries),
+    };
+  }
+
+  /** After a write: what the fsmonitor state asked for is on disk. */
+  private fsmonitorWritten(): void {
+    if (this.fsmonitor) this.fsmonitor.changed = false;
+    this.fsmonitorRemoved = false;
   }
 
   /** Whether the index was read (or last written) as a sparse index. */
@@ -600,6 +664,8 @@ export class IndexFile {
   /** Takes over what `other` (over the same file) last read or wrote. */
   adopt(other: IndexFile): void {
     this.format = other.format;
+    this.fsmonitor = other.fsmonitor;
+    this.fsmonitorRemoved = other.fsmonitorRemoved;
     this.checksum = other.checksum;
     this.version = other.version;
     this.extensions = other.extensions;
@@ -633,11 +699,13 @@ export class IndexFile {
       objectFormat: this.format,
     });
     let linkData: Uint8Array | undefined;
+    let fsmonitorData: Uint8Array | undefined;
     let sparse = false;
     const others: IndexExtension[] = [];
     for (const ext of parsed.extensionData) {
       if (ext.signature === "link") linkData = ext.data;
       else if (ext.signature === SPARSE_DIRECTORIES_EXTENSION) sparse = true;
+      else if (ext.signature === FSMONITOR_EXTENSION) fsmonitorData = ext.data;
       else others.push(ext);
     }
     assertWritableIndexExtensions(others);
@@ -669,7 +737,15 @@ export class IndexFile {
     if (sparse && this.options.keepSparseDirectories) {
       sparseDirs = entries.filter(isSparseDirectoryEntry).map((e) => e.path);
       for (const e of entries) if (!isSparseDirectoryEntry(e)) validateIndexEntryPaths([e]);
-      return { entries, version: parsed.version, extensions, encoding, split, sparseDirs };
+      return {
+        entries,
+        version: parsed.version,
+        extensions,
+        encoding,
+        split,
+        sparseDirs,
+        fsmonitor: undefined,
+      };
     }
     if (sparse) {
       // post_read_index_from's tweak_split_index: core.splitIndex=true on an index still
@@ -689,9 +765,9 @@ export class IndexFile {
       sparseDirs = entries.filter(isSparseDirectoryEntry).map((e) => e.path);
       const full = await expandSparseIndex(entries, cacheTree, trees);
       entries = full.entries;
-      extensions = others
-        .filter((e) => e.signature !== "TREE")
-        .filter((e) => e.signature !== "FSMN");
+      // the bitmap names the sparse index's entries: dropped (every entry dirty again)
+      fsmonitorData = undefined;
+      extensions = others.filter((e) => e.signature !== "TREE");
       if (full.cacheTree) {
         extensions = [
           { signature: "TREE", data: encodeCacheTree(full.cacheTree, this.rawLength) },
@@ -700,7 +776,10 @@ export class IndexFile {
       }
     }
     if (linkData || sparse) validateIndexEntryPaths(entries);
-    return { entries, version: parsed.version, extensions, encoding, split, sparseDirs };
+    // tweak_fsmonitor: the bitmap's positions are the merged index's (post_read_index_from)
+    const fsm = fsmonitorData ? parseFsmonitorExtension(fsmonitorData, entries.length) : undefined;
+    const fsmonitor = fsm ? FsmonitorState.fromExtension(fsm, entries) : undefined;
+    return { entries, version: parsed.version, extensions, encoding, split, sparseDirs, fsmonitor };
   }
 
   /**
@@ -726,10 +805,12 @@ export class IndexFile {
       if (this.sparseDirs !== undefined) throw new Error(SPLIT_WITH_SPARSE);
       split = { ordered: true };
     }
-    if (split) return this.planSplit(entries, extensions, split, settings, version);
+    const fsmonitor = this.fsmonitorExtension(entries, settings);
+    if (split) return this.planSplit(entries, extensions, split, settings, version, fsmonitor);
     const sparse = await this.planSparse(entries, extensions, settings, version);
     if (sparse) return sparse;
-    const { bytes, checksum, encoding } = await encodeIndexFileBytes(entries, version, extensions, {
+    const onDisk = fsmonitor ? [...extensions, fsmonitor] : extensions;
+    const { bytes, checksum, encoding } = await encodeIndexFileBytes(entries, version, onDisk, {
       ...(this.encoding ? { source: this.encoding } : {}),
       ...(settings.skipHash ? { skipHash: true } : {}),
       objectFormat: this.format,
@@ -744,6 +825,7 @@ export class IndexFile {
     split: SplitState,
     settings: IndexSettings,
     version: IndexVersion,
+    fsmonitor?: IndexExtension,
   ): Promise<IndexWritePlan> {
     let shared = split.shared;
     let classification: SplitClassification = shared
@@ -786,7 +868,7 @@ export class IndexFile {
     const main = await encodeIndexInOrder(
       items,
       version,
-      [{ signature: "link", data: link }, ...extensions],
+      [{ signature: "link", data: link }, ...extensions, ...(fsmonitor ? [fsmonitor] : [])],
       { ...(settings.skipHash ? { skipHash: true } : {}), objectFormat: this.format },
     );
     const finalShared = shared;
@@ -865,7 +947,7 @@ export class IndexFile {
     } catch {
       tree = undefined;
     }
-    const rest = extensions.filter((e) => e.signature !== "TREE" && e.signature !== "FSMN");
+    const rest = extensions.filter((e) => e.signature !== "TREE");
     const inCheckout = (path: string) => patterns.includes(path);
     // git's cache_tree_update(WRITE_TREE_MISSING_OK): every directory's tree stored, the
     // ones holding an intent-to-add entry invalid; undefined when it cannot be had
@@ -993,6 +1075,8 @@ export class IndexFile {
       this.sparseDirs = undefined;
       this.checksum = null;
       this.version = undefined;
+      this.fsmonitor = undefined;
+      this.fsmonitorRemoved = false;
       return undefined;
     }
     const data = await readFile(this.files, this.path);
@@ -1016,6 +1100,8 @@ export class IndexFile {
     this.version = decoded.version;
     this.extensions = decoded.extensions;
     this.entriesKept = this.extensions.length > 0 ? decoded.entries.slice() : undefined;
+    this.fsmonitor = decoded.fsmonitor;
+    this.fsmonitorRemoved = false;
     // the index file's own mtime; unknown is 0 (every entry racy), never "now"
     return { entries: decoded.entries, lastModified: stats.lastModified ?? 0 };
   }
@@ -1239,6 +1325,7 @@ export class IndexFile {
     this.sparseDirs = plan.sparseDirs;
     this.version = plan.version;
     this.wrote(entries, plan.extensions);
+    this.fsmonitorWritten();
   }
 
   /** `adjust_shared_perm` of a new lock file, as git's `create_tempfile_mode` applies it. */
@@ -1348,6 +1435,7 @@ export class IndexFile {
         this.sparseDirs = pending.sparseDirs;
         if (pending.version !== undefined) this.version = pending.version;
         this.wrote(pending.entries, pending.extensions);
+        this.fsmonitorWritten();
       },
       rollback: async () => {
         if (state === "held") await release();
@@ -1371,6 +1459,8 @@ export class IndexFile {
         this.lastEntries = parsed.split ? parsed.entries.slice() : [];
         this.sparseDirs = parsed.sparseDirs;
         this.entriesKept = this.extensions.length > 0 ? parsed.entries.slice() : undefined;
+        this.fsmonitor = parsed.fsmonitor;
+        this.fsmonitorRemoved = false;
         pending = {
           entries: parsed.entries.slice(),
           extensions: parsed.extensions,

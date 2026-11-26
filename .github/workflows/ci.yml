@@ -27,16 +27,80 @@ jobs:
       # dependencies, workspace dependencies, .tested/config.json) changed since they last passed
       # here, as recorded in .tested/. `pnpm test` still runs everything.
       # A pull request from a fork may not change the records (only CI writes them).
+      # packages/vcs-commands (about 400 test files, most of them spawning native git) runs in the
+      # four `commands-tests` shard jobs below instead.
       test-command: >-
-        node scripts/tested.mjs run --no-bail
+        node scripts/tested.mjs run --no-bail --exclude=packages/vcs-commands
         ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '--all' || '' }}
         ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && format('--records-unchanged-from={0}', github.event.pull_request.base.sha) || '' }}
+
+  # packages/vcs-commands's tests, split in four (`vitest run --shard`), each shard on a runner of
+  # its own: one vitest process took 24 minutes for them. The same runner image as the ci job, so
+  # the native-git twins see the same git (the shared workflow installs none). Each shard asks
+  # scripts/tested.mjs whether the package needs testing (its hash not recorded in .tested/, or
+  # --all on the weekly and manual runs) and skips itself otherwise; tested-record and the release
+  # jobs wait for all four.
+  commands-tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      SHARDS: 4
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      # git and node versions are part of the hash, as in the ci job; a fork's pull request may not
+      # change the records (--records-unchanged-from), as there.
+      - name: Needs testing
+        id: needs
+        env:
+          ALL: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '--all' || '' }}
+          RECORDS_GUARD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && format('--records-unchanged-from={0}', github.event.pull_request.base.sha) || '' }}
+        run: |
+          git --version
+          node scripts/tested.mjs status --package=packages/vcs-commands --json $ALL $RECORDS_GUARD \
+            > "$RUNNER_TEMP/status.json"
+          cat "$RUNNER_TEMP/status.json"
+          pending=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).pending' "$RUNNER_TEMP/status.json")
+          echo "test=$([ "$pending" = 1 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Tests of scripts/tested.mjs
+        if: matrix.shard == 1
+        run: node --test scripts/tested.test.mjs
+
+      - name: Install
+        if: steps.needs.outputs.test == 'true'
+        run: pnpm install --frozen-lockfile
+
+      # The tests import some workspace packages through their built entries (dist/).
+      - name: Build
+        if: steps.needs.outputs.test == 'true'
+        run: pnpm --filter "@statewalker/vcs-commands..." run build
+
+      - name: Test (shard ${{ matrix.shard }}/4)
+        if: steps.needs.outputs.test == 'true'
+        run: pnpm --filter @statewalker/vcs-commands exec vitest run --shard=${{ matrix.shard }}/$SHARDS
+
+      - name: Skipped
+        if: steps.needs.outputs.test != 'true'
+        run: echo "packages/vcs-commands is recorded as tested at this hash; nothing to run"
 
   # The lockfile-only pull request that .github/workflows/statewalker-update.yml opens: merged
   # once every other check on it passes, after checking it changes pnpm-lock.yaml alone
   # (statewalker/statewalker-ci's merge-lockfile.yml; statewalker-root docs/process/merging.md).
   lockfile:
-    needs: ci
+    needs: [ci, commands-tests]
     # !cancelled(): also after a failed check job, so the pull request gets a comment saying why.
     if: ${{ !cancelled() && github.event_name == 'pull_request' && github.head_ref == 'deps/statewalker-lockfile' }}
     permissions:
@@ -57,7 +121,7 @@ jobs:
   # the records being no test input), so the new head has the required check; a GITHUB_TOKEN
   # push would start no run and leave the pull request blocked.
   tested-record:
-    needs: ci
+    needs: [ci, commands-tests]
     if: >-
       !cancelled()
       && github.event_name == 'pull_request'
@@ -76,9 +140,10 @@ jobs:
         with:
           persist-credentials: false
       # The shared workflow runs the tests and uploads no records: after a green run, every package
-      # passed, so record the hashes of the tested commit.
+      # passed (vcs-commands in the four commands-tests shards), so record the hashes of the tested
+      # commit. Either failing records nothing.
       - name: Record the tested hashes
-        if: ${{ needs.ci.result == 'success' }}
+        if: ${{ needs.ci.result == 'success' && needs.commands-tests.result == 'success' }}
         run: node scripts/tested.mjs record
       - name: Push token
         id: token
@@ -157,7 +222,7 @@ jobs:
   # breaking line), then opens or updates the "chore: version packages" pull request. Never
   # publishes.
   version:
-    needs: ci
+    needs: [ci, commands-tests]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     concurrency:

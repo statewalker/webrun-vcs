@@ -151,6 +151,11 @@ export interface UntrackedScanOptions {
    * scan without ignored files (git's `validate_untracked_cache`). None: a plain scan
    */
   cache?: UntrackedCache;
+  /**
+   * The file system monitor answered for this index (git's `untracked->use_fsmonitor`): the
+   * cache's valid directories are taken as they are, without an lstat (`valid_cached_dir`)
+   */
+  trustValidDirectories?: boolean;
   /** The index file's mtime in whole seconds (racy directory stats are read again) */
   indexSeconds?: number;
   /** How directory stats are compared (`core.trustctime`, `core.checkStat`) */
@@ -391,15 +396,17 @@ export async function scanUntracked(
     node: UntrackedCacheDir,
     checkOnly: boolean,
   ): Promise<boolean> => {
-    const st = await host.lstat(dir);
-    if (!st) {
-      node.stat = zeroStatData();
-      return false;
-    }
-    const sd = statDataOf(st);
-    if (!node.valid || !statDataMatches(node.stat, sd, indexSeconds, options.stat)) {
-      node.stat = sd;
-      return false;
+    if (!(options.trustValidDirectories && node.valid)) {
+      const st = await host.lstat(dir);
+      if (!st) {
+        node.stat = zeroStatData();
+        return false;
+      }
+      const sd = statDataOf(st);
+      if (!node.valid || !statDataMatches(node.stat, sd, indexSeconds, options.stat)) {
+        node.stat = sd;
+        return false;
+      }
     }
     if (node.checkOnly !== checkOnly) return false;
     await prep(dir);
