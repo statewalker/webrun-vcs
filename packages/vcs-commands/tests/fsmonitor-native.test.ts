@@ -325,7 +325,7 @@ describeGit("fsmonitor against native git (t7519-status-fsmonitor.sh)", () => {
     expect(status.warnings ?? []).toContain("warning: Empty last update token.");
   });
 
-  it('t7519-status-fsmonitor.sh: "discard_index() also discards fsmonitor info" (version 1, trivial answer)', async () => {
+  it("a version 1 hook's trivial answer (t7519/fsmonitor-all) checks every entry", async () => {
     hook(ALL_V1);
     dirtyRepo();
     // version 2 fails, version 1 answers "/": every entry checked, a nanosecond token
