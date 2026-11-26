@@ -95,7 +95,10 @@ function fetchResponse(trace: string): string[] {
  */
 function expectSameResponse(mine: string[], theirs: string[], label: string): void {
   const isAck = (l: string) => /^(\\1)?ACK /.test(l);
-  expect(mine.filter((l) => !isAck(l)), label).toEqual(theirs.filter((l) => !isAck(l)));
+  expect(
+    mine.filter((l) => !isAck(l)),
+    label,
+  ).toEqual(theirs.filter((l) => !isAck(l)));
   const acks = mine.filter(isAck);
   for (const ack of theirs.filter(isAck)) expect(acks, label).toContain(ack);
   const band = (l: string) => l.startsWith("\\1");
