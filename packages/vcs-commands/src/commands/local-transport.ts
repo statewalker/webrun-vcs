@@ -192,6 +192,8 @@ export async function withLocalUploadPack<T>(
       // uploadpack.advertiseBundleURIs and bundle.*
       ...(settings.bundleUris !== undefined ? { bundleUris: settings.bundleUris } : {}),
       ...(settings.advertiseSID ? { advertiseSID: true } : {}),
+      // transfer.advertiseObjectInfo: v2 object-info
+      ...(settings.advertiseObjectInfo ? { advertiseObjectInfo: true } : {}),
       // promisor.advertise (with promisor.sendFields)
       ...(settings.promisorRemoteInfo !== undefined
         ? { promisorRemoteInfo: settings.promisorRemoteInfo }
