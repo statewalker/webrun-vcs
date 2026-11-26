@@ -33,7 +33,9 @@ async function oursInfo(
   compatibility: RepoCompatibility,
   cwd = "",
 ): Promise<Outcome> {
-  const git = await openOursAt(shell.home, dir);
+  // rooted at `/`, as git finds it: a linked worktree's or submodule's git directory (and its
+  // common directory's `extensions.refStorage`) lies outside a FilesApi rooted at `dir`
+  const { git } = await openOursFromEnvironment(shell.home, dir);
   return outcomeOf(() => {
     const command = git.repoInfo().setCompatibility(compatibility).setCurrentDirectory(cwd);
     for (const arg of argv) {
