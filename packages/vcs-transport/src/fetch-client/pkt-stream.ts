@@ -34,6 +34,8 @@ export class PktStream {
   private readonly next: () => Promise<IteratorResult<Uint8Array>>;
   private readonly stop: () => Promise<unknown>;
   private ended = false;
+  /** Data packets carry a side-band designator (protocol v2's `sideband-all`) */
+  private bands: { onProgress?: (message: string) => void } | undefined;
 
   constructor(
     /**
@@ -55,8 +57,35 @@ export class PktStream {
     }
   }
 
+  /**
+   * Reads every data packet as a side-band packet from now on, or no longer (`false`): git's
+   * `packet_reader` with `use_sideband` (protocol v2's `sideband-all`). Band 1 is the packet,
+   * band 2 goes to `onProgress`, band 3 throws a `ServerError`; flushes and delimiters stay as
+   * they are.
+   */
+  demultiplex(on: false | { onProgress?: (message: string) => void }): void {
+    this.bands = on === false ? undefined : on;
+  }
+
   /** The next packet, or `undefined` at the end of the stream (between packets). */
   async read(): Promise<Pkt | undefined> {
+    while (true) {
+      const p = await this.readRaw();
+      if (!this.bands || !p || p.type !== "data") return p;
+      // sideband.c's demultiplex_sideband
+      if (p.data.length === 0) {
+        throw new PacketLineError("protocol error: missing sideband designator");
+      }
+      const band = p.data[0] as number;
+      const payload = p.data.subarray(1);
+      if (band === 1) return dataPkt(payload);
+      if (band === 2) this.bands.onProgress?.(decoder.decode(payload));
+      else if (band === 3) throw new ServerError(decoder.decode(payload));
+      else throw new PacketLineError(`protocol error: bad band #${band}`);
+    }
+  }
+
+  private async readRaw(): Promise<Pkt | undefined> {
     if (!(await this.fill(4))) {
       if (this.queue.length > 0) throw new PacketLineError("Incomplete packet at end of stream");
       return undefined;
@@ -72,20 +101,7 @@ export class PktStream {
     }
     if (!(await this.fill(length))) throw new PacketLineError("Incomplete packet at end of stream");
     this.queue.take(4);
-    const data = this.queue.take(length - 4);
-    // decoded when asked: the sideband packets of a pack are never read as text
-    let text: string | undefined;
-    return {
-      type: "data",
-      data,
-      get text() {
-        if (text === undefined) {
-          text = decoder.decode(data);
-          if (text.endsWith("\n")) text = text.slice(0, -1);
-        }
-        return text;
-      },
-    };
+    return dataPkt(this.queue.take(length - 4));
   }
 
   /**
@@ -119,6 +135,22 @@ export class PktStream {
     }
     return true;
   }
+}
+
+/** A data packet, its text decoded when asked: the sideband packets of a pack never are. */
+function dataPkt(data: Uint8Array): Pkt {
+  let text: string | undefined;
+  return {
+    type: "data",
+    data,
+    get text() {
+      if (text === undefined) {
+        text = decoder.decode(data);
+        if (text.endsWith("\n")) text = text.slice(0, -1);
+      }
+      return text;
+    },
+  };
 }
 
 /**

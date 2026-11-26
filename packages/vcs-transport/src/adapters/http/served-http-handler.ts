@@ -314,6 +314,7 @@ function httpOptionsOf(
     uploadPackFilter,
     uploadPackRequestPolicy,
     allowRefInWant,
+    allowSidebandAll,
     advertiseSID,
     sessionId,
     packObjectsHook,
@@ -336,6 +337,7 @@ function httpOptionsOf(
   if (uploadPackFilter !== undefined) out.uploadPackFilter = uploadPackFilter;
   if (uploadPackRequestPolicy !== undefined) out.uploadPackRequestPolicy = uploadPackRequestPolicy;
   if (allowRefInWant !== undefined) out.allowRefInWant = allowRefInWant;
+  if (allowSidebandAll !== undefined) out.allowSidebandAll = allowSidebandAll;
   if (advertiseSID !== undefined) out.advertiseSID = advertiseSID;
   if (sessionId !== undefined) out.sessionId = sessionId;
   if (packObjectsHook !== undefined) out.packObjectsHook = packObjectsHook;

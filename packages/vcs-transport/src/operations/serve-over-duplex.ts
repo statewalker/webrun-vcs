@@ -181,6 +181,12 @@ export interface ServeOverDuplexOptions {
    */
   allowRefInWant?: boolean;
   /**
+   * Protocol v2: advertise `fetch=... sideband-all` and take a `sideband-all` argument (git's
+   * `uploadpack.allowSidebandAll`). Default false, as git: the argument ends the connection as
+   * an unexpected line
+   */
+  allowSidebandAll?: boolean;
+  /**
    * git's `transfer.advertiseSID`: upload-pack and receive-pack advertise `session-id=<id>`
    * (v0 capability, v2 capability line), the id {@link sessionId} names; the client's own
    * session id comes back as `ServeResult.clientSessionId`. Default false
@@ -301,6 +307,7 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
       options.requestPolicy ??
       (useV2 || service === "git-receive-pack" ? undefined : options.uploadPackRequestPolicy),
     ...(options.allowRefInWant ? { allowRefInWant: true } : {}),
+    ...(options.allowSidebandAll ? { allowSidebandAll: true } : {}),
     ...(options.advertiseSID
       ? { sessionId: validSessionId(options.sessionId) ?? processSessionId() }
       : {}),

@@ -183,6 +183,8 @@ export async function withLocalUploadPack<T>(
         ? { uploadPackRequestPolicy: settings.uploadPackRequestPolicy }
         : {}),
       ...(settings.allowRefInWant ? { allowRefInWant: true } : {}),
+      // uploadpack.allowSidebandAll
+      ...(settings.allowSidebandAll ? { allowSidebandAll: true } : {}),
       ...(settings.advertiseSID ? { advertiseSID: true } : {}),
       ...(head && "target" in head ? { currentBranch: head.target } : {}),
     }))().finally(() => server.close?.());
