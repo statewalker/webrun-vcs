@@ -210,6 +210,8 @@ export interface ServeOverDuplexOptions {
    * an unexpected line
    */
   allowSidebandAll?: boolean;
+  /** Protocol v2 `packfile-uris` (git's `uploadpack.blobPackfileUri` values) */
+  blobPackfileUris?: readonly string[];
   /**
    * Protocol v2: git's `uploadpack.advertiseBundleURIs`: `bundle-uri` advertised and answered
    * with these lines, the served repository's `bundle.*` settings as `<key>=<value>` in config
@@ -357,6 +359,7 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
       (useV2 || service === "git-receive-pack" ? undefined : options.uploadPackRequestPolicy),
     ...(options.allowRefInWant ? { allowRefInWant: true } : {}),
     ...(options.allowSidebandAll ? { allowSidebandAll: true } : {}),
+    ...(options.blobPackfileUris?.length ? { blobPackfileUris: options.blobPackfileUris } : {}),
     ...(options.bundleUris !== undefined && service !== "git-receive-pack"
       ? { bundleUris: options.bundleUris }
       : {}),
