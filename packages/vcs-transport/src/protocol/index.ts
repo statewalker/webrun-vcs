@@ -8,6 +8,7 @@ export * from "./git-request-parser.js";
 export * from "./hidden-refs.js";
 export * from "./object-format.js";
 export * from "./pkt-line-codec.js";
+export * from "./promisor-remote.js";
 export * from "./push-cert.js";
 export * from "./report-status.js";
 export * from "./session-id.js";

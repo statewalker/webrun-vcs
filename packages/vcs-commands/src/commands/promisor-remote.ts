@@ -41,6 +41,7 @@ import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { httpClientSettingsOf } from "./http-config.js";
+import { acceptedPromisorRemotes } from "./promisor-remote-reply.js";
 
 /** A promisor remote (git's `struct promisor_remote`). */
 export interface PromisorRemote {
@@ -168,6 +169,14 @@ export function createPromisorFetcher(
       return false;
     }
     const config = store();
+    // the child `git fetch <remote> --filter=blob:none` registers the filter first
+    // (fetch_one_setup_partial's partial_clone_register): a promisor remote without one,
+    // such as a large object promisor a server's promisor-remote capability named, gets it
+    if (remote.partialCloneFilter === undefined) {
+      registerPartialClone(config, remote.name, "blob:none");
+      await config.save();
+      remote.partialCloneFilter = "blob:none";
+    }
     const url = config.remoteUrlOf(remote.name);
     // the child fetch runs with fetch_if_missing = 0: it reads through the history's view
     // without lazy fetch (a read elsewhere meanwhile still fetches)
@@ -275,8 +284,15 @@ export function createPromisorFetcher(
     fetchIfMissing: () => !noLazyFetch(),
     async fetch(ids) {
       let remaining = [...ids];
-      // try_promisor_remotes: the first remote whose fetch succeeds ends it
-      for (const remote of promisorRemotes(store())) {
+      // try_promisor_remotes: the first remote whose fetch succeeds ends it, the remotes a
+      // server's promisor-remote capability made us accept first
+      const all = promisorRemotes(store());
+      const acceptedNames = acceptedPromisorRemotes(workingCopy);
+      const ordered = [
+        ...all.filter((r) => acceptedNames.has(r.name)),
+        ...all.filter((r) => !acceptedNames.has(r.name)),
+      ];
+      for (const remote of ordered) {
         if (await fetchFrom(remote, remaining)) return [];
         if (remaining.length === 1) continue;
         // remove_fetched_oids: what a failed fetch brought all the same

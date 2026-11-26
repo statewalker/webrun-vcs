@@ -115,9 +115,17 @@ export function serverV2Capabilities(
     list.splice(objectInfo >= 0 ? objectInfo : list.length, 0, `session-id=${options.sessionId}`);
   }
   const named = list.some((c) => c === "object-info" || c.startsWith("object-info="));
-  if (!advertiseObjectInfo || named) return list;
-  const attributes = objectInfoAttributes(repository);
-  if (attributes.length > 0) list.push(`object-info=${attributes.join(" ")}`);
+  if (advertiseObjectInfo && !named) {
+    const attributes = objectInfoAttributes(repository);
+    if (attributes.length > 0) list.push(`object-info=${attributes.join(" ")}`);
+  }
+  // serve.c's last capability: `promisor-remote=<pr-info>` (promisor.advertise)
+  if (
+    options.promisorRemote !== undefined &&
+    !list.some((c) => c === "promisor-remote" || c.startsWith("promisor-remote="))
+  ) {
+    list.push(`promisor-remote=${options.promisorRemote}`);
+  }
   return list;
 }
 
@@ -127,6 +135,8 @@ export interface ServerV2CapabilityOptions {
   allowRefInWant?: boolean;
   /** `session-id=<id>` (git's `transfer.advertiseSID`) */
   sessionId?: string;
+  /** `promisor-remote=<pr-info>` (git's `promisor.advertise`: `promisorRemoteAdvertisement`) */
+  promisorRemote?: string;
 }
 
 /**

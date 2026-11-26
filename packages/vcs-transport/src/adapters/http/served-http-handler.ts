@@ -316,6 +316,7 @@ function httpOptionsOf(
     allowRefInWant,
     advertiseSID,
     sessionId,
+    promisorRemoteInfo,
     packObjectsHook,
     logger,
     capabilities: _capabilities,
@@ -338,6 +339,7 @@ function httpOptionsOf(
   if (allowRefInWant !== undefined) out.allowRefInWant = allowRefInWant;
   if (advertiseSID !== undefined) out.advertiseSID = advertiseSID;
   if (sessionId !== undefined) out.sessionId = sessionId;
+  if (promisorRemoteInfo !== undefined) out.promisorRemoteInfo = promisorRemoteInfo;
   if (packObjectsHook !== undefined) out.packObjectsHook = packObjectsHook;
   if (options.maxRequestBodyBytes !== undefined) {
     out.maxRequestBodyBytes = options.maxRequestBodyBytes;

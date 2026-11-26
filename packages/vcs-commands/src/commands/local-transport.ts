@@ -188,6 +188,10 @@ export async function withLocalUploadPack<T>(
         : {}),
       ...(settings.allowRefInWant ? { allowRefInWant: true } : {}),
       ...(settings.advertiseSID ? { advertiseSID: true } : {}),
+      // promisor.advertise (with promisor.sendFields)
+      ...(settings.promisorRemoteInfo !== undefined
+        ? { promisorRemoteInfo: settings.promisorRemoteInfo }
+        : {}),
       ...(head && "target" in head ? { currentBranch: head.target } : {}),
     }))().finally(() => server.close?.());
   try {

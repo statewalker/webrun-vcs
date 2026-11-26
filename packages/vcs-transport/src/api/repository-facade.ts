@@ -131,6 +131,12 @@ export interface ExportPackOptions {
   shallow?: Set<string>;
   /** Write deltas on a base in the pack as OFS deltas (the client's `ofs-delta`; default true) */
   ofsDelta?: boolean;
+  /**
+   * pack-objects' `--missing=allow-promisor` (upload-pack's, once the client accepted a
+   * promisor remote of the `promisor-remote` capability): promisor objects the repository
+   * lacks are left out instead of failing the pack (nor fetched)
+   */
+  missingAllowPromisor?: boolean;
 }
 
 /**

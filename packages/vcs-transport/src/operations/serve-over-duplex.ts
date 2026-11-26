@@ -203,6 +203,12 @@ export interface ServeOverDuplexOptions {
   /** The session id {@link advertiseSID} advertises (default: one per process, `processSessionId()`) */
   sessionId?: string;
   /**
+   * Protocol v2: the `promisor-remote` capability's value (git's `promisor.advertise`,
+   * `promisorRemoteAdvertisement`); the remotes the client accepts come back in
+   * `ServeResult.acceptedPromisorRemotes`
+   */
+  promisorRemoteInfo?: string;
+  /**
    * upload-pack: git's `uploadpack.packObjectsHook`, run by the host (see `PackObjectsHook`):
    * the pack comes from its stdout. git reads the setting only from protected configuration,
    * so a served repository's config never sets it (`serverSettingsFromConfig` does not read it)
@@ -318,6 +324,9 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
     ...(options.advertiseSID
       ? { sessionId: validSessionId(options.sessionId) ?? processSessionId() }
       : {}),
+    ...(options.promisorRemoteInfo !== undefined && useV2 && service === "git-upload-pack"
+      ? { promisorRemote: options.promisorRemoteInfo }
+      : {}),
     advertiseObjectInfo: options.advertiseObjectInfo,
     ...(options.uploadPackFilter ? { uploadPackFilter: options.uploadPackFilter } : {}),
     hiddenRefs: [
@@ -392,10 +401,14 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
       await (write ?? ((data: Uint8Array) => duplex.write(data)))(encodePacketLine("version 1\n"));
     }
     const success = await fsm.run(ctx);
-    const clientSid =
-      ctx.output.clientSessionId !== undefined
+    const clientSid = {
+      ...(ctx.output.clientSessionId !== undefined
         ? { clientSessionId: ctx.output.clientSessionId }
-        : {};
+        : {}),
+      ...(ctx.output.acceptedPromisorRemotes !== undefined
+        ? { acceptedPromisorRemotes: ctx.output.acceptedPromisorRemotes }
+        : {}),
+    };
     for (const task of afterReport) setTimeout(() => void task(), 0);
 
     if (!success || ctx.output.error) {
