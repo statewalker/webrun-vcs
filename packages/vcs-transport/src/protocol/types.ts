@@ -96,4 +96,4 @@ export interface GitUri {
 /**
  * Transport service type.
  */
-export type ServiceType = "git-upload-pack" | "git-receive-pack";
+export type ServiceType = "git-upload-pack" | "git-receive-pack" | "git-upload-archive";
