@@ -17,6 +17,7 @@
 // the local cache (node_modules/.cache/tested, written by local runs).
 //
 //   node scripts/tested.mjs status            which packages need testing, and why
+//        [--json]                             as JSON: { pending, packages: [{ dir, state, test }] }
 //   node scripts/tested.mjs run [--all]       test those packages (locally: caches the passes)
 //        [--no-bail]
 //   node scripts/tested.mjs run --record      CI: also write .tested/<dir> for each pass
@@ -24,6 +25,10 @@
 //   node scripts/tested.mjs hash [dir]        print the hashes
 //
 //   --records-unchanged-from=<commit>         fail if .tested/ records differ from that commit's
+//   --package=<dir>                           status/run: only these packages (repeatable)
+//   --exclude=<dir>                           status/run: leave these packages out (repeatable);
+//                                             CI tests packages/vcs-commands in shard jobs of its
+//                                             own (`status --package=... --json` says whether)
 //
 // --source=worktree (default outside CI) hashes the working tree, uncommitted changes included;
 // --source=head (default when CI is set) hashes the HEAD commit.
@@ -57,6 +62,16 @@ const option = (name, fallback) => {
   return found ? found.slice(name.length + 3) : fallback;
 };
 const source = option("source", process.env.CI ? "head" : "worktree");
+// Every value of a repeatable option (`--exclude=a --exclude=b`, or `--exclude=a,b`), without a
+// trailing slash.
+const options = (name) =>
+  args
+    .filter((a) => a.startsWith(`--${name}=`))
+    .flatMap((a) => a.slice(name.length + 3).split(","))
+    .map((d) => d.replace(/\/+$/, ""))
+    .filter(Boolean);
+const onlyPackages = options("package");
+const excluded = options("exclude");
 
 const config = {
   globalFiles: [],
@@ -416,16 +431,32 @@ if (recordsBase) {
 }
 
 const hashes = computeHashes();
+for (const dir of [...onlyPackages, ...excluded])
+  if (!hashes.has(dir)) {
+    console.error(`no workspace package at ${dir}`);
+    process.exit(2);
+  }
+// The packages status and run look at: record and hash always see every package.
+const selected = [...hashes.values()].filter(
+  (pkg) =>
+    (onlyPackages.length === 0 || onlyPackages.includes(pkg.dir)) && !excluded.includes(pkg.dir),
+);
+const needsTest = (state) => state === "changed" || state === "new" || state === "forced";
 
 if (command === "hash") {
   const only = args.filter((a) => !a.startsWith("--"))[1];
   for (const pkg of hashes.values())
     if (!only || only === pkg.dir) console.log(`${pkg.hash}  ${pkg.dir}`);
 } else if (command === "status") {
-  const rows = [...hashes.values()].map((pkg) => [classify(pkg), pkg.dir]);
-  for (const [state, dir] of rows.sort()) console.log(`${state.padEnd(15)} ${dir}`);
-  const pending = rows.filter(([s]) => s === "changed" || s === "new" || s === "forced").length;
-  console.log(`\n${pending} of ${rows.length} packages to test (source: ${source})`);
+  const rows = selected.map((pkg) => [classify(pkg), pkg.dir]).sort();
+  const pending = rows.filter(([s]) => needsTest(s)).length;
+  if (flag("json")) {
+    const packages = rows.map(([state, dir]) => ({ dir, state, test: needsTest(state) }));
+    console.log(JSON.stringify({ pending, packages }));
+  } else {
+    for (const [state, dir] of rows) console.log(`${state.padEnd(15)} ${dir}`);
+    console.log(`\n${pending} of ${rows.length} packages to test (source: ${source})`);
+  }
 } else if (command === "record") {
   let written = 0;
   for (const pkg of hashes.values()) {
@@ -444,10 +475,10 @@ if (command === "hash") {
   }
   console.log(`recorded ${written} package(s), pruned ${pruned}`);
 } else if (command === "run") {
-  const todo = [...hashes.values()].filter((pkg) =>
-    ["changed", "new", "forced"].includes(classify(pkg)),
-  );
-  for (const pkg of hashes.values()) {
+  const todo = selected.filter((pkg) => needsTest(classify(pkg)));
+  for (const pkg of hashes.values())
+    if (!selected.includes(pkg)) console.log(`skip  ${pkg.dir} (excluded)`);
+  for (const pkg of selected) {
     const state = classify(pkg);
     if (state === "tested" || state === "tested-locally")
       console.log(`skip  ${pkg.dir} (${state})`);

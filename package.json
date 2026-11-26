@@ -19,6 +19,7 @@
     "test:status": "node scripts/tested.mjs status",
     "t-coverage": "node scripts/t-coverage.mjs",
     "test:t-coverage": "node --test scripts/t-coverage.test.mjs",
+    "test:tested": "node --test scripts/tested.test.mjs",
     "typecheck": "pnpm -r run typecheck",
     "typecheck:tests": "pnpm -r run typecheck:tests",
     "test:app": "turbo run test:app",
