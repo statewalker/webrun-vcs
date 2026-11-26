@@ -59,6 +59,13 @@ import {
   v0ObjectFormatCapabilities,
 } from "../../protocol/object-format.js";
 import { encodeFlush, encodePacketLine } from "../../protocol/pkt-line-codec.js";
+import {
+  checkPushCertNonce,
+  pushCertCommandLines,
+  pushCertNonce,
+  pushCertOptionsMatch,
+  signedTextEnd,
+} from "../../protocol/push-cert.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
 import { isAncestorOf, PushConnectivity } from "./connectivity.js";
 import {
@@ -76,6 +83,7 @@ import {
   type HookVerdict,
   type ReceiveCommand,
   type ReceiveDenyAction,
+  type ReceivedPushCertificate,
   type ReceivePackConfig,
   type ReceivePackHookContext,
   type ReceivePackHooks,
@@ -223,7 +231,10 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         const format = formatOf(getRepository(ctx));
         // transfer.advertiseSID: `session-id=<id>` after push-options (show_ref)
         const sessionId = getConfig(ctx).sessionId;
-        const offered = getConfig(ctx).serverCapabilities ?? RECEIVE_PACK_CAPABILITIES;
+        const offered = withPushCertCapability(
+          getConfig(ctx).serverCapabilities ?? RECEIVE_PACK_CAPABILITIES,
+          advertisedPushCertNonce(ctx),
+        );
         const capabilities = v0ObjectFormatCapabilities(
           sessionId !== undefined && !offered.some((c) => c.startsWith("session-id="))
             ? [...offered, `session-id=${sessionId}`]
@@ -287,9 +298,23 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         // ids are read in the repository's format (git's get_oid_hex / parse_oid_hex)
         const format = formatOf(getRepository(ctx));
         const OID = { test: (id: string) => isObjectIdOf(id, format) };
+        // read_head_info: a push certificate's lines (`push-cert` ... `push-cert-end`)
+        let certificate = "";
+        let inCertificate = false;
 
         while (true) {
           const pkt = await transport.readPktLine();
+          if (inCertificate) {
+            if (pkt.type === "flush") break;
+            if (pkt.type !== "data") {
+              return protocolError(ctx, "protocol error: got an unexpected packet");
+            }
+            // the lines as sent, their newlines kept (PACKET_READ_CHOMP_NEWLINE is off)
+            const text = new TextDecoder().decode(pkt.payload);
+            if (text === "push-cert-end\n") inCertificate = false;
+            else certificate += text;
+            continue;
+          }
           if (pkt.type === "flush") break;
           if (pkt.type === "eof") {
             // git's receive-pack ends quietly on a client that sends nothing
@@ -334,6 +359,11 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
             }
           }
 
+          if (line === "push-cert") {
+            inCertificate = true;
+            continue;
+          }
+
           // old-oid SP new-oid SP refname (indexOf, not split with a limit: it truncates)
           const sp1 = line.indexOf(" ");
           const sp2 = sp1 < 0 ? -1 : line.indexOf(" ", sp1 + 1);
@@ -357,6 +387,36 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
           if (pushCommands.length > maxCommands) {
             return protocolError(ctx, `protocol error: more than ${maxCommands} commands`);
           }
+        }
+
+        // queue_commands_from_cert: the certificate's commands after the unsigned ones (git's
+        // "got both push certificate and unsigned commands" checks the list's tail, which is
+        // always empty there: it never dies)
+        if (certificate) {
+          const lines = pushCertCommandLines(certificate);
+          if (!lines) {
+            return protocolError(ctx, `malformed push certificate ${certificate.slice(0, 100)}`);
+          }
+          for (const line of lines) {
+            const sp1 = line.indexOf(" ");
+            const sp2 = sp1 < 0 ? -1 : line.indexOf(" ", sp1 + 1);
+            const oldOid = line.slice(0, sp1);
+            const newOid = line.slice(sp1 + 1, sp2);
+            const refName = line.slice(sp2 + 1);
+            if (sp1 < 0 || sp2 < 0 || !OID.test(oldOid) || !OID.test(newOid) || !refName) {
+              return protocolError(ctx, `protocol error: expected old/new/ref, got '${line}'`);
+            }
+            const type: PushCommandType = isNullId(newOid)
+              ? "DELETE"
+              : isNullId(oldOid)
+                ? "CREATE"
+                : "UPDATE";
+            pushCommands.push({ oldOid, newOid, refName, type, result: "NOT_ATTEMPTED" });
+            if (pushCommands.length > maxCommands) {
+              return protocolError(ctx, `protocol error: more than ${maxCommands} commands`);
+            }
+          }
+          state.pushCertificate = certificate;
         }
 
         state.pushCommands = pushCommands;
@@ -420,6 +480,10 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       const output = getOutput(ctx);
       const rp = receivePackConfig(ctx);
       try {
+        // check_cert_push_options: a certificate's push options are the ones sent
+        if (!pushCertOptionsMatch(state.pushCertificate, state.pushOptions ?? [])) {
+          for (const cmd of state.pushCommands ?? []) reject(cmd, "inconsistent push options");
+        }
         const hook = receivePackHooks(ctx)?.authorize;
         if (hook) {
           const commands = state.pushCommands ?? [];
@@ -961,6 +1025,12 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
  * Extended state for server push operations.
  */
 interface ServerPushState extends ProtocolState {
+  /** The nonce this run advertises (`push-cert=<nonce>`): null without receive.certNonceSeed */
+  pushCertNonce?: string | null;
+  /** The push certificate received (its text, the signature included) */
+  pushCertificate?: string;
+  /** The certificate as the hooks are told (prepare_push_cert_sha1, run once) */
+  pushCertificateInfo?: Promise<ReceivedPushCertificate>;
   /** The side-band's closing flush waits for a relayed post-receive */
   flushAfterPostReceive?: boolean;
   pushCommands?: PushCommand[];
@@ -1279,9 +1349,88 @@ function hookContext(ctx: ProcessContext): ReceivePackHookContext {
       ...(rp.remoteUser !== undefined ? { remoteUser: rp.remoteUser } : {}),
       ...(rp.remoteAddr !== undefined ? { remoteAddr: rp.remoteAddr } : {}),
       message: (text: string) => sendMessage(ctx, text),
+      pushCertificate: () => receivedPushCertificate(ctx),
     };
   }
   return state.hookContext;
+}
+
+/**
+ * The nonce this receive-pack advertises (cmd_receive_pack's `prepare_push_cert_nonce` of its
+ * directory and the time it starts), undefined without `receive.certNonceSeed`.
+ */
+function advertisedPushCertNonce(ctx: ProcessContext): string | undefined {
+  const state = getState<ServerPushState>(ctx);
+  if (state.pushCertNonce === undefined) {
+    const settings = receivePackConfig(ctx).pushCertificates;
+    state.pushCertNonce =
+      settings?.nonceSeed !== undefined
+        ? pushCertNonce(
+            settings.nonceSeed,
+            settings.serviceDir ?? ".",
+            settings.now?.() ?? Math.floor(Date.now() / 1000),
+            formatOf(getRepository(ctx)),
+          )
+        : null;
+  }
+  return state.pushCertNonce ?? undefined;
+}
+
+/**
+ * receive-pack's `prepare_push_cert_sha1`: the certificate stored as a blob, its signature and
+ * nonce checked, once; undefined for a push without a certificate.
+ */
+function receivedPushCertificate(
+  ctx: ProcessContext,
+): Promise<ReceivedPushCertificate | undefined> {
+  const state = getState<ServerPushState>(ctx);
+  const certificate = state.pushCertificate;
+  if (!certificate) return Promise.resolve(undefined);
+  state.pushCertificateInfo ??= (async () => {
+    const settings = receivePackConfig(ctx).pushCertificates;
+    const repository = getRepository(ctx);
+    const encoder = new TextEncoder();
+    const id = await repository.storeBlob?.(encoder.encode(certificate)).catch(() => undefined);
+    const end = signedTextEnd(certificate);
+    const payload = certificate.slice(0, end);
+    // check_signature: a signature of no known format (none) dies; the verifier throws it
+    const signature = settings?.verify
+      ? await settings.verify(encoder.encode(payload), encoder.encode(certificate.slice(end)))
+      : { result: "N" };
+    const nonce = checkPushCertNonce({
+      payload,
+      advertised: advertisedPushCertNonce(ctx),
+      seed: settings?.nonceSeed,
+      dir: settings?.serviceDir ?? ".",
+      stateless: getConfig(ctx).statelessRpc === true,
+      slopLimit: settings?.nonceSlop ?? 0,
+      format: formatOf(repository),
+    });
+    return {
+      certificate,
+      ...(id !== undefined ? { id } : {}),
+      signature,
+      ...(nonce.nonce !== undefined ? { nonce: nonce.nonce } : {}),
+      nonceStatus: nonce.status,
+      ...(nonce.slop !== undefined ? { nonceSlop: nonce.slop } : {}),
+    };
+  })();
+  return state.pushCertificateInfo;
+}
+
+/**
+ * The capabilities with `push-cert=<nonce>` (git's show_ref: before `push-options`), as they are
+ * without a nonce.
+ */
+export function withPushCertCapability(
+  capabilities: readonly string[],
+  nonce: string | undefined,
+): string[] {
+  const out = capabilities.filter((c) => !c.startsWith("push-cert"));
+  if (nonce === undefined) return out;
+  const at = out.findIndex((c) => c === "push-options" || c.startsWith("session-id="));
+  out.splice(at < 0 ? out.length : at, 0, `push-cert=${nonce}`);
+  return out;
 }
 
 function logError(ctx: ProcessContext, message: string, error: unknown): void {

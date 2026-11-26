@@ -22,6 +22,8 @@ import { Fsm } from "../fsm/fsm.js";
 import { serverV2Handlers, serverV2Transitions } from "../fsm/protocol-v2/server-v2-fsm.js";
 import {
   DEFAULT_RECEIVE_PACK_WRITE_TIMEOUT_MS,
+  type PushCertSettings,
+  pushCertificatesOf,
   type ReceiveDenyAction,
   type ReceivePackConfig,
   type ReceivePackHooks,
@@ -113,6 +115,18 @@ export interface ServeOverDuplexOptions {
   advertiseAtomic?: boolean;
   /** receive-pack: git's `receive.maxInputSize` (see `ReceivePackConfig.maxInputSize`) */
   maxInputSize?: number;
+  /**
+   * receive-pack: git's `receive.certNonceSeed` (advertise `push-cert=<nonce>`; see
+   * `PushCertSettings.nonceSeed`)
+   */
+  certNonceSeed?: string;
+  /** receive-pack: git's `receive.certNonceSlop` in seconds */
+  certNonceSlop?: number;
+  /**
+   * receive-pack: the rest of the push certificate settings (the signature check, the nonce's
+   * directory and clock); `certNonceSeed`/`certNonceSlop` win over theirs
+   */
+  pushCertificates?: PushCertSettings;
   /**
    * receive-pack: git's `receive.keepAlive` in ms (0: none), over {@link keepAliveMs} for a push
    */
@@ -326,6 +340,7 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
       maxCommands: options.maxCommands,
       keepAliveMs: options.receiveKeepAliveMs ?? options.keepAliveMs,
       ...(options.maxInputSize ? { maxInputSize: options.maxInputSize } : {}),
+      ...pushCertificatesOf(options),
       ...(options.unpackLimit !== undefined ? { unpackLimit: options.unpackLimit } : {}),
       ...(options.afterPush ? { afterPush: options.afterPush } : {}),
       hookTimeoutMs: options.hookTimeoutMs,

@@ -23,12 +23,13 @@ import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils";
 import type {
   SigningFormat,
   VerificationOutcome,
+  Verifier,
   WorkingCopy,
 } from "@statewalker/vcs-working-tree";
 
 import { GitApiError } from "../errors/index.js";
 import { hostEnvironmentOf } from "./git-ident.js";
-import { signingConfigOf } from "./signing.js";
+import { type SigningConfig, signingConfigOf } from "./signing.js";
 
 /**
  * git's `sigc->result`: `G` good, `B` bad, `E` cannot be checked (missing key, several
@@ -432,6 +433,27 @@ export async function checkSignature(
   signature: Uint8Array,
   options: CheckSignatureOptions = {},
 ): Promise<SignatureCheck> {
+  return checkSignatureWith(
+    () => signingConfigOf(workingCopy),
+    hostEnvironmentOf(workingCopy)?.verifier,
+    payload,
+    signature,
+    options,
+  );
+}
+
+/**
+ * {@link checkSignature} with the signing configuration (read only when the signature has a
+ * known format) and the verifier given: a served repository's (receive-pack's push
+ * certificates).
+ */
+export async function checkSignatureWith(
+  signingConfig: () => SigningConfig,
+  verifier: Verifier | undefined,
+  payload: Uint8Array,
+  signature: Uint8Array,
+  options: CheckSignatureOptions = {},
+): Promise<SignatureCheck> {
   const check: SignatureCheck = {
     result: "N",
     trustLevel: "undefined",
@@ -450,7 +472,7 @@ export async function checkSignature(
   }
   const time = payloadTimestamp(payload, options.payloadType ?? "other");
   if (time === undefined) return check;
-  const config = signingConfigOf(workingCopy);
+  const config = signingConfig();
   const program = config.programs[format];
   let outcome: VerificationOutcome;
   if (format === "ssh" && config.allowedSignersFile === undefined) {
@@ -459,7 +481,6 @@ export async function checkSignature(
     );
     return check;
   }
-  const verifier = hostEnvironmentOf(workingCopy)?.verifier;
   if (verifier) {
     outcome = await verifier({
       format,

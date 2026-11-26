@@ -239,6 +239,13 @@ export interface RepositoryFacade {
   has(oid: string): Promise<boolean>;
 
   /**
+   * Stores `content` as a blob in the repository (not a push's quarantine) and resolves with its
+   * id: receive-pack's push certificate (`GIT_PUSH_CERT`). Absent where the store takes no
+   * writes outside a pack.
+   */
+  storeBlob?(content: Uint8Array): Promise<string>;
+
+  /**
    * Walks commit ancestry from a starting point.
    * Used during negotiation to find common ancestors.
    *
