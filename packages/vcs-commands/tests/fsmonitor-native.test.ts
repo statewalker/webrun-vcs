@@ -9,7 +9,7 @@
  * protocol version 1 makes git's token a nanosecond time: those indexes are compared with the
  * token's digits zeroed.
  */
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
   mkdirSync,
@@ -35,10 +35,11 @@ import {
 } from "@statewalker/vcs-working-tree";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { formatStatusPorcelain } from "../src/index.js";
+import { formatStatusPorcelain, type UpdateIndexCommand } from "../src/index.js";
 import { nativeIs25x } from "./hooks-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { openBare } from "./plumbing-native-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -223,6 +224,50 @@ async function statusTwins(
 async function oursLsFilesF(): Promise<string> {
   const out = await (await openOurs(dir, host())).lsFiles().setShowFsmonitorBit(true).callOutput();
   return Buffer.from(out.stdout).toString("latin1");
+}
+
+/** Native `git update-index <args>` as a process: its exit status, stderr and index. */
+function nativeUpdateIndex(args: string[], cwd = dir) {
+  const run = spawnSync("git", ["update-index", ...args], { cwd, env: env(), encoding: "utf8" });
+  return { status: run.status, stdout: run.stdout, stderr: run.stderr };
+}
+
+/** Our `git update-index` as a process: git's exit status, stderr and stdout. */
+async function oursUpdateIndex(
+  build: (command: UpdateIndexCommand) => UpdateIndexCommand,
+  git = openOurs(dir, host()),
+) {
+  try {
+    const result = await build((await git).updateIndex()).call();
+    return { status: result.exitCode, stdout: result.output, stderr: result.errors };
+  } catch (error) {
+    const e = error as { exitCode?: number; message: string; output?: string };
+    return { status: e.exitCode ?? -1, stdout: e.output ?? "", stderr: `${e.message}\n` };
+  }
+}
+
+/**
+ * Native `git update-index <args>` and ours (`build`) from the index as it is: the same exit
+ * status, stdout, stderr and index bytes (a nanosecond token zeroed with `zeroToken`). The
+ * index native git wrote is kept.
+ */
+async function updateIndexTwins(
+  args: string[],
+  build: (command: UpdateIndexCommand) => UpdateIndexCommand,
+  options: { zeroToken?: boolean } = {},
+) {
+  const saved = saveIndex();
+  const native = nativeUpdateIndex(args);
+  const nativeIndex = readFileSync(indexPath());
+  restoreIndex(saved);
+  const ours = await oursUpdateIndex(build);
+  const oursIndex = readFileSync(indexPath());
+  expect(ours).toEqual(native);
+  expect(normalized(oursIndex, !!options.zeroToken)).toBe(
+    normalized(nativeIndex, !!options.zeroToken),
+  );
+  writeFileSync(indexPath(), nativeIndex);
+  return { native, nativeIndex, oursIndex };
 }
 
 /** The full-scan status native git prints without the monitor. */
@@ -441,6 +486,207 @@ describeGit("fsmonitor against native git (t7519-status-fsmonitor.sh)", () => {
     expect(await fsmnOf(readFileSync(indexPath()))).toBeUndefined();
     await ours.reset().call();
     expect(await fsmnOf(readFileSync(indexPath()))).toBeUndefined();
+  });
+
+  it(`t7519-status-fsmonitor.sh: 'update-index --fsmonitor" adds the fsmonitor extension'`, async () => {
+    hook(NOTHING);
+    const { oursIndex } = await updateIndexTwins(["--fsmonitor"], (c) => c.setFsmonitor(true));
+    expect((await fsmnOf(oursIndex))?.token).toBe("last_update_token");
+    // asked again (the extension read): nothing to write, nothing printed
+    await updateIndexTwins(["--fsmonitor", "--verbose"], (c) =>
+      c.setVerbose(true).setFsmonitor(true),
+    );
+  });
+
+  it(`t7519-status-fsmonitor.sh: 'update-index --no-fsmonitor" removes the fsmonitor extension'`, async () => {
+    hook(NOTHING);
+    await updateIndexTwins(["--fsmonitor"], (c) => c.setFsmonitor(true));
+    // core.fsmonitor still set: git's warning, the extension removed
+    const { oursIndex, native } = await updateIndexTwins(["--verbose", "--no-fsmonitor"], (c) =>
+      c.setVerbose(true).setFsmonitor(false),
+    );
+    expect(native.stderr).toContain("core.fsmonitor is set");
+    expect(await fsmnOf(oursIndex)).toBeUndefined();
+  });
+
+  it("update-index --fsmonitor with core.fsmonitor unset: the warning, a nanosecond token", async () => {
+    git(["config", "core.fsmonitor", ""]);
+    const { native, oursIndex } = await updateIndexTwins(
+      ["--fsmonitor"],
+      (c) => c.setFsmonitor(true),
+      { zeroToken: true },
+    );
+    expect(native.stderr).toContain("core.fsmonitor is unset");
+    expect((await fsmnOf(oursIndex))?.token).toMatch(/^[0-9]+$/);
+    // the next read with the monitor off removes it again
+    await updateIndexTwins(["--no-fsmonitor"], (c) => c.setFsmonitor(false));
+    await updateIndexTwins(["--fsmonitor"], (c) => c.setFsmonitor(true), { zeroToken: true });
+    await updateIndexTwins([], (c) => c, { zeroToken: true });
+  });
+
+  it(`t7519-status-fsmonitor.sh: 'update-index --fsmonitor-valid" sets the fsmonitor valid bit'`, async () => {
+    hook(NOTHING);
+    await updateIndexTwins(["--fsmonitor"], (c) => c.setFsmonitor(true));
+    for (const path of ["dir1/modified", "dir2/modified", "modified"]) {
+      await updateIndexTwins(["--fsmonitor-valid", path], (c) =>
+        c.setFsmonitorValid(true).addPath(path),
+      );
+    }
+    expect(git(["ls-files", "-f"])).toBe(
+      "h dir1/modified\nH dir1/tracked\nh dir2/modified\nH dir2/tracked\nh modified\nH tracked\n",
+    );
+    expect(await oursLsFilesF()).toBe(git(["ls-files", "-f"]));
+    // t7519-status-fsmonitor.sh: 'update-index --no-fsmonitor-valid" clears the fsmonitor valid bit'
+    for (const path of ["dir1/modified", "dir2/modified", "modified"]) {
+      await updateIndexTwins(["--no-fsmonitor-valid", path], (c) =>
+        c.setFsmonitorValid(false).addPath(path),
+      );
+    }
+    expect(git(["ls-files", "-f"])).not.toContain("h ");
+    // a path not in the index dies
+    await updateIndexTwins(["--fsmonitor-valid", "nowhere"], (c) =>
+      c.setFsmonitorValid(true).addPath("nowhere"),
+    );
+  });
+
+  it("t7519-status-fsmonitor.sh: 'all unmodified files get marked valid'", async () => {
+    hook(NOTHING);
+    await updateIndexTwins(["--fsmonitor"], (c) => c.setFsmonitor(true));
+    // the first refresh stores the dated-back stats (entries replaced: dirty), the second
+    // marks them valid without --force-write-index
+    await updateIndexTwins(["--refresh"], (c) => c.refresh());
+    await updateIndexTwins(["--refresh"], (c) => c.refresh());
+    expect(git(["ls-files", "-f"])).toContain("h dir1/tracked\n");
+    expect(await oursLsFilesF()).toBe(git(["ls-files", "-f"]));
+    await updateIndexTwins(["--refresh", "--force-write-index"], (c) =>
+      c.refresh().setForceWriteIndex(true),
+    );
+  });
+
+  it("t7519-status-fsmonitor.sh: '*only* files returned by the integration script get flagged as invalid'", async () => {
+    hook(LISTED);
+    report(["dir1/modified"]);
+    cleanRepo();
+    await updateIndexTwins(["--refresh", "--force-write-index"], (c) =>
+      c.refresh().setForceWriteIndex(true),
+    );
+    await updateIndexTwins(["--refresh", "--force-write-index"], (c) =>
+      c.refresh().setForceWriteIndex(true),
+    );
+    put("modified", "1\n");
+    put("dir1/modified", "2\n");
+    put("dir2/modified", "3\n");
+    dateBack();
+    // valid entries are not looked at: only the reported dir1/modified needs an update
+    const { native } = await updateIndexTwins(["--refresh", "--force-write-index"], (c) =>
+      c.refresh().setForceWriteIndex(true),
+    );
+    expect(native.stdout).toBe("dir1/modified: needs update\n");
+    expect(native.status).toBe(1);
+    expect(await oursLsFilesF()).toBe(git(["ls-files", "-f"]));
+  });
+
+  it("t7519-status-fsmonitor.sh: 'incompatible bare repo'", async () => {
+    const bare = join(root, "bare-clone");
+    execFileSync("git", ["init", "-q", "--bare", bare], { env: env() });
+    for (const value of ["foo", "true"]) {
+      execFileSync("git", ["config", "core.fsmonitor", value], { cwd: bare, env: env() });
+      const native = nativeUpdateIndex(["--fsmonitor"], bare);
+      expect(native.status).toBe(128);
+      expect(native.stderr).toBe(
+        `fatal: bare repository '${bare}' is incompatible with fsmonitor\n`,
+      );
+      const ours = await oursUpdateIndex((c) => c.setFsmonitor(true), openBare(bare, host()));
+      expect(ours).toEqual(native);
+    }
+  });
+
+  it("diff-files and git diff take entries the monitor reported nothing for as unchanged", async () => {
+    hook(LISTED);
+    report([]);
+    await statusTwins();
+    await statusTwins({ keep: "ours" });
+    put("modified", "changed\n");
+    put("dir1/modified", "changed\n");
+    dateBack();
+    // nothing reported: neither change is seen, by native git or ours; then each one reported
+    for (const reported of [[], ["dir1/modified"], ["modified", "dir1/"]]) {
+      report(reported);
+      const saved = saveIndex();
+      const nativeFiles = git(["diff-files", "--name-only"]);
+      const nativeDiff = git(["diff", "--name-only"]);
+      restoreIndex(saved);
+      const ours = await openOurs(dir, host());
+      expect(await ours.diffFiles().setFormats(["name-only"]).callText()).toBe(nativeFiles);
+      restoreIndex(saved);
+      expect(await (await openOurs(dir, host())).diff().callText("name-only")).toBe(nativeDiff);
+      restoreIndex(saved);
+      expect(nativeDiff.split("\n").filter(Boolean)).toEqual(
+        reported.length === 0
+          ? []
+          : reported.length === 1
+            ? ["dir1/modified"]
+            : ["dir1/modified", "modified"],
+      );
+    }
+  });
+
+  it("diff-index sees an fsmonitor-valid file deleted only as 2.43 does, diff-files never", async () => {
+    hook(NOTHING);
+    await updateIndexTwins(["--fsmonitor"], (c) => c.setFsmonitor(true));
+    await updateIndexTwins(["--fsmonitor-valid", "modified", "tracked"], (c) =>
+      c.setFsmonitorValid(true).addPath("modified").addPath("tracked"),
+    );
+    rmSync(join(dir, "tracked"));
+    put("modified", "changed\n");
+    dateBack();
+    const saved = saveIndex();
+    const nativeIndexDiff = git(["diff-index", "--name-status", "HEAD"]);
+    restoreIndex(saved);
+    const nativeDiffHead = git(["diff", "--name-status", "HEAD"]);
+    restoreIndex(saved);
+    const nativeFiles = git(["diff-files", "--name-status"]);
+    // the valid entries: the modified one never listed, the deleted one only by 2.43, whose
+    // check_removed still lstats it (2.5x: fake_lstat); other entries' stats were dated back
+    if (nativeIs25x) expect(nativeIndexDiff).not.toContain("\ttracked\n");
+    else expect(nativeIndexDiff).toContain("D\ttracked\n");
+    expect(nativeIndexDiff).not.toMatch(/^M\tmodified$/m);
+    expect(nativeFiles).not.toMatch(/\t(tracked|modified)$/m);
+    restoreIndex(saved);
+    const ours = await openOurs(dir, host());
+    expect(await ours.diffIndex().setTree("HEAD").setFormats(["name-status"]).callText()).toBe(
+      nativeIndexDiff,
+    );
+    restoreIndex(saved);
+    expect(
+      await (await openOurs(dir, host())).diff().setOldTree("HEAD").callText("name-status"),
+    ).toBe(nativeDiffHead);
+    restoreIndex(saved);
+    expect(
+      await (await openOurs(dir, host())).diffFiles().setFormats(["name-status"]).callText(),
+    ).toBe(nativeFiles);
+  });
+
+  it("commit -a leaves a change the monitor reported nothing for unstaged", async () => {
+    hook(LISTED);
+    report([]);
+    await statusTwins();
+    await statusTwins({ keep: "ours" });
+    put("modified", "changed\n");
+    put("dir1/modified", "changed\n");
+    dateBack();
+    report(["dir1/modified"]);
+    const head = git(["rev-parse", "HEAD"]).trim();
+    const saved = saveIndex();
+    git(["commit", "-qam", "native"]);
+    const nativeTree = git(["rev-parse", "HEAD^{tree}"]);
+    const nativeIndex = readFileSync(indexPath());
+    git(["update-ref", "HEAD", head]);
+    restoreIndex(saved);
+    await (await openOurs(dir, host())).commit().setAll(true).setMessage("ours").call();
+    expect(git(["rev-parse", "HEAD^{tree}"])).toBe(nativeTree);
+    expect(git(["diff", "--name-only", "HEAD~1", "HEAD"])).toBe("dir1/modified\n");
+    expect(normalized(readFileSync(indexPath()), false)).toBe(normalized(nativeIndex, false));
   });
 
   it("a host callback answers as the hook would, and a throwing one checks every entry", async () => {
