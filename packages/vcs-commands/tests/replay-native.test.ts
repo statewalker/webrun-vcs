@@ -408,6 +408,25 @@ git config merge.directoryRenames false
     });
   });
 
+  // not in t3650: create_commit reads the message through repo_logmsg_reencode and
+  // read_commit_extra_headers drops `encoding` (a standard header field)
+  for (const config of ["", "git config i18n.commitEncoding ISO-8859-1"]) {
+    it(`replays a commit with a Latin-1 message ${config ? "(i18n.commitEncoding set)" : ""}`, async () => {
+      await twins([...PRINT, "--onto", "main", "topic1..latin"], {
+        before: `
+git switch -q -c latin topic1
+printf 'caf\\351\\n\\nbody \\351t\\351\\n' >msg
+echo latin >latin.t
+git add latin.t
+git -c i18n.commitEncoding=ISO-8859-1 commit -q -F msg
+rm msg
+git switch -q main
+${config}
+`,
+      });
+    });
+  }
+
   it.skipIf(!since(53))(
     't3650-replay-basics.sh: "default atomic behavior updates refs directly"',
     async () => {

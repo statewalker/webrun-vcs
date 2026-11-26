@@ -38,8 +38,11 @@
  * target with multiple sources ...`); 2.53 adds `--ref-action` and ref updates. 2.54 adds
  * `--revert`, `--ref`, root commits and dropped empty commits; 2.56 `--linearize`.
  *
- * Divergences: a non-UTF-8 commit's message is copied as stored (git re-encodes it to UTF-8
- * and keeps its `encoding` header); a detached HEAD updated with branches moves after them in
+ * The message is read as git's `repo_logmsg_reencode` reads it: a commit with an `encoding`
+ * header has its message re-encoded to UTF-8 (the header dropped, as every replayed commit's
+ * `encoding` is `i18n.commitEncoding`'s, written only when that is not UTF-8). Divergences: an
+ * `i18n.logOutputEncoding` other than UTF-8 keeps the message as stored (Web encoders write
+ * UTF-8 only); a detached HEAD updated with branches moves after them in
  * a transaction of its own (a batch of HEAD with other refs is not atomic in our stores).
  */
 
@@ -487,11 +490,13 @@ export class ReplayCommand extends PlumbingCommand {
     const split = raw.indexOf("\n\n");
     const headerText = split >= 0 ? raw.slice(0, split) : raw;
     const lines = headerText.split("\n");
-    const excluded = new Set(["tree", "parent", "author", "committer", "gpgsig"]);
+    // standard_header_field (encoding among them) and the signatures
+    const excluded = new Set(["tree", "parent", "author", "committer", "encoding", "gpgsig"]);
     if (this.compatibility !== "2.52") excluded.add("gpgsig-sha256");
     let author: string | undefined;
     let extra = "";
     let keep = false;
+    let encoding: string | undefined;
     for (const line of lines) {
       if (line.startsWith(" ")) {
         if (keep) extra += `${line}\n`;
@@ -500,12 +505,26 @@ export class ReplayCommand extends PlumbingCommand {
       const space = line.indexOf(" ");
       const key = space >= 0 ? line.slice(0, space) : line;
       if (key === "author" && author === undefined) author = line.slice(space + 1);
+      if (key === "encoding" && encoding === undefined) encoding = line.slice(space + 1);
       keep = !excluded.has(key);
       if (keep) extra += `${line}\n`;
     }
     const now = Math.floor(Date.now() / 1000);
     let message: string;
-    const body = split >= 0 ? skipBlankLines(raw, split + 2) : "";
+    const config = RemoteConfigStore.from(this._workingCopy);
+    const commitEncoding = config.value("i18n.commitEncoding");
+    const outputEncoding = config.value("i18n.logOutputEncoding") ?? commitEncoding;
+    let stored = split >= 0 ? raw.slice(split + 2) : "";
+    // repo_logmsg_reencode: from the commit's encoding to the output one (UTF-8 here)
+    if (encoding !== undefined && !isUtf8(encoding) && isUtf8(outputEncoding)) {
+      try {
+        const decoded = new TextDecoder(encoding, { fatal: true }).decode(latin1Bytes(stored));
+        stored = latin1(utf8(decoded));
+      } catch {
+        // an encoding the decoder does not know (or bytes it refuses): git keeps the message
+      }
+    }
+    const body = skipBlankLines(stored, 0);
     if (reverting) {
       const subject = body.slice(0, body.indexOf("\n") >= 0 ? body.indexOf("\n") : body.length);
       let text: string;
@@ -522,6 +541,7 @@ export class ReplayCommand extends PlumbingCommand {
     const committer = latin1(utf8(formatPersonIdent(committerIdentOf(this._workingCopy, { now }))));
     const text =
       `tree ${tree}\nparent ${parent}\nauthor ${author ?? ""}\ncommitter ${committer}\n` +
+      (isUtf8(commitEncoding) ? "" : `encoding ${commitEncoding}\n`) +
       `${extra}\n${message}`;
     const bytes = latin1Bytes(text);
     return objects.put("commit", bytes.length, [bytes]);
@@ -609,6 +629,11 @@ function incompatible(options: [boolean, string][]): void {
   throw die(
     `options ${set.slice(0, -1).join(", ")}, and ${set[set.length - 1]} cannot be used together`,
   );
+}
+
+/** utf8.c's is_encoding_utf8: unset, `UTF-8` or `utf8` in any case. */
+function isUtf8(name: string | undefined): boolean {
+  return name === undefined || /^utf-?8$/i.test(name);
 }
 
 const updateLine = (u: RefUpdate) => `update ${u.name} ${u.new} ${u.old}\n`;
