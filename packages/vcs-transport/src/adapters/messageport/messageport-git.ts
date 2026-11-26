@@ -46,7 +46,7 @@ import {
   setPortCloseSignal,
   structuredCodec,
 } from "@statewalker/webrun-rpc";
-import type { Duplex } from "../../api/duplex.js";
+import { type ByteStream, type Duplex, isDuplex } from "../../api/duplex.js";
 import {
   createDuplexConnector,
   type GitConnectRequest,
@@ -67,15 +67,28 @@ export type { MessageTarget };
 export interface MessagePortDuplexOptions extends WebrunDuplexOptions {
   /** Abort the stream after this many milliseconds without a chunk either way (default: none) */
   timeout?: number;
+  /**
+   * The serving side's close (a daemon answering a client over a socket's port): `close`
+   * first ends what was written and waits until the far end has taken all of it (a
+   * socket's adapter then writes it out and half-closes), giving up once it took no chunk
+   * for this many milliseconds, and only then abandons the rest and closes the port.
+   * Without it `close` abandons at once, which may drop the last of the answer still in
+   * the port.
+   */
+  drainTimeout?: number;
 }
+
+/** {@link MessagePortDuplexOptions.drainTimeout} of `GitDaemon.serve`'s ports. */
+export const DEFAULT_PORT_DRAIN_TIMEOUT = 30000;
 
 /**
  * A transport `Duplex` running one git session on a port served by {@link serveGitOverPort}
- * or {@link serveOverPort}. Writes wait (a promise) once `highWaterMark` bytes queue up; `end`
- * is a half-close (the server's input ends, its answer goes on). `close` abandons what is
- * still running and closes the port (idempotent). The server closes its end once the session
- * is over, which closes an entangled `MessageChannel` port too, so a session nobody closes
- * still frees both ports.
+ * or {@link serveOverPort}, or carrying a socket (vcs-utils-node's `socketMessagePort`).
+ * Writes wait (a promise) once `highWaterMark` bytes queue up; `end` is a half-close (the
+ * server's input ends, its answer goes on). `close` abandons what is still running and
+ * closes the port (idempotent; with `drainTimeout`, once what was written went out). The
+ * server closes its end once the session is over, which closes an entangled
+ * `MessageChannel` port too, so a session nobody closes still frees both ports.
  *
  * @param port - A `MessagePort` (or any webrun-rpc `MessageTarget`), one session per port
  */
@@ -83,23 +96,82 @@ export function messagePortDuplex(
   port: MessageTarget,
   options: MessagePortDuplexOptions = {},
 ): Duplex {
-  const { timeout, ...queue } = options;
+  const { timeout, drainTimeout, ...queue } = options;
   watchPortClose(port);
   const call = duplexOverPort(port, timeout !== undefined ? { timeout } : {});
+  // what the far end took of the input: each chunk pulled, then its end
+  let taken: () => void = () => {};
+  let inputOver = false;
+  const progress = () => taken();
   const duplex = webrunClientDuplex((input) => {
     // `duplexOverPort` installs its listeners synchronously: start the port right after.
-    const output = call(input);
+    const output = call(drainTimeout === undefined ? input : observePulls(input));
     startPort(port);
     return output;
   }, queue);
+  async function* observePulls(
+    input: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
+  ): AsyncGenerator<Uint8Array> {
+    for await (const chunk of input) {
+      progress();
+      yield chunk;
+    }
+    inputOver = true;
+    progress();
+  }
   const closePort = portCloser(port);
+  let closing: Promise<void> | undefined;
+  /** Ends the input and waits until the far end took all of it (or went quiet, or closed). */
+  const drain = async (limit: number) => {
+    const signal = getPortCloseSignal(port);
+    await duplex.end?.();
+    if (inputOver || signal?.aborted) return;
+    await new Promise<void>((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const done = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", done);
+        taken = () => {};
+        resolve();
+      };
+      const arm = () => {
+        clearTimeout(timer);
+        timer = setTimeout(done, limit);
+      };
+      signal?.addEventListener("abort", done, { once: true });
+      taken = () => (inputOver ? done() : arm());
+      arm();
+    });
+  };
   return {
     ...duplex,
-    close: async () => {
-      await duplex.close?.();
-      closePort();
+    close: () => {
+      closing ??= (async () => {
+        if (drainTimeout !== undefined) {
+          await drain(drainTimeout);
+          await duplex.close?.();
+          // the end of the input is posted in the turns after it was pulled: close after them
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        } else await duplex.close?.();
+        closePort();
+      })();
+      return closing;
     },
   };
+}
+
+/**
+ * The {@link Duplex} of a {@link ByteStream}: a duplex as it is, a port through
+ * {@link messagePortDuplex} (its other end serves the stream: a socket's
+ * `socketMessagePort`, `serveGitOverPort`, `serveOverPort`).
+ *
+ * @example
+ * ```ts
+ * const duplex = duplexOfStream(await connectSocketPort({ host, port })); // vcs-utils-node
+ * ```
+ */
+export function duplexOfStream(stream: ByteStream, options: MessagePortDuplexOptions = {}): Duplex {
+  return isDuplex(stream) ? stream : messagePortDuplex(stream, options);
 }
 
 /**

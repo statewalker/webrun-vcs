@@ -23,7 +23,9 @@
  * (`end()`, a FIN: the peer reads end of file and may still answer), the peer's FIN is the
  * end of the output; once both are over the port is closed. A socket error, or the caller
  * closing its port or abandoning the output, destroys the socket and closes the port, so
- * each side sees the failure.
+ * each side sees the failure; once the caller's input has ended (the socket half-closed),
+ * what it sent is still flushed to the peer before the socket is destroyed (a server that
+ * abandons the client's input after writing its whole answer loses none of it).
  *
  * Library code never imports this module: it receives such a port from the host (a
  * `GitHostEnvironment` function), and a `MessageChannel`, a worker, or a WebSocket bridge
@@ -68,7 +70,19 @@ export function socketMessagePort(
   const close = () => {
     if (closed) return;
     closed = true;
-    if (!socket.destroyed) socket.destroy();
+    if (!socket.destroyed) {
+      if (inputDone && !socket.writableFinished && !failure) {
+        // half-closed already (all the caller sent is written): let it reach the peer
+        // before the socket goes, then destroy it; a peer that never reads gets no longer
+        // than a stream timeout's worth (or 30 s)
+        const timer = setTimeout(() => socket.destroy(), options.timeout ?? 30000);
+        timer.unref?.();
+        socket.once("finish", () => {
+          clearTimeout(timer);
+          socket.destroy();
+        });
+      } else socket.destroy();
+    }
     try {
       // abandons the stream and tells the peer; posting may fail on a port already closed
       teardown();
@@ -172,6 +186,15 @@ export function connectSocketPort(
   });
 }
 
+/**
+ * Who an accepted connection comes from (`net.Socket`'s `remoteAddress`/`remotePort`; both
+ * absent for a Unix-domain socket), as git-daemon's `--max-connections` and access hook use it.
+ */
+export interface SocketPeer {
+  remoteAddress?: string;
+  remotePort?: number;
+}
+
 /** A listening socket handing each connection over as a port (see {@link listenSocketPorts}). */
 export interface SocketPortServer {
   /** The socket's path, or its TCP address (the port chosen when `port` was 0) */
@@ -183,18 +206,34 @@ export interface SocketPortServer {
 /**
  * Listens on a Unix-domain socket (a path) or a TCP address and calls `onPort` with each
  * accepted connection as a port ({@link socketMessagePort}), the serving side's view: its
- * input is what the client sends, its output goes back to the client.
+ * input is what the client sends, its output goes back to the client. `peer` names the
+ * client's address and port (TCP only).
+ *
+ * @example
+ * ```typescript
+ * const daemon = createGitDaemon({ resolveRepository }); // vcs-transport
+ * const server = await listenSocketPorts({ port: 9418 }, (port, peer) =>
+ *   void daemon.serve(port, {
+ *     ...(peer.remoteAddress !== undefined ? { remoteAddress: peer.remoteAddress } : {}),
+ *     ...(peer.remotePort !== undefined ? { remotePort: String(peer.remotePort) } : {}),
+ *   }),
+ * );
+ * ```
  */
 export function listenSocketPorts(
   target: SocketTarget,
-  onPort: (port: MessagePort) => void,
+  onPort: (port: MessagePort, peer: SocketPeer) => void,
   options: SocketMessagePortOptions = {},
 ): Promise<SocketPortServer> {
   const sockets = new Set<Socket>();
   const server: Server = createServer({ allowHalfOpen: true }, (socket) => {
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
-    onPort(socketMessagePort(socket, options));
+    const peer: SocketPeer = {
+      ...(socket.remoteAddress !== undefined ? { remoteAddress: socket.remoteAddress } : {}),
+      ...(socket.remotePort !== undefined ? { remotePort: socket.remotePort } : {}),
+    };
+    onPort(socketMessagePort(socket, options), peer);
   });
   return new Promise((resolve, reject) => {
     server.once("error", reject);

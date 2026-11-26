@@ -12,8 +12,6 @@
 
 import { type ChildProcess, execFile, execFileSync, spawnSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
-import type { AddressInfo } from "node:net";
-import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 
 import { ObjectType } from "@statewalker/vcs-core";
@@ -29,6 +27,7 @@ import {
   type TransportRepo,
 } from "./helpers.js";
 import { serveFetchHandler } from "./http-server.js";
+import { type DuplexServer, listenDuplexes } from "./socket-server.js";
 
 const describeGit = gitAvailable() ? describe : describe.skip;
 const TIMEOUT = 120000;
@@ -144,32 +143,16 @@ function answer(body: Buffer): { lines: string[]; packObjects?: number } {
 }
 
 /** A serveOverDuplex v0 upload-pack behind a TCP port, for git's `--upload-pack` relay. */
-function serveRelay(repo: TransportRepo): Server {
-  return createServer({ allowHalfOpen: true }, (socket: Socket) => {
-    void (async () => {
-      const it = socket[Symbol.asyncIterator]() as AsyncIterator<Buffer>;
-      await serveOverDuplex({
-        duplex: {
-          async *[Symbol.asyncIterator]() {
-            while (true) {
-              const next = await it.next();
-              if (next.done) return;
-              yield new Uint8Array(next.value);
-            }
-          },
-          write: (data: Uint8Array) =>
-            new Promise<void>((resolve) => {
-              socket.write(data, () => resolve());
-            }),
-        },
-        repository: repo.facade,
-        refStore: repo.refStore,
-        service: "git-upload-pack",
-        protocolVersion: "1",
-      });
-      socket.end();
-    })().catch(() => socket.destroy());
-  });
+function serveRelay(repo: TransportRepo): Promise<DuplexServer> {
+  return listenDuplexes((duplex) =>
+    serveOverDuplex({
+      duplex,
+      repository: repo.facade,
+      refStore: repo.refStore,
+      service: "git-upload-pack",
+      protocolVersion: "1",
+    }),
+  );
 }
 
 const RELAY = `
@@ -197,7 +180,7 @@ describeGit("Interop · upload-pack v0 negotiation as git's", { timeout: TIMEOUT
   let c0: string;
   let c1: string;
   let tag: string;
-  let relay: Server;
+  let relay: DuplexServer | undefined;
   let uploadPack: string;
 
   beforeAll(async () => {
@@ -242,11 +225,10 @@ describeGit("Interop · upload-pack v0 negotiation as git's", { timeout: TIMEOUT
     git(bare, ["update-ref", "refs/heads/main", c1]);
     git(bare, ["update-ref", "refs/tags/v1", tag]);
 
-    relay = serveRelay(server);
-    await new Promise<void>((resolve) => relay.listen(0, "127.0.0.1", resolve));
+    relay = await serveRelay(server);
     const script = join(root, "relay.mjs");
     writeFileSync(script, RELAY);
-    uploadPack = `${shellQuote(process.execPath)} ${shellQuote(script)} ${(relay.address() as AddressInfo).port}`;
+    uploadPack = `${shellQuote(process.execPath)} ${shellQuote(script)} ${relay.port}`;
   }, TIMEOUT);
 
   afterEach(() => {
@@ -255,7 +237,7 @@ describeGit("Interop · upload-pack v0 negotiation as git's", { timeout: TIMEOUT
   });
 
   afterAll(async () => {
-    await new Promise<void>((resolve) => relay?.close(() => resolve()));
+    await relay?.close();
     await server?.close();
     if (root) cleanupDir(root);
   });

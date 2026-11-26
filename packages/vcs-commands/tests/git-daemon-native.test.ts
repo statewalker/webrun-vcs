@@ -7,7 +7,7 @@
 
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { connect, createServer, type Server, type Socket } from "node:net";
+import { connect, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import {
@@ -21,13 +21,14 @@ import {
   createNodeFilesApi,
   createNodeGitHostEnvironment,
   createNodeHookRunner,
+  listenSocketPorts,
+  type SocketPortServer,
 } from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { openLocalRemote } from "../src/commands/local-transport.js";
 import { daemonAccessHookOf, type Git, servedRepositoryOf } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
-import { socketDuplex } from "./native-connect-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { testEnv } from "./status-native-support.js";
 
@@ -523,20 +524,20 @@ describeGit("git daemon front end (native twins)", () => {
       return { port, child };
     }
 
-    async function ourDaemon(max: number): Promise<{ port: number; server: Server }> {
+    /** Our daemon behind the socket adapter: each connection a port, its peer's address. */
+    async function ourDaemon(max: number): Promise<{ port: number; server: SocketPortServer }> {
       const daemon = createGitDaemon({
         maxConnections: max,
         resolveRepository: resolverOf({ exportAll: true }),
       });
-      const server = createServer({ allowHalfOpen: true }, (socket) => {
-        void daemon.serve(socketDuplex(socket), {
-          ...(socket.remoteAddress !== undefined ? { remoteAddress: socket.remoteAddress } : {}),
-          remotePort: String(socket.remotePort),
+      const server = await listenSocketPorts({ host: "127.0.0.1", port: 0 }, (port, peer) => {
+        void daemon.serve(port, {
+          ...(peer.remoteAddress !== undefined ? { remoteAddress: peer.remoteAddress } : {}),
+          remotePort: String(peer.remotePort),
         });
       });
-      await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
-      const address = server.address();
-      return { port: typeof address === "object" && address ? address.port : 0, server };
+      const address = server.address;
+      return { port: typeof address === "object" ? address.port : 0, server };
     }
 
     for (const name of Object.keys(scenarios)) {
@@ -555,7 +556,7 @@ describeGit("git daemon front end (native twins)", () => {
         try {
           oursSeen = await scenario(ours.port);
         } finally {
-          ours.server.close();
+          await ours.server.close();
         }
         const adv = advertised();
         const expected: Record<string, string[]> = {

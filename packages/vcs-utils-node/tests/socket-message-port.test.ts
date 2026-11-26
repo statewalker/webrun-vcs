@@ -223,4 +223,25 @@ describeUnix("socketMessagePort", () => {
       await server.close();
     }
   });
+
+  it("listenSocketPorts names a TCP client's address and port, none for a Unix socket", async () => {
+    const peers: unknown[] = [];
+    const tcp = await listenSocketPorts({ port: 0 }, (port, peer) => {
+      peers.push(peer);
+      void call(port, []);
+    });
+    const unix = await listenSocketPorts(join(dir, "u"), (port, peer) => {
+      peers.push(peer);
+      void call(port, []);
+    });
+    try {
+      const { port } = tcp.address as { port: number };
+      await call(await connectSocketPort({ port }), []);
+      await call(await connectSocketPort(join(dir, "u")), []);
+      expect(peers).toEqual([{ remoteAddress: "127.0.0.1", remotePort: expect.any(Number) }, {}]);
+    } finally {
+      await tcp.close();
+      await unix.close();
+    }
+  });
 });

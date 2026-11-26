@@ -48,7 +48,7 @@ cheaper on a peer-to-peer link and the only option where there is no HTTP at all
 ```typescript
 const transports = createDefaultTransports({
   fetchImpl: (request) => fetch(request),                    // the HTTP connector's fetch
-  openSocket: (host, port) => openTcp(host, port),           // adds git://
+  openSocket: (host, port) => connectSocketPort({ host, port }), // adds git:// (a MessagePort)
   exec: (target, command, env) => runSsh(target, command, env), // adds ssh
 });
 transports.register(myConnector, { priority: 10 });          // asked before the defaults
@@ -331,19 +331,19 @@ unreachable object a client must not fetch by id) turns the dumb protocol off wi
 ## git://
 
 ```typescript
-// client (Node): a TCP socket as a Duplex
-import { connect } from "node:net";
+// client (Node): each git:// session a socket's MessagePort (vcs-utils-node's adapter)
+import { connectSocketPort } from "@statewalker/vcs-utils-node/files";
 
 const transports = createDefaultTransports({
-  openSocket: (host, port) => tcpDuplex(connect({ host, port, allowHalfOpen: true })),
+  openSocket: (host, port) => connectSocketPort({ host, port }),
 });
 await git.clone().setURI("git://git.example.com/notes.git").setTransports(transports).call();
 ```
 
 ```typescript
 // server: git-daemon's side on every connection
-import { createServer } from "node:net";
-import { createBasePathResolver, serveGitConnection } from "@statewalker/vcs-transport";
+import { listenSocketPorts } from "@statewalker/vcs-utils-node/files";
+import { createBasePathResolver, createGitDaemon } from "@statewalker/vcs-transport";
 import { servedRepositoryOf } from "@statewalker/vcs-commands";
 
 const resolveRepository = createBasePathResolver({
@@ -354,10 +354,23 @@ const resolveRepository = createBasePathResolver({
     return opened && servedRepositoryOf(opened);
   },
 });
-createServer({ allowHalfOpen: true }, (socket) =>
-  serveGitConnection({ duplex: tcpDuplex(socket), resolveRepository, initTimeout: 10_000, timeout: 60_000 }),
-).listen(9418);
+const daemon = createGitDaemon({ resolveRepository, initTimeout: 10_000, timeout: 60_000 });
+await listenSocketPorts({ host: "0.0.0.0", port: 9418 }, (port, peer) =>
+  void daemon.serve(port, {
+    ...(peer.remoteAddress !== undefined ? { remoteAddress: peer.remoteAddress } : {}),
+    ...(peer.remotePort !== undefined ? { remotePort: String(peer.remotePort) } : {}),
+  }),
+);
 ```
+
+Portable code never touches a socket: `openSocket` (and ssh's `exec`) may return a `Duplex`
+or a `MessagePort` whose other end carries the stream, and `GitDaemon.serve` takes either.
+On Node the socket adapter (`connectSocketPort`, `listenSocketPorts`, `socketMessagePort` in
+`@statewalker/vcs-utils-node/files`) turns a TCP or Unix-domain socket into such a port; a
+`MessageChannel` whose other end runs `serveGitOverPort`, a worker or a WebSocket bridge
+serve the same way. The end of a client's request is the socket's FIN (the port's half-close),
+the daemon's answer is flushed before the socket closes (`GitDaemon.serve` closes its port
+with `messagePortDuplex`'s `drainTimeout`), and a reset or a closed port fails the other side.
 
 `tcpDuplex` is yours: a Node socket's data events as an async iterable, `write`, `end` as
 `socket.end()` (the half-close git uses after a request) and `close` as `socket.destroy()`. Both

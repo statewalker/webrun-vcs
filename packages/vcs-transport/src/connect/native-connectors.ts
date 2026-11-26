@@ -3,27 +3,35 @@
  * over a socket the host opens (`openSocket`), and ssh over a command channel the host runs
  * (`exec`: an ssh client, a WebSocket to a shell service, a local process in tests). The
  * protocol itself (the request line, the pack exchange) is ours; only the byte stream is the
- * host's.
+ * host's, given as a `Duplex` or as a `MessagePort` ({@link ByteStream}): on Node a socket
+ * is one through vcs-utils-node's `connectSocketPort`, and a `MessageChannel`, a worker or
+ * a WebSocket bridge serve the same way.
  *
  * @example
  * ```ts
+ * import { connectSocketPort } from "@statewalker/vcs-utils-node/files";
  * const transports = createDefaultTransports({
- *   openSocket: (host, port) => openTcp(host, port),          // git://
+ *   openSocket: (host, port) => connectSocketPort({ host, port }), // git://
  *   // ssh://, host:path; sshArgs puts `--` before the destination
  *   exec: (target, command, env) => spawnSsh(["ssh", ...sshArgs(target), command], env),
  * });
  * ```
  */
 
-import type { Duplex } from "../api/duplex.js";
+import { duplexOfStream } from "../adapters/messageport/index.js";
+import type { ByteStream } from "../api/duplex.js";
 import { GIT_PROTOCOL_DEFAULT_PORT, sqQuote, TransportError } from "../protocol/index.js";
 import type { GitConnectRequest, GitTransportConnector } from "./connector.js";
 import { protocolVersionFor } from "./open-session.js";
 
 /** Options of {@link createGitDaemonConnector}. */
 export interface GitDaemonConnectorOptions {
-  /** Opens a byte stream to `host:port` (a TCP socket where the host has one) */
-  openSocket(host: string, port: number): Promise<Duplex>;
+  /**
+   * Opens a byte stream to `host:port` (a TCP socket where the host has one): a `Duplex`, or
+   * a `MessagePort` whose other end carries the stream (`connectSocketPort` on Node,
+   * `serveGitOverPort` in a worker)
+   */
+  openSocket(host: string, port: number): Promise<ByteStream>;
 }
 
 /**
@@ -41,7 +49,9 @@ export function createGitDaemonConnector(
       const host = request.url.host;
       if (!host)
         throw new TransportError(`fatal: unable to connect to ${request.url.raw}: no host`);
-      const duplex = await options.openSocket(host, request.url.port ?? GIT_PROTOCOL_DEFAULT_PORT);
+      const duplex = duplexOfStream(
+        await options.openSocket(host, request.url.port ?? GIT_PROTOCOL_DEFAULT_PORT),
+      );
       return { kind: "native", duplex, handshake: "git-daemon" };
     },
   };
@@ -105,12 +115,13 @@ export function sshArgs(target: SshTarget): string[] {
 /** Options of {@link createSshConnector}. */
 export interface SshConnectorOptions {
   /**
-   * Runs `command` on `target` and returns its stdin/stdout as a stream (ssh's channel).
+   * Runs `command` on `target` and returns its stdin/stdout as a stream (ssh's channel): a
+   * `Duplex`, or a `MessagePort` whose other end carries it.
    * `env` is what git asks ssh to send (`SendEnv=GIT_PROTOCOL`): `GIT_PROTOCOL=version=<n>`
    * for protocol v1 and v2, nothing for v0. An exec running an ssh client builds its argument
    * list with {@link sshArgs} (never `-l <user> <host>` or the host alone in front of options).
    */
-  exec(target: SshTarget, command: string, env: Record<string, string>): Promise<Duplex>;
+  exec(target: SshTarget, command: string, env: Record<string, string>): Promise<ByteStream>;
 }
 
 /**
@@ -161,7 +172,7 @@ export function createSshConnector(options: SshConnectorOptions): GitTransportCo
         ...(port !== undefined ? { port } : {}),
         ...(user !== undefined ? { user } : {}),
       };
-      const duplex = await options.exec(target, command, gitSshEnv(request));
+      const duplex = duplexOfStream(await options.exec(target, command, gitSshEnv(request)));
       return { kind: "native", duplex, handshake: "implicit" };
     },
   };

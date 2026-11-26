@@ -15,7 +15,6 @@
 import { type ChildProcess, execFile, execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { writeFileSync } from "node:fs";
-import { type AddressInfo, createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -36,6 +35,7 @@ import {
   type TransportRepo,
 } from "./helpers.js";
 import { type LoopbackHttpServer, serveFetchHandler } from "./http-server.js";
+import { type DuplexServer, listenDuplexes } from "./socket-server.js";
 
 const HAS_GIT = gitAvailable();
 const describeGit = HAS_GIT ? describe : describe.skip;
@@ -821,42 +821,25 @@ describeGit(
     let root: string;
     let src: { dir: string; commits: string[] };
     let repo: TransportRepo;
-    let tcp: Server;
+    let tcp: DuplexServer;
     let receivePack: string;
     let hooks: Parameters<typeof serveOverDuplex>[0]["hooks"];
 
     beforeAll(async () => {
       root = makeTmpDir("vcs-interop-rp-pipe-");
       src = sourceRepo(root);
-      tcp = createServer({ allowHalfOpen: true }, (socket: Socket) => {
-        void (async () => {
-          const it = socket[Symbol.asyncIterator]() as AsyncIterator<Buffer>;
-          await serveOverDuplex({
-            duplex: {
-              async *[Symbol.asyncIterator]() {
-                while (true) {
-                  const next = await it.next();
-                  if (next.done) return;
-                  yield new Uint8Array(next.value);
-                }
-              },
-              write: (data: Uint8Array) =>
-                new Promise<void>((resolve) => {
-                  socket.write(data, () => resolve());
-                }),
-            },
-            repository: repo.facade,
-            refStore: repo.refStore,
-            service: "git-receive-pack",
-            hooks,
-          });
-          socket.end();
-        })().catch(() => socket.destroy());
-      });
-      await new Promise<void>((resolve) => tcp.listen(0, "127.0.0.1", resolve));
+      tcp = await listenDuplexes((duplex) =>
+        serveOverDuplex({
+          duplex,
+          repository: repo.facade,
+          refStore: repo.refStore,
+          service: "git-receive-pack",
+          hooks,
+        }),
+      );
       const relay = join(root, "relay.mjs");
       writeFileSync(relay, RELAY);
-      receivePack = `${shellQuote(process.execPath)} ${shellQuote(relay)} ${(tcp.address() as AddressInfo).port}`;
+      receivePack = `${shellQuote(process.execPath)} ${shellQuote(relay)} ${tcp.port}`;
     });
 
     afterEach(() => {
@@ -866,7 +849,7 @@ describeGit(
     });
 
     afterAll(async () => {
-      await new Promise<void>((resolve) => tcp.close(() => resolve()));
+      await tcp.close();
       cleanupDir(root);
     });
 

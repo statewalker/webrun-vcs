@@ -13,16 +13,21 @@
  *   resolveRepository: createBasePathResolver({ files, basePath: "/srv/git", openRepository }),
  *   accessHook: daemonAccessHookOf(hookRunner, "/usr/local/bin/git-access"), // vcs-commands
  * });
- * net.createServer({ allowHalfOpen: true }, (socket) =>
- *   void daemon.serve(socketDuplex(socket), {
- *     remoteAddress: socket.remoteAddress,
- *     remotePort: String(socket.remotePort),
+ * // Node: each accepted socket as a MessagePort (vcs-utils-node's socket adapter)
+ * await listenSocketPorts({ host: "0.0.0.0", port: 9418 }, (port, peer) =>
+ *   void daemon.serve(port, {
+ *     remoteAddress: peer.remoteAddress,
+ *     remotePort: String(peer.remotePort),
  *   }),
- * ).listen(9418);
+ * );
  * ```
+ *
+ * A connection is a `Duplex` or a `MessagePort` whose other end carries the client's bytes
+ * (`socketMessagePort`, `serveOverPort`), read through `messagePortDuplex`.
  */
 
-import type { Duplex } from "../api/duplex.js";
+import { DEFAULT_PORT_DRAIN_TIMEOUT, duplexOfStream } from "../adapters/messageport/index.js";
+import type { ByteStream, Duplex } from "../api/duplex.js";
 import {
   type ServeGitConnectionOptions,
   type ServeGitConnectionResult,
@@ -58,8 +63,11 @@ export interface GitDaemonConnectionInfo {
 
 /** A daemon serving the connections a host hands it. */
 export interface GitDaemon {
-  /** Serves one connection (git-daemon's child), or drops it when over the limit */
-  serve(duplex: Duplex, info?: GitDaemonConnectionInfo): Promise<ServeGitConnectionResult>;
+  /**
+   * Serves one connection (git-daemon's child), or drops it when over the limit: a `Duplex`,
+   * or a `MessagePort` carrying the client's bytes (a socket through `socketMessagePort`)
+   */
+  serve(stream: ByteStream, info?: GitDaemonConnectionInfo): Promise<ServeGitConnectionResult>;
   /** The connections being served (git-daemon's `live_children`) */
   readonly liveConnections: number;
 }
@@ -107,7 +115,9 @@ export function createGitDaemon(options: GitDaemonOptions): GitDaemon {
     get liveConnections() {
       return children.length;
     },
-    async serve(duplex, info = {}) {
+    async serve(stream, info = {}) {
+      // a port must not lose the end of the answer when the session closes it
+      const duplex = duplexOfStream(stream, { drainTimeout: DEFAULT_PORT_DRAIN_TIMEOUT });
       if (maxConnections > 0 && children.length >= maxConnections) {
         const killed = killSomeChild();
         let timer: ReturnType<typeof setTimeout> | undefined;
