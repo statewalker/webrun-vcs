@@ -208,7 +208,17 @@ describeGit("git archive --remote (native twins)", () => {
     }
   });
 
-  it('t5000-tar-tree.sh: "git archive --list" served remotely, -v\'s paths as remote lines', async () => {
+  it("--add-file and --add-virtual-file are refused remotely", async () => {
+    for (const arg of ["--add-file=b", "--add-virtual-file=x:y"]) {
+      const { native, ours: our } = await localTwins(".", [arg, "HEAD"]);
+      expect(native.status).toBe(1);
+      expect(our.status).toBe(1);
+      expect(our.out.length).toBe(0);
+      expect(sortedLines(our.err)).toEqual(sortedLines(native.err));
+    }
+  });
+
+  it("--list served remotely, -v's paths as remote lines", async () => {
     git(repo, ["config", "tar.tar.foo.command", "cat"]);
     try {
       const list = await localTwins(".", ["--list"]);

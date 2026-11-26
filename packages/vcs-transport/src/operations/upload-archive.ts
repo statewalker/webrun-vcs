@@ -10,6 +10,7 @@
  * flush, or, when the writer failed, `git upload-archive: archiver died with error` on band 3.
  */
 
+import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { type Duplex, endDuplex } from "../api/duplex.js";
 import { PktStream } from "../fetch-client/pkt-stream.js";
 import { encodeFlush, encodePacket } from "../protocol/pkt-line-codec.js";
@@ -82,7 +83,9 @@ export async function serveUploadArchive(
         output = died(`Too many options (>${MAX_ARGS})`);
         break;
       }
-      const line = packet.type === "data" ? packet.text : "";
+      // git's bytes: a non-UTF-8 pathspec or prefix passes as decodeGitPath's escapes
+      let line = packet.type === "data" ? decodeGitPath(packet.data) : "";
+      if (line.endsWith("\n")) line = line.slice(0, -1);
       if (packet.type !== "data" || !line.startsWith("argument ")) {
         output = died("'argument' token or flush expected");
         break;
@@ -160,8 +163,9 @@ export async function requestRemoteArchive(
   options: RemoteArchiveOptions = {},
 ): Promise<RemoteArchiveOutput> {
   const request: Uint8Array[] = [];
-  if (options.formatHint) request.push(encodePacket(`argument --format=${options.formatHint}\n`));
-  for (const arg of args) request.push(encodePacket(`argument ${arg}\n`));
+  const line = (arg: string) => encodePacket(encodeGitPath(`argument ${arg}\n`));
+  if (options.formatHint) request.push(line(`--format=${options.formatHint}`));
+  for (const arg of args) request.push(line(arg));
   request.push(encodeFlush());
   await duplex.write(concat(request));
   await endDuplex(duplex);

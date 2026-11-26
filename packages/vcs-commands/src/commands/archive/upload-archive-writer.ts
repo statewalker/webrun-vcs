@@ -124,6 +124,7 @@ export function applyArchiveArgs(command: ArchiveCommand, args: readonly string[
   const positional: string[] = [];
   let list = false;
   let format: string | undefined;
+  let extraFiles = false;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i] as string;
     if (arg === "--") {
@@ -160,10 +161,13 @@ export function applyArchiveArgs(command: ArchiveCommand, args: readonly string[
           command.setPrefix(value as string);
           break;
         case "add-file":
-          command.addFile(value as string);
-          break;
+          // add_file_cb stats the file while parsing, in the server's git directory: no
+          // host file is read here, every one reads as missing (git, finding one, would
+          // die on --remote below)
+          throw new GitApiError(`fatal: File not found: ${value}`);
         case "add-virtual-file":
-          command.addVirtualFile(value as string);
+          // refused below, once parsing is done, as parse_archive_args refuses it
+          extraFiles = true;
           break;
         case "mtime":
           command.setMtime(value as string);
@@ -196,6 +200,9 @@ export function applyArchiveArgs(command: ArchiveCommand, args: readonly string[
       else if (c === "o") throw new GitApiError("fatal: Unexpected option --output");
       else throw new GitApiError(`error: unknown switch \`${c}'`, { exitCode: 129 });
     }
+  }
+  if (extraFiles) {
+    throw new GitApiError("fatal: options '--add-file' and '--remote' cannot be used together");
   }
   if (format !== undefined) command.setFormat(format);
   if (list) return true;

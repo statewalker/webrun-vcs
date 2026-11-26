@@ -68,6 +68,21 @@ describe("serveUploadArchive", () => {
     expect(answer.endsWith("\x03git upload-archive: archiver died with error")).toBe(true);
   });
 
+  it("passes non-UTF-8 argument bytes through as git path escapes", async () => {
+    const client = scripted([encodePacket("ACK\n"), encodeFlush(), encodeFlush()]);
+    await requestRemoteArchive(client, ["caf\udce9"]);
+    const sent = client.written[0] as Uint8Array;
+    expect([...sent.subarray(sent.length - 9, sent.length - 4)]).toEqual([
+      0x63, 0x61, 0x66, 0xe9, 0x0a,
+    ]);
+    let seen: string[] = [];
+    await serveUploadArchive(scripted([sent]), async (args) => {
+      seen = args;
+      return { exitCode: 0, stdout: new Uint8Array(0), stderr: "" };
+    });
+    expect(seen).toEqual(["caf\udce9"]);
+  });
+
   it("dies on a line that is not an argument", async () => {
     const duplex = scripted([encodePacket("want x\n"), encodeFlush()]);
     await serveUploadArchive(duplex, async () => ({
