@@ -689,8 +689,13 @@ export async function serveGitService(
   }
   if (!served) return refuse(notExported ? "repository not exported" : "no such repository");
   const override = overridable ? configBoolOf(served.config, `daemon.${configKey}`) : undefined;
-  // upload-archive needs the repository's archive writer: refused as when not enabled
-  if (!(override ?? enabled) || (service === "git-upload-archive" && !served.uploadArchive)) {
+  // upload-archive needs the repository's archive writer: refused as when not enabled; never
+  // under a ref namespace (git archive would resolve names among every ref of the repository)
+  if (
+    !(override ?? enabled) ||
+    (service === "git-upload-archive" &&
+      (!served.uploadArchive || resolveServeSettings(options.settings, served).namespace))
+  ) {
     return refuse("service not enabled");
   }
   if (options.accessHook) {
