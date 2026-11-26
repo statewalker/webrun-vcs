@@ -7,6 +7,11 @@ import {
   type ProgressInfo,
 } from "@statewalker/vcs-transport";
 import type { WorkingCopy } from "@statewalker/vcs-working-tree";
+import {
+  type BundleUriHost,
+  createBundleUriHost,
+  fetchBundleUri,
+} from "./commands/bundle/index.js";
 import { hostEnvironmentOf } from "./commands/git-ident.js";
 import { httpClientSettingsOf } from "./commands/http-config.js";
 import { createPromisorFetcher, promisorOf } from "./commands/promisor-remote.js";
@@ -22,6 +27,7 @@ import {
   remoteContextOf,
   resolveRemote,
 } from "./commands/remote-transport.js";
+import { repositoryPlaceOf } from "./commands/worktree-support.js";
 import { GitCommand } from "./git-command.js";
 import { RemoteConfigStore } from "./remote-config/index.js";
 
@@ -373,7 +379,83 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
     if (this.progressCallback) child.setProgressMonitor(this.progressCallback);
     if (this.progressMessageCallback)
       child.setProgressMessageCallback(this.progressMessageCallback);
+    if (this.bundleUriOverride !== undefined) child.setBundleUri(this.bundleUriOverride);
     return child;
+  }
+
+  /**
+   * The repository side of bundle URIs (`fetch_bundle_uri`, `fetch_bundle_list`) for this
+   * command: downloads with its HTTP settings (static credentials and headers only to
+   * `remoteUrl`'s origin), unbundling into `refs/bundles/`, `fetch.bundleCreationToken` read
+   * from the config and written through `setConfigValue` (default: replacing its values).
+   */
+  protected bundleUriHost(options: {
+    remoteUrl?: string;
+    compatibility: "2.43" | "2.56";
+    message(line: string): void;
+    setConfigValue?(key: string, value: string): Promise<void>;
+    tempFileName?(): string;
+  }): BundleUriHost {
+    const store = RemoteConfigStore.from(this._workingCopy);
+    const worktree = repositoryPlaceOf(this._workingCopy);
+    return createBundleUriHost({
+      workingCopy: this._workingCopy,
+      setRef: (name, id, log) => this.refsStore.set(name, id, log),
+      getRef: async (name) => (await this.refsStore.resolve(name).catch(() => undefined))?.objectId,
+      reflogLine: (m) => this.reflogLine(m),
+      compatibility: options.compatibility,
+      readLocalFile: async (path) => worktree?.readLocalFile?.(path),
+      ...(options.remoteUrl !== undefined ? { remoteUrl: options.remoteUrl } : {}),
+      ...(this.credentials ? { credentials: this.credentials } : {}),
+      ...(this.headers ? { headers: this.headers } : {}),
+      ...(this.credentialHelper ? { credentialHelper: this.credentialHelper } : {}),
+      httpSettings: (url) => this.httpSettingsFor(url),
+      configValue: (key) => store.value(key),
+      setConfigValue:
+        options.setConfigValue ??
+        (async (key, value) => {
+          store.setValues(key, [value]);
+          await store.save();
+        }),
+      message: options.message,
+      ...(options.tempFileName ? { tempFileName: options.tempFileName } : {}),
+    });
+  }
+
+  /**
+   * `git -c fetch.bundleURI=<uri> fetch`: the bundle URI this fetch downloads before talking
+   * to the remote, over the config's `fetch.bundleURI` (`""` downloads nothing, as git's
+   * children of `fetch --all` are told).
+   */
+  setBundleUri(uri: string): this {
+    this.checkCallable();
+    this.bundleUriOverride = uri;
+    return this;
+  }
+
+  /** {@link setBundleUri}'s value */
+  protected bundleUriOverride?: string;
+
+  /**
+   * cmd_fetch's bundle step: `fetch.bundleURI` (or {@link setBundleUri}) downloaded and applied
+   * before the fetch (`fetch_bundle_uri`; a `creationToken` list only fetches bundles newer
+   * than `fetch.bundleCreationToken`). Returns git's lines, `failed to fetch bundles from`
+   * last when it failed.
+   */
+  protected async fetchConfiguredBundles(
+    compatibility: "2.43" | "2.56" = this.hooks.compatibility,
+  ): Promise<string[]> {
+    const uri =
+      this.bundleUriOverride ?? RemoteConfigStore.from(this._workingCopy).value("fetch.bundleURI");
+    if (uri === undefined) return [];
+    const lines: string[] = [];
+    const host = this.bundleUriHost({
+      compatibility,
+      message: (line) => lines.push(line),
+    });
+    const fetched = await fetchBundleUri(host, uri);
+    if (!fetched.ok) lines.push(`warning: failed to fetch bundles from '${uri}'`);
+    return lines;
   }
 
   /**
