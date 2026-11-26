@@ -192,6 +192,10 @@ export async function withLocalUploadPack<T>(
       // uploadpack.advertiseBundleURIs and bundle.*
       ...(settings.bundleUris !== undefined ? { bundleUris: settings.bundleUris } : {}),
       ...(settings.advertiseSID ? { advertiseSID: true } : {}),
+      // promisor.advertise (with promisor.sendFields)
+      ...(settings.promisorRemoteInfo !== undefined
+        ? { promisorRemoteInfo: settings.promisorRemoteInfo }
+        : {}),
       ...(head && "target" in head ? { currentBranch: head.target } : {}),
     }))().finally(() => server.close?.());
   try {

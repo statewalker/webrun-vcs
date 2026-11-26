@@ -6,6 +6,7 @@ import {
   historyWithoutLazyFetch,
   isSymbolicRef,
   parseCoreAbbrev,
+  parseObjectFilter,
   RefTransactionAbortedError,
   type RefTransactionHook,
 } from "@statewalker/vcs-core";
@@ -66,6 +67,7 @@ import {
   promisorRemotes,
   registerPartialClone,
 } from "./promisor-remote.js";
+import { promisorRemoteReplyOf } from "./promisor-remote-reply.js";
 import { withRemoteUploadPack } from "./remote-transport.js";
 import { clientSessionIdOf } from "./session-id.js";
 import {
@@ -442,7 +444,19 @@ export class FetchCommand extends TransportCommand<FetchResult> {
    */
   setFilter(spec: string | false): this {
     this.checkCallable();
-    this.filterSpec = spec;
+    if (spec === false) {
+      this.filterSpec = false;
+      return this;
+    }
+    // expand_list_objects_filter_spec: a blob limit recorded and sent in bytes (`5k`: 5120)
+    let limit: number | undefined;
+    try {
+      const filter = parseObjectFilter(spec);
+      if (filter.choice === "blob:limit") limit = filter.limit;
+    } catch {
+      // a spec git refuses goes on as given (its refusal comes later)
+    }
+    this.filterSpec = limit !== undefined ? `blob:limit=${limit}` : spec;
     return this;
   }
 
@@ -1091,6 +1105,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       ...(negotiationTips ? { negotiationTips } : {}),
       // the transport's warnings (a filter the server ignores, the dumb walker's alternates)
       onWarning: (line: string) => messages.push(line),
+      // the server's promisor-remote capability (promisor.acceptFromServer, storeFields)
+      promisorRemote: promisorRemoteReplyOf(this.workingCopy, (line) => messages.push(line)),
     };
     // --upload-pack, else remote.<name>.uploadpack (transport_get)
     const uploadPack = this.uploadPack ?? this.remoteProgram(this.remote, "uploadpack");

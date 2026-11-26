@@ -13,6 +13,10 @@ import type { ProcessContext } from "../../context/process-context.js";
 import { isRefHidden, visibleRefs } from "../../protocol/hidden-refs.js";
 import { formatOf, isObjectIdOf } from "../../protocol/object-format.js";
 import {
+  parsePromisorRemoteInfo,
+  parsePromisorRemoteNames,
+} from "../../protocol/promisor-remote.js";
+import {
   authorizeUpload,
   computeShallowUpdate,
   findUnreachableWant,
@@ -212,6 +216,23 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           ) {
             // serve.c's session_id_receive (git's trace2 `client-sid`)
             ctx.output.clientSessionId = line.slice("session-id=".length);
+          } else if (
+            (line === "promisor-remote" || line.startsWith("promisor-remote=")) &&
+            advertisesCapability(ctx, "promisor-remote")
+          ) {
+            // serve.c's promisor_remote_receive: the value is required
+            if (!line.startsWith("promisor-remote=")) {
+              ctx.output.error = "promisor-remote capability requires an argument";
+              return "ERROR";
+            }
+            const accepted = parsePromisorRemoteNames(line.slice("promisor-remote=".length));
+            const known = advertisedPromisorNames(ctx);
+            ctx.output.acceptedPromisorRemotes = [
+              ...new Set([
+                ...(ctx.output.acceptedPromisorRemotes ?? []),
+                ...accepted.filter((n) => known.includes(n)),
+              ]),
+            ];
           }
           // other capability lines (agent, server-option, ...) are accepted
           seen = true;
@@ -814,6 +835,10 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
                 : undefined,
               filterSpec: req?.filter ?? undefined,
               shallow: packShallow,
+              // upload-pack's missing_allow_promisor: a client accepted a promisor remote
+              ...((ctx.output.acceptedPromisorRemotes?.length ?? 0) > 0
+                ? { missingAllowPromisor: true }
+                : {}),
             });
 
         // The packfile section is side-band multiplexed (seeded as side-band-64k by the
@@ -1036,6 +1061,9 @@ function advertisedCapabilities(ctx: ProcessContext): string[] {
       ...(ctx.config.allowSidebandAll ? { allowSidebandAll: true } : {}),
       ...(ctx.config.sessionId !== undefined ? { sessionId: ctx.config.sessionId } : {}),
       ...(ctx.config.bundleUris !== undefined ? { bundleUri: true } : {}),
+      ...(ctx.config.promisorRemote !== undefined
+        ? { promisorRemote: ctx.config.promisorRemote }
+        : {}),
     },
   );
 }
@@ -1067,6 +1095,15 @@ async function objectInfo(
 }
 
 /** Whether the advertisement has capability `name` (`name` or `name=<features>`). */
+/**
+ * The names the `promisor-remote` capability advertises: the remotes a client may accept
+ * (git looks a name up among all its promisor remotes, which those with a URL are)
+ */
+function advertisedPromisorNames(ctx: ProcessContext): string[] {
+  const info = ctx.config.promisorRemote;
+  return info === undefined ? [] : parsePromisorRemoteInfo(info).remotes.map((r) => r.name);
+}
+
 function advertisesCapability(ctx: ProcessContext, name: string): boolean {
   return advertisedCapabilities(ctx).some((c) => c === name || c.startsWith(`${name}=`));
 }

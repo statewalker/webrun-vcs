@@ -63,6 +63,7 @@ import { runPostCheckoutHook } from "./git-hooks.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { copyLocalObjects } from "./local-clone.js";
 import { promisorOf } from "./promisor-remote.js";
+import { promisorRemoteReplyOf } from "./promisor-remote-reply.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { isValidRemoteName } from "./remote-command.js";
 import { withRemoteUploadPack } from "./remote-transport.js";
@@ -1211,6 +1212,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       ...(this.filterSpec !== undefined && !isLocal ? { filter: this.filterSpec } : {}),
       // the transport's warnings (a filter the server ignores, the dumb walker's alternates)
       onWarning: (line: string) => messages.push(`${line}\n`),
+      // the server's promisor-remote capability (promisor.acceptFromServer, storeFields)
+      promisorRemote: promisorRemoteReplyOf(this.workingCopy, (line) => messages.push(`${line}\n`)),
       ...(fsck ? { fsckObjects: fsck } : {}),
       ...(serverOptions.length > 0 ? { serverOptions } : {}),
       ...(rejectShallow ? { rejectShallow: true } : {}),

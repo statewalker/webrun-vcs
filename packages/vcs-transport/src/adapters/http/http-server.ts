@@ -168,6 +168,12 @@ export interface HttpServerOptions {
   advertiseSID?: boolean;
   /** The id {@link advertiseSID} advertises (default `processSessionId()`) */
   sessionId?: string;
+  /**
+   * Protocol v2: the `promisor-remote` capability's value (git's `promisor.advertise`,
+   * `promisorRemoteAdvertisement`). Each smart-HTTP request is its own upload-pack, as git's
+   * http-backend: what a client accepts in `ls-refs` does not reach its `fetch`
+   */
+  promisorRemoteInfo?: string;
   /** upload-pack: git's `uploadpack.packObjectsHook`, as the host runs it (`PackObjectsHook`) */
   packObjectsHook?: PackObjectsHook;
   /** receive-pack (push) hooks, limits and ref policies */
@@ -813,6 +819,9 @@ function v2CapabilityOptions(options: HttpServerOptions): ServerV2CapabilityOpti
     ...(options.allowSidebandAll ? { allowSidebandAll: true } : {}),
     ...(sid !== undefined ? { sessionId: sid } : {}),
     ...(options.bundleUris !== undefined ? { bundleUri: true } : {}),
+    ...(options.promisorRemoteInfo !== undefined
+      ? { promisorRemote: options.promisorRemoteInfo }
+      : {}),
   };
 }
 
@@ -950,6 +959,9 @@ export async function handleUploadPackV2(
     ...(options.bundleUris !== undefined ? { bundleUris: options.bundleUris } : {}),
     ...(advertisedSessionId(options) !== undefined
       ? { sessionId: advertisedSessionId(options) }
+      : {}),
+    ...(options.promisorRemoteInfo !== undefined
+      ? { promisorRemote: options.promisorRemoteInfo }
       : {}),
     keepAliveMs: options.keepAliveMs,
     hiddenRefs: uploadPackHiddenRefs(options),
@@ -1510,6 +1522,8 @@ export interface HttpHandlerOptions {
   advertiseSID?: boolean;
   /** The id {@link advertiseSID} advertises (see {@link HttpServerOptions.sessionId}) */
   sessionId?: string;
+  /** v2 `promisor-remote` (see {@link HttpServerOptions.promisorRemoteInfo}) */
+  promisorRemoteInfo?: string;
   /** upload-pack's pack-objects hook (see {@link HttpServerOptions.packObjectsHook}) */
   packObjectsHook?: PackObjectsHook;
   /** receive-pack hooks, limits and ref policies (see {@link ReceivePackServerOptions}) */
@@ -1564,6 +1578,7 @@ export function createHttpHandler(
     bundleUris,
     advertiseSID,
     sessionId,
+    promisorRemoteInfo,
     packObjectsHook,
     receivePack,
     uploadPack,
@@ -1595,6 +1610,7 @@ export function createHttpHandler(
       ...(bundleUris !== undefined ? { bundleUris } : {}),
       ...(advertiseSID ? { advertiseSID } : {}),
       ...(sessionId !== undefined ? { sessionId } : {}),
+      ...(promisorRemoteInfo !== undefined ? { promisorRemoteInfo } : {}),
       ...(packObjectsHook ? { packObjectsHook } : {}),
       receivePack,
       uploadPack,

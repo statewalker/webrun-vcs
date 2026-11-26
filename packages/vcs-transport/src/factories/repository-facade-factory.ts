@@ -94,6 +94,18 @@ export interface HistoryFacadeConfig {
  * const packStream = facade.exportPack(wants, exclude);
  * ```
  */
+/** The promisor objects (git's `is_promisor_object`) the store does not hold. */
+async function absentPromisorObjects(history: History): Promise<string[]> {
+  const objects = history.objects;
+  const promisor = objects?.promisor;
+  if (!objects || !promisor) return [];
+  const out: string[] = [];
+  for (const id of await promisor.promisedObjects({ skipUnreadable: true })) {
+    if (!(await objects.has(id))) out.push(id);
+  }
+  return out;
+}
+
 export function createRepositoryFacade(config: HistoryFacadeConfig): RepositoryFacade {
   const facade = createRepositoryFacadeFromHistory(
     config.history,
@@ -239,8 +251,13 @@ function createRepositoryFacadeFromHistory(
       const filter = options?.filterSpec
         ? await resolveObjectFilter(parseObjectFilter(options.filterSpec), loadSparse)
         : undefined;
+      // --missing=allow-promisor: the absent promisor objects are not listed
+      const excludeObjects = options?.missingAllowPromisor
+        ? await absentPromisorObjects(history)
+        : [];
       // listObjects + writePack: streamed, stored entries reused, deltas searched
       const pack = serialization.exportPack(wants, exclude, {
+        ...(excludeObjects.length > 0 ? { excludeObjects } : {}),
         ...(filter ? { filter } : {}),
         ...(maxTreeDepth !== undefined ? { maxTreeDepth } : {}),
         thinPack: options?.thin,

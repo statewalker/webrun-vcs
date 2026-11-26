@@ -155,8 +155,10 @@ export class DefaultSerializationApi implements SerializationApi {
     const boundary: ListedObject[] = [];
     const haveList = [...haves];
     const shallow = options.shallow ? [...options.shallow] : undefined;
+    const excludeObjects = options.excludeObjects ? [...options.excludeObjects] : [];
     const bitmap =
       options.useBitmaps !== false &&
+      excludeObjects.length === 0 &&
       (shallow === undefined || shallow.length === 0) &&
       !(options.thinPack && haveList.length > 0)
         ? await this.packs?.bitmap?.()
@@ -169,6 +171,7 @@ export class DefaultSerializationApi implements SerializationApi {
       includeTags: options.includeTags,
       ...(options.filter ? { filter: options.filter } : {}),
       ...(options.maxTreeDepth !== undefined ? { maxTreeDepth: options.maxTreeDepth } : {}),
+      ...(excludeObjects.length > 0 ? { excludeObjects } : {}),
       onBoundary: options.thinPack && !bitmap ? (b) => boundary.push(b) : undefined,
     })) {
       listed.push(o);

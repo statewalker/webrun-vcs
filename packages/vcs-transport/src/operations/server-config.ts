@@ -20,6 +20,7 @@ import {
   uploadPackFilterPolicyOf,
 } from "../fsm/fetch/upload-pack-filter.js";
 import type { ReceiveDenyAction } from "../fsm/push/receive-pack-types.js";
+import { encodePromisorRemoteInfo, type PromisorRemoteInfo } from "../protocol/promisor-remote.js";
 
 /** Reads a repository's configuration. */
 export interface ServerConfigReader {
@@ -109,6 +110,12 @@ export interface ServerConfigSettings {
    * left out, as git warns it away)
    */
   bundleUris?: string[];
+  /**
+   * The v2 `promisor-remote` capability's value (git 2.49+'s `promisor.advertise`, with the
+   * fields `promisor.sendFields` names): {@link promisorRemoteAdvertisement}; absent: not
+   * advertised
+   */
+  promisorRemoteInfo?: string;
   /**
    * receive-pack's `receive.procReceiveRefs` values, in order: the commands the proc-receive
    * hook takes (absent: none set)
@@ -247,6 +254,70 @@ function badNumeric(config: ServerConfigReader, key: string, value: unknown): st
 }
 
 /** The last value of `key`, or undefined. */
+/**
+ * promisor-remote.c's `promisor_remote_info`: under `promisor.advertise`, the repository's
+ * promisor remotes (promisor_remote_init: `remote.<name>.promisor` true or a
+ * `remote.<name>.partialCloneFilter`, in config order, `extensions.partialClone`'s last) that
+ * have a non-empty URL, each with the `promisor.sendFields` fields it sets non-empty
+ * (`partialCloneFilter`, `token`); undefined when nothing is advertised. Needs
+ * {@link ServerConfigReader.list} to find the remotes.
+ *
+ * @example
+ * ```ts
+ * // [promisor] advertise = true; [remote "lop"] url = file:///lop; promisor = true
+ * promisorRemoteAdvertisement(config); // "name=lop,url=file:///lop"
+ * ```
+ */
+export function promisorRemoteAdvertisement(config: ServerConfigReader): string | undefined {
+  if (!configBool(last(config, "promisor.advertise"), false) || !config.list) return undefined;
+  const names: string[] = [];
+  for (const { key, value } of config.list()) {
+    const first = key.indexOf(".");
+    const lastDot = key.lastIndexOf(".");
+    if (first < 0 || lastDot <= first) continue;
+    if (key.slice(0, first).toLowerCase() !== "remote") continue;
+    const name = key.slice(first + 1, lastDot);
+    const sub = key.slice(lastDot + 1).toLowerCase();
+    if (sub === "promisor" ? !configBool(value, false) : sub !== "partialclonefilter") continue;
+    if (name.startsWith("/")) continue;
+    if (!names.includes(name)) names.push(name);
+  }
+  const partial = last(config, "extensions.partialClone");
+  if (typeof partial === "string" && partial.length > 0) {
+    const at = names.indexOf(partial);
+    if (at >= 0) names.splice(at, 1);
+    names.push(partial);
+  }
+  const sendFields = (() => {
+    const value = last(config, "promisor.sendFields");
+    if (typeof value !== "string") return [];
+    return value
+      .split(",")
+      .map((f) => f.trim().toLowerCase())
+      .filter((f) => f === "partialclonefilter" || f === "token");
+  })();
+  const nonEmpty = (key: string): string | undefined => {
+    const v = last(config, key);
+    return typeof v === "string" && v.length > 0 ? v : undefined;
+  };
+  const remotes: PromisorRemoteInfo[] = [];
+  for (const name of names) {
+    const url = nonEmpty(`remote.${name}.url`);
+    if (url === undefined) continue;
+    const filter = sendFields.includes("partialclonefilter")
+      ? nonEmpty(`remote.${name}.partialCloneFilter`)
+      : undefined;
+    const token = sendFields.includes("token") ? nonEmpty(`remote.${name}.token`) : undefined;
+    remotes.push({
+      name,
+      url,
+      ...(filter !== undefined ? { filter } : {}),
+      ...(token !== undefined ? { token } : {}),
+    });
+  }
+  return remotes.length > 0 ? encodePromisorRemoteInfo(remotes) : undefined;
+}
+
 function last(config: ServerConfigReader, key: string): unknown {
   const all = config.getAll(key);
   return all.length === 0 ? undefined : all[all.length - 1];
@@ -440,6 +511,8 @@ export function explicitServerSettingsFromConfig(
   if (advertiseBundles !== undefined && configBool(advertiseBundles, false)) {
     out.bundleUris = bundleUriLinesOf(config);
   }
+  const promisorInfo = promisorRemoteAdvertisement(config);
+  if (promisorInfo !== undefined) out.promisorRemoteInfo = promisorInfo;
   // uploadpack.packObjectsHook is never read here: git takes it only from protected config
   // (system, global, command line), never from a served repository's own
   // a key without a value is an error in git (config_error_nonbool): receive-pack dies

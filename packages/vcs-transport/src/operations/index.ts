@@ -49,6 +49,7 @@ export {
   GIT_SERVER_SETTINGS_DEFAULTS,
   httpServerSettings,
   parseConfigInt,
+  promisorRemoteAdvertisement,
   serverSettingsFromConfig,
   unpackLimitOf,
   uploadPackRequestPolicyOf,

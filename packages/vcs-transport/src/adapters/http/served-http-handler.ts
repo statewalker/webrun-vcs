@@ -320,6 +320,7 @@ function httpOptionsOf(
     bundleUris,
     advertiseSID,
     sessionId,
+    promisorRemoteInfo,
     packObjectsHook,
     logger,
     namespace,
@@ -346,6 +347,7 @@ function httpOptionsOf(
   if (bundleUris !== undefined) out.bundleUris = bundleUris;
   if (advertiseSID !== undefined) out.advertiseSID = advertiseSID;
   if (sessionId !== undefined) out.sessionId = sessionId;
+  if (promisorRemoteInfo !== undefined) out.promisorRemoteInfo = promisorRemoteInfo;
   if (packObjectsHook !== undefined) out.packObjectsHook = packObjectsHook;
   if (options.maxRequestBodyBytes !== undefined) {
     out.maxRequestBodyBytes = options.maxRequestBodyBytes;
