@@ -28,6 +28,8 @@ export interface FetchV2Request {
   includeTags?: boolean;
   /** Use OFS_DELTA encoding */
   ofsDeltas?: boolean;
+  /** `sideband-all`: every packet of the response on side band 1, errors on band 3 */
+  sidebandAll?: boolean;
 
   // Shallow options
   /** Client's shallow boundaries */
@@ -100,12 +102,16 @@ export function serverV2Capabilities(
   options: ServerV2CapabilityOptions = {},
 ): string[] {
   // `fetch=... filter` with uploadpack.allowFilter, `ref-in-want` with
-  // uploadpack.allowRefInWant (upload_pack_advertise's order); `object-format=` names the
-  // repository's hash (serve.c's object_format_advertise)
+  // uploadpack.allowRefInWant, `sideband-all` with uploadpack.allowSidebandAll
+  // (upload_pack_advertise's order); `object-format=` names the repository's hash (serve.c's
+  // object_format_advertise)
   const list = v2ObjectFormatCapabilities(
-    withRefInWantFeature(
-      withFilterFeature(capabilities, uploadPackFilter),
-      options.allowRefInWant === true,
+    withSidebandAllFeature(
+      withRefInWantFeature(
+        withFilterFeature(capabilities, uploadPackFilter),
+        options.allowRefInWant === true,
+      ),
+      options.allowSidebandAll === true,
     ),
     formatOf(repository),
   );
@@ -135,6 +141,8 @@ export function serverV2Capabilities(
 export interface ServerV2CapabilityOptions {
   /** `fetch=... ref-in-want` (git's `uploadpack.allowRefInWant`) */
   allowRefInWant?: boolean;
+  /** `fetch=... sideband-all` (git's `uploadpack.allowSidebandAll`) */
+  allowSidebandAll?: boolean;
   /** `session-id=<id>` (git's `transfer.advertiseSID`) */
   sessionId?: string;
   /** `bundle-uri` (git's `uploadpack.advertiseBundleURIs`), after `object-info` */
@@ -155,6 +163,23 @@ export function withRefInWantFeature(capabilities: readonly string[], allow: boo
     if (features.includes("ref-in-want")) return c;
     const after = Math.max(features.indexOf("filter"), features.indexOf("wait-for-done"));
     features.splice(after >= 0 ? after + 1 : features.length, 0, "ref-in-want");
+    return `fetch=${features.join(" ")}`;
+  });
+}
+
+/**
+ * The `fetch=` capability with `sideband-all` added (after `ref-in-want`, before
+ * `packfile-uris`, as git's upload_pack_advertise) when `allow`; the capabilities as they are
+ * otherwise.
+ */
+export function withSidebandAllFeature(capabilities: readonly string[], allow: boolean): string[] {
+  if (!allow) return [...capabilities];
+  return capabilities.map((c) => {
+    if (c !== "fetch" && !c.startsWith("fetch=")) return c;
+    const features = c === "fetch" ? [] : c.slice("fetch=".length).split(" ").filter(Boolean);
+    if (features.includes("sideband-all")) return c;
+    const before = features.indexOf("packfile-uris");
+    features.splice(before >= 0 ? before : features.length, 0, "sideband-all");
     return `fetch=${features.join(" ")}`;
   });
 }

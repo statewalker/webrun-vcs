@@ -195,6 +195,12 @@ export interface ServeOverDuplexOptions {
    */
   allowRefInWant?: boolean;
   /**
+   * Protocol v2: advertise `fetch=... sideband-all` and take a `sideband-all` argument (git's
+   * `uploadpack.allowSidebandAll`). Default false, as git: the argument ends the connection as
+   * an unexpected line
+   */
+  allowSidebandAll?: boolean;
+  /**
    * Protocol v2: git's `uploadpack.advertiseBundleURIs`: `bundle-uri` advertised and answered
    * with these lines, the served repository's `bundle.*` settings as `<key>=<value>` in config
    * order (`bundle_uri_command`). Undefined: not advertised, and the command refused
@@ -327,6 +333,7 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
       options.requestPolicy ??
       (useV2 || service === "git-receive-pack" ? undefined : options.uploadPackRequestPolicy),
     ...(options.allowRefInWant ? { allowRefInWant: true } : {}),
+    ...(options.allowSidebandAll ? { allowSidebandAll: true } : {}),
     ...(options.bundleUris !== undefined && service !== "git-receive-pack"
       ? { bundleUris: options.bundleUris }
       : {}),

@@ -248,6 +248,12 @@ export class ProcessConfiguration {
   allowRefInWant?: boolean;
 
   /**
+   * Protocol v2: advertise `fetch=... sideband-all` and take a `sideband-all` argument, after
+   * which every packet of the fetch response is sent on side band 1 (errors on band 3), as
+   * git's `uploadpack.allowSidebandAll` (default false: the argument is an unexpected line)
+   */
+  allowSidebandAll?: boolean;
+  /**
    * Protocol v2: git's `uploadpack.advertiseBundleURIs`: `bundle-uri` advertised and answered
    * with these lines, the served repository's `bundle.*` settings as `<key>=<value>` in config
    * order (`bundle_uri_command`). Undefined: not advertised, and the command refused
