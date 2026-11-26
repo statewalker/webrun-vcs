@@ -134,6 +134,7 @@ export * from "./remote-show-command.js";
 export * from "./repack-command.js";
 export * from "./replace-command.js";
 export * from "./replay-command.js";
+export * from "./request-pull-command.js";
 export * from "./rerere.js";
 export * from "./rerere-command.js";
 export * from "./reset-command.js";
