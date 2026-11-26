@@ -180,8 +180,14 @@ function compare(dirs: Dirs): void {
   expect(commitBytes(dirs.ours)).toEqual(commitBytes(dirs.native));
 }
 
-/** 2.43 shows a todo command's subject without the `# ` ours writes in every version. */
-const evenOut = (line: string) => line.replace(/^(Could not apply [0-9a-f]+\.\.\. )# /, "$1");
+/**
+ * 2.43 shows a todo command's subject without the `# ` ours writes in every version; an
+ * autostash is dated by each run's clock.
+ */
+const evenOut = (line: string) =>
+  line
+    .replace(/^(Could not apply [0-9a-f]+\.\.\. )# /, "$1")
+    .replace(/^Created autostash: [0-9a-f]+$/, "Created autostash: <id>");
 
 /** What native git printed, without the merge backend's progress and final line. */
 function printed(r: { stdout: string; stderr: string }): string[] {
@@ -201,7 +207,8 @@ function oursPrinted(result: RebaseResult): string[] {
 function configureFor(args: string[]) {
   return (r: RebaseCommand) => {
     let upstream = false;
-    for (const a of args) {
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i] as string;
       if (a === "--apply") r.setBackend("apply");
       else if (a === "-m" || a === "--merge") r.setBackend("merge");
       else if (a === "--ignore-whitespace") r.setIgnoreWhitespace(true);
@@ -213,6 +220,9 @@ function configureFor(args: string[]) {
       else if (a === "--continue") r.setOperation(RebaseOperation.CONTINUE);
       else if (a === "--skip") r.setOperation(RebaseOperation.SKIP);
       else if (a === "--abort") r.setOperation(RebaseOperation.ABORT);
+      else if (a === "--autostash") r.setAutoStash(true);
+      else if (a === "--onto") r.setOnto(args[++i] as string);
+      else if (a === "--exec") r.setExec([args[++i] as string]);
       else if (a.startsWith("-")) throw new Error(`option ${a}`);
       else if (!upstream) {
         r.setUpstream(a);
@@ -459,6 +469,41 @@ describeGit("git rebase --apply against native git", () => {
       expect(await rebaseTwins(dirs, ["--abort"])).toBe(0);
       await rebaseTwins(dirs, ["--whitespace=bogus", "main"]);
       await rebaseTwins(dirs, ["--apply", "--merge", "main"]);
+      await rebaseTwins(dirs, ["--apply", "--exec", "true", "main"]);
+      both(dirs, (s) => s.git("config", "rebase.backend", "bogus"));
+      await rebaseTwins(dirs, ["main"]);
+    });
+
+    it('t3436-rebase-more-options.sh: "--ignore-whitespace works with apply backend" (rebase.backend=apply, every commit already upstream)', async () => {
+      const dirs = twins((s) => {
+        setup(s);
+        s.git("checkout", "-q", "-b", "picked", "side");
+        s.tick();
+        s.git("cherry-pick", "commit1");
+        s.git("config", "rebase.backend", "apply");
+      });
+      // picked's one commit is a copy of commit1, which topic has
+      expect(await rebaseTwins(dirs, ["topic"])).toBe(0);
+    });
+
+    it('t3436-rebase-more-options.sh: "--ignore-whitespace works with apply backend" (a rename onto a modified source, --autostash)', async () => {
+      const dirs = twins((s) => {
+        s.write("a", "1\n2\n3\n4\n5\n");
+        s.git("add", "a");
+        s.tick();
+        s.git("commit", "-q", "-m", "base");
+        s.git("checkout", "-q", "-b", "topic");
+        s.git("mv", "a", "b");
+        s.tick();
+        s.git("commit", "-q", "-m", "rename");
+        s.git("checkout", "-q", "main");
+        s.write("a", "1\n2\nthree\n4\n5\n");
+        s.tick();
+        s.git("commit", "-q", "-am", "modify");
+        s.git("checkout", "-q", "topic");
+        s.write("b", "1\n2\n3\n4\n5\nlocal\n");
+      });
+      await rebaseTwins(dirs, ["--apply", "--autostash", "main"]);
     });
   });
 });

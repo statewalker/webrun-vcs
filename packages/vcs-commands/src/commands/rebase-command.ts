@@ -3980,6 +3980,11 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     const saved = (await state.read(`${APPLY_DIR}/allow_rerere_autoupdate`))?.trim();
     if (saved === "--rerere-autoupdate") this.rerereAutoUpdate = true;
     else if (saved === "--no-rerere-autoupdate") this.rerereAutoUpdate = false;
+    // run_am: `--resolved` gets the run's gpg_sign_opt (read_basic_state), `--skip` none
+    if (mode === "continue" && this.sign === undefined) {
+      const saved = (await state.read(`${APPLY_DIR}/gpg_sign_opt`))?.trim();
+      if (saved?.startsWith("-S")) this.sign = saved.length > 2 ? saved.slice(2) : true;
+    }
     const am = this.amForRebase().setResume(mode === "continue" ? "resolved" : "skip");
     if (mode === "skip") am.setSign(undefined);
     return this.runAmForRebase(state, worktree, am, { headName, onto, origHead }, [], false);

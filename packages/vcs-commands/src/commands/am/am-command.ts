@@ -1045,7 +1045,8 @@ export class AmCommand extends GitCommand<AmResult> {
     const diff = new DiffCommand(this.workingCopy)
       .setOldTree(parent ?? this.objectFormat.emptyTreeId)
       .setNewTree(id)
-      .setRenames(true)
+      // write_commit_patch: repo_init_revisions without the diff UI defaults, no renames
+      .setRenames(false)
       .setOptions({
         binaryPatch: true,
         fullIndex: true,
