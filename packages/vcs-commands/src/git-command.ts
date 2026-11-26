@@ -46,6 +46,7 @@ import {
   clearSkipWorktreeFromPresentFiles,
   compareWithWorktree,
   IndexChangedError,
+  isIndexUnborn,
   type OperationOptions,
   type SparseCheckoutPatterns,
   type Staging,
@@ -1306,8 +1307,14 @@ export abstract class GitCommand<T> {
    *
    * @param refuseUnwritten false for a command that writes no index (`clean`): unwritten
    *   edits are then kept and used instead of refusing
+   *
+   * The file system monitor is then asked (git's `tweak_fsmonitor`, see `fsmonitorRefresh`).
    */
-  protected async readCurrentIndex(refuseUnwritten = true): Promise<void> {
+  protected async readCurrentIndex(
+    refuseUnwritten = true,
+    /** false: the command asks the monitor itself (it needs what the read found first) */
+    fsmonitor = true,
+  ): Promise<void> {
     const staging = this.staging;
     if (await staging.isOutdated()) {
       if (staging.hasUnwrittenChanges?.() !== false) {
@@ -1317,6 +1324,10 @@ export abstract class GitCommand<T> {
       await staging.read();
     }
     await this.clearPresentSkipWorktree();
+    // do_read_index's tweak_fsmonitor: the monitor asked (an extension added when missing,
+    // the valid bits dropped on a failed answer) for every index read, not only by the
+    // commands that use the bits; a missing index file is read without it
+    if (fsmonitor && !(await isIndexUnborn(staging))) await this.fsmonitorRefresh(staging);
   }
 
   /**
