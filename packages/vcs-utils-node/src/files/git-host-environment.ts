@@ -97,6 +97,13 @@ const PROGRAM_VARIABLES = [
   "PAGER",
 ] as const;
 
+const DIFF_VARIABLES = [
+  "GIT_EXTERNAL_DIFF",
+  "GIT_EXTERNAL_DIFF_TRUST_EXIT_CODE",
+  "GIT_DIFF_OPTS",
+  "GIT_MERGE_VERBOSITY",
+] as const;
+
 /** The environment as `GitHostEnvironment` describes it. */
 export interface NodeGitHostEnvironment {
   defaultEditor?: string;
@@ -108,6 +115,8 @@ export interface NodeGitHostEnvironment {
     >
   >;
   httpVariables?: Partial<Record<(typeof HTTP_VARIABLES)[number], string>>;
+  diffVariables?: Partial<Record<(typeof DIFF_VARIABLES)[number], string>>;
+  tempDirectory?: string;
   readFile(path: string): Promise<Uint8Array | undefined>;
   /** The Node storage holding a host path (`git config --global` writes through it) */
   hostFilesOf(path: string): Promise<{ files: FilesApi; path: string }>;
@@ -484,9 +493,15 @@ export function createNodeGitHostEnvironment(
   const httpVariables = Object.fromEntries(
     HTTP_VARIABLES.filter((name) => env[name] !== undefined).map((name) => [name, env[name]]),
   ) as Partial<Record<(typeof HTTP_VARIABLES)[number], string>>;
+  const diffVariables = Object.fromEntries(
+    DIFF_VARIABLES.filter((name) => env[name] !== undefined).map((name) => [name, env[name]]),
+  ) as Partial<Record<(typeof DIFF_VARIABLES)[number], string>>;
   return {
     programVariables,
     httpVariables,
+    diffVariables,
+    // git's `$TMPDIR`, else `/tmp` (tempfile.c's `mks_tempfile_t`)
+    tempDirectory: env.TMPDIR || "/tmp",
     ...(options.defaultEditor !== undefined ? { defaultEditor: options.defaultEditor } : {}),
     ...(options.defaultPager !== undefined ? { defaultPager: options.defaultPager } : {}),
     readFile: readHostFile,
