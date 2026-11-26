@@ -17,7 +17,18 @@ export interface BatchObjectData {
   rest?: string;
 }
 
-type Part = string | { atom: "objectname" | "objecttype" | "objectsize" | "rest" | "objectmode" };
+type Part =
+  | string
+  | {
+      atom:
+        | "objectname"
+        | "objecttype"
+        | "objectsize"
+        | "rest"
+        | "objectmode"
+        | "objectsize:disk"
+        | "deltabase";
+    };
 
 /** A parsed format and what it needs read. */
 export interface BatchFormat {
@@ -27,6 +38,12 @@ export interface BatchFormat {
   needsSize: boolean;
   /** `%(rest)`: input lines are split at their first whitespace */
   splitOnWhitespace: boolean;
+  /**
+   * An atom the stores cannot answer (`objectsize:disk`, `deltabase`), kept by a parse with
+   * `deferUnsupported`: refused only when a local object needs it (`remote-object-info`
+   * expands it to nothing, as git)
+   */
+  unsupported?: string;
 }
 
 /** The default format, `%(objectname) %(objecttype) %(objectsize)`. */
@@ -38,7 +55,11 @@ export const DEFAULT_BATCH_FORMAT = "%(objectname) %(objecttype) %(objectsize)";
  * `%(objectsize:disk)` and `%(deltabase)` are refused: the stores do not report on-disk sizes
  * or delta bases, and printing a made-up value would lie.
  */
-export function parseBatchFormat(format: string, compatibility: "2.43" | "2.56"): BatchFormat {
+export function parseBatchFormat(
+  format: string,
+  compatibility: "2.43" | "2.56",
+  options: { deferUnsupported?: boolean } = {},
+): BatchFormat {
   const parts: Part[] = [];
   const result: BatchFormat = {
     parts,
@@ -93,7 +114,9 @@ export function parseBatchFormat(format: string, compatibility: "2.43" | "2.56")
         break;
       case "objectsize:disk":
       case "deltabase":
-        throw new PlumbingError(`fatal: cat-file: %(${atom}) is not supported`);
+        if (!options.deferUnsupported) throw unsupportedAtom(atom);
+        result.unsupported ??= atom;
+        break;
       default:
         throw unknownAtom(atom, compatibility);
     }
@@ -104,6 +127,11 @@ export function parseBatchFormat(format: string, compatibility: "2.43" | "2.56")
   }
   if (literal) parts.push(literal);
   return result;
+}
+
+/** The refusal of an atom the stores cannot answer (see {@link BatchFormat.unsupported}). */
+export function unsupportedAtom(atom: string): PlumbingError {
+  return new PlumbingError(`fatal: cat-file: %(${atom}) is not supported`);
 }
 
 function unknownAtom(atom: string, compatibility: "2.43" | "2.56"): PlumbingError {
@@ -156,6 +184,9 @@ export function expandBatchFormat(
       case "objectmode":
         if (data.mode !== undefined) out += data.mode.toString(8).padStart(6, "0");
         break;
+      case "objectsize:disk":
+      case "deltabase":
+        throw unsupportedAtom(part.atom);
     }
   }
   return out;

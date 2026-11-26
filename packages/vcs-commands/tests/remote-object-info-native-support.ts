@@ -207,11 +207,21 @@ const SCENARIOS: Scenario[] = [
   },
   {
     title: `t1017-cat-file-remote-object-info.sh: "unsupported placeholders on remote return empty string"`,
-    // %(objectsize:disk) and %(deltabase) are refused by our cat-file (the stores report
-    // neither), so the two atoms both have are asked
-    format: "%(objectmode) %(rest)",
+    format: "%(objectmode) %(objectsize:disk) %(rest) %(deltabase)",
     input: (url, i) => [`remote-object-info "${url}" ${i.hello}`],
-    expected: () => [" "],
+    expected: () => ["   "],
+  },
+  {
+    title: `t1017-cat-file-remote-object-info.sh: "remote-object-info fails on unsupported filter option (objectsize:disk)"`,
+    format: "%(objectname) %(objectsize:disk)",
+    input: (url, i) => [`remote-object-info "${url}" ${i.hello}`],
+    expected: (i) => [`${i.hello} `],
+  },
+  {
+    title: `t1017-cat-file-remote-object-info.sh: "remote-object-info fails on unsupported filter option (deltabase)"`,
+    format: "%(deltabase)",
+    input: (url, i) => [`remote-object-info "${url}" ${i.hello}`],
+    expected: () => [""],
   },
   {
     title: `t1017-cat-file-remote-object-info.sh: "requesting only objectname echoes back"`,
@@ -473,6 +483,19 @@ export function defineRemoteObjectInfoTwins(bin: string | undefined): void {
         expect(run.status).toBe(128);
       }
     }
+
+    // divergence: the stores report no on-disk size or delta base, so a local object still
+    // refuses these atoms (git answers them); only remote-object-info lines print them empty
+    it("refuses %(objectsize:disk) and %(deltabase) for a local object only", async () => {
+      const result = await ours
+        .catFile()
+        .setBatch("command", "%(objectname) %(deltabase)")
+        .setStdin(`info ${ids.unstored}\ninfo ${ids.local}\n`)
+        .callOutput();
+      expect(Buffer.from(result.stdout).toString("latin1")).toBe(`${ids.unstored} missing\n`);
+      expect(fatalLine(result.stderr)).toBe("fatal: cat-file: %(deltabase) is not supported");
+      expect(result.exitCode).toBe(128);
+    });
 
     // the object-info answers cat-file builds on, through the command API
     for (const serverIndex of [1, 2, 3, 4]) {

@@ -418,7 +418,11 @@ export class CatFileCommand extends PlumbingCommand {
   /** batch_objects */
   private async runBatch(): Promise<number> {
     const compatibility = this.compatibility;
-    const format = parseBatchFormat(this.format ?? DEFAULT_BATCH_FORMAT, compatibility);
+    // --batch-command defers %(objectsize:disk)/%(deltabase) to the first local object: a
+    // remote-object-info line prints them empty, as git
+    const format = parseBatchFormat(this.format ?? DEFAULT_BATCH_FORMAT, compatibility, {
+      deferUnsupported: this.batch === "command",
+    });
     const plain = this.format === undefined || this.format === DEFAULT_BATCH_FORMAT;
     const state: BatchState = {
       format,
