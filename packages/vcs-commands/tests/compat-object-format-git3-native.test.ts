@@ -577,4 +577,85 @@ describe.skipIf(!git3)("extensions.compatObjectFormat (git master)", () => {
       expect(git(mine, ["fsck", "--strict"])).toMatchObject({ status: 0, err: "" });
     });
   }
+
+  /**
+   * `am -S`: ours signs the storage commit and its conversion, both through the signer. git
+   * master signs the storage commit alike, but its compatibility buffer is written after
+   * `fmt_ident`'s static buffer was reused for the committer: the author line it signs reads
+   * `<committer name> <committer email>` without a date, so its SHA-1 signature covers a
+   * buffer that is not the commit's SHA-1 view. Ours deliberately does not copy that (a
+   * signature over the wrong buffer): the storage signature and everything else agree.
+   */
+  for (const encoding of [undefined, "ISO-8859-1"]) {
+    it(`am -S signs both views (i18n.commitEncoding ${encoding ?? "unset"})`, async () => {
+      const program = hashingGpg();
+      const source = fresh("src");
+      mkdirSync(source);
+      ok(source, ["init", "-q", "-b", "main", "--object-format=sha256"]);
+      writeFileSync(join(source, "a"), "hello\n");
+      ok(source, ["add", "a"]);
+      ok(source, ["commit", "-q", "-m", "base"]);
+      writeFileSync(join(source, "a"), "hello again\n");
+      ok(source, ["commit", "-q", "-am", "change"]);
+      const patch = ok(source, ["format-patch", "--stdout", "-1"]);
+      const twins = ["n", "o"].map((name) => {
+        const dir = compatRepo(name);
+        ok(dir, ["config", "gpg.program", program]);
+        if (encoding) ok(dir, ["config", "i18n.commitEncoding", encoding]);
+        writeFileSync(join(dir, "a"), "hello\n");
+        ok(dir, ["add", "a"]);
+        ok(dir, ["commit", "-q", "-m", "base"]);
+        return dir;
+      });
+      const [native, mine] = twins as [string, string];
+      const applied = gitIn(native, ["am", "-q", "-S"], patch);
+      expect(applied.status, applied.err).toBe(0);
+      const g = await openOurs(
+        mine,
+        createNodeGitHostEnvironment({
+          env: env(),
+          effectiveUid: null,
+          signer: createNodeSigner({ env: env() }),
+        }),
+      );
+      const result = await g.am().addMbox(new TextEncoder().encode(patch)).setSign(true).call();
+      expect(result.exitCode, String(result.errors)).toBe(0);
+      /** a commit's headers: each signature apart, the rest with the message */
+      const split = (raw: string) => {
+        const sig: Record<string, string> = {};
+        const rest: string[] = [];
+        let current: string | undefined;
+        for (const line of raw.split("\n")) {
+          const m = /^(gpgsig(?:-sha256)?) (.*)$/.exec(line);
+          if (m) {
+            current = m[1] as string;
+            sig[current] = `${m[2]}\n`;
+          } else if (current && line.startsWith(" ")) sig[current] += `${line.slice(1)}\n`;
+          else {
+            current = undefined;
+            rest.push(line);
+          }
+        }
+        return { sig, rest: rest.join("\n") };
+      };
+      const hashOf = (text: string) =>
+        spawnSync("sha256sum", { input: text, encoding: "utf8" }).stdout.slice(0, 48);
+      const ourHead = split(ok(mine, ["cat-file", "commit", "HEAD"]));
+      const nativeHead = split(ok(native, ["cat-file", "commit", "HEAD"]));
+      // the storage commit and its signature as git's
+      expect(ourHead.rest).toBe(nativeHead.rest);
+      expect(ourHead.sig["gpgsig-sha256"]).toBe(nativeHead.sig["gpgsig-sha256"]);
+      expect(Object.keys(ourHead.sig)).toEqual(["gpgsig", "gpgsig-sha256"]);
+      // ours: the SHA-1 signature covers the commit's SHA-1 view without its signatures
+      const sha1 = ok(mine, ["rev-parse", "--output-object-format=sha1", "HEAD"]).trim();
+      const view = split(ok(mine, ["cat-file", "commit", sha1])).rest;
+      expect(ourHead.sig.gpgsig).toContain(`\n${hashOf(view)}\n`);
+      // git master's covers an author line without its date (see above)
+      expect(nativeHead.sig.gpgsig).not.toContain(`\n${hashOf(view)}\n`);
+      expect(nativeHead.sig.gpgsig).toContain(
+        `\n${hashOf(view.replace(/^author .*$/m, "author C <c@example.com>"))}\n`,
+      );
+      expect(git(mine, ["fsck", "--strict"])).toMatchObject({ status: 0, err: "" });
+    });
+  }
 });

@@ -1348,21 +1348,37 @@ export class AmCommand extends GitCommand<AmResult> {
       let header = "";
       if (sign !== undefined) {
         const payload = encodeGitPath(head + body);
-        const signature = latin1ToPath(
-          bytesToLatin1(
-            await this.signOrDie((cwd) =>
-              signPayload(this.workingCopy, sign, payload, {
-                committer,
-                tail: [],
-                ...(cwd !== undefined ? { cwd } : {}),
-              }),
+        const signBytes = async (bytes: Uint8Array) =>
+          latin1ToPath(
+            bytesToLatin1(
+              await this.signOrDie((cwd) =>
+                signPayload(this.workingCopy, sign, bytes, {
+                  committer,
+                  tail: [],
+                  ...(cwd !== undefined ? { cwd } : {}),
+                }),
+              ),
             ),
-          ),
-        );
-        // add_header_signature: the repository's header (`gpgsig`, `gpgsig-sha256` in a
-        // SHA-256 repository) after the other headers, continuation lines indented
-        const lines = (signature.endsWith("\n") ? signature.slice(0, -1) : signature).split("\n");
-        header = `${this.objectFormat.signatureHeader} ${lines.join("\n ")}\n`;
+          );
+        // add_header_signature: the header (`gpgsig`, `gpgsig-sha256` in a SHA-256
+        // repository) after the other headers, continuation lines indented
+        const headerOf = (name: string, signature: string) =>
+          `${name} ${(signature.endsWith("\n") ? signature.slice(0, -1) : signature).split("\n").join("\n ")}\n`;
+        const signatures = [
+          { name: this.objectFormat.signatureHeader, value: await signBytes(payload) },
+        ];
+        // commit_tree_extended with a compatibility object format: the converted commit
+        // signed too, both signatures in both objects, `gpgsig` (SHA-1) first
+        const compat = objects.compat;
+        if (compat) {
+          const compatPayload = await compat.convertToCompat("commit", payload);
+          signatures.push({
+            name: compat.compat.signatureHeader,
+            value: await signBytes(compatPayload),
+          });
+          signatures.sort((a, b) => (a.name === "gpgsig" ? -1 : b.name === "gpgsig" ? 1 : 0));
+        }
+        header = signatures.map((s) => headerOf(s.name, s.value)).join("");
       }
       id = await objects.putUnsized("commit", [encodeGitPath(head + header + body)]);
     } else {
