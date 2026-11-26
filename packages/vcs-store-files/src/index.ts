@@ -28,7 +28,8 @@ export * from "./pack/index.js";
 export * from "./promisor-objects.js";
 // `git prune` without the rest of gc
 export * from "./prune.js";
-
+// Repack
+export * from "./pseudo-merge-config.js";
 export * from "./quarantine/index.js";
 // Reachability roots (refs, reflogs, index) for repack and gc
 export * from "./reachable-objects.js";
@@ -36,7 +37,6 @@ export * from "./reachable-objects.js";
 export * from "./reflog-expire.js";
 // Refs (file-dependent)
 export * from "./refs/index.js";
-// Repack
 export * from "./repack.js";
 export * from "./repack-geometric.js";
 // core.repositoryformatversion and extensions.*, checked as git does

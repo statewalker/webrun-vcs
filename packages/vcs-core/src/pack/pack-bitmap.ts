@@ -8,10 +8,11 @@
  *  - four EWAH bitmaps of the objects of each type (commits, trees, blobs, tags);
  *  - one entry per selected commit: its position in the idx, an XOR offset (the entry's
  *    bitmap is stored XORed with the one that many entries before it), flags, the bitmap;
- *  - optional sections at the end, before the trailing hash: pseudo-merges (skipped: their
- *    commits are read as if absent), the lookup table (entries are read in order anyway, which
- *    gives the same bitmaps) and the name-hash cache (one 32-bit path hash per object, in idx
- *    order).
+ *  - optional sections at the end, before the trailing hash: pseudo-merges (`pseudo-merge.ts`:
+ *    each one's parents and their reach are read and checked; the per-commit table is not
+ *    used, readers cascade over the list as git's `cascade_pseudo_merges`), the lookup table
+ *    (entries are read in order anyway, which gives the same bitmaps) and the name-hash cache
+ *    (one 32-bit path hash per object, in idx order).
  *
  * The pack checksum in the header and the trailing hash are the repository's object format's
  * (`rawLength` bytes; SHA-256 in a SHA-256 repository): the header is 12 bytes plus that width.
@@ -29,7 +30,7 @@
  * ignore bits at or above the pack's count, so a crafted file cannot allocate without bound or
  * mark objects outside the pack.
  */
-import { EwahBitmap } from "@statewalker/vcs-utils";
+import { EwahBitmap, RawBitmap } from "@statewalker/vcs-utils";
 import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import type { ObjectId } from "../common/id/index.js";
@@ -76,6 +77,14 @@ export interface PackBitmapEntry {
   flags: number;
 }
 
+/** One pseudo-merge of a bitmap file: a set of commits and the objects they reach together. */
+export interface PackBitmapPseudoMerge {
+  /** Its parents, by pack position (commits of the pack) */
+  readonly commits: EwahBitmap;
+  /** What they reach, by pack position (a superset of `commits`) */
+  readonly bitmap: EwahBitmap;
+}
+
 /** A pack's bitmap, read and checked. */
 export interface PackBitmapIndex {
   readonly pack: BitmapPack;
@@ -83,6 +92,11 @@ export interface PackBitmapIndex {
   readonly options: number;
   /** The selected commits, in file order. */
   readonly entries: readonly PackBitmapEntry[];
+  /**
+   * The pseudo-merges (`BITMAP_OPT_PSEUDO_MERGES`), in file order: each one's parents and
+   * what they reach, by pack position. Empty without the section.
+   */
+  readonly pseudoMerges: readonly PackBitmapPseudoMerge[];
   /** The objects of each type, by pack position. */
   readonly commits: EwahBitmap;
   readonly trees: EwahBitmap;
@@ -165,6 +179,7 @@ export function parsePackBitmap(bytes: Uint8Array, pack: BitmapPack, path = ""):
       throw new PackBitmapError("corrupted bitmap index file (too short to fit lookup table)");
     indexEnd -= tableSize;
   }
+  let pseudoSection: { start: number; tableOffset: number; end: number } | undefined;
   if (options & BITMAP_OPT_PSEUDO_MERGES) {
     if (8 > indexEnd - HEADER_SIZE)
       throw new PackBitmapError(
@@ -175,6 +190,11 @@ export function parsePackBitmap(bytes: Uint8Array, pack: BitmapPack, path = ""):
       throw new PackBitmapError(
         "corrupted bitmap index file (too short to fit pseudo-merge table)",
       );
+    pseudoSection = {
+      start: indexEnd - tableSize,
+      tableOffset: tableSize >= 24 ? Number(view.getBigUint64(indexEnd - 16)) : 0,
+      end: indexEnd,
+    };
     indexEnd -= tableSize;
   }
 
@@ -216,6 +236,10 @@ export function parsePackBitmap(bytes: Uint8Array, pack: BitmapPack, path = ""):
     byId.set(id, i);
     entries.push({ id, indexPosition, xorOffset, flags });
   }
+
+  const pseudoMerges = pseudoSection
+    ? readPseudoMerges(bytes, view, pseudoSection, maxWords, commits)
+    : [];
 
   // pack position <-> idx position
   const order = pack.packOrder();
@@ -260,6 +284,7 @@ export function parsePackBitmap(bytes: Uint8Array, pack: BitmapPack, path = ""):
     pack,
     options,
     entries,
+    pseudoMerges,
     commits,
     trees,
     blobs,
@@ -288,4 +313,54 @@ export function parsePackBitmap(bytes: Uint8Array, pack: BitmapPack, path = ""):
       return i === undefined ? undefined : resolve(i);
     },
   };
+}
+
+/**
+ * The pseudo-merges of a section (git's load_bitmap_header and use_pseudo_merge), checked
+ * more than git checks them, since a wrong pseudo-merge drops objects from served packs: the
+ * trailer's counts must fit the section, each pseudo-merge's offset must lie before the
+ * commit table and its two bitmaps there, its parents must be commits of the pack (at least
+ * one) and its bitmap must hold them. Anything else refuses the whole bitmap.
+ */
+function readPseudoMerges(
+  bytes: Uint8Array,
+  view: DataView,
+  section: { start: number; tableOffset: number; end: number },
+  maxWords: number,
+  commitsOfPack: EwahBitmap,
+): PackBitmapPseudoMerge[] {
+  const { start, end } = section;
+  const size = end - start;
+  const bad = (what: string) =>
+    new PackBitmapError(`corrupted bitmap index file, pseudo-merge table ${what}`);
+  if (size < 24) throw bad("too short");
+  const nr = view.getUint32(end - 24);
+  const commitsNr = view.getUint32(end - 20);
+  if (nr * 8 + 24 > size) throw bad("too short");
+  const tableStart = start + section.tableOffset;
+  if (section.tableOffset > size - 24 - nr * 8) throw bad("has a bad commit table offset");
+  if (commitsNr * 12 > end - 24 - nr * 8 - tableStart) throw bad("has too many commits");
+  const pack = RawBitmap.fromEwah(commitsOfPack);
+  const out: PackBitmapPseudoMerge[] = [];
+  const offsetsAt = end - 24 - nr * 8;
+  for (let i = 0; i < nr; i++) {
+    const at = Number(view.getBigUint64(offsetsAt + i * 8));
+    if (at < start || at >= tableStart) throw bad("has an out-of-bounds pseudo-merge");
+    const read = (from: number) => {
+      const r = EwahBitmap.read(bytes, from, tableStart);
+      if (!r?.bitmap.isWellFormed()) throw bad("has a corrupt pseudo-merge");
+      if (r.bitmap.bitSize > maxWords * 64 || r.bitmap.expandedWords() > maxWords)
+        throw new PackBitmapError("corrupted bitmap index file (bitmap larger than its pack)");
+      return r;
+    };
+    const c = read(at);
+    const b = read(c.next);
+    const parents = RawBitmap.fromEwah(c.bitmap);
+    if (parents.popcount() === 0 || !parents.isSubsetOf(pack))
+      throw bad("has a pseudo-merge whose parents are not commits");
+    if (!parents.isSubsetOf(RawBitmap.fromEwah(b.bitmap)))
+      throw bad("has a pseudo-merge that does not reach its parents");
+    out.push({ commits: c.bitmap, bitmap: b.bitmap });
+  }
+  return out;
 }
