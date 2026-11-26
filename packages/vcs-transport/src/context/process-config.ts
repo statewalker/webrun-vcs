@@ -268,6 +268,15 @@ export class ProcessConfiguration {
    * git's `uploadpack.allowSidebandAll` (default false: the argument is an unexpected line)
    */
   allowSidebandAll?: boolean;
+
+  /**
+   * Protocol v2: git's `uploadpack.blobPackfileUri` values, `<object-hash> <pack-hash> <uri>`.
+   * Any value advertises `fetch=... packfile-uris` and takes a `packfile-uris <protocols>`
+   * argument; with `sideband-all`, each listed object the pack would hold whose URI is of one
+   * of those protocols is left out and named in a `packfile-uris` section instead (git's
+   * `pack-objects --uri-protocol`). A malformed value fails every pack, as pack-objects dies
+   */
+  blobPackfileUris?: readonly string[];
   /**
    * Protocol v2: git's `uploadpack.advertiseBundleURIs`: `bundle-uri` advertised and answered
    * with these lines, the served repository's `bundle.*` settings as `<key>=<value>` in config
