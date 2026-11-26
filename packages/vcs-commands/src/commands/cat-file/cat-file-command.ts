@@ -301,21 +301,19 @@ export class CatFileCommand extends PlumbingCommand {
 
   /** cat_one_file */
   private async catOne(name: string): Promise<number> {
-    const compat = this.compatObjects;
-    // GET_OID_HASH_ANY: a full id of the compatibility format names the object as that
-    // format sees it (its storage object converted)
-    if (compat && name.length === compat.compat.hexLength && /^[0-9a-f]+$/.test(name)) {
-      return this.catOneCompat(name, compat);
-    }
     const resolver = this.revisionResolver();
     let id: ObjectId | undefined;
     try {
-      id = await resolver.resolve(name, { onlyToDie: true });
+      // GET_OID_HASH_ANY: an id of the compatibility format (full or abbreviated) names the
+      // object as that format sees it (its storage object converted)
+      id = await resolver.resolve(name, { onlyToDie: true, hashAny: true });
     } finally {
       for (const line of resolver.warnings) this.warn(line);
       resolver.warnings.length = 0;
     }
     if (id === undefined) throw new PlumbingError(`fatal: Not a valid object name ${name}`);
+    const compat = this.compatIdOf(id);
+    if (compat) return this.catOneCompat(id, compat);
     const couldNotGetInfo = () =>
       new PlumbingError("fatal: git cat-file: could not get object info");
     switch (this.mode) {
@@ -344,6 +342,12 @@ export class CatFileCommand extends PlumbingCommand {
       default:
         return this.catTyped(name, id, this.type as string);
     }
+  }
+
+  /** The compatibility objects when `id` is an id of the compatibility format (not storage's) */
+  private compatIdOf(id: ObjectId): CompatObjects | undefined {
+    const compat = this.compatObjects;
+    return compat && id.length !== this.objectFormat.hexLength ? compat : undefined;
   }
 
   /**
@@ -690,7 +694,7 @@ export class CatFileCommand extends PlumbingCommand {
   ): Promise<void> {
     let id: ObjectId | undefined;
     try {
-      id = await resolver.resolve(name);
+      id = await resolver.resolve(name, { hashAny: true });
     } finally {
       for (const line of resolver.warnings) this.warn(line);
     }
@@ -707,12 +711,46 @@ export class CatFileCommand extends PlumbingCommand {
     });
   }
 
+  /**
+   * batch_object_write for an id of the compatibility format (`GET_OID_HASH_ANY` in
+   * batch_one_object): the object read through the map and converted, so its id, type, size
+   * and content are the compatibility format's. Replace refs are storage ids: they do not
+   * apply to it.
+   */
+  private async batchCompatWrite(
+    state: BatchState,
+    name: string | undefined,
+    data: BatchObjectData,
+    compat: CompatObjects,
+  ): Promise<void> {
+    const object = await compat.readAsCompat(data.id);
+    if (!object) {
+      await this.write(`${name ?? data.id} missing${state.delim}`);
+      return;
+    }
+    let content = object.content;
+    if (this.useMailmap && (object.type === "commit" || object.type === "tag")) {
+      content = await this.mapIdents(content);
+    }
+    data.type = object.type;
+    data.size = content.length;
+    const header = state.plain
+      ? `${data.id} ${data.type} ${data.size}${state.delim}`
+      : `${expandBatchFormat(state.format, data)}${state.delim}`;
+    await this.write(header);
+    if (!state.contents) return;
+    await this.write(content);
+    await this.write(state.delim);
+  }
+
   /** batch_object_write */
   private async batchObjectWrite(
     state: BatchState,
     name: string | undefined,
     data: BatchObjectData,
   ): Promise<void> {
+    const compat = this.compatIdOf(data.id);
+    if (compat) return this.batchCompatWrite(state, name, data, compat);
     const target = state.replace ? await this.replaced(data.id) : data.id;
     const info = await this.info(target);
     if (!info) {

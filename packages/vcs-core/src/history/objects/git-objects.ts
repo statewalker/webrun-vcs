@@ -320,6 +320,12 @@ export interface CompatObjects {
   /** The storage id of `compatId`, undefined when the map has none */
   toStorage(compatId: ObjectId): Promise<ObjectId | undefined>;
   /**
+   * The mapped compatibility ids starting with `prefix` (lowercase hex digits): what git's
+   * `get_short_oid` finds of the compatibility format under `GET_OID_HASH_ANY` (the map's
+   * half of its loose object cache)
+   */
+  compatIdsWithPrefix(prefix: string): Promise<ObjectId[]>;
+  /**
    * The object `compatId` names, as the compatibility format sees it: its storage object
    * converted (git's `odb_read_object_info_extended` for an id of the other format); undefined
    * when unmapped or absent. Throws where git's conversion dies.

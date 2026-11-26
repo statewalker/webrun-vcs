@@ -194,16 +194,14 @@ export class RevParseCommand extends GitCommand<RevParseResult> {
       if (await this.tryParentShorthands(resolver, arg, lines)) continue;
       const reversed = arg.startsWith("^");
       let id: ObjectId | undefined;
-      if (output !== undefined) {
-        const translated = await this.translatedRevision(reversed ? arg.slice(1) : arg, output);
-        if (translated !== undefined) {
-          lines.push(reversed ? `^${translated}` : translated);
-          continue;
-        }
-      }
       try {
-        id = await resolver.resolve(reversed ? arg.slice(1) : arg);
-        if (id !== undefined && output === "compat") id = await this.outputCompat(id);
+        // under --output-object-format git adds GET_OID_HASH_ANY: ids of the compatibility
+        // format, full or abbreviated, name objects too
+        id = await resolver.resolve(
+          reversed ? arg.slice(1) : arg,
+          output !== undefined ? { hashAny: true } : {},
+        );
+        if (id !== undefined && output !== undefined) id = await this.outputId(id, output);
       } catch (error) {
         if (error instanceof RevisionError && resolver.warnings.length > 0) {
           throw new RevisionError(arg, [...resolver.warnings, error.message].join("\n"));
@@ -237,27 +235,15 @@ export class RevParseCommand extends GitCommand<RevParseResult> {
   }
 
   /**
-   * A full id of the compatibility format under `--output-object-format` (git's
-   * `GET_OID_HASH_ANY`): printed as given in that format, else as the storage id the map
-   * gives (as given when it has none, as git's ignored `repo_oid_to_algop` failure leaves it).
-   * Undefined for anything else.
+   * `repo_oid_to_algop`: `id` (of either format) printed in the format asked, through the map;
+   * as it is when the map has no translation (git ignores that failure).
    */
-  private async translatedRevision(
-    name: string,
-    output: "storage" | "compat",
-  ): Promise<string | undefined> {
+  private async outputId(id: ObjectId, output: "storage" | "compat"): Promise<ObjectId> {
     const compat = this.compatObjects;
-    if (!compat || name.length !== compat.compat.hexLength || !/^[0-9a-fA-F]+$/.test(name)) {
-      return undefined;
-    }
-    const id = name.toLowerCase();
-    if (output === "compat") return id;
-    return (await compat.toStorage(id)) ?? id;
-  }
-
-  /** `id` in the compatibility format, as the map gives it (else as it is, as git) */
-  private async outputCompat(id: ObjectId): Promise<ObjectId> {
-    return (await this.compatObjects?.toCompat(id)) ?? id;
+    if (!compat) return id;
+    const isStorage = id.length === this.objectFormat.hexLength;
+    if (output === "storage") return isStorage ? id : ((await compat.toStorage(id)) ?? id);
+    return isStorage ? ((await compat.toCompat(id)) ?? id) : id;
   }
 
   /**

@@ -150,6 +150,20 @@ export class LooseObjectMap {
   }
 
   /**
+   * The mapped compatibility ids starting with `prefix` (lowercase hex), this map's and its
+   * parent's: the compatibility half of git's loose object cache (`odb_source_loose_cache`,
+   * which `insert_loose_map` fills with every mapped compatibility id, the reserved ones
+   * too), which `get_short_oid` searches under `GET_OID_HASH_ANY`.
+   */
+  async compatIdsWithPrefix(prefix: string): Promise<string[]> {
+    await this.load();
+    const out = new Set<string>();
+    for (const id of this.toStorageMap.keys()) if (id.startsWith(prefix)) out.add(id);
+    if (this.parent) for (const id of await this.parent.compatIdsWithPrefix(prefix)) out.add(id);
+    return [...out];
+  }
+
+  /**
    * `repo_add_loose_object_map`: records `id` ↔ `compatId`, appending a line to the file when
    * the pair is new (the header first, into an empty file), under `loose-object-idx.lock`.
    */

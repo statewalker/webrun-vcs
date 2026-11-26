@@ -1702,6 +1702,18 @@ export abstract class GitCommand<T> {
    * from its stored bytes without the name check. Undefined when the tree cannot be read.
    */
   protected async listedTreeEntries(id: ObjectId): Promise<readonly TreeEntry[] | undefined> {
+    const compat = this.compatObjects;
+    if (compat && id.length !== this.objectFormat.hexLength) {
+      // a tree named by its compatibility id (GET_OID_HASH_ANY): read converted, its entries
+      // the compatibility format's ids, as git's parse_tree of such an id lists them
+      const tree = await compat.readAsCompat(id).catch(() => undefined);
+      if (tree?.type !== "tree") return undefined;
+      return decodeTreeBytes(tree.content, {
+        canonicalModes: true,
+        idLength: compat.compat.rawLength,
+        checkNames: false,
+      });
+    }
     try {
       const loaded = await this.trees.load(id);
       if (!loaded) return undefined;

@@ -77,7 +77,7 @@ export interface RevisionSources {
    * The object store, for abbreviated ids (its `listPrefix`, else `list`); without it the
    * typed stores' `keys()` are listed
    */
-  objects?: Pick<GitObjects, "list" | "listPrefix" | "objectFormat">;
+  objects?: Pick<GitObjects, "list" | "listPrefix" | "objectFormat" | "compat">;
   /**
    * The lengths git abbreviates ids to (`repo_find_unique_abbrev` with `core.abbrev`), for
    * the candidates of an ambiguous short id; 7 digits without it
@@ -119,6 +119,13 @@ export interface ResolveOptions {
    * searched
    */
   onlyToDie?: boolean;
+  /**
+   * git's `GET_OID_HASH_ANY` (`cat-file`, `ls-tree`, `rev-parse --output-object-format`): in
+   * a repository with a compatibility object format, an abbreviated or full id of that format
+   * names the object too, and is given back as it is (an id of the compatibility format's
+   * length), the storage and mapped compatibility ids disambiguated together
+   */
+  hashAny?: boolean;
 }
 
 /** git's `get_short_oid` result. */
@@ -200,6 +207,13 @@ export class RevisionResolver {
   lastMode: number | undefined;
   private config?: RemoteConfigStore;
   private disambiguateChecked = false;
+  /**
+   * Whether an abbreviation missed: git's get_short_oid then runs `odb_reprepare`, which
+   * flushes the loose object cache the map had put the compatibility ids into, and nothing
+   * puts them back, so the rest of the process finds no compatibility id by `GET_OID_HASH_ANY`
+   * (git master: `echo <miss> <compat id> | git cat-file --batch-check` reports both missing)
+   */
+  private compatIdsFlushed = false;
   /** Refs read while resolving one revision (`HEAD~3` reads HEAD once) */
   private readonly refCache = new Map<string, Promise<{ id: ObjectId; ref: string } | undefined>>();
 
@@ -834,6 +848,11 @@ export class RevisionResolver {
 
   /** The type of an object, undefined when the repository does not have it. */
   async objectType(id: ObjectId): Promise<ObjectType | undefined> {
+    const compat = this.sources.objects?.compat;
+    if (compat && id.length !== this.hexLength && id.length === compat.compat.hexLength) {
+      // an id of the compatibility format (GET_OID_HASH_ANY): its object as converted
+      return (await safe(() => compat.readAsCompat(id)))?.type;
+    }
     const { commits, tags, trees, blobs } = this.sources;
     if (await safe(() => commits.has(id))) return "commit";
     if (tags && (await safe(() => tags.has(id)))) return "tag";
@@ -1076,16 +1095,26 @@ export class RevisionResolver {
    * when it accepts several.
    */
   private async shortOid(name: string, flags: ResolveOptions = {}): Promise<ShortOid> {
-    if (
-      name.length < MINIMUM_ABBREV_LENGTH ||
-      name.length > this.hexLength ||
-      !HEX_DIGITS.test(name)
-    ) {
+    // GET_OID_HASH_ANY: the prefix may be of either format (init_object_disambiguation takes
+    // up to GIT_MAX_HEXSZ digits), the map's compatibility ids searched beside the objects
+    const compat =
+      flags.hashAny && !this.compatIdsFlushed ? this.sources.objects?.compat : undefined;
+    const maxLength = Math.max(this.hexLength, compat?.compat.hexLength ?? 0);
+    if (name.length < MINIMUM_ABBREV_LENGTH || name.length > maxLength || !HEX_DIGITS.test(name)) {
       return { status: "invalid" };
     }
     const prefix = name.toLowerCase();
-    const candidates = await this.objectsWithPrefix(prefix);
-    if (candidates.length === 0) return { status: "missing" };
+    const candidates = name.length <= this.hexLength ? await this.objectsWithPrefix(prefix) : [];
+    if (compat && name.length <= compat.compat.hexLength) {
+      const ids = await compat.compatIdsWithPrefix(prefix);
+      // the reserved mappings (empty tree and blob, null id) are in git's cache too
+      for (const id of ids) if (!candidates.includes(id)) candidates.push(id);
+      candidates.sort();
+    }
+    if (candidates.length === 0) {
+      if (this.sources.objects?.compat) this.compatIdsFlushed = true;
+      return { status: "missing" };
+    }
     const hint = flags.hint ?? this.defaultHint();
     let status: ShortOid;
     let listedHint = hint;
@@ -1117,17 +1146,30 @@ export class RevisionResolver {
   ): Promise<void> {
     const typed: { id: ObjectId; type: ObjectType | undefined }[] = [];
     for (const id of candidates) typed.push({ id, type: await this.objectType(id) });
-    // tags, commits, trees, blobs (git's type % 4); by id within a type
+    // tags, commits, trees, blobs (git's type % 4); within a type by hash algorithm (SHA-1
+    // ids, the shorter, before SHA-256 ones: oidcmp's algo order), then by id
     const rank = (t: ObjectType | undefined) =>
       t === "tag" ? 0 : t === "commit" ? 1 : t === "tree" ? 2 : t === "blob" ? 3 : -1;
     typed.sort((a, b) =>
-      rank(a.type) !== rank(b.type) ? rank(a.type) - rank(b.type) : a.id < b.id ? -1 : 1,
+      rank(a.type) !== rank(b.type)
+        ? rank(a.type) - rank(b.type)
+        : a.id.length !== b.id.length
+          ? a.id.length - b.id.length
+          : a.id < b.id
+            ? -1
+            : 1,
     );
     const shown: typeof typed = [];
     for (const c of typed)
       if (hint === undefined || (await this.satisfies(c.id, hint))) shown.push(c);
+    // compatibility ids are abbreviated to the default 7 digits (only storage ids are
+    // measured against the repository)
     const lengths =
-      (await safe(async () => this.sources.abbreviate?.(shown.map((c) => c.id)))) ?? undefined;
+      (await safe(async () =>
+        this.sources.abbreviate?.(
+          shown.filter((c) => c.id.length === this.hexLength).map((c) => c.id),
+        ),
+      )) ?? undefined;
     const lines = [`error: short object ID ${prefix} is ambiguous`, "hint: The candidates are:"];
     for (const { id, type } of shown) {
       const hash = id.slice(0, lengths?.get(id) ?? 7);
