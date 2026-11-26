@@ -10,7 +10,6 @@
  * installed during the walk (a push, a fetch) may hold objects the walk did not see.
  */
 
-import { assertObjectsAtGitDir } from "./relocated-objects.js";
 import type {
   DeltaIslandRules,
   DeltaSearchOptions,
@@ -53,6 +52,7 @@ import {
 } from "./pack/pack-write-settings.js";
 import { type PromisorExclusions, promisorExclusions } from "./promisor-objects.js";
 import { listReachableObjects } from "./reachable-objects.js";
+import { assertObjectsAtGitDir } from "./relocated-objects.js";
 import { geometricRepack } from "./repack-geometric.js";
 import { assertObjectsDeletable, readRepositoryFormat } from "./repository-format.js";
 import { updateServerInfo } from "./server-info.js";

@@ -6,7 +6,6 @@
  * pack directories, and the shallow commits nothing reached (`prune_shallow`).
  */
 
-import { assertObjectsAtGitDir } from "./relocated-objects.js";
 import type { FilesApi, GitObjects, History, ObjectId, PackSet } from "@statewalker/vcs-core";
 import {
   graftFileBaseDir,
@@ -19,6 +18,7 @@ import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { objectLinks, recentPackedObjects, typeOfObject } from "./cruft-pack.js";
 import { promisorExclusions } from "./promisor-objects.js";
 import { listReachableObjects, rebaseFileRoots } from "./reachable-objects.js";
+import { assertObjectsAtGitDir } from "./relocated-objects.js";
 import { assertObjectsDeletable, readRepositoryFormat } from "./repository-format.js";
 
 /** Options of {@link prune}. */

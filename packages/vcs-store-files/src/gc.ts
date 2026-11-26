@@ -5,7 +5,6 @@
  * sweep temporaries and write the commit-graph. One gc at a time, under `gc.pid`.
  */
 
-import { assertObjectsAtGitDir } from "./relocated-objects.js";
 import type { FilesApi, GitObjects, History, PackSet } from "@statewalker/vcs-core";
 import {
   graftFileBaseDir,
@@ -29,6 +28,7 @@ import { sweepQuarantines } from "./quarantine/files-quarantine.js";
 import { listReachableObjects, rebaseFileRoots } from "./reachable-objects.js";
 import { expireReflogs, gcExpiresReflogs, parseExpiryDate } from "./reflog-expire.js";
 import { createFilesRefOps } from "./refs/index.js";
+import { assertObjectsAtGitDir } from "./relocated-objects.js";
 import {
   DEFAULT_PRUNE_EXPIRE_MS,
   type PackSnapshot,
