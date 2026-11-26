@@ -971,7 +971,7 @@ export async function openPackSet(
         ...(sha1 ? {} : { objectFormat }),
         ...o,
       });
-      const name = `pack-${r.packId}`;
+      const name = `${o?.namePrefix ?? "pack"}-${r.packId}`;
       if (!byName.has(name)) {
         // taken before the open, as a scan does: the pack is retried once its files change
         const sig = await signature(name);

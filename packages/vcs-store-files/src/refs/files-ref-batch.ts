@@ -150,6 +150,8 @@ export interface FilesPackRefsOptions {
    * nothing is locked and no hook runs.
    */
   auto?: boolean;
+  /** With `auto`: return 1 when the check would pack, else 0, packing nothing */
+  checkOnly?: boolean;
   /** Told each error line git prints while packing (`error: <ref> does not point to ...`). */
   onError?: (line: string) => void;
 }
@@ -1227,6 +1229,7 @@ export function createFilesRefOps(
         if (count >= limit) break;
       }
       if (count < limit) return 0;
+      if (o.checkOnly) return 1;
     }
     const packedNow = new Map<string, string>();
     const hook = options.transactionHook?.();
