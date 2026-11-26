@@ -545,40 +545,70 @@ describeSigned("signed git rebase --apply resumed against native git", () => {
     fx.gitOk(dir, "commit", "-q", "-am", "main change");
   }
 
-  async function stopSigned(format: TwinFormat) {
+  /**
+   * The stop of `rebase --apply -S[<key>] main side`. With a key (ssh: the key file), the
+   * repository has no `user.signingKey`, so only the key read back from `gpg_sign_opt` can
+   * sign what `--continue` writes.
+   */
+  async function stopSigned(format: TwinFormat, key?: string) {
     const dirs = fx.twins(format, build);
-    const native = fx.git(dirs.native, ["rebase", "--apply", "--gpg-sign", "main", "side"]);
+    if (key !== undefined) {
+      for (const dir of [dirs.native, dirs.ours])
+        fx.gitOk(dir, "config", "--unset", "user.signingKey");
+    }
+    const native = fx.git(dirs.native, [
+      "rebase",
+      "--apply",
+      key === undefined ? "--gpg-sign" : `--gpg-sign=${key}`,
+      "main",
+      "side",
+    ]);
     expect(native.status, native.stderr).toBe(1);
     const result = await (await fx.ours(dirs.ours))
       .rebase()
       .setBackend("apply")
-      .setSign(true)
+      .setSign(key ?? true)
       .setUpstream("main")
       .setBranch("side")
       .call();
     expect(result.status).toBe("stopped");
     for (const dir of [dirs.native, dirs.ours]) {
-      expect(readFileSync(join(dir, ".git/rebase-apply/gpg_sign_opt"), "utf8")).toBe("-S\n");
+      expect(readFileSync(join(dir, ".git/rebase-apply/gpg_sign_opt"), "utf8")).toBe(
+        `-S${key ?? ""}\n`,
+      );
     }
     return dirs;
   }
 
+  /** The conflict resolved in both twins, then `--continue` without -S; all commits compared. */
+  async function continueResolved(
+    format: TwinFormat,
+    dirs: { native: string; ours: string },
+    label: string,
+  ) {
+    for (const dir of [dirs.native, dirs.ours]) {
+      writeFileSync(join(dir, "file"), "line 1\nresolved line 2\nline 3\n");
+      fx.gitOk(dir, "add", "file");
+    }
+    const native = fx.git(dirs.native, ["rebase", "--continue"]);
+    expect(native.status, native.stderr).toBe(0);
+    const result = await (await fx.ours(dirs.ours))
+      .rebase()
+      .setOperation(RebaseOperation.CONTINUE)
+      .call();
+    expect(result.status, result.message).toBe("ok");
+    await fx.expectSameCommits(format, dirs, true, ["main..HEAD"], label);
+  }
+
   it("--continue without -S signs the resolved commit and the rest (git's run_am)", async () => {
     for (const format of FORMATS) {
-      const dirs = await stopSigned(format);
-      for (const dir of [dirs.native, dirs.ours]) {
-        writeFileSync(join(dir, "file"), "line 1\nresolved line 2\nline 3\n");
-        fx.gitOk(dir, "add", "file");
-      }
-      const native = fx.git(dirs.native, ["rebase", "--continue"]);
-      expect(native.status, native.stderr).toBe(0);
-      const result = await (await fx.ours(dirs.ours))
-        .rebase()
-        .setOperation(RebaseOperation.CONTINUE)
-        .call();
-      expect(result.status, result.message).toBe("ok");
-      await fx.expectSameCommits(format, dirs, true, ["main..HEAD"], `continue (${format})`);
+      await continueResolved(format, await stopSigned(format), `continue (${format})`);
     }
+  }, 120_000);
+
+  it("--continue without -S signs with the run's -S<key> (ssh key file, no user.signingKey)", async () => {
+    const key = fx.formatConfig("ssh")["user.signingKey"] as string;
+    await continueResolved("ssh", await stopSigned("ssh", key), "continue -S<key> (ssh)");
   }, 120_000);
 
   it("--skip passes no signing option: the commits after it are not signed", async () => {
