@@ -65,6 +65,8 @@ const CONFIG_KEYS = [
   "advertiseSID",
   "advertiseAtomic",
   "maxInputSize",
+  "certNonceSeed",
+  "certNonceSlop",
   "receiveKeepAliveMs",
   "unpackLimit",
   "uploadPackHideRefs",

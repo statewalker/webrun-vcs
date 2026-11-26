@@ -23,12 +23,13 @@ import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils";
 import type {
   SigningFormat,
   VerificationOutcome,
+  Verifier,
   WorkingCopy,
 } from "@statewalker/vcs-working-tree";
 
 import { GitApiError } from "../errors/index.js";
 import { hostEnvironmentOf } from "./git-ident.js";
-import { signingConfigOf } from "./signing.js";
+import { type SigningConfig, signingConfigOf } from "./signing.js";
 
 /**
  * git's `sigc->result`: `G` good, `B` bad, `E` cannot be checked (missing key, several
@@ -80,7 +81,7 @@ export interface SignatureCheck {
 }
 
 /** What is signed: the ident whose date ssh checks keys against. */
-export type SignaturePayloadType = "commit" | "tag" | "other";
+export type SignaturePayloadType = "commit" | "tag" | "push-cert" | "other";
 
 /** The armor lines that start a signature of each format (gpg-interface.c's `sigs`). */
 const SIGNATURE_STARTS: readonly [SigningFormat, string][] = [
@@ -242,10 +243,21 @@ function findHeader(bytes: Uint8Array, name: string): Uint8Array | undefined {
  */
 function payloadTimestamp(payload: Uint8Array, type: SignaturePayloadType): number | undefined {
   if (type === "other") return 0;
+  if (type === "push-cert") {
+    // parse_payload_metadata: the pusher's date when its line splits as an ident (a key id
+    // alone does not: no time then, and the check goes on)
+    const pusher = findHeader(payload, "pusher");
+    if (!pusher || pusher.length === 0) return 0;
+    return identTimestamp(decoder.decode(pusher)) ?? 0;
+  }
   const ident = findHeader(payload, type === "commit" ? "committer" : "tagger");
   if (!ident || ident.length === 0) return undefined;
+  return identTimestamp(decoder.decode(ident));
+}
+
+/** split_ident_line's date: after the last `>` following a `<` (undefined: no mail). */
+function identTimestamp(text: string): number | undefined {
   // split_ident_line: a mail between the last '<' ... '>' pair; the date after it
-  const text = decoder.decode(ident);
   const lt = text.indexOf("<");
   if (lt < 0) return undefined;
   const gt = text.lastIndexOf(">");
@@ -432,6 +444,27 @@ export async function checkSignature(
   signature: Uint8Array,
   options: CheckSignatureOptions = {},
 ): Promise<SignatureCheck> {
+  return checkSignatureWith(
+    () => signingConfigOf(workingCopy),
+    hostEnvironmentOf(workingCopy)?.verifier,
+    payload,
+    signature,
+    options,
+  );
+}
+
+/**
+ * {@link checkSignature} with the signing configuration (read only when the signature has a
+ * known format) and the verifier given: a served repository's (receive-pack's push
+ * certificates).
+ */
+export async function checkSignatureWith(
+  signingConfig: () => SigningConfig,
+  verifier: Verifier | undefined,
+  payload: Uint8Array,
+  signature: Uint8Array,
+  options: CheckSignatureOptions = {},
+): Promise<SignatureCheck> {
   const check: SignatureCheck = {
     result: "N",
     trustLevel: "undefined",
@@ -450,7 +483,7 @@ export async function checkSignature(
   }
   const time = payloadTimestamp(payload, options.payloadType ?? "other");
   if (time === undefined) return check;
-  const config = signingConfigOf(workingCopy);
+  const config = signingConfig();
   const program = config.programs[format];
   let outcome: VerificationOutcome;
   if (format === "ssh" && config.allowedSignersFile === undefined) {
@@ -459,7 +492,6 @@ export async function checkSignature(
     );
     return check;
   }
-  const verifier = hostEnvironmentOf(workingCopy)?.verifier;
   if (verifier) {
     outcome = await verifier({
       format,

@@ -4,6 +4,7 @@
 
 import type { RepositoryFacade } from "../../api/repository-facade.js";
 import type { ReceivedObjectsFsck } from "../../fetch-client/fetch-checks.js";
+import type { PushCertNonceStatus } from "../../protocol/push-cert.js";
 import type { ProcReceiveProcess } from "./proc-receive.js";
 import type { PushCommandType } from "./types.js";
 
@@ -73,6 +74,87 @@ export interface ReceivePackHookContext {
    * nothing without side-band).
    */
   message(text: string): Promise<void>;
+  /**
+   * The push certificate of a signed push (`git push --signed`), undefined for a push without
+   * one. The first call stores the certificate as a blob in the repository and checks its
+   * signature and nonce (receive-pack's `prepare_push_cert_sha1`, which git runs for the first
+   * hook that exists among pre-receive, post-receive and proc-receive); later calls give the
+   * same answer. See {@link pushCertificateEnv} for git's hook variables.
+   */
+  pushCertificate?(): Promise<ReceivedPushCertificate | undefined>;
+}
+
+/** A signature check of a push certificate (git's `struct signature_check`). */
+export interface PushCertSignatureCheck {
+  /** `GIT_PUSH_CERT_STATUS`: git's `%G?` letter (`G`, `B`, `U`, `X`, `Y`, `R`, `E`, `N`) */
+  result: string;
+  /** `GIT_PUSH_CERT_SIGNER` */
+  signer?: string;
+  /** `GIT_PUSH_CERT_KEY` */
+  key?: string;
+}
+
+/** A push certificate as receive-pack hands it to its hooks. */
+export interface ReceivedPushCertificate {
+  /** The certificate as sent: the signed text and its signature */
+  readonly certificate: string;
+  /** `GIT_PUSH_CERT`: the blob it is stored as (undefined: it could not be stored) */
+  readonly id?: string;
+  /** The signature check (`GIT_PUSH_CERT_SIGNER`, `_KEY`, `_STATUS`) */
+  readonly signature: PushCertSignatureCheck;
+  /** `GIT_PUSH_CERT_NONCE`: the nonce advertised (undefined: none, no `receive.certNonceSeed`) */
+  readonly nonce?: string;
+  /** `GIT_PUSH_CERT_NONCE_STATUS` (told only with a nonce) */
+  readonly nonceStatus: PushCertNonceStatus;
+  /** `GIT_PUSH_CERT_NONCE_SLOP` (status `SLOP` only) */
+  readonly nonceSlop?: number;
+}
+
+/**
+ * git's push certificate variables of a hook (receive-pack's `prepare_push_cert_sha1`):
+ * `GIT_PUSH_CERT`, `GIT_PUSH_CERT_SIGNER`, `GIT_PUSH_CERT_KEY`, `GIT_PUSH_CERT_STATUS`, and with a
+ * nonce `GIT_PUSH_CERT_NONCE`, `GIT_PUSH_CERT_NONCE_STATUS` (and `GIT_PUSH_CERT_NONCE_SLOP`);
+ * none without a stored certificate.
+ */
+export function pushCertificateEnv(
+  cert: ReceivedPushCertificate | undefined,
+): Record<string, string> {
+  if (!cert?.id) return {};
+  const env: Record<string, string> = {
+    GIT_PUSH_CERT: cert.id,
+    GIT_PUSH_CERT_SIGNER: cert.signature.signer ?? "",
+    GIT_PUSH_CERT_KEY: cert.signature.key ?? "",
+    GIT_PUSH_CERT_STATUS: cert.signature.result,
+  };
+  if (cert.nonce !== undefined) {
+    env.GIT_PUSH_CERT_NONCE = cert.nonce;
+    env.GIT_PUSH_CERT_NONCE_STATUS = cert.nonceStatus;
+    if (cert.nonceStatus === "SLOP") env.GIT_PUSH_CERT_NONCE_SLOP = String(cert.nonceSlop ?? 0);
+  }
+  return env;
+}
+
+/**
+ * receive-pack's push certificates (`ReceivePackConfig.pushCertificates`): the `push-cert`
+ * capability with its nonce, and the signature check of a certificate received.
+ */
+export interface PushCertSettings {
+  /**
+   * `receive.certNonceSeed`: advertise `push-cert=<nonce>` (signed pushes); undefined: no
+   * `push-cert` (a certificate sent anyway reads `UNSOLICITED`)
+   */
+  nonceSeed?: string;
+  /** `receive.certNonceSlop` in seconds (0, the default: none) */
+  nonceSlop?: number;
+  /** The directory the nonce is computed for (git's receive-pack argument; default `.`) */
+  serviceDir?: string;
+  /**
+   * Checks the signature over the signed text (git's `check_signature` with the repository's
+   * `gpg.*`); absent: `N` (git when its program cannot run)
+   */
+  verify?(payload: Uint8Array, signature: Uint8Array): Promise<PushCertSignatureCheck>;
+  /** The clock in seconds (default `Date.now()`) */
+  now?(): number;
 }
 
 /** A hook's answer for a set of commands. */
@@ -192,6 +274,20 @@ export interface ReceivePackLogger {
   warn?(message: string): void;
 }
 
+/** The push certificate settings of the options (receive-pack's `pushCertificates`). */
+export function pushCertificatesOf(options: {
+  certNonceSeed?: string;
+  certNonceSlop?: number;
+  pushCertificates?: PushCertSettings;
+}): { pushCertificates?: PushCertSettings } {
+  const settings: PushCertSettings = {
+    ...options.pushCertificates,
+    ...(options.certNonceSeed !== undefined ? { nonceSeed: options.certNonceSeed } : {}),
+    ...(options.certNonceSlop !== undefined ? { nonceSlop: options.certNonceSlop } : {}),
+  };
+  return Object.keys(settings).length > 0 ? { pushCertificates: settings } : {};
+}
+
 /** Default most commands one push may carry. */
 export const DEFAULT_MAX_PUSH_COMMANDS = 65536;
 
@@ -222,6 +318,8 @@ export type ReceiveDenyAction = "unconfigured" | "ignore" | "warn" | "refuse" | 
 export interface ReceivePackConfig {
   /** The hooks */
   hooks?: ReceivePackHooks;
+  /** Signed pushes: `receive.certNonceSeed`, `receive.certNonceSlop`, the signature check */
+  pushCertificates?: PushCertSettings;
   /**
    * Most commands in one push; more is a protocol error (HTTP 400 over smart HTTP).
    * Default {@link DEFAULT_MAX_PUSH_COMMANDS}.

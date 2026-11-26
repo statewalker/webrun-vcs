@@ -28,9 +28,10 @@
  * globally), was not taken; switch only on the human's word.
  */
 import { type Commit, collectCommitBytes, type PersonIdent } from "@statewalker/vcs-core";
-import { parseGitBool } from "@statewalker/vcs-utils";
+import { createSha256, parseGitBool } from "@statewalker/vcs-utils";
 import {
   expandUserPath,
+  type GitHostEnvironment,
   type Signer,
   type SigningFormat,
   type SigningRequest,
@@ -161,29 +162,44 @@ export interface SigningConfig {
  *   '<key>' in file '<file>' at line <n>`
  */
 export function signingConfigOf(workingCopy: WorkingCopy): SigningConfig {
-  const config: SigningConfig = { format: "openpgp", programs: { ...DEFAULT_PROGRAMS } };
-  if (!workingCopy.config) return config;
+  if (!workingCopy.config) return { format: "openpgp", programs: { ...DEFAULT_PROGRAMS } };
   const store = RemoteConfigStore.from(workingCopy);
-  const environment = hostEnvironmentOf(workingCopy);
-  const keys = [
-    "user.signingkey",
-    "gpg.format",
-    "gpg.mintrustlevel",
-    "gpg.ssh.defaultkeycommand",
-    "gpg.ssh.allowedsignersfile",
-    "gpg.ssh.revocationfile",
-    "gpg.program",
-    "gpg.openpgp.program",
-    "gpg.x509.program",
-    "gpg.ssh.program",
-  ];
+  const keys = [...SIGNING_KEYS];
   const entries: (ConfigValueWhere & { key: string })[] =
     store.entriesWithOriginFor(keys) ??
     keys.flatMap((key) => {
       const text = store.value(key);
       return text === undefined ? [] : [{ key, text }];
     });
+  return signingConfigFromEntries(entries, hostEnvironmentOf(workingCopy));
+}
+
+/** The variables {@link signingConfigOf} reads, lower case. */
+export const SIGNING_KEYS: readonly string[] = [
+  "user.signingkey",
+  "gpg.format",
+  "gpg.mintrustlevel",
+  "gpg.ssh.defaultkeycommand",
+  "gpg.ssh.allowedsignersfile",
+  "gpg.ssh.revocationfile",
+  "gpg.program",
+  "gpg.openpgp.program",
+  "gpg.x509.program",
+  "gpg.ssh.program",
+];
+
+/**
+ * {@link signingConfigOf} over config entries in git's order (keys lower case, only
+ * {@link SIGNING_KEYS} are read), for a configuration that is no working copy's (a served
+ * repository's).
+ */
+export function signingConfigFromEntries(
+  entries: Iterable<ConfigValueWhere & { key: string }>,
+  environment: GitHostEnvironment | undefined,
+): SigningConfig {
+  const config: SigningConfig = { format: "openpgp", programs: { ...DEFAULT_PROGRAMS } };
   for (const { key, text, file, line } of entries) {
+    if (!SIGNING_KEYS.includes(key)) continue;
     const fail = (error: string): never => {
       const fatal =
         file !== undefined && line !== undefined
@@ -382,4 +398,94 @@ export async function signCommit(
     ...unsigned,
     gpgSignature: signature.endsWith("\n") ? signature.slice(0, -1) : signature,
   };
+}
+
+/** A uint32 length-prefixed string of an ssh wire buffer at `at`. */
+function sshString(bytes: Uint8Array, at: number): { value: Uint8Array; next: number } | undefined {
+  if (at + 4 > bytes.length) return undefined;
+  const length = new DataView(bytes.buffer, bytes.byteOffset + at, 4).getUint32(0);
+  if (at + 4 + length > bytes.length) return undefined;
+  return { value: bytes.subarray(at + 4, at + 4 + length), next: at + 4 + length };
+}
+
+function base64Bytes(text: string): Uint8Array | undefined {
+  try {
+    return Uint8Array.from(atob(text.replace(/\s+/g, "")), (c) => c.charCodeAt(0));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The public key blob of an ssh key as `ssh-keygen -l` reads it: a public key line
+ * (`<type> <base64> [comment]`) or an OpenSSH private key file (its public part, which is
+ * never encrypted).
+ */
+function sshPublicKeyBlob(text: string): Uint8Array | undefined {
+  const pem = /-----BEGIN OPENSSH PRIVATE KEY-----([\s\S]*?)-----END OPENSSH PRIVATE KEY-----/.exec(
+    text,
+  );
+  if (pem) {
+    const bytes = base64Bytes(pem[1] as string);
+    const magic = new TextEncoder().encode("openssh-key-v1\0");
+    if (!bytes || bytes.length < magic.length || magic.some((b, i) => bytes[i] !== b)) {
+      return undefined;
+    }
+    let at = magic.length;
+    // ciphername, kdfname, kdfoptions, then the number of keys and the first public key
+    for (let i = 0; i < 3; i++) {
+      const s = sshString(bytes, at);
+      if (!s) return undefined;
+      at = s.next;
+    }
+    return sshString(bytes, at + 4)?.value;
+  }
+  const line = text.split("\n").find((l) => l.trim() !== "" && !l.startsWith("#"));
+  const field = line?.trim().split(/\s+/)[1];
+  return field ? base64Bytes(field) : undefined;
+}
+
+/**
+ * gpg-interface.c's `get_signing_key_id()` for `sign` (`""`: the default key): the key of an
+ * openpgp or x509 signature (`user.signingKey`, else the committer as `Name <email>`), the
+ * SHA-256 fingerprint of an ssh key (`ssh-keygen -lf`'s `SHA256:...`, for a literal key, a
+ * public key file or an OpenSSH private key file).
+ *
+ * @throws SigningFailedError as git dies when it cannot fingerprint an ssh key (`fatal: failed
+ *   to get the ssh fingerprint for key '<key>'`), or has none
+ */
+export async function signingKeyIdOf(
+  workingCopy: WorkingCopy,
+  sign: string,
+  committer: Pick<PersonIdent, "name" | "email">,
+): Promise<string> {
+  const config = signingConfigOf(workingCopy);
+  const key = sign !== "" ? sign : config.signingKey;
+  if (config.format !== "ssh") return key ?? `${committer.name} <${committer.email}>`;
+  if (key === undefined) {
+    throw new SigningFailedError(
+      "fatal: either user.signingkey or gpg.ssh.defaultKeyCommand needs to be configured",
+      sign,
+      128,
+    );
+  }
+  let text: string | undefined;
+  if (key.startsWith("key::")) text = key.slice(5);
+  else if (key.startsWith("ssh-")) text = key;
+  else {
+    const environment = hostEnvironmentOf(workingCopy);
+    const path = expandUserPath(key, environment) ?? key;
+    const bytes = await environment?.readFile(path).catch(() => undefined);
+    text = bytes ? new TextDecoder().decode(bytes) : undefined;
+  }
+  const blob = text === undefined ? undefined : sshPublicKeyBlob(text);
+  if (!blob) {
+    throw new SigningFailedError(
+      `fatal: failed to get the ssh fingerprint for key '${key}'`,
+      sign,
+      128,
+    );
+  }
+  const digest = createSha256().update(blob).digest();
+  return `SHA256:${btoa(String.fromCharCode(...digest)).replace(/=+$/, "")}`;
 }

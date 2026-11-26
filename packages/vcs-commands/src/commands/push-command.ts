@@ -1,5 +1,6 @@
 import { isValidRefName, parseCoreAbbrev } from "@statewalker/vcs-core";
 import {
+  anonymizeUrl,
   countRefspecMatch,
   createRepositoryFacade,
   createTransportRefStore,
@@ -11,6 +12,7 @@ import {
   ObjectFormatMismatchError,
   objectSource,
   PushCertificateError,
+  type PushCertSigner,
   type PushClientResult,
   type PushCommandResult,
   PushRefspecError,
@@ -39,11 +41,16 @@ import { type PushResult, PushStatus, type RemoteRefUpdate } from "../results/pu
 import { TransportCommand } from "../transport-command.js";
 import { endOfSymbolicChain, installTracking, pushTrackingPlan } from "./branch-tracking.js";
 import { FetchCommand } from "./fetch-command.js";
-import { hostEnvironmentOf } from "./git-ident.js";
+import { committerIdentOf, hostEnvironmentOf, localTimezoneOffset } from "./git-ident.js";
 import { remoteHookSession } from "./local-transport.js";
 import { withRemoteReceivePack } from "./remote-transport.js";
 import { clientSessionIdOf } from "./session-id.js";
-import { SIGNING_FAILED_LINES, SigningFailedError } from "./signing.js";
+import {
+  SIGNING_FAILED_LINES,
+  SigningFailedError,
+  signingKeyIdOf,
+  signPayload,
+} from "./signing.js";
 import {
   createSubmoduleAuthPolicy,
   guardSubmoduleTransports,
@@ -426,8 +433,9 @@ export class PushCommand extends TransportCommand<PushResult> {
    * certificate; undefined (the default) leaves it to `push.gpgSign` (a boolean or
    * `if-asked`). A server that takes no certificate refuses a signed push (`fatal: the
    * receiving end does not support --signed push`) and gets an `if-asked` one unsigned,
-   * with git's warning ({@link PushResult.warnings}). Not signed yet: a certificate
-   * the server takes fails as git fails when gpg cannot sign (`error: gpg failed to sign
+   * with git's warning ({@link PushResult.warnings}). The certificate is signed through the
+   * host's signer as `commit -S` signs (`gpg.format`, `user.signingKey`); without a signer, or
+   * when it fails, the push dies as git does when gpg cannot sign (`error: gpg failed to sign
    * the data:`, `fatal: failed to sign the push certificate`, exit 128:
    * {@link SigningFailedError}), before anything is sent.
    */
@@ -450,6 +458,43 @@ export class PushCommand extends TransportCommand<PushResult> {
       }
     }
     return value === true ? "always" : value === "if-asked" ? "if-asked" : undefined;
+  }
+
+  /**
+   * send-pack's `generate_push_cert` through the host's signer (`sign_buffer` with the default
+   * key, as `push --signed` signs): the pusher is `get_signing_key_id()`, the date now in the
+   * local zone (git's `datestamp`: never `GIT_COMMITTER_DATE`), the pushee the URL without its
+   * credentials. A failed signing dies as git: gpg's lines, `fatal: failed to sign the push
+   * certificate`, exit 128.
+   */
+  private pushCertSigner(remoteUrl: string): PushCertSigner {
+    const committer = () => committerIdentOf(this.workingCopy);
+    return {
+      pusher: () => signingKeyIdOf(this.workingCopy, "", committer()),
+      pushee: anonymizeUrl(remoteUrl),
+      date: () => {
+        const timestamp = Math.floor(Date.now() / 1000);
+        return { timestamp, tzOffset: localTimezoneOffset(timestamp) };
+      },
+      sign: async (payload) => {
+        const cwd = await this.hooks.hostWorkingDirectory().catch(() => undefined);
+        try {
+          return await signPayload(this.workingCopy, "", payload, {
+            committer: committer(),
+            ...(cwd !== undefined ? { cwd } : {}),
+            tail: ["fatal: failed to sign the push certificate"],
+          });
+        } catch (error) {
+          if (!(error instanceof SigningFailedError) || error.exitCode !== undefined) throw error;
+          throw new SigningFailedError(error.message, error.signingKey, 128, {
+            ...(error.signerMessages ? { signerMessages: error.signerMessages } : {}),
+            ...(error.programExitCode !== undefined
+              ? { programExitCode: error.programExitCode }
+              : {}),
+          });
+        }
+      },
+    };
   }
 
   /**
@@ -742,7 +787,9 @@ export class PushCommand extends TransportCommand<PushResult> {
       refspecs,
       force: this.force || mirror,
       atomic: this.atomic,
-      ...(this.pushCertMode() ? { signed: this.pushCertMode() } : {}),
+      ...(this.pushCertMode()
+        ? { signed: this.pushCertMode(), pushCertSigner: this.pushCertSigner(remoteUrl) }
+        : {}),
       thin: this.thin,
       dryRun: this.dryRun,
       prune: this.prune,

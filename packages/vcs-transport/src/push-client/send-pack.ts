@@ -15,11 +15,13 @@ import {
 } from "../fetch-client/index.js";
 import {
   encodeFlush,
+  encodePacket,
   encodePacketLine,
   ObjectFormatMismatchError,
   TransportError,
 } from "../protocol/index.js";
 import { formatOf, isNullId } from "../protocol/object-format.js";
+import { buildPushCertificate, isValidPushCertNonce } from "../protocol/push-cert.js";
 import { validSessionId } from "../protocol/session-id.js";
 import { type AbbrevLengths, abbrevLengthsOf, transportSummaryWidth } from "../summary/index.js";
 import type { ReceivePackConnection } from "./connection.js";
@@ -88,11 +90,13 @@ export interface PushClientOptions {
   /**
    * `--signed` / `push.gpgSign` (git's SEND_PACK_PUSH_CERT_*): `"always"` needs a server that
    * advertises `push-cert`, `"if-asked"` signs only for one that does (else warns and pushes
-   * unsigned); undefined signs nothing. Push certificates cannot be signed here yet (no
-   * signer): a push that must sign one fails ({@link PushCertificateError}) before any
-   * command is sent, as git fails when gpg cannot sign.
+   * unsigned); undefined signs nothing. The certificate is signed by `pushCertSigner`; without
+   * one a push that must sign fails ({@link PushCertificateError}) before any command is sent,
+   * as git fails when gpg cannot sign.
    */
   signed?: "always" | "if-asked";
+  /** Signs the push certificate of a `signed` push (see {@link PushCertSigner}) */
+  pushCertSigner?: PushCertSigner;
   /**
    * `--mirror` (see `MatchPushRefsOptions.mirror`): with `:` every local ref is pushed, and
    * every remote ref the refspecs leave out is deleted. git's `--mirror` also forces (`force`)
@@ -135,6 +139,27 @@ export interface PushClientOptions {
   negotiate?: (
     tips: readonly string[],
   ) => Promise<{ commons?: readonly string[]; warnings?: readonly string[] }>;
+}
+
+/**
+ * What send-pack's `generate_push_cert` needs from the pusher: who pushes, where to, when, and
+ * the signature.
+ */
+export interface PushCertSigner {
+  /**
+   * `get_signing_key_id()`: the key id (ssh: its fingerprint), else the committer
+   * `Name <email>`; asked only when a certificate is signed (a throw ends the push)
+   */
+  pusher(): Promise<string>;
+  /** The remote's URL without its credentials (`transport_anonymize_url`; none: no `pushee`) */
+  pushee?: string;
+  /** git's `datestamp`: now, in seconds, with the local zone as git writes it (`-0700`) */
+  date(): { timestamp: number; tzOffset: string };
+  /**
+   * The signature of the certificate's text (`sign_buffer`); a throw ends the push before
+   * anything is sent
+   */
+  sign(payload: Uint8Array): Promise<Uint8Array>;
 }
 
 /**
@@ -409,6 +434,12 @@ async function sendPack(
     else warnings.push("warning: push negotiation failed; proceeding anyway with push");
   }
   const pushCert = options.signed !== undefined && caps.has("push-cert");
+  // reject_invalid_nonce: the nonce is signed as it is, so only a harmless one is
+  if (pushCert && !isValidPushCertNonce(caps.get("push-cert") ?? "")) {
+    throw new TransportError(
+      `fatal: the receiving end asked to sign an invalid nonce <${caps.get("push-cert") ?? ""}>`,
+    );
+  }
   if (options.signed && !pushCert) {
     if (options.signed === "always") {
       throw new PushCertificateError(
@@ -441,10 +472,24 @@ async function sendPack(
     for (const u of toSend) setStatus(u, "atomic-push-failed");
     toSend.length = 0;
   }
-  // generate_push_cert signs only when a command is sent (update_seen), never in a dry run:
-  // nothing signs one here yet, so such a push is refused as git refuses when gpg cannot sign
+  // generate_push_cert signs only when a command is sent (update_seen), never in a dry run;
+  // without a signer such a push is refused as git refuses when gpg cannot sign
+  let certificate: string | undefined;
   if (pushCert && toSend.length > 0 && !options.dryRun) {
-    throw new PushCertificateError("failed to sign the push certificate", "signing");
+    const signer = options.pushCertSigner;
+    if (!signer) throw new PushCertificateError("failed to sign the push certificate", "signing");
+    const { timestamp, tzOffset } = signer.date();
+    const text = buildPushCertificate({
+      pusher: await signer.pusher(),
+      timestamp,
+      tzOffset,
+      ...(signer.pushee ? { pushee: signer.pushee } : {}),
+      nonce: caps.get("push-cert") ?? "",
+      ...(options.pushOptions?.length ? { pushOptions: options.pushOptions } : {}),
+      updates: toSend,
+    });
+    const signature = await signer.sign(new TextEncoder().encode(text));
+    certificate = text + new TextDecoder().decode(signature);
   }
 
   const requested: string[] = [];
@@ -488,13 +533,21 @@ async function sendPack(
   // and its pack stops there
   const shallow = (await refStore.getShallow?.()) ?? [];
   const request: Uint8Array[] = shallow.map((oid) => encodePacketLine(`shallow ${oid}\n`));
-  const commands: Uint8Array[] = toSend.map((u, i) =>
-    encodePacketLine(
-      i === 0
-        ? `${u.oldOid} ${u.newOid} ${u.remoteRef}\0${requested.join(" ")}\n`
-        : `${u.oldOid} ${u.newOid} ${u.remoteRef}\n`,
-    ),
-  );
+  // the commands, or the certificate holding them: `push-cert\0<caps>`, its lines, its end
+  const commands: Uint8Array[] =
+    certificate === undefined
+      ? toSend.map((u, i) =>
+          encodePacketLine(
+            i === 0
+              ? `${u.oldOid} ${u.newOid} ${u.remoteRef}\0${requested.join(" ")}\n`
+              : `${u.oldOid} ${u.newOid} ${u.remoteRef}\n`,
+          ),
+        )
+      : [
+          encodePacket(`push-cert\0${requested.join(" ")}`),
+          ...(certificate.match(/[^\n]*\n|[^\n]+$/g) ?? []).map((line) => encodePacket(line)),
+          encodePacketLine("push-cert-end\n"),
+        ];
   request.push(...commands, encodeFlush());
   if (options.pushOptions?.length) {
     for (const option of options.pushOptions) request.push(encodePacketLine(`${option}\n`));
