@@ -9,11 +9,17 @@ import { spawnSync } from "node:child_process";
 import { existsSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
+import {
+  createGitFilesBackend,
+  openGitLinkedWorktrees,
+  openRepositoryFromEnvironment,
+} from "@statewalker/vcs-store-files";
 import {
   createNodeFilesApi,
   createNodeGitHostEnvironment,
 } from "@statewalker/vcs-utils-node/files";
+
+import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 
 import { Git, type PlumbingOutput } from "../src/index.js";
 import { nativeGitEnv } from "./native-git-http-backend.js";
@@ -141,6 +147,30 @@ export async function openOursAt(home: string, dir: string): Promise<Git> {
   const worktrees = await openGitLinkedWorktrees({ files, gitDir, history, environment });
   if (bare) return Git.fromWorktreeAdmin(await worktrees.openAdmin());
   return Git.fromWorkingCopy(await worktrees.openCurrent());
+}
+
+/**
+ * Our Git as a git command started in `cwd` with the repository variables of `env`
+ * (`GIT_DIR`, `GIT_COMMON_DIR`, `GIT_INDEX_FILE`...) sees it: opened through
+ * `openRepositoryFromEnvironment` over a FilesApi rooted at `/`; `prefix` is git's.
+ */
+export async function openOursFromEnvironment(
+  home: string,
+  cwd: string,
+  env: Record<string, string> = {},
+): Promise<{ git: Git; prefix: string }> {
+  const files = createNodeFilesApi({ rootDir: "/" });
+  const environment = createNodeGitHostEnvironment({ env: { ...nativeGitEnv(home), ...env } });
+  const { admin, setup } = await openRepositoryFromEnvironment({
+    files,
+    cwd: realpathSync(cwd).slice(1),
+    environment,
+  });
+  const git =
+    setup.workTree === undefined
+      ? Git.fromWorktreeAdmin(admin)
+      : Git.fromWorkingCopy(admin as WorkingCopy);
+  return { git, prefix: setup.prefix ?? "" };
 }
 
 /** A plumbing run as an outcome (stdout as latin1). */
