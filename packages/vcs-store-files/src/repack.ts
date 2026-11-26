@@ -56,7 +56,11 @@ import {
   readPackWriteSettings,
 } from "./pack/pack-write-settings.js";
 import { type PromisorExclusions, promisorExclusions } from "./promisor-objects.js";
-import { type PseudoMergeConfigEntry, pseudoMergeGroupsOf } from "./pseudo-merge-config.js";
+import {
+  type PseudoMergeConfigEntry,
+  PseudoMergeConfigError,
+  pseudoMergeGroupsOf,
+} from "./pseudo-merge-config.js";
 import { listReachableObjects } from "./reachable-objects.js";
 import { assertObjectsAtGitDir } from "./relocated-objects.js";
 import { geometricRepack } from "./repack-geometric.js";
@@ -757,7 +761,10 @@ export async function repackListed(
   } catch (e) {
     // pack-objects died before naming the pack: repack replaces nothing, and the new pack is
     // not left installed (unless it is one of the packs already there, which stays)
-    if (e instanceof BitmapWriteError && !before.some((p) => p.packId === installed.packId))
+    if (
+      (e instanceof BitmapWriteError || e instanceof PseudoMergeConfigError) &&
+      !before.some((p) => p.packId === installed.packId)
+    )
       await packs.remove([installed.packId]);
     throw e;
   }

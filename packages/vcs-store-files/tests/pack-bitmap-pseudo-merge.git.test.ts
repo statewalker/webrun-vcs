@@ -321,9 +321,12 @@ describe.skipIf(!hasPseudoMerges)("pseudo-merge bitmaps (t5333)", () => {
     });
     expect(native.status).toBe(128);
     for (const [k, v] of Object.entries(config)) git(dir, ["config", k, v]);
+    const packsBefore = readdirSync(packDir(dir)).sort();
     const { backend } = await open(dir);
     const error = await repack({ ...backend, writeBitmaps: true }).catch((e) => e);
     expect(error).toBeInstanceOf(PseudoMergeConfigError);
+    // as git (pack-objects dies before the pack is renamed), no new pack is left behind
+    expect(readdirSync(packDir(dir)).sort()).toEqual(packsBefore);
     expect(`fatal: ${(error as Error).message}\n`).toBe(native.stderr);
   });
 
