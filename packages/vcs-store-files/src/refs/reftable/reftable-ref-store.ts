@@ -568,6 +568,8 @@ export class ReftableRefStore implements Refs {
    */
   async packRefs(_refNames: string[], options?: PackRefsOptions): Promise<number> {
     const writer = (this.own ?? this.main).writer;
+    // git's reftable_be_optimize_required: whether a compaction would run
+    if (options?.auto && options.checkOnly) return (await writer.compactionRequired(true)) ? 1 : 0;
     if (options?.auto) await writer.autoCompact();
     else await writer.compactAll();
     return 0;

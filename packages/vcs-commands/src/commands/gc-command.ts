@@ -167,6 +167,14 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
     return this;
   }
 
+  /**
+   * git's `need_to_gc`: whether `gc --auto` has work to do (the maintenance gc task's `--auto`
+   * condition). Reads only the configuration and the objects directory.
+   */
+  async isAutoGcNeeded(): Promise<boolean> {
+    return this.needsAutoGc();
+  }
+
   /** git's `need_to_gc`: whether `gc --auto` has work to do. */
   private async needsAutoGc(): Promise<boolean> {
     const config = RemoteConfigStore.from(this.workingCopy);

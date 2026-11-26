@@ -136,6 +136,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   /** Whether the remote was named (it is then in the reflog action, as on git's command line). */
   private remoteGiven = false;
   private refSpecs: string[] = [];
+  private prefetch = false;
   private updateHeadOk = false;
   private removeDeletedRefs?: boolean;
   private pruneTags?: boolean;
@@ -292,6 +293,26 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     this.checkCallable();
     this.tagOption = option;
     this.tagOptionSet = true;
+    return this;
+  }
+
+  /**
+   * `git fetch --prefetch` (fetch.c `filter_prefetch_refspec`): every refspec, the given and
+   * the remote's configured ones, writes under `refs/prefetch/` instead (`refs/remotes/o/*`
+   * becomes `refs/prefetch/remotes/o/*`, always forced); refspecs without a destination and
+   * those of `refs/tags/` are dropped, and without a refspec left nothing is fetched (no
+   * remote HEAD). The maintenance prefetch task's fetch.
+   *
+   * @example
+   * ```typescript
+   * // git fetch origin --prefetch --prune --no-tags --no-write-fetch-head
+   * await git.fetch().setRemote("origin").setPrefetch(true).setRemoveDeletedRefs(true)
+   *   .setTagOpt(TagOption.NO_TAGS).setWriteFetchHead(false).call();
+   * ```
+   */
+  setPrefetch(prefetch: boolean): this {
+    this.checkCallable();
+    this.prefetch = prefetch;
     return this;
   }
 
@@ -855,11 +876,13 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       configBool(store.value(`remote.${this.remote}.pruneTags`)) ??
       configBool(store.value("fetch.pruneTags")) ??
       false;
-    const configured = viaConfig ? store.configuredFetchRefspecs(this.remote) : [];
-    const explicitSpecs = [...this.refSpecs];
+    const prefetchSpecs = (specs: string[]) => (this.prefetch ? prefetchRefspecs(specs) : specs);
+    const configured = prefetchSpecs(viaConfig ? store.configuredFetchRefspecs(this.remote) : []);
+    const explicitSpecs = prefetchSpecs([...this.refSpecs]);
     // fetch.c fetch_one: --prune-tags (only without command-line refspecs) adds the tag
     // refspec to the configured ones, or for a URL to those of the fetch
-    if (pruneTags && this.refSpecs.length === 0) {
+    // (under --prefetch filter_prefetch_refspec drops the tag refspec again: refs/tags/ untouched)
+    if (pruneTags && this.refSpecs.length === 0 && !this.prefetch) {
       if (viaConfig) configured.push(TAG_REFSPEC);
       else explicitSpecs.push(TAG_REFSPEC);
     }
@@ -881,7 +904,14 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     // git (fetch.c get_ref_map): the remote's configured refspecs, or with none the current
     // branch's upstream refs when this remote is its upstream; else the remote HEAD
     const useConfig = fromConfig && (configured.length > 0 || upstreamHere);
-    const given = !fromConfig ? explicitSpecs : useConfig ? configured : ["HEAD"];
+    // (--prefetch never falls back to the remote HEAD)
+    const given = !fromConfig
+      ? explicitSpecs
+      : useConfig
+        ? configured
+        : this.prefetch
+          ? []
+          : ["HEAD"];
     // add_merge_config: fetching the current branch's upstream remote also takes the
     // branch's `branch.<name>.merge` refs, for FETCH_HEAD
     const mergeRefs = useConfig && upstream && upstreamHere ? upstream.merge : [];
@@ -896,6 +926,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     // 2.48+; 2.43 leaves it alone)
     const followHead =
       fromConfig &&
+      !this.prefetch &&
       configured.length > 0 &&
       (this.compatibility ?? this.hooks.compatibility) !== "2.43"
         ? this.followRemoteHead(store)
@@ -2202,4 +2233,28 @@ export function fetchSucceeded(result: FetchResult): boolean {
       (u) => u.status === RefUpdateStatus.REJECTED || u.status === RefUpdateStatus.LOCK_FAILURE,
     )
   );
+}
+
+/**
+ * fetch.c's `filter_prefetch_refspec`: negative refspecs kept; a refspec without a destination
+ * or whose source is under `refs/tags/` dropped; any other written under `refs/prefetch/` (the
+ * destination less its `refs/`), forced.
+ */
+export function prefetchRefspecs(specs: readonly string[]): string[] {
+  const out: string[] = [];
+  for (const spec of specs) {
+    if (spec.startsWith("^")) {
+      out.push(spec);
+      continue;
+    }
+    const body = spec.startsWith("+") ? spec.slice(1) : spec;
+    const colon = body.indexOf(":");
+    if (colon < 0) continue;
+    const src = body.slice(0, colon);
+    const dst = body.slice(colon + 1);
+    if (dst === "" || src.startsWith("refs/tags/")) continue;
+    const sub = dst.startsWith("refs/") ? dst.slice("refs/".length) : dst;
+    out.push(`+${src}:refs/prefetch/${sub}`);
+  }
+  return out;
 }
