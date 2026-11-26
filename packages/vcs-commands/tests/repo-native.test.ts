@@ -369,6 +369,15 @@ function describeRepo(native: NativeGit) {
           { GIT_DIR: "../.git", GIT_INDEX_FILE: "idx" },
           keys,
         );
+        // outside the worktree git's setup stays where it started: the index is read there
+        // (absolute key only: `setCurrentDirectory` names no directory outside the worktree)
+        const out = join(shell.home, `out${counter++}`);
+        mkdirSync(out);
+        await infoFromEnvironment(
+          out,
+          { GIT_DIR: join(dir, ".git"), GIT_WORK_TREE: dir, GIT_INDEX_FILE: "idx" },
+          ["path.index.absolute"],
+        );
       });
 
       /** `repo info`'s superproject keys in `dir`, native and ours. */

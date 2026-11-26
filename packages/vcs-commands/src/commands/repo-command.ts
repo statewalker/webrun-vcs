@@ -171,7 +171,10 @@ function hostPathOf(files: FilesApi, path: string): string | undefined {
  * and worktree are the working copy's: open it where git's setup puts them
  * (`openRepositoryFromEnvironment` for `$GIT_DIR`/`$GIT_WORK_TREE`) and pass its `prefix` to
  * {@link setCurrentDirectory}; `$GIT_COMMON_DIR` and `$GIT_INDEX_FILE` are read from the host
- * environment (a relative index from the worktree top, where git's setup went).
+ * environment (a relative index is the file the working copy opened: git's setup reads it from
+ * the worktree top, or from where it started outside the worktree). Relative keys are
+ * computed from {@link setCurrentDirectory}, so a git started outside the worktree is not
+ * expressed.
  * `path.superprojectworkingtree.*` is submodule.c's `get_superproject_working_tree`: the
  * repository of the worktree's parent directory (reached through `hostFilesOf`, else the
  * FilesApi) must hold a gitlink at the worktree's path in its index.
@@ -311,7 +314,11 @@ export class RepoInfoCommand extends PlumbingCommand {
       : named
         ? await real(named.startsWith("/") ? named : `${facts.gitDir}/${named}`)
         : facts.gitDir;
+    // repo_get_index_file: `$GIT_INDEX_FILE` (an absolute one as given; a relative one is the
+    // file the working copy opened, which git's setup read from the directory it went to:
+    // the worktree top, else where it started), else `<git dir>/index`
     const indexFile = environment?.indexFile;
+    const location = indexFile && !indexFile.startsWith("/") ? this.indexLocation() : undefined;
     facts.index =
       indexFile === undefined
         ? facts.gitDir
@@ -319,16 +326,25 @@ export class RepoInfoCommand extends PlumbingCommand {
           : undefined
         : indexFile.startsWith("/")
           ? indexFile
-          : // relative to where git's setup went: the worktree top (`chdir_to_toplevel`),
-            // the git directory of a bare repository
-            await real(
-              `${hostPathOf(files, layout.bare ? layout.gitDir : layout.top) ?? ""}/${indexFile}`,
+          : await real(
+              location
+                ? hostPathOf(location.files, location.path)
+                : `${hostPathOf(files, layout.bare ? layout.gitDir : layout.top) ?? ""}/${indexFile}`,
             );
     if (!layout.bare) {
       facts.workTree = await real(hostPathOf(files, layout.top));
       facts.superproject = await this.superprojectOf(files, layout.top, facts.workTree);
     }
     return facts;
+  }
+
+  /** The index file of the working copy's staging; undefined without one (bare, memory). */
+  private indexLocation(): { files: FilesApi; path: string } | undefined {
+    try {
+      return this.resolveStaging().indexLocation?.();
+    } catch {
+      return undefined;
+    }
   }
 
   /**
