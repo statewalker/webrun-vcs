@@ -53,3 +53,11 @@ export {
   unpackLimitOf,
   uploadPackRequestPolicyOf,
 } from "./server-config.js";
+export type {
+  RemoteArchiveOptions,
+  RemoteArchiveOutput,
+  ServeUploadArchiveResult,
+  UploadArchiveOutput,
+  UploadArchiveWriter,
+} from "./upload-archive.js";
+export { ARCHIVER_DIED, requestRemoteArchive, serveUploadArchive } from "./upload-archive.js";

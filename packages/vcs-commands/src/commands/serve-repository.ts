@@ -18,6 +18,7 @@ import {
   servedGitFilesOf,
 } from "@statewalker/vcs-transport";
 import { type OpenedRepository, sparseFilterMatcher } from "@statewalker/vcs-working-tree";
+import { uploadArchiveWriterOf } from "./archive/upload-archive-writer.js";
 import type { HookSession } from "./git-hooks.js";
 import {
   httpBackendEnv,
@@ -143,6 +144,11 @@ export async function servedRepositoryOf(
     ...(remote.files
       ? { files: servedGitFilesOf(remote.files, remote.commonDir ?? remote.gitDir) }
       : {}),
+    // git archive --remote (upload-archive--writer in the git directory)
+    ...(() => {
+      const uploadArchive = uploadArchiveWriterOf(remote);
+      return uploadArchive ? { uploadArchive } : {};
+    })(),
     around: <T>(service: string, serve: () => Promise<T>, client?: ServedRequestContext) => {
       // a served partial clone never fetches lazily (upload-pack's GIT_NO_LAZY_FETCH,
       // receive-pack's rev-list --exclude-promisor-objects): the facade reads through the

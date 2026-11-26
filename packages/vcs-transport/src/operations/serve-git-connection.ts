@@ -46,6 +46,7 @@ import {
   GIT_SERVER_SETTINGS_DEFAULTS,
   type ServerConfigReader,
 } from "./server-config.js";
+import { serveUploadArchive, type UploadArchiveWriter } from "./upload-archive.js";
 
 /** The `serveOverDuplex` options a served repository decides (everything but the stream and the protocol). */
 export type GitServeSettings = Omit<
@@ -78,6 +79,12 @@ export interface ServedRepository {
    * `objects/...` request is answered 404
    */
   files?: ServedGitFiles;
+  /**
+   * Makes the archives `git archive --remote` asks for (git's `upload-archive--writer`:
+   * `servedRepositoryOf` runs `git archive` in the repository). Without it upload-archive is
+   * refused as a service not enabled
+   */
+  uploadArchive?: UploadArchiveWriter;
   /**
    * Runs around the serving of one request (`serve`), for what the repository's owner
    * installs for its duration: the repository's reference-transaction hook while
@@ -141,6 +148,13 @@ export interface GitServeOptions {
    * implicit session too: an ssh server that accepts pushes says so)
    */
   enableReceivePack?: boolean;
+  /**
+   * Serve upload-archive (`git archive --remote`; default false, as git-daemon without
+   * `--enable=upload-archive`): only for repositories that give an
+   * {@link ServedRepository.uploadArchive} writer, a repository's `daemon.uploadarch`
+   * overriding it where overrides are allowed
+   */
+  enableUploadArchive?: boolean;
   /**
    * Let a repository's `daemon.uploadpack` / `daemon.receivepack` turn its service on or off
    * (git-daemon's `--forbid-override` is false). Default: true for git:// (`refusal:
@@ -552,7 +566,7 @@ export async function serveGitService(
       ? options.enableUploadPack !== false
       : service === "git-receive-pack"
         ? options.enableReceivePack === true
-        : false;
+        : options.enableUploadArchive === true;
   const overridable = options.allowOverride ?? daemon;
   if (!enabled && !overridable) return refuse("service not enabled");
   if (isUnsafeServicePath(path, { implicit: !daemon })) return refuse("no such repository");
@@ -570,9 +584,22 @@ export async function serveGitService(
   }
   if (!served) return refuse("no such repository");
   const override = overridable ? configBoolOf(served.config, `daemon.${configKey}`) : undefined;
-  // upload-archive is not served here: refused as when it is not enabled
-  if (!(override ?? enabled) || service === "git-upload-archive") {
+  // upload-archive needs the repository's archive writer: refused as when not enabled
+  if (!(override ?? enabled) || (service === "git-upload-archive" && !served.uploadArchive)) {
     return refuse("service not enabled");
+  }
+  if (service === "git-upload-archive" && served.uploadArchive) {
+    const writer = served.uploadArchive;
+    try {
+      const result = await serveUploadArchive(duplex, writer);
+      return {
+        success: result.success,
+        ...(result.error !== undefined ? { error: result.error } : {}),
+        request,
+      };
+    } finally {
+      if (options.closeDuplex !== false) await closeQuietly(duplex);
+    }
   }
 
   const settings = resolveServeSettings(options.settings, served);

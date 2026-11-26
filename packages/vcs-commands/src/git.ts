@@ -92,6 +92,7 @@ import {
   RefsMigrateCommand,
   RefsVerifyCommand,
   RemoteAddCommand,
+  RemoteArchiveCommand,
   RemoteGetUrlCommand,
   RemoteListCommand,
   RemotePruneCommand,
@@ -1207,6 +1208,20 @@ export class Git implements Disposable {
   archive(): ArchiveCommand {
     this.checkClosed();
     return new ArchiveCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a RemoteArchiveCommand (`git archive --remote`): an archive made by a remote's
+   * upload-archive (a local repository, git://, ssh).
+   *
+   * @example
+   * ```typescript
+   * const { archive } = await git.archiveRemote().setRemote("origin").addArguments("HEAD").call();
+   * ```
+   */
+  archiveRemote(): RemoteArchiveCommand {
+    this.checkClosed();
+    return new RemoteArchiveCommand(this._workingCopy);
   }
 
   /**
