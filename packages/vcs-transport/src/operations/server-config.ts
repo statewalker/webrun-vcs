@@ -99,6 +99,8 @@ export interface ServerConfigSettings {
   uploadPackRequestPolicy?: UploadPackRequestPolicy;
   /** `uploadpack.allowRefInWant` (git's default: false) */
   allowRefInWant?: boolean;
+  /** `uploadpack.allowSidebandAll` (git's default: false) */
+  allowSidebandAll?: boolean;
   /** `transfer.advertiseSID` (git's default: false) */
   advertiseSID?: boolean;
   /**
@@ -423,6 +425,8 @@ export function explicitServerSettingsFromConfig(
   if (wantPolicy !== undefined) out.uploadPackRequestPolicy = wantPolicy;
   const refInWant = last(config, "uploadpack.allowRefInWant");
   if (refInWant !== undefined) out.allowRefInWant = configBool(refInWant, false);
+  const sidebandAll = last(config, "uploadpack.allowSidebandAll");
+  if (sidebandAll !== undefined) out.allowSidebandAll = configBool(sidebandAll, false);
   const sid = last(config, "transfer.advertiseSID");
   if (sid !== undefined) out.advertiseSID = configBool(sid, false);
   // uploadpack.packObjectsHook is never read here: git takes it only from protected config
