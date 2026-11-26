@@ -87,13 +87,6 @@ export interface ServedRepository {
    */
   uploadArchive?: UploadArchiveWriter;
   /**
-   * Runs around the serving of one request (`serve`), for what the repository's owner
-   * installs for its duration: the repository's reference-transaction hook while
-   * receive-pack updates its refs (`servedRepositoryOf`). `context` tells what the server
-   * knows of the client: an HTTP request's user and address (the variables git's
-   * http-backend hands its children, the hooks included)
-   */
-  /**
    * The path the repository was found at (git's `enter_repo` result: the base path or
    * interpolated directory plus the suffix that matched), as git-daemon's `--access-hook` is
    * told it; `createBasePathResolver` sets it
@@ -101,6 +94,13 @@ export interface ServedRepository {
   path?: string;
   /** Its git directory (a gitfile followed), where git-daemon runs the access hook */
   gitDir?: string;
+  /**
+   * Runs around the serving of one request (`serve`), for what the repository's owner
+   * installs for its duration: the repository's reference-transaction hook while
+   * receive-pack updates its refs (`servedRepositoryOf`). `context` tells what the server
+   * knows of the client: an HTTP request's user and address (the variables git's
+   * http-backend hands its children, the hooks included)
+   */
   around?<T>(
     service: "git-upload-pack" | "git-receive-pack",
     serve: () => Promise<T>,
