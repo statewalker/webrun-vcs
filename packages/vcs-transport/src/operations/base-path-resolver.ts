@@ -21,6 +21,7 @@
  */
 
 import type { FilesApi, PosixFilesApi } from "@statewalker/vcs-utils/files";
+import { type DaemonHostLookup, daemonHostInfo, expandInterpolatedPath } from "./daemon-host.js";
 import {
   type GitServiceRequest,
   isUnsafeServicePath,
@@ -71,6 +72,32 @@ export interface BasePathResolverOptions {
    * `strictPaths`) a path below one. Default: every directory inside the base
    */
   whitelist?: readonly string[];
+  /**
+   * git-daemon's `--interpolated-path`: for a request with extended arguments (`host=`, as
+   * every git client sends), the directory is this template expanded (`%H` the host name,
+   * `%CH` its canonical name, `%IP` its address, `%P` the port, `%D` the absolute path asked
+   * for, `%%` a percent sign) instead of the path below `basePath`; a relative path is
+   * refused then. Unlike git-daemon, the expansion is a path in `files` that must stay
+   * inside `basePath` (and the whitelist): a host name cannot lead out of it
+   */
+  interpolatedPath?: string;
+  /**
+   * Resolves a `host=` name for `%CH` and `%IP` (git-daemon's `getaddrinfo`); default
+   * `lookupLiteralHost` (an IPv4 literal is its own address, nothing else resolves)
+   */
+  lookupHost?: DaemonHostLookup;
+}
+
+/**
+ * Thrown by {@link createBasePathResolver} for a repository found but not exported (no
+ * `git-daemon-export-ok`): git-daemon's "repository not exported", which its informative
+ * errors tell from "no such repository"
+ */
+export class RepositoryNotExportedError extends Error {
+  constructor(readonly gitDir: string) {
+    super(`'${gitDir}': repository not exported.`);
+    this.name = "RepositoryNotExportedError";
+  }
 }
 
 /** Most symbolic links followed while resolving one path (as the kernel's ELOOP). */
@@ -195,6 +222,8 @@ async function readGitfile(files: FilesApi, file: string): Promise<string | unde
  * - `~user[/path]` read below `userPath(user)`, refused without that option or with an empty
  *   user (`~`, `~/x`: `userPath` is never asked for "");
  * - an empty path refused (it would name the base itself);
+ * - with `interpolatedPath` and a `host=` in the request, an absolute path mapped through
+ *   the template (a relative one refused), the result checked to stay inside `basePath`;
  * - any other path read below `basePath` (an implicit session's relative path too, as if
  *   absolute);
  * - unless `strictPaths`, trailing slashes dropped and the first git directory of
@@ -205,7 +234,10 @@ async function readGitfile(files: FilesApi, file: string): Promise<string | unde
  *   followed where `files` can read them.
  *
  * Undefined (not served) whenever a rule refuses; `serveGitService` then answers as for a
- * missing repository.
+ * missing repository. A repository found but not exported throws
+ * {@link RepositoryNotExportedError} (git-daemon's informative "repository not exported").
+ * The repository served carries the path it was found at (`path`, git's `enter_repo`
+ * result: what `--access-hook` is told) and its git directory (`gitDir`).
  */
 export function createBasePathResolver(
   options: BasePathResolverOptions,
@@ -228,6 +260,21 @@ export function createBasePathResolver(
       if (home === undefined) return undefined;
       root = normalize(home);
       dir = `${root}${slash < 0 ? "" : path.slice(slash)}`;
+    } else if (options.interpolatedPath !== undefined && request.extendedArgs) {
+      // path_ok: "Non-absolute path denied (interpolated-path active)"
+      if (!path.startsWith("/")) return undefined;
+      const template = options.interpolatedPath;
+      const info =
+        template.includes("%CH") || template.includes("%IP")
+          ? await daemonHostInfo(request.host, options.lookupHost)
+          : undefined;
+      root = base;
+      dir = expandInterpolatedPath(template, {
+        hostname: request.host ?? "",
+        port: request.port ?? "",
+        directory: path,
+        ...info,
+      });
     } else {
       root = base;
       dir = `${base}/${path}`;
@@ -288,8 +335,9 @@ export function createBasePathResolver(
     }
     if (!options.exportAll) {
       const ok = await files.stats(`${gitDir}/git-daemon-export-ok`).catch(() => undefined);
-      if (!ok) return undefined;
+      if (!ok) throw new RepositoryNotExportedError(gitDir);
     }
-    return options.openRepository(gitDir, request);
+    const served = await options.openRepository(gitDir, request);
+    return served && { ...served, path: found, gitDir };
   };
 }
