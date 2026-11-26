@@ -135,6 +135,8 @@ import {
   StashBranchCommand,
   StashCreateCommand,
   StashDropCommand,
+  StashExportCommand,
+  StashImportCommand,
   StashListCommand,
   StashPopCommand,
   StashShowCommand,
@@ -2614,6 +2616,34 @@ export class Git implements Disposable {
   stashStore(): StashStoreCommand {
     this.checkClosed();
     return new StashStoreCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a StashExportCommand: `git stash export` (git 2.51+), the stashes written as a
+   * chain of commits that any transport carries, its tip printed or written to a ref.
+   *
+   * @example
+   * ```typescript
+   * await git.stashExport().setToRef("refs/heads/stashes").call();
+   * ```
+   */
+  stashExport(): StashExportCommand {
+    this.checkClosed();
+    return new StashExportCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a StashImportCommand: `git stash import` (git 2.51+), the stashes of an exported
+   * chain added to `refs/stash`.
+   *
+   * @example
+   * ```typescript
+   * await git.stashImport().setCommit("refs/heads/stashes").call();
+   * ```
+   */
+  stashImport(): StashImportCommand {
+    this.checkClosed();
+    return new StashImportCommand(this._workingCopy);
   }
 
   // ============ Component Access ============

@@ -166,6 +166,7 @@ export * from "./stash-apply-command.js";
 export * from "./stash-branch-command.js";
 export * from "./stash-create-command.js";
 export * from "./stash-drop-command.js";
+export * from "./stash-export-command.js";
 export * from "./stash-info.js";
 export * from "./stash-list-command.js";
 export * from "./stash-pop-command.js";
