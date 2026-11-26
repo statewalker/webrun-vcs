@@ -67,7 +67,7 @@ function commitBody(raw: string): string | undefined {
   return at < 0 ? undefined : raw.slice(at + 2);
 }
 
-function error(message: string, exitCode = 1): GitApiError {
+function error(message: string, exitCode = 128): GitApiError {
   return new GitApiError(message).withExitCode(exitCode);
 }
 
@@ -146,7 +146,7 @@ abstract class StashChainCommand<T> extends StashInfoCommand<T> {
  * (`--to-ref`, no reflog message). `git stash import` reads the chain back.
  *
  * As git: `error: exactly one of --print and --to-ref is required`, `error: unable to find
- * stash entry <stash>`, `error: <revision> does not look like a stash commit` (exit 1); a
+ * stash entry <stash>`, `error: <revision> does not look like a stash commit` (exit 128 as git 2.56; 2.51-2.55 exit 1); a
  * `refs/stash` entry that is no stash stops the export with exit 0 and nothing written
  * (`StashExportResult.errors`). Under `setCompatibility("2.43")` it refuses as git 2.43, which
  * has no such subcommand.
@@ -296,7 +296,7 @@ export class StashExportCommand extends StashChainCommand<StashExportResult> {
  * the chain's tip becomes `stash@{0}`; the entries already there stay below), as
  * builtin/stash.c's do_import_stash adds them.
  *
- * The whole chain is checked before anything is stored, with git's messages (exit 1):
+ * The whole chain is checked before anything is stored, with git's messages (exit 128 as git 2.56; 2.51-2.55 exit 1):
  * `not a valid revision: <rev>`, `not a commit: <rev>`, `<id> is not a valid exported stash
  * commit` (a tree other than the empty one, or neither none nor two parents), `found stash
  * commit <id> without expected prefix`, `<id> does not look like a stash commit`, `found root
