@@ -103,6 +103,7 @@ export async function refreshFsmonitor(
     if (done && done.owner === options.owner) return done.run;
   }
   const nanotime = options.nanotime ?? (() => BigInt(Date.now()) * 1_000_000n);
+  const added = !state;
   if (!state) {
     // add_fsmonitor: a V1-like token for now, every entry dirty, the index changed
     state = new FsmonitorState(String(nanotime()));
@@ -112,7 +113,7 @@ export async function refreshFsmonitor(
   const run: FsmonitorRun = { state, untrackedPaths: [], warnings: [] };
   runs.set(state, { owner: options.owner, run });
   state.hasRun = true;
-  await refresh(run, mode, options, nanotime);
+  await refresh(run, mode, options, nanotime, added);
   // the untracked cache in memory loses the reported directories (refresh_fsmonitor's
   // untracked_cache_invalidate_trimmed_path), carried by whatever writes the index next:
   // the new token must never be written beside directories the monitor reported
@@ -154,6 +155,7 @@ async function refresh(
   mode: Exclude<FsmonitorMode, { kind: "disabled" }>,
   options: RefreshFsmonitorOptions,
   nanotime: () => bigint,
+  added: boolean,
 ): Promise<void> {
   const { state } = run;
   let result: Uint8Array | undefined;
@@ -161,7 +163,8 @@ async function refresh(
   let bol = 0;
   let trivial = false;
   if (mode.kind === "ipc") {
-    result = await ask(options, { mode: "ipc", token: state.token });
+    // add_fsmonitor leaves no token: the daemon is asked since "builtin:fake"
+    result = await ask(options, { mode: "ipc", token: added ? "builtin:fake" : state.token });
     if (result) {
       token = cString(result, 0);
       bol = token.length + 1;

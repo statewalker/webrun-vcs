@@ -974,6 +974,9 @@ importers:
       '@statewalker/vcs-working-tree':
         specifier: workspace:^
         version: link:../vcs-working-tree
+      '@statewalker/webrun-rpc':
+        specifier: 'catalog:'
+        version: 0.15.2
     devDependencies:
       '@statewalker/vcs-store-kv':
         specifier: workspace:^
@@ -990,9 +993,6 @@ importers:
       '@statewalker/vcs-utils-node':
         specifier: workspace:^
         version: link:../vcs-utils-node
-      '@statewalker/webrun-rpc':
-        specifier: 'catalog:'
-        version: 0.15.2
       '@types/node':
         specifier: 'catalog:'
         version: 26.6.4
@@ -1482,6 +1482,9 @@ importers:
       '@statewalker/webrun-files-node':
         specifier: 'catalog:'
         version: 0.12.0
+      '@statewalker/webrun-rpc':
+        specifier: 'catalog:'
+        version: 0.15.2
     devDependencies:
       '@types/node':
         specifier: 'catalog:'

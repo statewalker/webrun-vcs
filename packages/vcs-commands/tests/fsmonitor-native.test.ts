@@ -33,9 +33,14 @@ import {
   parseFsmonitorExtension,
   parseIndexFile,
 } from "@statewalker/vcs-working-tree";
+import { serveDuplexOverPort } from "@statewalker/webrun-rpc";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-
-import { formatStatusPorcelain, type UpdateIndexCommand } from "../src/index.js";
+import {
+  encodePacketized,
+  formatStatusPorcelain,
+  queryFsmonitorDaemon,
+  type UpdateIndexCommand,
+} from "../src/index.js";
 import { nativeIs25x } from "./hooks-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
@@ -269,6 +274,71 @@ async function updateIndexTwins(
   writeFileSync(indexPath(), nativeIndex);
   return { native, nativeIndex, oursIndex };
 }
+
+/**
+ * A fake builtin daemon on `MessageChannel`s (no socket): each port opened is served one
+ * simple-ipc exchange, the request's token recorded and `answer(token)` sent back as
+ * pkt-lines and a flush (or `undefined`: the daemon hangs up before answering).
+ */
+function fakeDaemon(answer: (token: string) => Uint8Array | undefined) {
+  const tokens: string[] = [];
+  const paths: string[] = [];
+  const open = async (request: { path: string }) => {
+    paths.push(request.path);
+    const { port1, port2 } = new MessageChannel();
+    serveDuplexOverPort(port1, (input) =>
+      (async function* () {
+        let buffered = Buffer.alloc(0);
+        let token = "";
+        const reader = (input as AsyncIterable<Uint8Array>)[Symbol.asyncIterator]();
+        outer: for (;;) {
+          while (buffered.length >= 4) {
+            const length = Number.parseInt(buffered.subarray(0, 4).toString(), 16);
+            if (length === 0) break outer;
+            if (buffered.length < length) break;
+            token += buffered.subarray(4, length).toString();
+            buffered = buffered.subarray(length);
+          }
+          const next = await reader.next();
+          if (next.done) return;
+          buffered = Buffer.concat([buffered, next.value]);
+        }
+        tokens.push(token);
+        const bytes = answer(token);
+        if (bytes) yield encodePacketized(bytes);
+      })(),
+    );
+    port1.start();
+    return port2;
+  };
+  return { tokens, paths, open };
+}
+
+/** Our host with `core.fsmonitor=true` on its command line and `openIpcPort` replaced. */
+function ipcHost(openIpcPort: GitHostEnvironment["openIpcPort"]): GitHostEnvironment {
+  const e = env();
+  const n = Number(e.GIT_CONFIG_COUNT ?? 0);
+  const withIpc = {
+    ...e,
+    GIT_CONFIG_COUNT: String(n + 1),
+    [`GIT_CONFIG_KEY_${n}`]: "core.fsmonitor",
+    [`GIT_CONFIG_VALUE_${n}`]: "true",
+  };
+  return {
+    ...createNodeGitHostEnvironment({
+      env: withIpc,
+      hookRunner: createNodeHookRunner({
+        env: withIpc,
+        compatibility: nativeIs25x ? "2.56" : "2.43",
+      }),
+    }),
+    ...(openIpcPort ? { openIpcPort } : {}),
+  };
+}
+
+const INTEGRATION_ANSWER = new TextEncoder().encode(
+  "last_update_token\0untracked\0dir1/untracked\0dir2/untracked\0modified\0dir1/modified\0dir2/modified\0new\0dir1/new\0dir2/new\0",
+);
 
 /** The full-scan status native git prints without the monitor. */
 const withoutMonitor = () => git(["-c", "core.fsmonitor=", "status", "--porcelain"]);
@@ -722,4 +792,95 @@ describeGit("fsmonitor against native git (t7519-status-fsmonitor.sh)", () => {
       }),
     });
   });
+  it("the builtin daemon over a MessageChannel answers as the version 2 hook does", async () => {
+    // native git runs t7519's integration hook; ours asks a fake daemon giving its bytes
+    hook(INTEGRATION);
+    cleanRepo();
+    dirtyRepo();
+    const daemon = fakeDaemon(() => INTEGRATION_ANSWER);
+    const first = await statusTwins({ host: ipcHost(daemon.open) });
+    expect((await fsmnOf(first.oursIndex))?.token).toBe("last_update_token");
+    await statusTwins({ keep: "ours", host: ipcHost(daemon.open) });
+    // add_fsmonitor leaves no token: git asks since builtin:fake, then since the answer's
+    expect(daemon.tokens).toEqual(["builtin:fake", "last_update_token"]);
+    expect(daemon.paths).toEqual([
+      `${dir}/.git/fsmonitor--daemon.ipc`,
+      `${dir}/.git/fsmonitor--daemon.ipc`,
+    ]);
+  });
+
+  it("a daemon that hangs up, or none, is a failed query: the token builtin:fake", async () => {
+    hook(INTEGRATION);
+    cleanRepo();
+    dirtyRepo();
+    for (const open of [
+      fakeDaemon(() => undefined).open,
+      async () => {
+        throw new Error("ENOENT");
+      },
+      undefined,
+    ]) {
+      const status = await (await openOurs(dir, ipcHost(open))).status().call();
+      // read before native git's status without the monitor rewrites the index
+      expect((await fsmnOf(readFileSync(indexPath())))?.token).toBe("builtin:fake");
+      expect(formatStatusPorcelain(status)).toBe(withoutMonitor());
+    }
+  });
+
+  it("queryFsmonitorDaemon sends a long token in several pkt-lines", async () => {
+    const token = "t".repeat(70_000);
+    const daemon = fakeDaemon((t) => new TextEncoder().encode(`${t.length}\0`));
+    const port = await daemon.open({ path: "x" });
+    const answer = await queryFsmonitorDaemon(port, token);
+    expect(new TextDecoder().decode(answer)).toBe("70000\0");
+    expect(daemon.tokens).toEqual([token]);
+    // two pkt-lines (65516 bytes, then the rest) and a flush
+    const encoded = encodePacketized(new TextEncoder().encode(token));
+    expect(encoded.length).toBe(70_000 + 4 + 4 + 4);
+    expect(Buffer.from(encoded.subarray(0, 4)).toString()).toBe("fff0");
+  });
+
+  it("update-index --fsmonitor-valid sets a gitlink's bit too (written as not dirty)", async () => {
+    hook(NOTHING);
+    const sub = "0123456789abcdef0123456789abcdef01234567";
+    git(["update-index", "--add", "--cacheinfo", `160000,${sub},sub`]);
+    await updateIndexTwins(["--fsmonitor"], (c) => c.setFsmonitor(true));
+    await updateIndexTwins(["--fsmonitor-valid", "sub"], (c) =>
+      c.setFsmonitorValid(true).addPath("sub"),
+    );
+  });
+
+  // git 2.5x on Linux: the real daemon, through the Node socket adapter
+  it.runIf(nativeHasDaemon)(
+    "core.fsmonitor=true asks git's fsmonitor--daemon through a socket port",
+    async () => {
+      git(["config", "core.fsmonitor", "true"]);
+      git(["fsmonitor--daemon", "start"]);
+      try {
+        git(["status", "--porcelain"]);
+        // the default Node host: openIpcPort is connectSocketPort
+        let status = await (await openOurs(dir, host())).status().call();
+        // the token read before native git's status without the monitor rewrites the index
+        const token = (await fsmnOf(readFileSync(indexPath())))?.token ?? "";
+        expect(token).toMatch(/^builtin:/);
+        expect(token).not.toBe("builtin:fake");
+        expect(formatStatusPorcelain(status)).toBe(withoutMonitor());
+        // a change the daemon sees (its cookie file orders the answer after it)
+        put("modified", "changed\n");
+        put("dir1/untracked", "");
+        status = await (await openOurs(dir, host())).status().call();
+        const next = (await fsmnOf(readFileSync(indexPath())))?.token ?? "";
+        expect(next).toMatch(/^builtin:/);
+        expect(next).not.toBe("builtin:fake");
+        // native git through the daemon from our index, then a full scan: all agree
+        const nativeOut = git(["status", "--porcelain"]);
+        const expected = withoutMonitor();
+        expect(expected).toContain(" M modified");
+        expect(formatStatusPorcelain(status)).toBe(expected);
+        expect(nativeOut).toBe(expected);
+      } finally {
+        spawnSync("git", ["fsmonitor--daemon", "stop"], { cwd: dir, env: env() });
+      }
+    },
+  );
 });
