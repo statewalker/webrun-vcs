@@ -361,7 +361,7 @@ export class UpdateIndexCommand extends GitCommand<UpdateIndexResult> {
         );
       }
     }
-    await this.readCurrentIndex();
+    await this.readCurrentIndex(true, false);
     // tweak_fsmonitor on the index read: the monitor asked, the extension added or removed
     const hadFsmonitor = !!this.staging.getFsmonitor?.();
     const fsm = await this.fsmonitorRefresh(this.staging);

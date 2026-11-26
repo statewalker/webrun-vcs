@@ -90,7 +90,13 @@ import { globalPathspecMagic } from "./pathspec.js";
 import { PathspecFile } from "./pathspec-file.js";
 import { markIndexUpdate } from "./post-index-change.js";
 import { reflogMessages } from "./reflog-messages.js";
-import { checkFlaggedEntries, recordWrittenStat, restoreWorktreeHard } from "./reset-command.js";
+import {
+  checkFlaggedEntries,
+  fsmonitorKeptEntries,
+  recordWrittenStat,
+  restoreKeptEntries,
+  restoreWorktreeHard,
+} from "./reset-command.js";
 import { removeBranchState } from "./sequencer-support.js";
 import { pushSparseWarnings, SparseUnpack } from "./sparse-checkout-support.js";
 import { StashApplyCommand } from "./stash-apply-command.js";
@@ -974,7 +980,12 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       treeId,
       sparse,
     );
+    // oneway_merge: what the file system monitor holds unchanged is neither stat'ed nor written
+    const fsmKept = worktree
+      ? await fsmonitorKeptEntries(this.trees, this.staging, treeId)
+      : new Map<string, StagingEntry>();
     await this.staging.readTree(this.trees, treeId, { keepMatching: "flags" });
+    await restoreKeptEntries(this.staging, fsmKept);
     // reset_head's prime_cache_tree: the index is HEAD's tree
     this.staging.setCacheTree?.(await cacheTreeOfTree(this.trees, treeId));
     markIndexUpdate(this.staging, { workdir: true });
@@ -986,6 +997,8 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         trackedBefore,
         keptOut,
         sparse,
+        undefined,
+        new Set(fsmKept.keys()),
       );
       // check_updates: the entries written carry the stat of their new files
       await recordWrittenStat(this.staging, worktree, written);
@@ -1188,6 +1201,12 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     });
     const quiet = (path: string) => sparse?.leavesAlone(path) === true;
     const writes = (path: string) => !sparse || sparse.writes(path);
+    // checkout -f's oneway_merge: an entry the file system monitor holds unchanged and the
+    // target keeps is neither stat'ed nor written, and stays in the index as it is
+    const fsmKept =
+      this.force && targetTreeId && this.worktreeAccess
+        ? await fsmonitorKeptEntries(this.trees, this.staging, targetTreeId)
+        : new Map<string, StagingEntry>();
     // --recurse-submodules: unpack-trees' submodule checks and moves (forced: o->reset)
     const subs = this.worktreeAccess
       ? await SubmoduleUnpack.start(this.workingCopy, {
@@ -1272,6 +1291,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         if ((i as { skipWorktree?: boolean } | undefined)?.skipWorktree && sameSide(i, t)) {
           continue;
         }
+        if (fsmKept.has(path) && sameSide(i, t)) continue;
         if (quiet(path)) continue;
         // merged_entry's submodule check (FORCE): the submodule must be able to move
         if (subs && t && !sameSide(i, t)) await subs.mergedRefuses(path, i, t);
@@ -1573,6 +1593,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       // oneway_merge: an unchanged entry keeps its flags and stat, a changed one its
       // skip-worktree bit
       await this.staging.readTree(this.trees as any, targetTreeId, { keepMatching: "flags" });
+      await restoreKeptEntries(this.staging, fsmKept);
       // check_updates: the entries written carry the stat of their new files
       if (worktree) await recordWrittenStat(this.staging, worktree, written);
       await this.writeSwitchedIndex();

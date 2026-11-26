@@ -438,9 +438,14 @@ export class ResetCommand extends GitCommand<Ref> {
     // --hard: unpack-trees' one-way merge checks the entries whose flags cheat (assume-unchanged,
     // skip-worktree) before anything changes; a file kept outside the worktree stays so
     let flagged: FlaggedEntries | undefined;
+    let fsmKept: Map<string, StagingEntry> | undefined;
     if (this.mode === ResetMode.HARD) {
       const commit = await this.commits.load(targetId);
       if (commit) {
+        // oneway_merge: what the file system monitor holds unchanged is not even lstat'ed
+        if (this.worktreeAccess) {
+          fsmKept = await fsmonitorKeptEntries(this.trees, this.staging, commit.tree);
+        }
         flagged = await checkFlaggedEntries(
           {
             trees: this.trees,
@@ -508,7 +513,7 @@ export class ResetCommand extends GitCommand<Ref> {
         this.staging,
         this.mode === ResetMode.HARD ? { workdir: true } : { skipWorktree: true },
       );
-      await this.resetStaging(targetId);
+      await this.resetStaging(targetId, fsmKept);
     }
     // a mixed reset refreshes the index and lists what is left unstaged
     if (this.mode === ResetMode.MIXED && (await this.refreshAfterReset())) {
@@ -523,6 +528,7 @@ export class ResetCommand extends GitCommand<Ref> {
         flagged?.keptOut,
         sparse,
         submodules && { unpack: submodules, oldIndex },
+        fsmKept && new Set(fsmKept.keys()),
       );
       // check_updates: the entries written carry the stat of their new files
       if (this.worktreeAccess && written.size > 0) {
@@ -820,6 +826,7 @@ export class ResetCommand extends GitCommand<Ref> {
     keptOut?: ReadonlySet<string>,
     sparse?: SparseUnpack,
     submodules?: HardResetSubmodules,
+    unchanged?: ReadonlySet<string>,
   ): Promise<Set<string>> {
     const worktree = this.worktreeAccess;
     if (!worktree) {
@@ -838,19 +845,25 @@ export class ResetCommand extends GitCommand<Ref> {
       keptOut,
       sparse,
       submodules,
+      unchanged,
     );
   }
 
   /**
    * Reset staging area to match a tree.
    */
-  private async resetStaging(commitId: ObjectId): Promise<void> {
+  private async resetStaging(
+    commitId: ObjectId,
+    kept?: ReadonlyMap<string, StagingEntry>,
+  ): Promise<void> {
     const commit = await this.commits.load(commitId);
     if (commit) {
       if (this.mode !== ResetMode.MIXED) {
         // oneway_merge: an unchanged entry keeps its flags, a changed one its skip-worktree
         // bit (the stat data goes: every file is written again)
         await this.staging.readTree(this.trees, commit.tree, { keepMatching: "flags" });
+        // an entry the file system monitor holds unchanged stays whole (oneway_merge)
+        if (kept) await restoreKeptEntries(this.staging, kept);
         await this.primeCacheTree(commit.tree);
         await this.staging.write();
         return;
@@ -934,6 +947,8 @@ export async function restoreWorktreeHard(
   keptOut?: ReadonlySet<string>,
   sparse?: SparseUnpack,
   submodules?: HardResetSubmodules,
+  /** Entries oneway_merge leaves alone (fsmonitor-valid and unchanged: `fsmonitorKeptEntries`) */
+  unchanged?: ReadonlySet<string>,
 ): Promise<Set<string>> {
   const { trees, blobs, workingCopy, worktree } = deps;
   const subs = submodules?.unpack;
@@ -952,11 +967,15 @@ export async function restoreWorktreeHard(
   // a skip-worktree entry the tree keeps is not checked out (oneway_merge skips it); in a
   // sparse checkout, nothing outside its patterns is (apply_sparse_checkout), and an entry
   // coming back into them is written
-  const skip = sparse
+  const outside = sparse
     ? (path: string) => !sparse.writes(path)
     : keptOut && keptOut.size > 0
       ? (path: string) => keptOut.has(path)
       : undefined;
+  const skip =
+    unchanged && unchanged.size > 0
+      ? (path: string) => unchanged.has(path) || !!outside?.(path)
+      : outside;
   const plan = skip
     ? {
         ...fullPlan,
@@ -1048,6 +1067,59 @@ export async function recordWrittenStat(
     });
   }
   if (edits > 0) await editor.finish();
+}
+
+/**
+ * unpack-trees' `oneway_merge` under a reset (`reset --hard`, `checkout -f`): a stage-0 entry
+ * the target keeps unchanged and the file system monitor holds valid (`CE_FSMONITOR_VALID`)
+ * is neither lstat'ed nor written, and stays in the index as it is, bit and stat included.
+ * Only an entry the monitor was asked about in this command, and reported nothing for, is
+ * held valid (`FsmonitorState.isValid`: exactly as marked); gitlinks and skip-worktree
+ * entries never are here. The entries by path, empty when the monitor is off.
+ */
+export async function fsmonitorKeptEntries(
+  trees: CommandTrees,
+  staging: Staging,
+  treeId: ObjectId,
+): Promise<Map<string, StagingEntry>> {
+  const kept = new Map<string, StagingEntry>();
+  const state = staging.getFsmonitor?.();
+  if (!state?.hasRun) return kept;
+  let target: Awaited<ReturnType<typeof flatTree>> | undefined;
+  for await (const entry of staging.entries()) {
+    if (entry.stage !== 0 || entry.mode === FileMode.GITLINK) continue;
+    if (entry.skipWorktree || entry.intentToAdd || !state.isValid(entry)) continue;
+    target ??= await flatTree(trees, treeId);
+    const t = target.get(entry.path);
+    if (t && t.mode === entry.mode && t.objectId === entry.objectId) kept.set(entry.path, entry);
+  }
+  return kept;
+}
+
+/**
+ * After a one-way reset read the target into the index: the entries `oneway_merge` kept
+ * (`fsmonitorKeptEntries`) put back exactly as they were (`add_entry` of the old entry), so
+ * their stat and fsmonitor bit survive. Not written here.
+ */
+export async function restoreKeptEntries(
+  staging: Staging,
+  kept: ReadonlyMap<string, StagingEntry>,
+): Promise<void> {
+  if (kept.size === 0) return;
+  const editor = staging.createEditor();
+  for (const old of kept.values()) {
+    editor.add({
+      path: old.path,
+      apply: (existing) =>
+        existing &&
+        existing.stage === 0 &&
+        existing.mode === old.mode &&
+        existing.objectId === old.objectId
+          ? old
+          : existing,
+    });
+  }
+  await editor.finish();
 }
 
 /** What {@link checkFlaggedEntries} found. */

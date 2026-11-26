@@ -735,6 +735,7 @@ export class IndexFile {
     }
     let extensions = others;
     let sparseDirs: string[] | undefined;
+    let sparseFsmonitor: FsmonitorState | undefined;
     if (sparse && this.options.keepSparseDirectories) {
       sparseDirs = entries.filter(isSparseDirectoryEntry).map((e) => e.path);
       for (const e of entries) if (!isSparseDirectoryEntry(e)) validateIndexEntryPaths([e]);
@@ -764,10 +765,16 @@ export class IndexFile {
         cacheTree = undefined;
       }
       sparseDirs = entries.filter(isSparseDirectoryEntry).map((e) => e.path);
+      // the bitmap's positions are the sparse index's: its bits are held for the entries as
+      // read, a sparse directory's for the directory entry itself (the entries it expands
+      // into are dirty, as ensure_full_index's new entries); a sparse write gives them back
+      const sparseFsm = fsmonitorData
+        ? parseFsmonitorExtension(fsmonitorData, entries.length)
+        : undefined;
+      sparseFsmonitor = sparseFsm ? FsmonitorState.fromExtension(sparseFsm, entries) : undefined;
+      fsmonitorData = undefined;
       const full = await expandSparseIndex(entries, cacheTree, trees);
       entries = full.entries;
-      // the bitmap names the sparse index's entries: dropped (every entry dirty again)
-      fsmonitorData = undefined;
       extensions = others.filter((e) => e.signature !== "TREE");
       if (full.cacheTree) {
         extensions = [
@@ -779,7 +786,7 @@ export class IndexFile {
     if (linkData || sparse) validateIndexEntryPaths(entries);
     // tweak_fsmonitor: the bitmap's positions are the merged index's (post_read_index_from)
     const fsm = fsmonitorData ? parseFsmonitorExtension(fsmonitorData, entries.length) : undefined;
-    const fsmonitor = fsm ? FsmonitorState.fromExtension(fsm, entries) : undefined;
+    const fsmonitor = fsm ? FsmonitorState.fromExtension(fsm, entries) : sparseFsmonitor;
     return { entries, version: parsed.version, extensions, encoding, split, sparseDirs, fsmonitor };
   }
 
@@ -972,14 +979,7 @@ export class IndexFile {
         },
       );
       if (kept && (await sparseIndexMatches(kept.entries, entries, trees, this.format))) {
-        return this.sparsePlan(
-          kept.entries,
-          kept.cacheTree,
-          tree,
-          rest,
-          version,
-          settings.skipHash,
-        );
+        return this.sparsePlan(kept.entries, kept.cacheTree, tree, rest, version, settings);
       }
     }
     let fromIndex = true;
@@ -998,14 +998,7 @@ export class IndexFile {
       if (!(await sparseIndexMatches(collapsed.entries, entries, trees, this.format)))
         return undefined;
     }
-    return this.sparsePlan(
-      collapsed.entries,
-      collapsed.cacheTree,
-      tree,
-      rest,
-      version,
-      settings.skipHash,
-    );
+    return this.sparsePlan(collapsed.entries, collapsed.cacheTree, tree, rest, version, settings);
   }
 
   /** The bytes of a sparse index: its entries, its cache-tree, the other extensions, `sdir`. */
@@ -1015,13 +1008,18 @@ export class IndexFile {
     fullTree: CacheTree | undefined,
     rest: IndexExtension[],
     version: IndexVersion,
-    skipHash?: boolean,
+    settings: IndexSettings,
   ): Promise<IndexWritePlan> {
+    const skipHash = settings.skipHash;
+    // the FSMN bitmap over the sparse entries (git keeps it collapsed: t7519, t1092)
+    const fsmonitor = this.fsmonitorExtension(sparseEntries, settings);
     const onDisk: IndexExtension[] = [
       ...(sparseTree
         ? [{ signature: "TREE", data: encodeCacheTree(sparseTree, this.rawLength) }]
         : []),
       ...rest,
+      // do_write_index's order: FSMN, then sdir
+      ...(fsmonitor ? [fsmonitor] : []),
       { signature: SPARSE_DIRECTORIES_EXTENSION, data: new Uint8Array(0) },
     ];
     const { bytes, checksum, encoding } = await encodeIndexFileBytes(
