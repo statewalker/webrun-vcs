@@ -62,6 +62,7 @@ import {
   worktreeModeTrust,
 } from "./commands/core-config.js";
 import type { ForkPointSource } from "./commands/fork-point.js";
+import { FSMONITOR_DAEMON_IPC_NAME, queryFsmonitorDaemon } from "./commands/fsmonitor-ipc.js";
 import { type FsmonitorRun, refreshFsmonitor } from "./commands/fsmonitor-refresh.js";
 import { type HookHost, HookSession, refTransactionHookOf } from "./commands/git-hooks.js";
 import {
@@ -463,7 +464,19 @@ export abstract class GitCommand<T> {
       ignoreCase: parseGitBool(config.value("core.ignorecase")) === true,
       query: async (query) => {
         if (environment?.fsmonitor) return environment.fsmonitor.query(query);
-        if (query.mode !== "hook" || query.command === undefined) return undefined;
+        if (query.mode === "ipc") {
+          // the builtin daemon at <git dir>/fsmonitor--daemon.ipc, through the host's port
+          if (!environment?.openIpcPort) return undefined;
+          const gitDir = await this.hooks.hostGitDir({ real: false });
+          if (!gitDir) return undefined;
+          const port = await environment.openIpcPort({
+            service: "fsmonitor--daemon",
+            path: `${gitDir}/${FSMONITOR_DAEMON_IPC_NAME}`,
+          });
+          const stdout = await queryFsmonitorDaemon(port, query.token);
+          return stdout ? { exitCode: 0, stdout } : undefined;
+        }
+        if (query.command === undefined) return undefined;
         return this.hooks.runShellCommandBytes("fsmonitor", query.command, [
           String(query.version),
           query.token,

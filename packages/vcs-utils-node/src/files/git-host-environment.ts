@@ -14,6 +14,7 @@ import { NodeFilesApi } from "@statewalker/webrun-files-node";
 import type { NodeHookRunner } from "./node-hook-runner.js";
 import type { NodeSigner, NodeVerifier } from "./node-signer.js";
 import { PosixNodeFilesApi, realHostPath, statHostFile } from "./posix-node-files-api.js";
+import { connectSocketPort } from "./socket-message-port.js";
 
 /** Where the files are; each defaults to the process environment, as git reads it. */
 export interface NodeGitHostEnvironmentOptions {
@@ -153,6 +154,8 @@ export interface NodeGitHostEnvironment {
   notesRewriteMode?: string;
   pathspecs?: { literal?: string; glob?: string; noglob?: string; icase?: string };
   hookRunner?: NodeHookRunner;
+  /** Opens a simple-ipc endpoint (a Unix socket's path) as a port: `connectSocketPort` */
+  openIpcPort?: (request: { service: string; path: string }) => Promise<MessagePort>;
   signer?: NodeSigner;
   verifier?: NodeVerifier;
   effectiveUid?: number;
@@ -626,6 +629,8 @@ export function createNodeGitHostEnvironment(
     // the global pathspec magic, as given (git_env_bool reads them when a pathspec is parsed)
     ...(pathspecs ? { pathspecs } : {}),
     ...(options.hookRunner ? { hookRunner: options.hookRunner } : {}),
+    // simple-ipc endpoints (the fsmonitor daemon's socket) as MessagePorts
+    openIpcPort: (request) => connectSocketPort(request.path),
     ...(options.signer ? { signer: options.signer } : {}),
     ...(options.verifier ? { verifier: options.verifier } : {}),
     // the ownership checks (safe.directory): the effective uid, sudo's, git's test switch

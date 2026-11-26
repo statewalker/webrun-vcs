@@ -86,11 +86,14 @@ export class FsmonitorState {
   }
 
   /**
-   * git's `mark_fsmonitor_valid`: `entry` (as it is) is up to date; a gitlink never is.
+   * git's `mark_fsmonitor_valid`: `entry` (as it is) is up to date; a gitlink never is,
+   * unless `gitlinks` (update-index's `mark_ce_flags`).
    * Marks the index changed when the bit was not set.
    */
-  markValid(entry: StagingEntry): void {
-    if (entry.mode === GITLINK) return;
+  markValid(entry: StagingEntry, options: { gitlinks?: boolean } = {}): void {
+    // update-index --fsmonitor-valid sets the flag on any entry (mark_ce_flags): a gitlink's
+    // bit is then written as not dirty, and cleared again when the index is read
+    if (entry.mode === GITLINK && !options.gitlinks) return;
     if (this.isValid(entry)) return;
     this.valid.set(keyOf(entry), fingerprintOf(entry));
     this.changed = true;

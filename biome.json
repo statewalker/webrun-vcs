@@ -86,7 +86,8 @@
     {
       "includes": [
         "packages/vcs-utils-node/src/files/git-host-environment.ts",
-        "packages/vcs-utils-node/src/files/node-hook-runner.ts"
+        "packages/vcs-utils-node/src/files/node-hook-runner.ts",
+        "packages/vcs-utils-node/src/files/socket-message-port.ts"
       ],
       "linter": {
         "rules": {
