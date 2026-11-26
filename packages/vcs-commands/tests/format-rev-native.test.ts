@@ -5,7 +5,7 @@
  * `$GIT3`, each skipped when it has no `format-rev` (2.43).
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -204,6 +204,72 @@ function describeFormatRev(native: NativeGit) {
           await formatRev([`--stdin-mode=${mode}`, "--format=%s", "--null-output"], lf);
           // t6120-describe.sh: "format-rev -z --stdin-mode=$mode with multi-line output"
           await formatRev([`--stdin-mode=${mode}`, "--format=%s%n%h", "-z"], nul);
+        }
+      });
+
+      it("format-rev's builtin formats print pretty_print_commit without the commit line", async ({
+        skip,
+      }) => {
+        if (!available) skip();
+        // a history with a merge, a body with a tab and a "From " line, and non-ASCII text
+        const dir = join(shell.home, "repo-builtin");
+        shell.ok(shell.home, "init", "-q", "--object-format=sha1", dir);
+        shell.commit(dir, "base");
+        shell.ok(dir, "checkout", "-q", "-b", "side");
+        shell.commit(dir, "side");
+        shell.ok(dir, "checkout", "-q", "-");
+        shell.commit(dir, "main");
+        shell.tick();
+        shell.ok(dir, "merge", "-q", "--no-ff", "-m", "Merge side\n\n\tindented body", "side");
+        shell.tick();
+        shell.ok(
+          dir,
+          "commit",
+          "-q",
+          "--allow-empty",
+          "-m",
+          "Subject\n\nFrom here\nCaf\u00e9 body",
+        );
+        shell.tick();
+        shell.ok(dir, "commit", "-q", "--allow-empty", "-m", "only a subject");
+        // format-rev's fresh rev_info reads no log.* settings and its builtin formats map no
+        // idents, whatever the configuration and .mailmap say
+        shell.ok(dir, "config", "log.date", "relative");
+        shell.ok(dir, "config", "log.mailmap", "true");
+        shell.ok(dir, "config", "log.abbrevCommit", "true");
+        writeFileSync(
+          join(dir, ".mailmap"),
+          `Mapped Name <mapped@example.com> <${shell.ok(dir, "log", "-1", "--format=%ae").trim()}>\n`,
+        );
+        const revs = "HEAD\nHEAD~1\nHEAD~2\nHEAD~2^2\n";
+        const list = shell.ok(dir, "rev-list", "HEAD");
+        const previous = repo;
+        repo = dir;
+        try {
+          for (const format of [
+            "oneline",
+            "medium",
+            "short",
+            "full",
+            "fuller",
+            "raw",
+            "email",
+            "mboxrd",
+          ]) {
+            const out = await formatRev(["--stdin-mode=revs", `--format=${format}`], revs);
+            expect(out.status).toBe(0);
+            expect(out.stdout).not.toMatch(/^commit /m);
+            await formatRev(["--stdin-mode=text", `--format=${format}`], list);
+            await formatRev(
+              ["--stdin-mode=revs", `--format=${format}`, "-z"],
+              revs.replace(/\n/g, "\0"),
+            );
+          }
+          // a pretty.<name> alias naming a builtin format
+          shell.ok(dir, "config", "pretty.mine", "fuller");
+          await formatRev(["--stdin-mode=revs", "--format=mine"], revs);
+        } finally {
+          repo = previous;
         }
       });
 
