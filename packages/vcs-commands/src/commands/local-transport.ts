@@ -976,11 +976,13 @@ function scriptReceiveHooks(hooks: HookSession): ReceivePackHooks {
   // prepare_push_cert_sha1: the push certificate's variables for pre-receive, post-receive and
   // proc-receive (never update), computed when the first of them exists
   const certEnv = async (name: string, ctx: ReceivePackHookContext) => {
-    if (!ctx.pushCertificate || !(await hooks.exists(name))) return {};
+    if (!ctx.pushCertificate) return {};
     try {
+      if (!(await hooks.exists(name))) return {};
       return pushCertificateEnv(await ctx.pushCertificate());
     } catch (error) {
-      // check_signature dies on a signature of no known format (none at all)
+      // receive-pack dies: a broken hook.* configuration found looking the hook up, or
+      // check_signature on a signature of no known format (none at all)
       if (error instanceof GitApiError && error.message.startsWith("fatal: ")) {
         throw new ReceivePackDiedError(error.message.slice("fatal: ".length));
       }

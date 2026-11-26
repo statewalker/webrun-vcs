@@ -79,6 +79,8 @@ function hostEnvironment() {
  * The receiving hook: logs the push certificate variables (nonces as `<nonce>` once they have
  * git's shape), the certificate read back from its blob (date, nonce and pushee normalised),
  * whether its nonce is the one the hook is told, and its stdin; in `hooks.log` of the git dir.
+ * An ssh signature's lines are left out: ssh signs the certificate's date and nonce, which are
+ * the clock's.
  */
 const RECEIVE_HOOK = String.raw`#!/bin/sh
 n=$(basename "$0")
@@ -94,7 +96,8 @@ n=$(basename "$0")
     echo "GIT_PUSH_CERT is a blob: $(git cat-file -t "$GIT_PUSH_CERT")"
     if git cat-file blob "$GIT_PUSH_CERT" | grep -qx "nonce $GIT_PUSH_CERT_NONCE"; then echo "nonce told"; fi
     git cat-file blob "$GIT_PUSH_CERT" | sed -e 's/^\(pusher .*\) [0-9]* [-+][0-9]\{4\}$/\1 <date>/' \
-      -e 's/^nonce [1-9][0-9]*-[0-9a-f]\{40\}$/nonce <nonce>/' -e 's/^pushee .*/pushee <url>/'
+      -e 's/^nonce [1-9][0-9]*-[0-9a-f]\{40\}$/nonce <nonce>/' -e 's/^pushee .*/pushee <url>/' \
+      -e '/^-----BEGIN SSH SIGNATURE-----$/,/^-----END SSH SIGNATURE-----$/{/^-----/!d;}'
     echo "<end>"
   fi
   cat
