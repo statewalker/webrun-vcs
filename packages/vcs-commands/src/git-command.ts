@@ -456,7 +456,10 @@ export abstract class GitCommand<T> {
     return refreshFsmonitor({
       staging,
       owner: this,
-      config: (key) => config.value(key),
+      // fsm_settings: a bare repository is incompatible, the monitor off (tweak_fsmonitor
+      // then removes the extension)
+      config: (key) =>
+        key === "core.fsmonitor" && !this.hasWorktree() ? undefined : config.value(key),
       ignoreCase: parseGitBool(config.value("core.ignorecase")) === true,
       query: async (query) => {
         if (environment?.fsmonitor) return environment.fsmonitor.query(query);
@@ -467,6 +470,11 @@ export abstract class GitCommand<T> {
         ]);
       },
     });
+  }
+
+  /** Whether the working copy has a worktree (a bare repository's refuses to give one). */
+  protected hasWorktree(): boolean {
+    return "worktree" in this._workingCopy && !!this._workingCopy.worktree;
   }
 
   /**
