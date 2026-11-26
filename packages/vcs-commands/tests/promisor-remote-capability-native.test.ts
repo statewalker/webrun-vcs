@@ -439,6 +439,37 @@ describeGit("promisor-remote capability (t5710) against native git", () => {
         expect(t.native.config).toContain("blob:limit=8k");
       },
     );
+
+    it(`t5710-promisor-remote-capability.sh: "clone with 'KnownName' and missing URL in the config"`, async () => {
+      const t = await cloneTwins([
+        "remote.lop.promisor=true",
+        "promisor.acceptfromserver=KnownName",
+      ]);
+      expectTwins(t);
+      expect(t.native.accepted).toEqual([]);
+      expect(t.native.missing).toEqual([]);
+    });
+
+    /** A clone both fail: the same status, line sent and server state (native removes its client). */
+    const expectFailedTwins = (t: { native: Outcome; ours: Outcome }) => {
+      expect(t.native.status).not.toBe(0);
+      expect(t.ours.status).not.toBe(0);
+      expect(t.ours.accepted).toEqual(t.native.accepted);
+      expect(t.ours.missing).toEqual(t.native.missing);
+    };
+
+    it(`t5710-promisor-remote-capability.sh: "clone with 'KnownUrl' and url not configured on the server"`, async () => {
+      const t = await cloneTwins(lopClient("KnownUrl"), [["--unset", "remote.lop.url"]]);
+      expectFailedTwins(t);
+      expect(t.native.accepted).toEqual([]);
+      expect(t.native.missing).toEqual([largeOid]);
+    });
+
+    it(`t5710-promisor-remote-capability.sh: "clone with 'KnownUrl' and empty url, so not advertised"`, async () => {
+      const t = await cloneTwins(lopClient("KnownUrl"), [["remote.lop.url", ""]]);
+      expectFailedTwins(t);
+      expect(t.native.missing).toEqual([largeOid]);
+    });
   });
 
   describe("our server, native clients", () => {
