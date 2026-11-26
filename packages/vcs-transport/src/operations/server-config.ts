@@ -104,6 +104,8 @@ export interface ServerConfigSettings {
   allowSidebandAll?: boolean;
   /** `transfer.advertiseSID` (git's default: false) */
   advertiseSID?: boolean;
+  /** `transfer.advertiseObjectInfo` (git's default: false): v2 `object-info` advertised and served */
+  advertiseObjectInfo?: boolean;
   /**
    * `uploadpack.advertiseBundleURIs` true: the `bundle.*` lines the v2 `bundle-uri` command
    * answers with (`<key>=<value>`, config order; a key without a value or with an empty one is
@@ -506,6 +508,8 @@ export function explicitServerSettingsFromConfig(
   if (sidebandAll !== undefined) out.allowSidebandAll = configBool(sidebandAll, false);
   const sid = last(config, "transfer.advertiseSID");
   if (sid !== undefined) out.advertiseSID = configBool(sid, false);
+  const objectInfo = last(config, "transfer.advertiseObjectInfo");
+  if (objectInfo !== undefined) out.advertiseObjectInfo = configBool(objectInfo, false);
   // bundle_uri_advertise / bundle_uri_command
   const advertiseBundles = last(config, "uploadpack.advertiseBundleURIs");
   if (advertiseBundles !== undefined && configBool(advertiseBundles, false)) {
