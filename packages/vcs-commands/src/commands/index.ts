@@ -71,6 +71,7 @@ export {
   installMergeDrivers,
   type MergeAttributeValue,
   type MergeDriver,
+  MergeDriverCommandMissingError,
   MergeDriverFailedError,
   type MergeDriverInput,
   type MergeDriverRegistry,
