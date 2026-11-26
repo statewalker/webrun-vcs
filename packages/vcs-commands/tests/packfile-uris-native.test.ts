@@ -597,7 +597,9 @@ describeGit("protocol v2 packfile URIs, as native git", () => {
     }
     const mine = await rawV2(await openTcpSocket("127.0.0.1", ours.port), "/anything", body);
     // (ours ends the answer with a flush after the abort, as for every pack-objects death)
-    expect(mine.slice(0, theirs.length)).toEqual(theirs);
+    // and git 2.5x sends the abort without 2.43's trailing NUL, which ours keeps
+    const noNul = (lines: string[]) => lines.map((l) => l.replace(/\0$/, ""));
+    expect(noNul(mine.slice(0, theirs.length))).toEqual(noNul(theirs));
     expect(theirs.join("\n")).toContain("value of uploadpack.blobpackfileuri must be of the form");
   });
 
