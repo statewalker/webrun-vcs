@@ -54,6 +54,7 @@ import {
 import { Git } from "../git.js";
 import type { InitResult } from "../results/init-result.js";
 import {
+  checkDefaultObjectStorage,
   defaultInitialBranch,
   defaultRefFormat,
   InvalidInitialBranchError,
@@ -486,6 +487,8 @@ export class InitCommand {
         ? await defaultRefFormat(this.environment, this.refFormat)
         : undefined;
       if (refFormat) warnings.push(...refFormat.warnings);
+      // the object storage (git master's `extensions.objectStorage`): plain `files` only
+      warnings.push(...(await checkDefaultObjectStorage(this.environment, fresh)));
 
       // core.sharedRepository: --shared, else the configuration (the repository's own when it
       // exists); what init creates gets git's modes (adjust_shared_perm)
