@@ -114,6 +114,15 @@ function refsOf(dir: string): string {
 function pushedPushee(): string {
   const dir = join(root, `pushee-${counter++}`);
   git(root, "init", "-q", "--bare", "-b", "main", dir);
+  // a local push starts receive-pack with local_repo_env cleared (GIT_CONFIG_COUNT too), so
+  // its detached auto maintenance would change objects/ while twin() copies the repository
+  for (const [key, value] of [
+    ["receive.autogc", "false"],
+    ["maintenance.auto", "false"],
+    ["gc.auto", "0"],
+  ]) {
+    git(dir, "config", key, value);
+  }
   git(original, "push", "-q", dir, "main:refs/namespaces/namespace/refs/heads/main");
   git(original, "push", "-q", dir, "refs/tags/*:refs/namespaces/namespace/refs/tags/*");
   return dir;
