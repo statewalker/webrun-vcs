@@ -85,9 +85,17 @@ export interface RepositoryFormat {
 
 /** A repository whose format version or extensions we cannot read or write safely. */
 export class UnsupportedRepositoryFormatError extends Error {
-  constructor(message: string) {
+  /**
+   * True when git itself opens such a repository and only webrun-vcs does not (an
+   * `extensions.objectStorage` payload): a caller that can go on without this repository
+   * (a superproject looking into a submodule) reports it instead of dying, where git's own
+   * refusals (an unknown extension, a bad version) stay fatal as in git.
+   */
+  readonly notSupportedHere: boolean;
+  constructor(message: string, options: { notSupportedHere?: boolean } = {}) {
     super(message);
     this.name = "UnsupportedRepositoryFormatError";
+    this.notSupportedHere = options.notSupportedHere ?? false;
   }
 }
 
@@ -241,6 +249,7 @@ export function checkRepositoryFormat(config: RepositoryFormatConfig): Repositor
   if (unsupported.length > 0) {
     throw new UnsupportedRepositoryFormatError(
       `repository format not supported by webrun-vcs:${unsupported.map((e) => `\n\t${e}`).join("")}`,
+      { notSupportedHere: true },
     );
   }
   if (format.partialClone === undefined) {
