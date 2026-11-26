@@ -42,7 +42,17 @@ export interface NativeGit {
 export function nativeGits(): NativeGit[] {
   const gits: NativeGit[] = [{ label: "git on PATH", binary: "git", env: nativeGitEnv }];
   const git3 = process.env.GIT3;
-  if (git3 && existsSync(git3)) gits.push({ label: "$GIT3", binary: git3, env: nativeGit3Env });
+  if (git3 && existsSync(git3)) {
+    // the bare twins under a git 3.0 build (safe.bareRepository's default is `explicit`); ours
+    // runs without breakingChanges, so the twins compare the output, not the refusal
+    const env = (home: string) => ({
+      ...nativeGit3Env(home),
+      GIT_CONFIG_COUNT: "3",
+      GIT_CONFIG_KEY_2: "safe.bareRepository",
+      GIT_CONFIG_VALUE_2: "all",
+    });
+    gits.push({ label: "$GIT3", binary: git3, env });
+  }
   return gits;
 }
 
