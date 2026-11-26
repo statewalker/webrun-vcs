@@ -21,7 +21,7 @@ import {
   TransportError,
 } from "../protocol/index.js";
 import { formatOf, isNullId } from "../protocol/object-format.js";
-import { buildPushCertificate } from "../protocol/push-cert.js";
+import { buildPushCertificate, isValidPushCertNonce } from "../protocol/push-cert.js";
 import { validSessionId } from "../protocol/session-id.js";
 import { type AbbrevLengths, abbrevLengthsOf, transportSummaryWidth } from "../summary/index.js";
 import type { ReceivePackConnection } from "./connection.js";
@@ -434,6 +434,12 @@ async function sendPack(
     else warnings.push("warning: push negotiation failed; proceeding anyway with push");
   }
   const pushCert = options.signed !== undefined && caps.has("push-cert");
+  // reject_invalid_nonce: the nonce is signed as it is, so only a harmless one is
+  if (pushCert && !isValidPushCertNonce(caps.get("push-cert") ?? "")) {
+    throw new TransportError(
+      `fatal: the receiving end asked to sign an invalid nonce <${caps.get("push-cert") ?? ""}>`,
+    );
+  }
   if (options.signed && !pushCert) {
     if (options.signed === "always") {
       throw new PushCertificateError(

@@ -301,6 +301,9 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         // read_head_info: a push certificate's lines (`push-cert` ... `push-cert-end`)
         let certificate = "";
         let inCertificate = false;
+        // the certificate is read before any authorization: bounded by the commands it may
+        // hold (an untrusted client cannot make it buffer without end)
+        const certificateLimit = maxCommands * 512 + (1 << 20);
 
         while (true) {
           const pkt = await transport.readPktLine();
@@ -313,6 +316,9 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
             const text = new TextDecoder().decode(pkt.payload);
             if (text === "push-cert-end\n") inCertificate = false;
             else certificate += text;
+            if (certificate.length > certificateLimit) {
+              return protocolError(ctx, "protocol error: push certificate too large");
+            }
             continue;
           }
           if (pkt.type === "flush") break;

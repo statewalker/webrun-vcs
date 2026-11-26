@@ -55,7 +55,7 @@ function hmacHash(format: ObjectFormat, key: Uint8Array, text: Uint8Array): Uint
 
 /**
  * git's `prepare_push_cert_nonce`: `<stamp>-<hmac>`, the HMAC keyed by `<dir>:<stamp>` over
- * the seed (git passes them in this order), its first 40 hex digits whatever the hash.
+ * the seed (git passes them in this order), in the repository's hash (`hexsz` digits).
  * `dir` is the directory receive-pack was started on (its argument: `.` under http-backend).
  *
  * @example
@@ -71,7 +71,7 @@ export function pushCertNonce(
 ): string {
   const hash = hmacHash(format, encoder.encode(`${dir}:${stamp}`), encoder.encode(seed));
   const hex = Array.from(hash, (b) => b.toString(16).padStart(2, "0")).join("");
-  return `${stamp}-${hex.slice(0, 40)}`;
+  return `${stamp}-${hex.slice(0, format.hexLength)}`;
 }
 
 /**
@@ -228,6 +228,18 @@ export function checkPushCertNonce(options: CheckPushCertNonceOptions): PushCert
   return { ...result("SLOP"), slop };
 }
 
+/** send-pack's `NONCE_LEN_LIMIT` */
+const NONCE_LEN_LIMIT = 256;
+
+/**
+ * send-pack's `reject_invalid_nonce`: whether a server's nonce may be signed (shorter than 256
+ * bytes, only `[A-Za-z0-9-./+=_]`); git dies on another one: `the receiving end asked to sign
+ * an invalid nonce <nonce>`.
+ */
+export function isValidPushCertNonce(nonce: string): boolean {
+  return nonce.length < NONCE_LEN_LIMIT && /^[A-Za-z0-9\-./+=_]*$/.test(nonce);
+}
+
 /** What send-pack's `generate_push_cert` writes before signing. */
 export interface PushCertificateFields {
   /** `get_signing_key_id()`: the key id, else the committer as `Name <email>` */
@@ -251,7 +263,8 @@ export function buildPushCertificate(fields: PushCertificateFields): string {
   let cert = "certificate version 0.1\n";
   cert += `pusher ${fields.pusher} ${fields.timestamp} ${fields.tzOffset}\n`;
   if (fields.pushee) cert += `pushee ${fields.pushee}\n`;
-  cert += `nonce ${fields.nonce}\n`;
+  // a bare `push-cert` (no nonce) writes no nonce line
+  if (fields.nonce) cert += `nonce ${fields.nonce}\n`;
   for (const option of fields.pushOptions ?? []) cert += `push-option ${option}\n`;
   cert += "\n";
   for (const u of fields.updates) cert += `${u.oldOid} ${u.newOid} ${u.remoteRef}\n`;

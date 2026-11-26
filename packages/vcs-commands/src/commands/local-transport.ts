@@ -287,11 +287,14 @@ function pushCertVerifierOf(
         ...(e.file !== undefined ? { file: e.file } : {}),
         ...(e.line !== undefined ? { line: e.line } : {}),
       }));
+    // receive-pack runs its gpg / ssh-keygen in the git directory
+    const cwd = await hooks?.hostGitDir().catch(() => undefined);
     const check = await checkSignatureWith(
       () => signingConfigFromEntries(entries(), environment),
       environment?.verifier,
       payload,
       signature,
+      { payloadType: "push-cert", ...(cwd !== undefined ? { cwd } : {}) },
     );
     return {
       result: check.result,

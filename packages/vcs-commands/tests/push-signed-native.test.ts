@@ -30,9 +30,11 @@ import {
   checkPushCertNonce,
   createBasePathResolver,
   createDefaultTransports,
+  isValidPushCertNonce,
   pushCertNonce,
   serveGitConnection,
 } from "@statewalker/vcs-transport";
+import { SHA256_OBJECT_FORMAT } from "@statewalker/vcs-utils";
 import {
   createNodeFilesApi,
   createNodeGitHostEnvironment,
@@ -398,7 +400,7 @@ describeGit("signed pushes (t5534-push-signed.sh)", () => {
     expect(out.n.log).toContain("pusher 13B6F51ECDDE430D <date>");
   });
 
-  // push options in the certificate (receive-pack's check_cert_push_options)
+  // not ported from t5534: push options in the certificate (send-pack.c's generate_push_cert)
   it("push options are signed with the certificate", async () => {
     const f = fixture(
       { ...seeded(), "receive.advertisePushOptions": "true" },
@@ -421,7 +423,7 @@ describeGit("signed pushes (t5534-push-signed.sh)", () => {
     expect(out.n.gpgLog).toBe("");
   });
 
-  // a failing signing program (sign_buffer_gpg's error, then send-pack dies)
+  // not ported from t5534: a failing signing program (gpg-interface.c's sign_buffer_gpg)
   it("a signing failure dies before anything is sent", async () => {
     const f = fixture(seeded(), { "gpg.program": gpg });
     for (const way of WAYS) writeFileSync(join(f.dirs[way], "src.gpg-fail"), "");
@@ -679,6 +681,23 @@ describeGit("push certificates as receive-pack reads them (JGit PushCertificateP
     expect(advertised).not.toBeNull();
     const stamp = Number(advertised?.[1]);
     expect(pushCertNonce("sekrit", ".", stamp)).toBe(`${advertised?.[1]}-${advertised?.[2]}`);
+    // a SHA-256 repository's nonce: the HMAC in SHA-256, all 64 digits
+    git(root, "init", "-q", "--bare", "--object-format=sha256", join(p.base, "s256"));
+    git(join(p.base, "s256"), "config", "receive.certNonceSeed", "sekrit");
+    const ad256 = spawnSync("git", ["receive-pack", "."], {
+      cwd: join(p.base, "s256"),
+      env: env(),
+      input: "",
+    });
+    const nonce256 = /push-cert=(\d+)-([0-9a-f]+)/.exec(ad256.stdout.toString("latin1"));
+    expect(nonce256?.[2]).toHaveLength(64);
+    expect(pushCertNonce("sekrit", ".", Number(nonce256?.[1]), SHA256_OBJECT_FORMAT)).toBe(
+      `${nonce256?.[1]}-${nonce256?.[2]}`,
+    );
+    // send-pack's reject_invalid_nonce
+    expect(isValidPushCertNonce(`${stamp}-abc/+=_.`)).toBe(true);
+    expect(isValidPushCertNonce("1\n\npush-option x")).toBe(false);
+    expect(isValidPushCertNonce("x".repeat(256))).toBe(false);
     // a nonce of another receive-pack (same seed and directory), 100 seconds old: git's HMAC
     // check passes and the slop is reported, as ours computes it
     const old = pushCertNonce("sekrit", ".", stamp - 100);

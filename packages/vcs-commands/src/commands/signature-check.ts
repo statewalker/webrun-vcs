@@ -81,7 +81,7 @@ export interface SignatureCheck {
 }
 
 /** What is signed: the ident whose date ssh checks keys against. */
-export type SignaturePayloadType = "commit" | "tag" | "other";
+export type SignaturePayloadType = "commit" | "tag" | "push-cert" | "other";
 
 /** The armor lines that start a signature of each format (gpg-interface.c's `sigs`). */
 const SIGNATURE_STARTS: readonly [SigningFormat, string][] = [
@@ -243,10 +243,21 @@ function findHeader(bytes: Uint8Array, name: string): Uint8Array | undefined {
  */
 function payloadTimestamp(payload: Uint8Array, type: SignaturePayloadType): number | undefined {
   if (type === "other") return 0;
+  if (type === "push-cert") {
+    // parse_payload_metadata: the pusher's date when its line splits as an ident (a key id
+    // alone does not: no time then, and the check goes on)
+    const pusher = findHeader(payload, "pusher");
+    if (!pusher || pusher.length === 0) return 0;
+    return identTimestamp(decoder.decode(pusher)) ?? 0;
+  }
   const ident = findHeader(payload, type === "commit" ? "committer" : "tagger");
   if (!ident || ident.length === 0) return undefined;
+  return identTimestamp(decoder.decode(ident));
+}
+
+/** split_ident_line's date: after the last `>` following a `<` (undefined: no mail). */
+function identTimestamp(text: string): number | undefined {
   // split_ident_line: a mail between the last '<' ... '>' pair; the date after it
-  const text = decoder.decode(ident);
   const lt = text.indexOf("<");
   if (lt < 0) return undefined;
   const gt = text.lastIndexOf(">");
