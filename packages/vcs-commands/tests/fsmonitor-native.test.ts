@@ -39,6 +39,7 @@ import {
   encodePacketized,
   formatStatusPorcelain,
   queryFsmonitorDaemon,
+  ResetMode,
   type UpdateIndexCommand,
 } from "../src/index.js";
 import { nativeIs25x } from "./hooks-native-support.js";
@@ -848,6 +849,212 @@ describeGit("fsmonitor against native git (t7519-status-fsmonitor.sh)", () => {
     await updateIndexTwins(["--fsmonitor-valid", "sub"], (c) =>
       c.setFsmonitorValid(true).addPath("sub"),
     );
+  });
+
+  /**
+   * Native git and ours each run one index-writing command (`nativeArgs` / `ours`) from the
+   * index and worktree as they are: the same `FSMN` payload, the same bits native git reads
+   * (`ls-files -f`) and the same worktree file `checkFile` holds. Native git's result is kept.
+   */
+  async function commandTwins(
+    nativeArgs: string[],
+    ours: (git: Awaited<ReturnType<typeof openOurs>>) => Promise<unknown>,
+    checkFile?: string,
+    /** a version 1 token (a failed hook's nanosecond time) compared as digits */
+    zeroToken = false,
+  ) {
+    const saved = saveIndex();
+    const savedFile = checkFile ? readFileSync(join(dir, checkFile)) : undefined;
+    const head = git(["rev-parse", "HEAD"]).trim();
+    const branch = git(["symbolic-ref", "-q", "HEAD"]).trim();
+    git(nativeArgs);
+    const nativeIndex = readFileSync(indexPath());
+    const nativeBits = git(["ls-files", "-f"]);
+    const nativeFile = checkFile ? readFileSync(join(dir, checkFile), "latin1") : undefined;
+    const nativeHead = git(["rev-parse", "HEAD"]).trim();
+    const nativeBranch = git(["symbolic-ref", "-q", "HEAD"]).trim();
+    // the worktree, refs and index put back for ours
+    git(["-c", "core.fsmonitor=", "checkout", "-qf", branch.replace("refs/heads/", "")]);
+    git(["update-ref", branch, head]);
+    git(["-c", "core.fsmonitor=", "reset", "-q", "--hard", head]);
+    if (checkFile && savedFile) {
+      writeFileSync(join(dir, checkFile), savedFile);
+      dateBack();
+    }
+    restoreIndex(saved);
+    await ours(await openOurs(dir, host()));
+    const oursIndex = readFileSync(indexPath());
+    expect(git(["rev-parse", "HEAD"]).trim()).toBe(nativeHead);
+    expect(git(["symbolic-ref", "-q", "HEAD"]).trim()).toBe(nativeBranch);
+    const tokenless = async (bytes: Buffer) => {
+      const fsmn = await fsmnOf(bytes);
+      return fsmn && zeroToken ? { ...fsmn, token: fsmn.token.replace(/[0-9]/g, "0") } : fsmn;
+    };
+    expect(await tokenless(oursIndex)).toEqual(await tokenless(nativeIndex));
+    expect(git(["ls-files", "-f"])).toBe(nativeBits);
+    if (checkFile) expect(readFileSync(join(dir, checkFile), "latin1")).toBe(nativeFile);
+    return { nativeIndex, oursIndex, nativeFile };
+  }
+
+  const ourRmCached = (path: string) => (g: Awaited<ReturnType<typeof openOurs>>) =>
+    g.rm().addFilepattern(path).setCached(true).call();
+
+  it("every index-writing command adds the extension git's tweak_fsmonitor adds on its read", async () => {
+    hook(NOTHING);
+    git(["config", "core.fsmonitor", ""]);
+    git(["status", "--porcelain"]);
+    git(["config", "core.fsmonitor", ".git/hooks/fsmonitor-test"]);
+    expect(await fsmnOf(readFileSync(indexPath()))).toBeUndefined();
+    const commands: [string[], (g: Awaited<ReturnType<typeof openOurs>>) => Promise<unknown>][] = [
+      [["rm", "-q", "--cached", "dir1/tracked"], ourRmCached("dir1/tracked")],
+      [
+        ["restore", "--staged", "tracked"],
+        (g) => g.restore().setStaged(true).addPath("tracked").call(),
+      ],
+      [["reset", "-q", "HEAD"], (g) => g.reset().setRef("HEAD").call()],
+      [
+        ["reset", "-q", "--hard", "HEAD"],
+        (g) => g.reset().setMode(ResetMode.HARD).setRef("HEAD").call(),
+      ],
+    ];
+    for (const [args, ours] of commands) {
+      const saved = saveIndex();
+      const { oursIndex } = await commandTwins(args, ours);
+      const fsmn = await fsmnOf(oursIndex);
+      expect(fsmn?.token).toBe("last_update_token");
+      // the extension added by the read: every entry dirty
+      expect(fsmn?.dirty.length).toBe(
+        (await parseIndexFile(new Uint8Array(oursIndex))).entries.length,
+      );
+      git(["-c", "core.fsmonitor=", "reset", "-q", "--hard", "HEAD"]);
+      restoreIndex(saved);
+      dateBack();
+    }
+  });
+
+  it("a failing monitor drops the valid bits in any index-writing command, as git's read does", async () => {
+    hook(NOTHING);
+    await statusTwins();
+    await statusTwins({ keep: "ours" });
+    expect(git(["ls-files", "-f"])).toContain("h dir1/tracked\n");
+    hook("#!/bin/sh\nexit 1\n");
+    const { oursIndex } = await commandTwins(
+      ["rm", "-q", "--cached", "dir1/tracked"],
+      ourRmCached("dir1/tracked"),
+      undefined,
+      true,
+    );
+    expect(git(["ls-files", "-f"])).not.toMatch(/^h /m);
+    expect((await fsmnOf(oursIndex))?.dirty.length).toBeGreaterThan(0);
+  });
+
+  it("a reported change drops its bit in a command that only carried the state before", async () => {
+    hook(LISTED);
+    report([]);
+    await statusTwins();
+    await statusTwins({ keep: "ours" });
+    put("modified", "changed\n");
+    dateBack();
+    report(["modified"]);
+    await commandTwins(["rm", "-q", "--cached", "dir1/tracked"], ourRmCached("dir1/tracked"));
+    expect(git(["ls-files", "-f"])).toContain("H modified\n");
+  });
+
+  for (const how of ["reset --hard", "checkout -f"] as const) {
+    const nativeArgs =
+      how === "reset --hard" ? ["reset", "-q", "--hard", "HEAD"] : ["checkout", "-qf", "main"];
+    const oursRun = (g: Awaited<ReturnType<typeof openOurs>>) =>
+      how === "reset --hard"
+        ? g.reset().setMode(ResetMode.HARD).setRef("HEAD").call()
+        : g.checkout().setName("main").setForced(true).call();
+
+    it(`${how} leaves a change the monitor did not report alone (oneway_merge)`, async () => {
+      hook(LISTED);
+      report([]);
+      await statusTwins();
+      await statusTwins({ keep: "ours" });
+      put("modified", "unreported\n");
+      dateBack();
+      const { nativeFile, oursIndex } = await commandTwins(nativeArgs, oursRun, "modified");
+      expect(nativeFile).toBe("unreported\n");
+      // the entry keeps its bit (and its stat): native git still sees nothing
+      expect(git(["ls-files", "-f"])).toContain("h modified\n");
+      expect((await fsmnOf(oursIndex))?.token).toBe("listed_token");
+    });
+
+    it(`${how} restores a change the monitor reported`, async () => {
+      hook(LISTED);
+      report([]);
+      await statusTwins();
+      await statusTwins({ keep: "ours" });
+      put("modified", "reported\n");
+      dateBack();
+      report(["modified"]);
+      const { nativeFile } = await commandTwins(nativeArgs, oursRun, "modified");
+      expect(nativeFile).toBe("");
+    });
+
+    it(`${how} writes a valid entry the target changes, unreported or not`, async () => {
+      hook(LISTED);
+      report([]);
+      put("modified", "committed\n");
+      git(["-c", "core.fsmonitor=", "commit", "-qam", "second"]);
+      git(["-c", "core.fsmonitor=", "reset", "-q", "--soft", "HEAD~1"]);
+      git([
+        "-c",
+        "core.fsmonitor=",
+        "update-index",
+        "--cacheinfo",
+        `100644,${git(["rev-parse", "HEAD@{1}:modified"]).trim()},modified`,
+      ]);
+      git(["-c", "core.fsmonitor=", "update-index", "--refresh", "-q"]);
+      dateBack();
+      // the index has the second commit's `modified`, HEAD the first's (empty): the entry is
+      // valid but the reset changes it
+      git(["-c", "core.fsmonitor=", "update-index", "--fsmonitor"]);
+      git(["update-index", "--fsmonitor-valid", "modified"]);
+      expect(git(["ls-files", "-f", "modified"])).toBe("h modified\n");
+      const { nativeFile } = await commandTwins(nativeArgs, oursRun, "modified");
+      expect(nativeFile).toBe("");
+    });
+  }
+
+  it("t7519-status-fsmonitor.sh: 'status succeeds with sparse index'", async () => {
+    hook(LISTED);
+    report([]);
+    put("dir3/outside", "o\n");
+    put("dir3/deep/file", "d\n");
+    git(["-c", "core.fsmonitor=", "add", "."]);
+    git(["-c", "core.fsmonitor=", "commit", "-qm", "outside"]);
+    git(["-c", "core.fsmonitor=", "sparse-checkout", "init", "--cone", "--sparse-index"]);
+    git(["-c", "core.fsmonitor=", "sparse-checkout", "set", "dir1", "dir2"]);
+    dateBack();
+    // the extension is kept over the collapsed entries (dir3/ one of them)
+    await statusTwins();
+    const { oursIndex } = await statusTwins({ keep: "ours" });
+    expect(Buffer.from(oursIndex).includes(Buffer.from("sdir"))).toBe(true);
+    expect((await fsmnOf(oursIndex))?.token).toBe("listed_token");
+    expect(git(["ls-files", "-f", "--sparse"])).toContain("S dir3/\n");
+    // a change reported inside the cone, and the collapsed directory reported
+    put("dir1/modified", "changed\n");
+    dateBack();
+    report(["dir1/modified", "dir3"]);
+    const { nativeOut } = await statusTwins();
+    expect(nativeOut).toContain(" M dir1/modified");
+    report(["dir3/"]);
+    await statusTwins({ keep: "ours" });
+    // another command reading and writing the sparse index keeps the extension
+    report([]);
+    const rm = await commandTwins(
+      ["rm", "-q", "--cached", "dir2/tracked"],
+      ourRmCached("dir2/tracked"),
+    );
+    expect(Buffer.from(rm.oursIndex).includes(Buffer.from("sdir"))).toBe(true);
+    expect((await fsmnOf(rm.oursIndex))?.token).toBe("listed_token");
+    // a failing monitor: every bit dropped, the index still sparse
+    hook("#!/bin/sh\nexit 1\n");
+    const failed = await statusTwins({ zeroToken: true });
+    expect(Buffer.from(failed.oursIndex).includes(Buffer.from("sdir"))).toBe(true);
   });
 
   // git 2.5x on Linux: the real daemon, through the Node socket adapter

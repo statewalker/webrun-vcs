@@ -104,3 +104,23 @@ describe("FSMN extension", () => {
     expect(third.getFsmonitor()).toBeUndefined();
   });
 });
+
+describe("FsmonitorState over a sparse index's directory entries", () => {
+  it("a sparse directory's bit is held for the directory entry and dropped by its cone", () => {
+    const dir: StagingEntry = { ...entry("out/", 0, 0o40000), skipWorktree: true };
+    const file = entry("tracked");
+    const state = FsmonitorState.fromExtension({ token: "t", dirty: [], bitSize: 0 }, [dir, file]);
+    expect(state.isValid(dir)).toBe(true);
+    // a file entry the directory expands into is no entry git held a bit for
+    expect(state.isValid(entry("out/f"))).toBe(false);
+    // a reported path elsewhere leaves it, a report of its cone drops it
+    expect(state.markSparseDirectoriesInvalid("o/")).toBe(false);
+    expect(state.markSparseDirectoriesInvalid("out/")).toBe(true);
+    expect(state.isValid(dir)).toBe(false);
+    expect(state.isValid(file)).toBe(true);
+    // the bitmap over the sparse entries names the directory dirty again
+    expect(parseFsmonitorExtension(encodeFsmonitorExtension(state, [dir, file]), 2)?.dirty).toEqual(
+      [0],
+    );
+  });
+});

@@ -104,6 +104,23 @@ export class FsmonitorState {
     return this.valid.delete(keyOf(entry));
   }
 
+  /**
+   * Clears the bits of the sparse directory entries (`out/`) at or below `prefix` (a path
+   * ending in `/`): a sparse index's directories are entries of their own, which git's
+   * refresh callback finds in the cone of a reported directory. True when one was set.
+   */
+  markSparseDirectoriesInvalid(prefix: string): boolean {
+    let had = false;
+    for (const key of this.valid.keys()) {
+      const path = key.slice(0, key.lastIndexOf("\0"));
+      if (path.endsWith("/") && path.startsWith(prefix)) {
+        this.valid.delete(key);
+        had = true;
+      }
+    }
+    return had;
+  }
+
   /** Clears every bit; true when one was set. */
   invalidateAll(): boolean {
     const had = this.valid.size > 0;

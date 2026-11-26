@@ -290,6 +290,8 @@ function onPath(
       run.state.markInvalid(e);
       count++;
     }
+    // a sparse index's directory entry in the cone (held apart from the expanded entries)
+    if (run.state.markSparseDirectoriesInvalid(prefix)) count++;
   };
   if (name.endsWith("/")) {
     cone(name);
