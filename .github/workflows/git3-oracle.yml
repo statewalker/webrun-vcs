@@ -14,7 +14,7 @@ on:
   pull_request:
     paths:
       - "packages/*/src/**"
-      - "packages/vcs-commands/tests/**"
+      - "packages/*/tests/**"
       - "scripts/git3-twins.mjs"
       - "scripts/git3-twins.test.mjs"
       - "pnpm-lock.yaml"

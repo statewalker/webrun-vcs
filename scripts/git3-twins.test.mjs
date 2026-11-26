@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -45,5 +45,16 @@ test("vcs-commands' selection keeps the known twins", () => {
     "tests/sha1dc-native.test.ts",
   ]) {
     assert.ok(twins.includes(file), file);
+  }
+});
+
+test("no other package has $GIT3 twins (the oracle job scans vcs-commands only)", () => {
+  for (const name of readdirSync("packages")) {
+    if (name === "vcs-commands" || !existsSync(join("packages", name, "tests"))) continue;
+    assert.deepEqual(
+      git3Twins(join("packages", name)),
+      [],
+      `packages/${name}: add it to git3-oracle.yml`,
+    );
   }
 });
