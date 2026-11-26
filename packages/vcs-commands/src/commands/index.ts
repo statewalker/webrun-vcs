@@ -34,6 +34,7 @@ export * from "./diff-color-config.js";
 export * from "./diff-command.js";
 export * from "./diff-plumbing/index.js";
 export * from "./diff-textconv.js";
+export * from "./fast-export/index.js";
 export * from "./fetch-command.js";
 export * from "./fetch-multiple-command.js";
 export * from "./fmt-merge-msg-command.js";
