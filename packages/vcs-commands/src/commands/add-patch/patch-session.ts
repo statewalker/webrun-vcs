@@ -36,6 +36,10 @@ export interface PatchSelectionRequest extends PatchOptions {
   selector: PatchSelector | undefined;
   /** The revision the diff compares with (a tree-ish; the empty tree for an unborn HEAD) */
   diffRevision?: string;
+  /** The `trees` mode's second tree-ish */
+  newDiffRevision?: string;
+  /** add-patch's ADD_P_DISALLOW_EDIT: no `e` */
+  disallowEdit?: boolean;
   paths: string[];
   compatibility?: PatchCompatibility;
   temporaryIndex?: TemporaryIndex;
@@ -107,6 +111,7 @@ export async function runPatchSelection(
     mode: request.mode,
     paths: request.paths,
     ...(request.diffRevision !== undefined ? { revision: request.diffRevision } : {}),
+    ...(request.newDiffRevision !== undefined ? { newRevision: request.newDiffRevision } : {}),
     ...(context !== undefined ? { context } : {}),
     ...(interHunkContext !== undefined ? { interHunkContext } : {}),
     ...(algorithm ? { algorithm } : {}),
@@ -118,6 +123,7 @@ export async function runPatchSelection(
     backend,
     selector,
     compatibility: request.compatibility ?? "2.56",
+    ...(request.disallowEdit ? { disallowEdit: true } : {}),
     ...(request.autoAdvance !== undefined ? { autoAdvance: request.autoAdvance } : {}),
     ...(comment && comment !== "auto" ? { commentString: comment } : {}),
   });

@@ -46,6 +46,7 @@ export * from "./git-describe.js";
 export * from "./git-hooks.js";
 export * from "./git-ident.js";
 export * from "./grep/index.js";
+export * from "./history-command.js";
 export * from "./hook-command.js";
 export * from "./http-config.js";
 export {
