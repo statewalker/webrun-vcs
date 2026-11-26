@@ -61,6 +61,7 @@ import {
   worktreeModeTrust,
 } from "./commands/core-config.js";
 import type { ForkPointSource } from "./commands/fork-point.js";
+import { type FsmonitorRun, refreshFsmonitor } from "./commands/fsmonitor-refresh.js";
 import { type HookHost, HookSession, refTransactionHookOf } from "./commands/git-hooks.js";
 import {
   authorIdentOf,
@@ -441,6 +442,29 @@ export abstract class GitCommand<T> {
       | undefined;
     if (!filter?.setAttributesSourceResolver || !this._workingCopy.history) return;
     filter.setAttributesSourceResolver(attributesSourceResolver(() => this.revisionResolver()));
+  }
+
+  /**
+   * git's `tweak_fsmonitor` on the index `staging` holds (see `refreshFsmonitor`): the monitor
+   * asked once per index read, through the host's `fsmonitor` callback, else the hook
+   * program `core.fsmonitor` names, run by the hook runner in the worktree top.
+   */
+  protected fsmonitorRefresh(staging: Staging): Promise<FsmonitorRun | undefined> {
+    const config = RemoteConfigStore.from(this._workingCopy);
+    const environment = hostEnvironmentOf(this._workingCopy);
+    return refreshFsmonitor({
+      staging,
+      config: (key) => config.value(key),
+      ignoreCase: parseGitBool(config.value("core.ignorecase")) === true,
+      query: async (query) => {
+        if (environment?.fsmonitor) return environment.fsmonitor.query(query);
+        if (query.mode !== "hook" || query.command === undefined) return undefined;
+        return this.hooks.runShellCommandBytes("fsmonitor", query.command, [
+          String(query.version),
+          query.token,
+        ]);
+      },
+    });
   }
 
   /**

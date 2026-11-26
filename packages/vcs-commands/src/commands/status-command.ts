@@ -12,6 +12,7 @@ import {
   getWorktreeEntries,
   IndexPathLookup,
   type IndexStatUpdate,
+  invalidateUntrackedPath,
   isCleanByStat,
   modeFromWorktree,
   readConvertedContent,
@@ -886,12 +887,20 @@ export class StatusCommand extends GitCommand<Status> {
     // (git's preload_index), each entry then compared synchronously where its stat settles
     // it, so only the few undecided ones (racy, changed, submodules) cost a promise
     const matchAll = this.paths.length === 0;
+    // the file system monitor, asked once for this index (git's tweak_fsmonitor at read):
+    // entries it reported nothing for since its token are up to date without an lstat
+    const fsm = worktree ? await this.fsmonitorRefresh(this.staging) : undefined;
+    const fsmValid = (entry: StagingEntry) => !!fsm && fsm.state.isValid(entry);
+    // entries refresh_index replaces (stat stored): their directories' untracked lists go
+    // too (replace_index_entry's mark_fsmonitor_invalid, with the monitor on)
+    const replacedPaths: string[] = [];
     const stated = (entry: StagingEntry) =>
       !!worktree &&
       entry.stage === 0 &&
       !entry.skipWorktree &&
       !entry.assumeValid &&
       !isGitlink(entry.mode) &&
+      !fsmValid(entry) &&
       (matchAll || this.matchesTracked(entry.path, entry.mode));
     const all = this.staging.entryList?.() ?? (await collectEntries(this.staging.entries()));
     // `:(attr:...)`: the attributes of the tracked paths the pathspec may match
@@ -958,12 +967,16 @@ export class StatusCommand extends GitCommand<Status> {
         if (worktree && (entry.skipWorktree || entry.assumeValid)) {
           // git's refresh takes these as up to date (CE_SKIP_WORKTREE, CE_VALID)
           if (isIgnoreFilePath(entry.path)) upToDate.add(entry.path);
+        } else if (worktree && entry.stage === 0 && fsmValid(entry)) {
+          // CE_FSMONITOR_VALID: taken as up to date, never stat'ed (refresh_cache_ent)
+          if (isIgnoreFilePath(entry.path)) upToDate.add(entry.path);
         } else if (
           current !== undefined &&
           isCleanByStat(entry, current, trust as WorktreeModeTrust, indexTime)
         ) {
           // clean by its stat: nothing to report, nothing to refresh
           if (isIgnoreFilePath(entry.path)) upToDate.add(entry.path);
+          if (!entry.intentToAdd) fsm?.state.markValid(entry);
         } else if (worktree) {
           const flags = isGitlink(entry.mode) ? await this.worktreeFlags(entry.path) : undefined;
           if (!flags?.all) {
@@ -974,9 +987,18 @@ export class StatusCommand extends GitCommand<Status> {
             worktreeMode = result.worktreeMode;
             // proved clean only by hashing: its fresh stat goes into the index (git's refresh);
             // changed behind a matching stat: smudged
+            let replaced = false;
             if (result.hashedId !== undefined || result.smudge) {
               const update = statUpdateOf(entry, result);
-              if (update) refresh.push(update);
+              if (update) {
+                refresh.push(update);
+                replaced = true;
+                if (fsm) replacedPaths.push(entry.path);
+              }
+            }
+            // up to date and kept as it is: mark_fsmonitor_valid (a replaced entry is not)
+            if (!result.kind && !replaced && !flags && !entry.intentToAdd) {
+              fsm?.state.markValid(entry);
             }
             if (!result.kind && isIgnoreFilePath(entry.path)) upToDate.add(entry.path);
             if (flags && result.kind === "modified") commitChanged = true;
@@ -1042,7 +1064,7 @@ export class StatusCommand extends GitCommand<Status> {
     }
 
     const renamed = new Map<string, string>();
-    const warnings: string[] = [];
+    const warnings: string[] = (fsm?.warnings ?? []).map((w) => `warning: ${w}`);
     const renameMode = this.renameMode();
     if (renameMode) await this.pairRenames(files, renamed, worktree, warnings, renameMode);
 
@@ -1055,6 +1077,14 @@ export class StatusCommand extends GitCommand<Status> {
       host,
       this.objectFormat,
     );
+    // the directories of the paths the monitor reported, and of the entries refreshed, are
+    // read again (untracked_cache_invalidate_path on the cache as read)
+    const fsmInvalidated = !!fsm && (fsm.untrackedPaths.length > 0 || replacedPaths.length > 0);
+    if (fsm && untrackedCache.cache) {
+      for (const path of [...fsm.untrackedPaths, ...replacedPaths]) {
+        invalidateUntrackedPath(untrackedCache.cache, path);
+      }
+    }
     if (worktree && this.resolvedUntracked !== "no") {
       // git's wt_status_collect_untracked: the dir flags of the modes
       let flags =
@@ -1087,6 +1117,8 @@ export class StatusCommand extends GitCommand<Status> {
         flags,
         ...(matchAll ? {} : { matcher: untrackedScanPathspec(this.pathspec, attributes) }),
         ...(cache ? { cache } : {}),
+        // with the monitor's answer, the cache's valid directories are trusted unstat'ed
+        ...(cache && fsm?.state.useForUntracked ? { trustValidDirectories: true } : {}),
         indexSeconds: Math.floor(indexTime / 1000),
         ...(trust ? { stat: { ctime: trust.ctime, fullStat: trust.fullStat } } : {}),
         // git's "could not open directory" for each directory its scan cannot list
@@ -1106,10 +1138,15 @@ export class StatusCommand extends GitCommand<Status> {
     // with the untracked cache when it changed; never under `GIT_OPTIONAL_LOCKS=0` (`git
     // --no-optional-locks`: cmd_status takes the index lock only when use_optional_locks())
     if (this.writeIndex && hostEnvironmentOf(this.workingCopy)?.optionalLocks !== false) {
+      const changed = untrackedCache.changed();
       await refreshIndexStats(
         this.staging,
         refresh,
-        untrackedCache.changed() ? { untrackedCache: untrackedCache.cache ?? null } : undefined,
+        changed
+          ? { untrackedCache: untrackedCache.cache ?? null }
+          : fsmInvalidated && untrackedCache.cache
+            ? { carriedUntrackedCache: untrackedCache.cache }
+            : undefined,
       );
     }
 

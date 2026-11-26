@@ -16,6 +16,7 @@ import {
   DeleteStagingEntry,
   type EntryStat,
   entryStatOf,
+  type FsmonitorState,
   type GitlinkHeadState,
   type IndexEditor,
   invalidateCacheTreePath,
@@ -285,6 +286,13 @@ export class IndexAdder {
   private emptyBlobStored = false;
   /** The gitlinks the edits stage, by path: a path added twice is up to date the second time */
   private readonly stagedGitlinks = new Map<string, ObjectId>();
+  /**
+   * The fsmonitor state of the index (`core.fsmonitor`): a valid entry is up to date for
+   * `ie_match_stat`, and a regular file given an entry where none was is marked valid
+   */
+  private fsmonitor: FsmonitorState | undefined;
+  /** The regular files staged where the index had no stage-0 entry (`fill_stat_cache_info`) */
+  private readonly freshFiles = new Set<string>();
 
   private constructor(
     private readonly staging: Staging,
@@ -307,7 +315,12 @@ export class IndexAdder {
     staging: Staging,
     blobs: Blobs,
     trust: WorktreeModeTrust,
-    options: { pretend?: boolean; pathRules?: WorktreePathOptions } = {},
+    options: {
+      pretend?: boolean;
+      pathRules?: WorktreePathOptions;
+      /** The index's fsmonitor state, once the monitor was asked (see `fsmonitor`) */
+      fsmonitor?: FsmonitorState;
+    } = {},
   ): Promise<IndexAdder> {
     const adder = new IndexAdder(
       staging,
@@ -316,6 +329,7 @@ export class IndexAdder {
       options.pretend === true,
       options.pathRules,
     );
+    adder.fsmonitor = options.fsmonitor;
     const take = (entry: StagingEntry) => {
       if (entry.stage === 0) {
         adder.basePaths.push(entry.path);
@@ -376,7 +390,7 @@ export class IndexAdder {
   unchangedByStat(indexed: StagingEntry, entry: WorktreeEntry): boolean {
     if (indexed.stage !== 0 || entry.isDirectory) return false;
     if (this.added.has(indexed.path) || this.removed.has(indexed.path)) return false;
-    return this.statUnchanged(indexed, entry);
+    return this.fsmonitorValid(indexed) || this.statUnchanged(indexed, entry);
   }
 
   /** Whether `path` has conflict stages (as edited so far). */
@@ -428,7 +442,7 @@ export class IndexAdder {
       indexed &&
       !options.intentToAdd &&
       !options.renormalize &&
-      this.statUnchanged(indexed, entry)
+      (this.fsmonitorValid(indexed) || this.statUnchanged(indexed, entry))
     ) {
       return "unchanged";
     }
@@ -487,6 +501,10 @@ export class IndexAdder {
     }).catch((error) => unreadable(path, error));
     const mode = modeFromWorktree(stored.entry.mode, known?.mode, this.trust);
     this.stage(name, stored.id, mode, entryStatOf(stored.entry));
+    // fill_stat_cache_info marks a regular file valid; add_index_entry's replace of an
+    // existing stage-0 entry clears the bit again (replace_index_entry)
+    if (indexed) this.freshFiles.delete(name);
+    else if ((mode & 0o170000) === 0o100000) this.freshFiles.add(name);
     return indexed && indexed.objectId === stored.id && indexed.mode === mode ? "same" : "added";
   }
 
@@ -570,6 +588,16 @@ export class IndexAdder {
    * entry's stat matches the file's and it is not racily clean (an intent-to-add entry never
    * matches).
    */
+  /** CE_FSMONITOR_VALID: `ie_match_stat` takes the entry as up to date without its stat. */
+  private fsmonitorValid(indexed: StagingEntry): boolean {
+    return (
+      !!this.fsmonitor &&
+      !indexed.intentToAdd &&
+      !this.added.has(indexed.path) &&
+      this.fsmonitor.isValid(indexed)
+    );
+  }
+
   private statUnchanged(indexed: StagingEntry, entry: WorktreeEntry): boolean {
     return (
       !indexed.intentToAdd &&
@@ -626,6 +654,12 @@ export class IndexAdder {
   async finish(): Promise<void> {
     if (this.pretend) return;
     await this.editor.finish();
+    if (this.fsmonitor) {
+      for (const path of this.freshFiles) {
+        const entry = await this.staging.getEntry(path);
+        if (entry && entry.stage === 0 && !entry.intentToAdd) this.fsmonitor.markValid(entry);
+      }
+    }
     if (this.resolveUndo.length > 0) this.staging.recordResolveUndo?.(this.resolveUndo);
     if (this.touched.size === 0 || !this.staging.setCacheTree) return;
     const tree = this.staging.getCacheTree?.();

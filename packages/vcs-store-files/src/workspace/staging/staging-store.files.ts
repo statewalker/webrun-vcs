@@ -5,6 +5,7 @@ import { tryReadFile } from "@statewalker/vcs-utils/files";
 import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type {
   CacheTree,
+  FsmonitorState,
   IndexBuilder,
   IndexBuilderFinishOptions,
   IndexEditor,
@@ -290,6 +291,14 @@ export class FileStagingStore implements Staging {
 
   getUntrackedCache(): UntrackedCache | undefined {
     return this.indexFile.untrackedCache(this._entries);
+  }
+
+  getFsmonitor(): FsmonitorState | undefined {
+    return this.indexFile.getFsmonitor();
+  }
+
+  setFsmonitor(state: FsmonitorState | undefined): void {
+    this.indexFile.setFsmonitor(state);
   }
 
   setUntrackedCache(cache: UntrackedCache | null): void {
@@ -701,7 +710,7 @@ export class FileStagingStore implements Staging {
    */
   async refreshStats(
     updates: IndexStatUpdate[],
-    options?: { untrackedCache?: UntrackedCache | null },
+    options?: { untrackedCache?: UntrackedCache | null; carriedUntrackedCache?: UntrackedCache },
   ): Promise<boolean> {
     const entries = await refreshIndexFile(
       this.indexFile,
@@ -710,6 +719,7 @@ export class FileStagingStore implements Staging {
       updates,
       this.skipWorktreeCleared,
       options?.untrackedCache,
+      options?.carriedUntrackedCache,
     );
     if (!entries) return false;
     this.skipWorktreeCleared = new Set();

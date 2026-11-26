@@ -229,7 +229,8 @@ export async function refreshIndexStats(
   updates: IndexStatUpdate[],
   options?: RefreshStatsOptions,
 ): Promise<boolean> {
-  const untrackedChanged = options?.untrackedCache !== undefined;
+  const untrackedChanged =
+    options?.untrackedCache !== undefined || options?.carriedUntrackedCache !== undefined;
   if (typeof staging.refreshStats === "function") {
     // with nothing to store, an index file is still written when the configuration splits
     // or unsplits it (git's SPLIT_INDEX_ORDERED / remove_split_index mark it changed)
