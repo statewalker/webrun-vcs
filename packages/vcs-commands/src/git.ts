@@ -49,6 +49,8 @@ import {
   DiffPairsCommand,
   DiffTreeCommand,
   EditBranchDescriptionCommand,
+  FastExportCommand,
+  FastImportCommand,
   FetchCommand,
   FetchMultipleCommand,
   FmtMergeMsgCommand,
@@ -934,6 +936,33 @@ export class Git implements Disposable {
   mktag(): MktagCommand {
     this.checkClosed();
     return new MktagCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a FastExportCommand writing history as a fast-import stream (`git fast-export`).
+   *
+   * @example
+   * ```typescript
+   * const { stdout } = await git.fastExport().addArgument("--all").callOutput();
+   * ```
+   */
+  fastExport(): FastExportCommand {
+    this.checkClosed();
+    return new FastExportCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a FastImportCommand writing objects and refs from a fast-import stream
+   * (`git fast-import`).
+   *
+   * @example
+   * ```typescript
+   * const { exitCode } = await git.fastImport().setInput(stream).callOutput();
+   * ```
+   */
+  fastImport(): FastImportCommand {
+    this.checkClosed();
+    return new FastImportCommand(this._workingCopy);
   }
 
   /**
