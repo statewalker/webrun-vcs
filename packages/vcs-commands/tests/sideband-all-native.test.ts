@@ -88,6 +88,20 @@ function fetchResponse(trace: string): string[] {
   return out;
 }
 
+/**
+ * The same fetch response, except for which haves are acknowledged: git 2.45+'s upload-pack
+ * skips a have whose child it acknowledged first, ours (as 2.43) acknowledges every one
+ * (statewalker/webrun-vcs#396). Every native ACK is ours too, each on the same band.
+ */
+function expectSameResponse(mine: string[], theirs: string[], label: string): void {
+  const isAck = (l: string) => /^(\\1)?ACK /.test(l);
+  expect(mine.filter((l) => !isAck(l)), label).toEqual(theirs.filter((l) => !isAck(l)));
+  const acks = mine.filter(isAck);
+  for (const ack of theirs.filter(isAck)) expect(acks, label).toContain(ack);
+  const band = (l: string) => l.startsWith("\\1");
+  for (const ack of acks) expect(band(ack), label).toBe(theirs.some(band));
+}
+
 /** Whether a native client's packet trace shows it sent `sideband-all`. */
 function sentSidebandAll(trace: string): boolean {
   return /(fetch|clone)> sideband-all$/m.test(readFileSync(trace, "latin1"));
@@ -275,7 +289,7 @@ describeGit("protocol v2 sideband-all, as native git", () => {
       const theirs = await run(nativeUrl(repo));
       const mine = await run(ourUrl(repo));
       expect(sentSidebandAll(mine.trace), repo).toBe(repo === "sba");
-      expect(fetchResponse(mine.trace), repo).toEqual(fetchResponse(theirs.trace));
+      expectSameResponse(fetchResponse(mine.trace), fetchResponse(theirs.trace), repo);
       expect(mine.head).toBe(ids.c4);
     }
     // the band byte, as git's packet_writer_write sends it
@@ -307,7 +321,7 @@ describeGit("protocol v2 sideband-all, as native git", () => {
       expect(r.status, r.stderr).toBe(0);
       return fetchResponse(trace);
     };
-    expect(await deepen(mine.dir)).toEqual(await deepen(theirs.dir));
+    expectSameResponse(await deepen(mine.dir), await deepen(theirs.dir), "deepen");
     expect(readFileSync(join(mine.dir, ".git", "shallow"), "utf8")).toBe(
       readFileSync(join(theirs.dir, ".git", "shallow"), "utf8"),
     );
