@@ -75,6 +75,8 @@ interface Archiver {
   name: string;
   /** A tar filter's command; undefined for tar and zip */
   command?: string;
+  /** git's `ARCHIVER_REMOTE`: served to `git archive --remote` (`tar.<format>.remote`) */
+  remote?: boolean;
 }
 
 /** A file added with `--add-file` or `--add-virtual-file`. */
@@ -130,6 +132,8 @@ export class ArchiveCommand extends GitCommand<Uint8Array> {
   private filterDrivers?: FilterDriverRegistry;
   private compatibility: "2.43" | "2.56" = "2.56";
   private readonly messages: string[] = [];
+  /** Run by upload-archive (`write_archive`'s `remote`): `allowUnreachable` its setting */
+  private uploadArchive?: { allowUnreachable: boolean };
 
   /** The tree-ish archived (a commit, a tag, a tree). */
   setTree(name: string): this {
@@ -301,16 +305,41 @@ export class ArchiveCommand extends GitCommand<Uint8Array> {
     return this.archivers().map((a) => a.name);
   }
 
-  /** The archivers in git's registration order: tar, the tar filters, zip. */
+  /**
+   * Runs the command as git's upload-archive runs it for `git archive --remote` (its
+   * `upload-archive--writer`): only formats served remotely (tar, zip, the tar filters with
+   * `tar.<format>.remote`, by default `tgz` and `tar.gz`), and, unless `allowUnreachable`
+   * (`uploadarchive.allowUnreachable`), only a tree-ish a ref names (`no such ref: <name>`).
+   * See {@link runArchiveWriter}.
+   */
+  setUploadArchive(options: { allowUnreachable: boolean }): this {
+    this.checkCallable();
+    this.uploadArchive = { allowUnreachable: options.allowUnreachable };
+    return this;
+  }
+
+  /**
+   * The format `name`'s extension names (archive.c's `archive_format_from_filename`: the
+   * archivers of this repository's configuration), or undefined.
+   */
+  formatFromFilename(name: string): string | undefined {
+    return this.archivers().find((a) => matchExtension(name, a.name))?.name;
+  }
+
+  /**
+   * The archivers in git's registration order: tar, the tar filters, zip; upload-archive's
+   * only those served remotely.
+   */
   private archivers(): Archiver[] {
     const filters = new Map<string, Archiver>();
-    const define = (name: string, command: string | undefined) => {
+    const define = (name: string, command: string | undefined, remote?: boolean) => {
       const known = filters.get(name) ?? { name };
       if (command !== undefined) known.command = command;
+      if (remote !== undefined) known.remote = remote;
       filters.set(name, known);
     };
-    define("tgz", INTERNAL_GZIP_COMMAND);
-    define("tar.gz", INTERNAL_GZIP_COMMAND);
+    define("tgz", INTERNAL_GZIP_COMMAND, true);
+    define("tar.gz", INTERNAL_GZIP_COMMAND, true);
     for (const { key, value } of this.tarConfig()) {
       const last = key.lastIndexOf(".");
       const name = key.slice(4, last);
@@ -318,13 +347,21 @@ export class ArchiveCommand extends GitCommand<Uint8Array> {
       const type = key.slice(last + 1);
       if (type === "command") {
         if (value !== undefined) define(name, value);
-      } else if (type === "remote") define(name, undefined);
+      } else if (type === "remote") {
+        // git_config_bool: a key without a value is true, a bad one dies
+        const remote = value === undefined ? true : parseGitBool(value);
+        if (remote === undefined) {
+          throw new GitApiError(`fatal: bad boolean config value '${value}' for '${key}'`);
+        }
+        define(name, undefined, remote);
+      }
     }
-    return [
-      { name: "tar" },
+    const all: Archiver[] = [
+      { name: "tar", remote: true },
       ...[...filters.values()].filter((a) => a.command !== undefined),
-      { name: "zip" },
+      { name: "zip", remote: true },
     ];
+    return this.uploadArchive ? all.filter((a) => a.remote) : all;
   }
 
   /** The `tar.*` variables in configuration order. */
@@ -357,9 +394,7 @@ export class ArchiveCommand extends GitCommand<Uint8Array> {
     const extras = await this.readExtraFiles();
     let format = this.format;
     if (format === undefined && this.outputName !== undefined) {
-      format = this.archivers().find((a) =>
-        matchExtension(this.outputName as string, a.name),
-      )?.name;
+      format = this.formatFromFilename(this.outputName);
     }
     format ??= "tar";
     if (this.tree === undefined) throw new GitApiError(USAGE, { exitCode: 129 });
@@ -475,6 +510,13 @@ export class ArchiveCommand extends GitCommand<Uint8Array> {
   /** `parse_treeish_arg`: the tree, the commit (if any) and the archive's time. */
   private async resolveTreeish(name: string): Promise<ArchiveTarget> {
     const resolver = this.revisionResolver();
+    if (this.uploadArchive && !this.uploadArchive.allowUnreachable) {
+      // remotes are only allowed to fetch actual refs
+      const colon = name.indexOf(":");
+      const refName = colon < 0 ? name : name.slice(0, colon);
+      const found = await resolver.dwimRef(refName).catch(() => []);
+      if (found.length === 0) throw new GitApiError(`fatal: no such ref: ${refName}`);
+    }
     const id = await resolver.resolve(name).catch(() => undefined);
     if (id === undefined) throw new GitApiError(`fatal: not a valid object name: ${name}`);
     const peeled = await resolver.peelTags(id);

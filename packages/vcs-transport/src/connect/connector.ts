@@ -14,7 +14,7 @@ import type { HttpClientSettings, HttpCredentialHelper } from "../http-client/in
 import type { GitUrl } from "./git-url.js";
 
 /** The service a session talks to. */
-export type GitService = "git-upload-pack" | "git-receive-pack";
+export type GitService = "git-upload-pack" | "git-receive-pack" | "git-upload-archive";
 
 /** What a connector is asked to connect to. */
 export interface GitConnectRequest {
