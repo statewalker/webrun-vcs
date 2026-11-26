@@ -38,6 +38,7 @@ import {
   readGitDaemonRequest,
 } from "../protocol/git-daemon-request.js";
 import { encodePacket } from "../protocol/pkt-line-codec.js";
+import { type DaemonHostLookup, daemonHostInfo } from "./daemon-host.js";
 import { type ServeOverDuplexOptions, serveOverDuplex } from "./serve-over-duplex.js";
 import type { ServedGitFiles } from "./served-git-files.js";
 import {
@@ -92,6 +93,14 @@ export interface ServedRepository {
    * knows of the client: an HTTP request's user and address (the variables git's
    * http-backend hands its children, the hooks included)
    */
+  /**
+   * The path the repository was found at (git's `enter_repo` result: the base path or
+   * interpolated directory plus the suffix that matched), as git-daemon's `--access-hook` is
+   * told it; `createBasePathResolver` sets it
+   */
+  path?: string;
+  /** Its git directory (a gitfile followed), where git-daemon runs the access hook */
+  gitDir?: string;
   around?<T>(
     service: "git-upload-pack" | "git-receive-pack",
     serve: () => Promise<T>,
@@ -119,6 +128,8 @@ export interface GitServiceRequest {
   host?: string;
   /** git:// only: the port of `host=` */
   port?: string;
+  /** git:// only: the request carried `host=` (git-daemon's `saw_extended_args`) */
+  extendedArgs?: boolean;
   /** The `GIT_PROTOCOL` parameters (`version=2`), git:// ones after the second NUL */
   gitProtocol?: string;
   /** The protocol `gitProtocol` asks for (git's greatest `version=`) */
@@ -184,6 +195,90 @@ export interface GitServeOptions {
   settings?: GitServeSettings;
   /** Close the stream once served (default true: the connection is over, as git-daemon's child exits) */
   closeDuplex?: boolean;
+  /**
+   * git-daemon's `--access-hook`: asked once the service is enabled for the repository found,
+   * before it is served; a run that fails (exits non-zero, or cannot start: undefined) refuses
+   * the request with the first line of its stdout, leading white space dropped ("service
+   * rejected" when there is none), as `ERR <line>: <path>` under `informativeErrors`. The
+   * hook is a host's program: vcs-commands' `daemonAccessHookOf` runs one through a
+   * `HookRunner`
+   */
+  accessHook?: DaemonAccessHook;
+  /**
+   * Resolves the `host=` name for the access hook's canonical name and address; default
+   * `lookupLiteralHost` (an IPv4 literal is its own address, nothing else resolves)
+   */
+  lookupHost?: DaemonHostLookup;
+  /** The client's address (git-daemon's `REMOTE_ADDR`), given to the access hook */
+  remoteAddress?: string;
+  /** The client's port (git-daemon's `REMOTE_PORT`), given to the access hook */
+  remotePort?: string;
+  /**
+   * Cuts the connection off while it is still being set up: once aborted, a request not yet
+   * served is closed without an answer (git-daemon's SIGTERM to a child that has not passed
+   * the access hook yet; a served one ignores it). See `createGitDaemon`
+   */
+  signal?: AbortSignal;
+  /** Called right before the service starts (the client passed every check) */
+  onServiceStart?(): void;
+}
+
+/** What git-daemon's `--access-hook` is run with (its arguments, after the hook). */
+export interface DaemonAccessHookRequest {
+  /** The service without `git-` (`upload-pack`, `receive-pack`, `upload-archive`) */
+  service: string;
+  /** The repository's path ({@link ServedRepository.path}, else the path asked for) */
+  path: string;
+  /** The git directory, where git-daemon runs the hook ({@link ServedRepository.gitDir}) */
+  gitDir?: string;
+  /** `host=`'s name (empty without one) */
+  hostname: string;
+  /** Its canonical name (empty when it does not resolve) */
+  canonicalHostname: string;
+  /** Its address (empty when it does not resolve) */
+  ipAddress: string;
+  /** `host=`'s port (empty without one) */
+  port: string;
+  /** The client's address and port (the hook's `REMOTE_ADDR` / `REMOTE_PORT`), when known */
+  remoteAddress?: string;
+  remotePort?: string;
+  /** The request and the repository found */
+  request: GitServiceRequest;
+  repository: ServedRepository;
+}
+
+/** What the access hook did: its exit code and its stdout (its stderr is discarded). */
+export interface DaemonAccessHookOutcome {
+  exitCode: number;
+  stdout: Uint8Array;
+}
+
+/** Runs git-daemon's access hook; undefined when it could not be started. */
+export type DaemonAccessHook = (
+  request: DaemonAccessHookRequest,
+) => Promise<DaemonAccessHookOutcome | undefined>;
+
+/**
+ * daemon.c's `run_access_hook`'s verdict: undefined when the hook allows the request, else
+ * the refusal's text (stdout's first line, leading white space dropped, "service rejected"
+ * when empty).
+ */
+async function accessRefusal(
+  hook: DaemonAccessHook,
+  request: DaemonAccessHookRequest,
+): Promise<string | undefined> {
+  let outcome: DaemonAccessHookOutcome | undefined;
+  try {
+    outcome = await hook(request);
+  } catch {
+    outcome = undefined;
+  }
+  if (outcome && outcome.exitCode === 0) return undefined;
+  let text = outcome ? new TextDecoder().decode(outcome.stdout) : "";
+  text = text.replace(/^[ \t\n\v\f\r]+/, "");
+  const eol = text.indexOf("\n");
+  if (eol >= 0) text = text.slice(0, eol);
+  return text === "" ? "service rejected" : text;
 }
 
 /** Options of {@link serveGitConnection}. */
@@ -223,6 +318,8 @@ export interface ServeGitServiceOptions extends GitServeOptions {
   /** git:// only: the request's virtual host and port */
   host?: string;
   port?: string;
+  /** git:// only: the request carried `host=` (`--interpolated-path` applies) */
+  extendedArgs?: boolean;
 }
 
 /** The outcome of a served connection. */
@@ -514,6 +611,7 @@ export async function serveGitConnection(
     ...(request.gitProtocol !== undefined ? { gitProtocol: request.gitProtocol } : {}),
     ...(request.host !== undefined ? { host: request.host } : {}),
     ...(request.port !== undefined ? { port: request.port } : {}),
+    ...(request.extendedArgs ? { extendedArgs: true } : {}),
   });
   if (timed?.expired()) {
     const message = "timed out waiting for the client";
@@ -541,15 +639,20 @@ export async function serveGitService(
     version,
     ...(options.host !== undefined ? { host: options.host } : {}),
     ...(options.port !== undefined ? { port: options.port } : {}),
+    ...(options.extendedArgs ? { extendedArgs: true } : {}),
     ...(options.gitProtocol !== undefined ? { gitProtocol: options.gitProtocol } : {}),
   };
   const daemon = options.refusal === "daemon";
-  const refuse = async (reason: "no such repository" | "service not enabled") => {
-    const text = daemon
-      ? `ERR ${options.informativeErrors ? reason : "access denied or repository not exported"}: ${path}`
-      : reason === "service not enabled" && options.informativeErrors
-        ? `ERR service not enabled: ${path}`
-        : `ERR '${path}' does not appear to be a git repository`;
+  const refuse = async (
+    reason: "no such repository" | "repository not exported" | "service not enabled" | string,
+    hook = false,
+  ) => {
+    const text =
+      daemon || hook
+        ? `ERR ${options.informativeErrors ? reason : "access denied or repository not exported"}: ${path}`
+        : reason === "service not enabled" && options.informativeErrors
+          ? `ERR service not enabled: ${path}`
+          : `ERR '${path}' does not appear to be a git repository`;
     try {
       await duplex.write(encodePacket(text));
     } catch {
@@ -571,6 +674,7 @@ export async function serveGitService(
   if (!enabled && !overridable) return refuse("service not enabled");
   if (isUnsafeServicePath(path, { implicit: !daemon })) return refuse("no such repository");
   let served: ServedRepository | undefined;
+  let notExported = false;
   try {
     served = await options.resolveRepository(path, request);
   } catch (error) {
@@ -580,14 +684,40 @@ export async function serveGitService(
       if (options.closeDuplex !== false) await closeQuietly(duplex);
       return { success: false, error: error.message, refused: error.message, request };
     }
+    notExported = error instanceof Error && error.name === "RepositoryNotExportedError";
     served = undefined;
   }
-  if (!served) return refuse("no such repository");
+  if (!served) return refuse(notExported ? "repository not exported" : "no such repository");
   const override = overridable ? configBoolOf(served.config, `daemon.${configKey}`) : undefined;
   // upload-archive needs the repository's archive writer: refused as when not enabled
   if (!(override ?? enabled) || (service === "git-upload-archive" && !served.uploadArchive)) {
     return refuse("service not enabled");
   }
+  if (options.accessHook) {
+    // run_access_hook: after the service checks, before git-daemon ignores SIGTERM
+    const info = await daemonHostInfo(options.host, options.lookupHost);
+    const refusal = await accessRefusal(options.accessHook, {
+      service: service.slice(4),
+      path: served.path ?? path,
+      ...(served.gitDir !== undefined ? { gitDir: served.gitDir } : {}),
+      hostname: options.host ?? "",
+      canonicalHostname: info.canonicalHostname,
+      ipAddress: info.ipAddress,
+      port: options.port ?? "",
+      ...(options.remoteAddress !== undefined ? { remoteAddress: options.remoteAddress } : {}),
+      ...(options.remotePort !== undefined ? { remotePort: options.remotePort } : {}),
+      request,
+      repository: served,
+    });
+    if (refusal !== undefined) return refuse(refusal, true);
+  }
+  if (options.signal?.aborted) {
+    // cut off before the client passed every check: closed without an answer
+    if (options.closeDuplex !== false) await closeQuietly(duplex);
+    const message = "connection cut off";
+    return { success: false, error: message, refused: message, request };
+  }
+  options.onServiceStart?.();
   if (service === "git-upload-archive" && served.uploadArchive) {
     const writer = served.uploadArchive;
     try {

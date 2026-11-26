@@ -597,7 +597,10 @@ export function createServedHttpHandler(
       try {
         served = await options.resolveRepository(repoPath, serviceRequest);
       } catch (error) {
-        logger?.error(`Error resolving repository ${repoPath}`, error);
+        // a repository not exported is http-backend's 404 too ("Repository not exported")
+        if (!(error instanceof Error && error.name === "RepositoryNotExportedError")) {
+          logger?.error(`Error resolving repository ${repoPath}`, error);
+        }
         // enter_repo's die_upon_dubious_ownership, a config read git dies on: http-backend's
         // die_webcgi answers 500 (its message goes to the server's log only)
         if (isFatalResolution(error)) return internalError();
