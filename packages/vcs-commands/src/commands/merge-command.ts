@@ -42,7 +42,7 @@ import {
   FmtMergeMsgCommand,
   fmtMergeMsgConfigOf,
 } from "./fmt-merge-msg-command.js";
-import { configBool, conflictStyleOf } from "./merge-config.js";
+import { configBool, conflictStyleOf, mergeVerbosityOf } from "./merge-config.js";
 import { MergeDriverFailedError, ortConfigOptions } from "./merge-drivers.js";
 import { parseStrategyOptions, strategyOrtOptions } from "./merge-strategy-options.js";
 import {
@@ -1227,7 +1227,10 @@ export class MergeCommand extends GitCommand<MergeResult> {
         failingPaths: failing(refused.paths),
       };
     }
-    output.push(...(merge?.messages ?? []));
+    // merge_ort_recursive's show_msgs (git 2.50+): no messages at verbosity 0
+    if (this.hooks.compatibility === "2.43" || mergeVerbosityOf(this.workingCopy) !== 0) {
+      output.push(...(merge?.messages ?? []));
+    }
     // git's merge_msg: the message given, or fmt-merge-msg's, without its last newline
     const message = await this.mergeMessage(headId, [{ id: srcId, name: srcName }]);
 
