@@ -14,7 +14,11 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createBasePathResolver, createServedFetchHandler } from "@statewalker/vcs-transport";
+import {
+  createBasePathResolver,
+  createServedFetchHandler,
+  serveGitConnection,
+} from "@statewalker/vcs-transport";
 import {
   createNodeFilesApi,
   createNodeGitHostEnvironment,
@@ -33,7 +37,7 @@ import {
 import { compatibility, ourClone, ourCloneFails } from "./clone-options-native-support.js";
 import { type LoopbackServer, serveOnLoopback } from "./http-loopback-support.js";
 import { openOurs } from "./merge-native-helpers.js";
-import { gitAsync } from "./native-connect-support.js";
+import { gitAsync, startTcpServer } from "./native-connect-support.js";
 import { nativeGitAvailable, nativeGitHttpBackend } from "./native-git-http-backend.js";
 import { testEnv } from "./status-native-support.js";
 
@@ -567,6 +571,10 @@ git bundle create -q ALL.bundle --all
     let srv: string;
     let parent: string;
     let ourHttp: LoopbackServer;
+    let ourDaemon: { port: number; close(): Promise<void> };
+    let otherHost: LoopbackServer;
+    /** Files our HTTP server also serves under /static/, and the headers each GET carried */
+    const staticSeen: { url: string; authorization: string | null; secret: string | null }[] = [];
     let nativeHttpServer: { server: LoopbackServer; close(): Promise<void> } | undefined;
     let host: Git;
 
@@ -594,7 +602,29 @@ git bundle create -q ALL.bundle --all
           return opened ? servedRepositoryOf(opened) : undefined;
         },
       });
-      ourHttp = await serveOnLoopback(createServedFetchHandler({ resolveRepository }));
+      const served = createServedFetchHandler({ resolveRepository });
+      const staticFile = (request: Request): Response => {
+        const url = new URL(request.url);
+        staticSeen.push({
+          url: `${url.origin}${url.pathname}`,
+          authorization: request.headers.get("authorization"),
+          secret: request.headers.get("x-secret"),
+        });
+        try {
+          return new Response(readFileSync(join(home, url.pathname.slice("/static/".length))));
+        } catch {
+          return new Response(null, { status: 404 });
+        }
+      };
+      ourHttp = await serveOnLoopback(async (request) =>
+        new URL(request.url).pathname.startsWith("/static/")
+          ? staticFile(request)
+          : served(request),
+      );
+      otherHost = await serveOnLoopback(async (request) => staticFile(request));
+      ourDaemon = await startTcpServer((duplex) =>
+        serveGitConnection({ duplex, resolveRepository }),
+      );
       if (nativeHttp) {
         const backend = nativeGitHttpBackend(srv, home);
         const server = await serveOnLoopback((request) => backend.fetch(request));
@@ -610,6 +640,8 @@ git bundle create -q ALL.bundle --all
 
     afterAll(async () => {
       await ourHttp?.close();
+      await otherHost?.close();
+      await ourDaemon?.close();
       await nativeHttpServer?.close();
     });
 
@@ -723,6 +755,71 @@ git bundle create -q ALL.bundle --all
         expect(bundleState(dir).refs).toContain("refs/bundles/");
       },
     );
+
+    it('t5731-protocol-v2-bundle-uri-git.sh: "connect with git:// using protocol v2: have bundle-uri"', async () => {
+      setBundles([["bundle.only.uri", `file://${home}/only.bundle`]]);
+      const trace = join(home, "trace-daemon-ls");
+      const r = await gitAsync(
+        home,
+        home,
+        [
+          "-c",
+          "protocol.version=2",
+          "ls-remote",
+          "--symref",
+          `git://127.0.0.1:${ourDaemon.port}/parent`,
+        ],
+        { GIT_TRACE_PACKET: trace },
+      );
+      expect(r.status).toBe(0);
+      const lines = serverLines(readFileSync(trace, "utf8"));
+      expect(lines).toContain("version 2");
+      expect(lines).toContain("bundle-uri");
+    });
+
+    it('t5731-protocol-v2-bundle-uri-git.sh: "clone with git:// using protocol v2: request bundle-uris"', async () => {
+      // native git against our daemon, and the same clone of the repository through native
+      // upload-pack (file://): the same bundle refs and messages
+      setBundles([["bundle.only.uri", `file://${home}/only.bundle`]]);
+      const state = async (url: string, trace?: string) => {
+        const dir = join(home, `daemon-clone-${++counter}`);
+        const r = await gitAsync(
+          home,
+          home,
+          ["-c", "transfer.bundleURI=true", "-c", "protocol.version=2", "clone", url, dir],
+          trace ? { GIT_TRACE_PACKET: trace } : {},
+        );
+        expect(r.status).toBe(0);
+        return { ...bundleState(dir), messages: messageLines(r.stderr) };
+      };
+      const trace = join(home, "trace-daemon-clone");
+      const ours = await state(`git://127.0.0.1:${ourDaemon.port}/parent`, trace);
+      expect(readFileSync(trace, "utf8")).toContain("> command=bundle-uri");
+      expect(ours).toEqual(await state(`file://${parent}`));
+      expect(ours.refs).toContain("refs/bundles/");
+    });
+
+    it("bundle downloads carry the static credentials and headers only to the remote's origin", async () => {
+      // the bundle list is the server's content and may name any host
+      const remote = `${ourHttp.baseUrl}/parent`;
+      for (const [name, bundleUri, expected] of [
+        ["same", `${ourHttp.baseUrl}/static/only.bundle`, true],
+        ["other", `${otherHost.baseUrl}/static/only.bundle`, false],
+      ] as const) {
+        staticSeen.length = 0;
+        const result = await ourClone(home, join(home, `auth-${name}-${++counter}`), (c) =>
+          c
+            .setURI(remote)
+            .setBundleUri(bundleUri)
+            .setCredentials({ username: "u", password: "p" })
+            .setHeaders({ "X-Secret": "s" }),
+        );
+        expect(messageLines((result.messages ?? []).join(""))).toEqual([]);
+        expect(staticSeen.map((r) => r.url)).toEqual([bundleUri]);
+        expect(staticSeen[0]?.authorization !== null).toBe(expected);
+        expect(staticSeen[0]?.secret).toBe(expected ? "s" : null);
+      }
+    });
 
     it('t5730-protocol-v2-bundle-uri-file.sh: "clone with file:// using protocol v2: request bundle-uris"', async () => {
       // ours as the client, native git as the server (a local upload-pack), and the same
