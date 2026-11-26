@@ -12,6 +12,8 @@
 export * from "./alternates/index.js";
 // The commit-graph: settings, provider, writeCommitGraph
 export * from "./commit-graph.js";
+// extensions.compatObjectFormat: the loose object map, converted objects and ids
+export * from "./compat/index.js";
 // Factory functions
 export * from "./create-git-files-backend.js";
 export * from "./create-git-files-history-with-ops.js";

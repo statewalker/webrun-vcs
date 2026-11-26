@@ -56,6 +56,7 @@ import {
   FmtMergeMsgCommand,
   ForEachRefCommand,
   FormatPatchCommand,
+  FormatRevCommand,
   FsckCommand,
   GarbageCollectCommand,
   GrepCommand,
@@ -112,6 +113,8 @@ import {
   RepackCommand,
   ReplaceCommand,
   ReplayCommand,
+  RepoInfoCommand,
+  RepoStructureCommand,
   RequestPullCommand,
   RerereCommand,
   ResetCommand,
@@ -132,6 +135,8 @@ import {
   StashBranchCommand,
   StashCreateCommand,
   StashDropCommand,
+  StashExportCommand,
+  StashImportCommand,
   StashListCommand,
   StashPopCommand,
   StashShowCommand,
@@ -1481,6 +1486,49 @@ export class Git implements Disposable {
   }
 
   /**
+   * Create a RepoInfoCommand (`git repo info`): the repository's layout, formats and paths as
+   * `key=value` lines.
+   *
+   * @example
+   * ```typescript
+   * const { stdout } = await git.repoInfo().addKeys("layout.bare").callOutput();
+   * // "layout.bare=false\n"
+   * ```
+   */
+  repoInfo(): RepoInfoCommand {
+    this.checkClosed();
+    return new RepoInfoCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a RepoStructureCommand (`git repo structure`): counts and sizes of the references
+   * and of the objects reachable from them.
+   *
+   * @example
+   * ```typescript
+   * const { stdout } = await git.repoStructure().setFormat("lines").callOutput();
+   * ```
+   */
+  repoStructure(): RepoStructureCommand {
+    this.checkClosed();
+    return new RepoStructureCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a FormatRevCommand (`git format-rev`, experimental): commits read from stdin, or
+   * object ids in running text, replaced by a pretty format.
+   *
+   * @example
+   * ```typescript
+   * const { stdout } = await git.formatRev().setStdinMode("revs").setFormat("%s").setInput("HEAD\n").callOutput();
+   * ```
+   */
+  formatRev(): FormatRevCommand {
+    this.checkClosed();
+    return new FormatRevCommand(this._workingCopy);
+  }
+
+  /**
    * Create a CheckRefFormatCommand (`git check-ref-format`): whether a name is a valid ref
    * name (`--normalize`, `--allow-onelevel`, `--refspec-pattern`), or `--branch`'s branch.
    *
@@ -2568,6 +2616,34 @@ export class Git implements Disposable {
   stashStore(): StashStoreCommand {
     this.checkClosed();
     return new StashStoreCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a StashExportCommand: `git stash export` (git 2.51+), the stashes written as a
+   * chain of commits that any transport carries, its tip printed or written to a ref.
+   *
+   * @example
+   * ```typescript
+   * await git.stashExport().setToRef("refs/heads/stashes").call();
+   * ```
+   */
+  stashExport(): StashExportCommand {
+    this.checkClosed();
+    return new StashExportCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a StashImportCommand: `git stash import` (git 2.51+), the stashes of an exported
+   * chain added to `refs/stash`.
+   *
+   * @example
+   * ```typescript
+   * await git.stashImport().setCommit("refs/heads/stashes").call();
+   * ```
+   */
+  stashImport(): StashImportCommand {
+    this.checkClosed();
+    return new StashImportCommand(this._workingCopy);
   }
 
   // ============ Component Access ============

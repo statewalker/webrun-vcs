@@ -37,6 +37,7 @@ import {
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { openObjectAlternates, withAlternates } from "./alternates/index.js";
 import { createFilesCommitGraphProvider } from "./commit-graph.js";
+import { createCompatObjects, LooseObjectMap, withCompatWrites } from "./compat/index.js";
 import { parseConfigInt, readPackSetSettings, skipPacked, withPacks } from "./pack/index.js";
 import { beginFilesQuarantine } from "./quarantine/files-quarantine.js";
 import {
@@ -203,7 +204,9 @@ export interface GitFilesBackendResult {
  *
  * The repository's format is checked first, as git does (`readRepositoryFormat`): a
  * `core.repositoryformatversion` above 1, an unknown version-1 extension, or one we do not
- * implement (`extensions.compatObjectFormat`) throws `UnsupportedRepositoryFormatError`. A
+ * implement (an `extensions.objectStorage` payload) throws `UnsupportedRepositoryFormatError`. A
+ * repository with `extensions.compatObjectFormat` keeps `objects/loose-object-idx` on its loose
+ * writes and translates ids through `objects.compat` (`compat/`). A
  * SHA-256 repository (`extensions.objectFormat = sha256`) opens with 32-byte object ids
  * (`objects.objectFormat`): its packs, `.idx`, `.rev` and `.mtimes` hold 32-byte ids and
  * SHA-256 checksums, and so do its multi-pack-index (and chain), bitmaps and commit-graph
@@ -337,9 +340,27 @@ export async function createGitFilesBackend(
       commitGraph.invalidate();
     };
   }
-  const loose = createGitObjects(skipPacked(staging, packs, alternates), { objectFormat });
+  // extensions.compatObjectFormat: every new loose object gets its compatibility id in
+  // objects/loose-object-idx (git's loose object map); packs get none, as in git
+  const compatMap = format.compatObjectFormat
+    ? new LooseObjectMap({
+        files,
+        objectsDir,
+        storage: objectFormat,
+        compat: format.compatObjectFormat,
+      })
+    : undefined;
+  let storedObjects: GitObjects | undefined;
+  const looseWrites = createGitObjects(skipPacked(staging, packs, alternates), { objectFormat });
+  const loose = compatMap
+    ? withCompatWrites(looseWrites, {
+        map: compatMap,
+        has: (id) => (storedObjects ?? looseWrites).has(id),
+      })
+    : looseWrites;
   const local = withPacks(loose, packs);
   const stored = alternates ? withAlternates(local, alternates) : local;
+  storedObjects = stored;
   // a partial clone's absent objects: fetched from its promisor remote on a read (once a
   // fetcher is installed: vcs-commands installs one), its promisor packs known by their
   // `.promisor` files
@@ -367,7 +388,9 @@ export async function createGitFilesBackend(
       objects: objects.withoutLazyFetch ?? objects,
       packs,
       freshenMaxAgeMs,
+      ...(compatMap ? { compatMap } : {}),
     });
+  if (compatMap) objects.compat = createCompatObjects(compatMap, objects);
   const reflog = readRefStoreConfig(settingsConfig);
   // a reftable repository's refs are in `<git dir>/reftable`; a files repository's are loose
   // refs and packed-refs
