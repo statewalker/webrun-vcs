@@ -65,6 +65,11 @@ export interface PackRefsOptions {
   deleteLoose?: boolean;
   prefixes?: string[];
   auto?: boolean;
+  /**
+   * With `auto`: only answer whether the auto check would pack (1) or not (0), changing
+   * nothing (git's `refs_optimize_required`, the maintenance pack-refs task's condition)
+   */
+  checkOnly?: boolean;
   onError?: (line: string) => void;
 }
 
