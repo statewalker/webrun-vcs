@@ -34,6 +34,11 @@ export interface LsRemoteResult {
   refs: RemoteRef[];
   /** Default branch (from HEAD symref) */
   defaultBranch?: string;
+  /**
+   * The object HEAD names, git ls-remote's first line (`<id>\tHEAD`); undefined when the
+   * remote has no HEAD or it is unborn, or with `--heads`/`--tags`
+   */
+  head?: ObjectId;
 }
 
 /**
@@ -218,6 +223,7 @@ export class LsRemoteCommand extends TransportCommand<LsRemoteResult> {
       uri: remoteUrl,
       refs: filteredRefs,
       defaultBranch,
+      ...(head?.oid && !this.heads && !this.tags ? { head: head.oid } : {}),
     };
   }
 
