@@ -1,0 +1,479 @@
+/**
+ * The file system monitor (`core.fsmonitor`, the `FSMN` index extension) against native git,
+ * with t7519-status-fsmonitor.sh's scenarios: from one index, native `git status` / `git add`
+ * and ours, given the same monitor answers (t7519's hook scripts, run by both), must print the
+ * same status and write the same index bytes, the `FSMN` token and dirty bitmap included.
+ *
+ * The twins share one repository: the index (bytes and mtime) is put back before the second
+ * run. Worktree files are dated back, so no entry is racily clean. A hook answering with the
+ * protocol version 1 makes git's token a nanosecond time: those indexes are compared with the
+ * token's digits zeroed.
+ */
+import { execFileSync } from "node:child_process";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  createNodeGitHostEnvironment,
+  createNodeHookRunner,
+} from "@statewalker/vcs-utils-node/files";
+import {
+  type FsmonitorQuery,
+  type GitHostEnvironment,
+  parseFsmonitorExtension,
+  parseIndexFile,
+} from "@statewalker/vcs-working-tree";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
+import { formatStatusPorcelain } from "../src/index.js";
+import { nativeIs25x } from "./hooks-native-support.js";
+import { openOurs } from "./merge-native-helpers.js";
+import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+
+const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
+
+/** Whether native git is built with the builtin daemon (`feature: fsmonitor--daemon`). */
+const nativeHasDaemon =
+  nativeGitAvailable() &&
+  /fsmonitor--daemon/.test(execFileSync("git", ["version", "--build-options"]).toString());
+
+let root: string;
+let dir: string;
+const env = (extra: Record<string, string> = {}) => ({ ...nativeGitEnv(root), ...extra });
+const git = (args: string[], extra?: Record<string, string>) =>
+  execFileSync("git", args, {
+    cwd: dir,
+    env: env(extra),
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+const put = (path: string, content: string) => {
+  mkdirSync(join(dir, path, ".."), { recursive: true });
+  writeFileSync(join(dir, path), content);
+};
+
+/** t7519's `write_integration_script`: version 2, every path dirty_repo touches. */
+const INTEGRATION = `#!/bin/sh
+if test "$#" -ne 2
+then
+	echo "$0: exactly 2 arguments expected"
+	exit 2
+fi
+if test "$1" != 2
+then
+	echo "Unsupported core.fsmonitor hook version." >&2
+	exit 1
+fi
+printf "last_update_token\\0"
+printf "untracked\\0"
+printf "dir1/untracked\\0"
+printf "dir2/untracked\\0"
+printf "modified\\0"
+printf "dir1/modified\\0"
+printf "dir2/modified\\0"
+printf "new\\0"
+printf "dir1/new\\0"
+printf "dir2/new\\0"
+`;
+
+/** A version 2 hook answering its token and nothing changed (t7519's `printf "last_update_token\0"`). */
+const NOTHING = `#!/bin/sh
+printf "last_update_token\\0"
+`;
+
+/** A version 2 hook answering the paths `report` listed (`.git/fsm-list`). */
+const LISTED = `#!/bin/sh
+printf "listed_token\\0"
+cat .git/fsm-list 2>/dev/null
+`;
+function report(paths: string[]) {
+  writeFileSync(join(dir, ".git/fsm-list"), paths.map((p) => `${p}\0`).join(""));
+}
+
+/** t7519/fsmonitor-all: version 1 only, the trivial answer (everything may have changed). */
+const ALL_V1 = `#!/bin/sh
+if test "$#" -ne 2
+then
+	echo "$0: exactly 2 arguments expected" >&2
+	exit 2
+fi
+if test "$1" != 1
+then
+	exit 1
+fi
+echo "/"
+`;
+
+function hook(script: string) {
+  const path = join(dir, ".git/hooks/fsmonitor-test");
+  mkdirSync(join(dir, ".git/hooks"), { recursive: true });
+  writeFileSync(path, script);
+  chmodSync(path, 0o755);
+}
+
+let back = 0;
+/** Every worktree file and directory dated back (a second never used before). */
+function dateBack() {
+  back++;
+  const when = Math.floor(Date.now() / 1000) - 100_000 + back;
+  const walk = (rel: string) => {
+    for (const entry of readdirSync(join(dir, rel), { withFileTypes: true })) {
+      if (entry.name === ".git" && rel === "") continue;
+      const path = rel ? `${rel}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) walk(path);
+      utimesSync(join(dir, path), when, when);
+    }
+  };
+  walk("");
+  utimesSync(dir, when, when);
+}
+
+/** t7519's `dirty_repo`. */
+function dirtyRepo() {
+  put("untracked", "");
+  put("dir1/untracked", "");
+  put("dir2/untracked", "");
+  put("modified", "1\n");
+  put("dir1/modified", "2\n");
+  put("dir2/modified", "3\n");
+  put("new", "4\n");
+  put("dir1/new", "5\n");
+  put("dir2/new", "6\n");
+  dateBack();
+}
+
+/** t7519's `clean_repo`. */
+function cleanRepo() {
+  git(["-c", "core.fsmonitor=", "reset", "--hard", "-q", "HEAD"]);
+  git(["-c", "core.fsmonitor=", "clean", "-fdq"]);
+  dateBack();
+}
+
+/** Our host: native git's environment and a hook runner of its version. */
+function host(extra: Partial<GitHostEnvironment> = {}): GitHostEnvironment {
+  const e = env();
+  return {
+    ...createNodeGitHostEnvironment({
+      env: e,
+      hookRunner: createNodeHookRunner({ env: e, compatibility: nativeIs25x ? "2.56" : "2.43" }),
+    }),
+    ...extra,
+  };
+}
+
+const indexPath = () => join(dir, ".git/index");
+function saveIndex() {
+  return { bytes: readFileSync(indexPath()), mtime: statSync(indexPath()).mtime };
+}
+function restoreIndex(saved: ReturnType<typeof saveIndex>) {
+  writeFileSync(indexPath(), saved.bytes);
+  utimesSync(indexPath(), saved.mtime, saved.mtime);
+}
+
+/** The index's bytes, a version 1 hook's nanosecond token zeroed (and so the trailer). */
+function normalized(bytes: Buffer, zeroToken: boolean): string {
+  if (!zeroToken) return bytes.toString("hex");
+  const out = Buffer.from(bytes);
+  const at = out.lastIndexOf(Buffer.from("FSMN"));
+  if (at >= 0) {
+    for (let i = at + 12; i < out.length && out[i] !== 0; i++) out[i] = 0x30;
+  }
+  return out.subarray(0, out.length - 20).toString("hex");
+}
+
+async function fsmnOf(bytes: Buffer) {
+  const parsed = await parseIndexFile(new Uint8Array(bytes));
+  const ext = parsed.extensionData.find((e) => e.signature === "FSMN");
+  return ext ? parseFsmonitorExtension(ext.data, parsed.entries.length) : undefined;
+}
+
+/**
+ * Native `git status` and ours from the index as it is: the same porcelain output and index
+ * bytes. The index native git wrote is kept afterwards (`keep: "native"`) or ours.
+ */
+async function statusTwins(
+  options: { zeroToken?: boolean; keep?: "native" | "ours"; host?: GitHostEnvironment } = {},
+) {
+  const saved = saveIndex();
+  const nativeOut = git(["status", "--porcelain"]);
+  const nativeIndex = readFileSync(indexPath());
+  restoreIndex(saved);
+  const ours = await openOurs(dir, options.host ?? host());
+  const status = await ours.status().call();
+  const oursIndex = readFileSync(indexPath());
+  expect(formatStatusPorcelain(status)).toBe(nativeOut);
+  expect(normalized(oursIndex, !!options.zeroToken)).toBe(
+    normalized(nativeIndex, !!options.zeroToken),
+  );
+  if ((options.keep ?? "native") === "native") writeFileSync(indexPath(), nativeIndex);
+  return { nativeOut, nativeIndex, oursIndex, status };
+}
+
+/** Our `git ls-files -f`. */
+async function oursLsFilesF(): Promise<string> {
+  const out = await (await openOurs(dir, host())).lsFiles().setShowFsmonitorBit(true).callOutput();
+  return Buffer.from(out.stdout).toString("latin1");
+}
+
+/** The full-scan status native git prints without the monitor. */
+const withoutMonitor = () => git(["-c", "core.fsmonitor=", "status", "--porcelain"]);
+
+describeGit("fsmonitor against native git (t7519-status-fsmonitor.sh)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "fsmonitor-native-"));
+    dir = join(root, "repo");
+    mkdirSync(dir);
+    git(["init", "-q", "-b", "main"]);
+    // t7519-status-fsmonitor.sh: "setup"
+    put("tracked", "");
+    put("modified", "");
+    put("dir1/tracked", "");
+    put("dir1/modified", "");
+    put("dir2/tracked", "");
+    put("dir2/modified", "");
+    git(["-c", "core.fsmonitor=", "add", "."]);
+    git(["-c", "core.fsmonitor=", "commit", "-qm", "initial"]);
+    git(["config", "core.fsmonitor", ".git/hooks/fsmonitor-test"]);
+    put(".gitignore", ".gitignore\nexpect*\nactual*\nmarker*\n");
+    dateBack();
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  for (const uc of [false, true]) {
+    it(`t7519-status-fsmonitor.sh: "compare status with and without fsmonitor" (untrackedCache=${uc})`, async () => {
+      git(["config", "core.untrackedcache", String(uc)]);
+      hook(INTEGRATION);
+      cleanRepo();
+      dirtyRepo();
+      git(["add", "new", "dir1/new", "dir2/new"]);
+      dateBack();
+      // the first status adds the extension, the second reads it
+      const first = await statusTwins();
+      expect(first.nativeOut).toBe(withoutMonitor());
+      expect((await fsmnOf(first.oursIndex))?.token).toBe("last_update_token");
+      const second = await statusTwins({ keep: "ours" });
+      expect(second.nativeOut).toBe(withoutMonitor());
+    });
+
+    it(`t7519-status-fsmonitor.sh: "status doesn't detect unreported modifications" (untrackedCache=${uc})`, async () => {
+      git(["config", "core.untrackedcache", String(uc)]);
+      hook(NOTHING);
+      cleanRepo();
+      await statusTwins();
+      await statusTwins({ keep: "ours" });
+      dirtyRepo();
+      // nothing reported: the modified files are taken as up to date, and with the untracked
+      // cache its valid directories are not read again
+      const { nativeOut } = await statusTwins();
+      expect(nativeOut).not.toContain(" M ");
+      if (uc) expect(nativeOut).not.toContain("??");
+      else expect(nativeOut).toContain("?? untracked");
+    });
+  }
+
+  it('t7519-status-fsmonitor.sh: "newly added files are marked valid"', async () => {
+    hook(NOTHING);
+    dirtyRepo();
+    await statusTwins();
+    const saved = saveIndex();
+    git(["add", "new", "dir1/new", "dir2/new"]);
+    const nativeIndex = readFileSync(indexPath());
+    restoreIndex(saved);
+    const ours = await openOurs(dir, host());
+    await ours
+      .add()
+      .addFilepattern("new")
+      .addFilepattern("dir1/new")
+      .addFilepattern("dir2/new")
+      .call();
+    expect(readFileSync(indexPath()).toString("hex")).toBe(nativeIndex.toString("hex"));
+    // native git reads our bits as its own, and our ls-files -f lists them as native's
+    expect(git(["ls-files", "-f"])).toContain("h dir1/new\n");
+    expect(await oursLsFilesF()).toBe(git(["ls-files", "-f"]));
+  });
+
+  it('t7519-status-fsmonitor.sh: "all files returned by integration script get flagged as invalid"', async () => {
+    hook(NOTHING);
+    // the first status stores the stats the files were dated back to (entries replaced:
+    // dirty), the second marks them valid
+    await statusTwins();
+    expect(await oursLsFilesF()).toBe(git(["ls-files", "-f"]));
+    await statusTwins({ keep: "ours" });
+    expect(await oursLsFilesF()).toBe(git(["ls-files", "-f"]));
+    expect(git(["ls-files", "-f"])).toContain("h dir1/tracked\n");
+    hook(INTEGRATION);
+    dirtyRepo();
+    // reading the index asks the monitor: the paths it names are listed uppercase
+    const native = git(["ls-files", "-f"]);
+    expect(native).toContain("H modified\n");
+    expect(await oursLsFilesF()).toBe(native);
+  });
+
+  it('t7519-status-fsmonitor.sh: "refresh_index() invalidates fsmonitor cache"', async () => {
+    hook(INTEGRATION);
+    cleanRepo();
+    dirtyRepo();
+    git(["add", "."]);
+    hook("#!/bin/sh\n");
+    git(["commit", "-qm", "to reset"]);
+    git(["reset", "-q", "HEAD~1"]);
+    dateBack();
+    // an empty answer: "Empty last update token.", every entry checked, the token empty
+    const { nativeOut, status } = await statusTwins();
+    expect(nativeOut).toBe(withoutMonitor());
+    expect(status.warnings ?? []).toContain("warning: Empty last update token.");
+  });
+
+  it("a version 1 hook's trivial answer (t7519/fsmonitor-all) checks every entry", async () => {
+    hook(ALL_V1);
+    dirtyRepo();
+    // version 2 fails, version 1 answers "/": every entry checked, a nanosecond token
+    const first = await statusTwins({ zeroToken: true });
+    expect(first.nativeOut).toBe(withoutMonitor());
+    await statusTwins({ zeroToken: true, keep: "ours" });
+  });
+
+  it("a failing hook checks every entry (core.fsmonitorHookVersion=2: an empty token)", async () => {
+    hook("#!/bin/sh\nexit 1\n");
+    git(["config", "core.fsmonitorHookVersion", "2"]);
+    dirtyRepo();
+    const first = await statusTwins();
+    expect(first.nativeOut).toBe(withoutMonitor());
+    expect((await fsmnOf(first.oursIndex))?.token).toBe("");
+    await statusTwins({ keep: "ours" });
+  });
+
+  // git 2.5x on Linux has the builtin daemon (and would start one): only a git without it
+  // fails the IPC query as ours does without a host monitor
+  it.skipIf(nativeHasDaemon)(
+    "core.fsmonitor=true without the builtin daemon: the token builtin:fake",
+    async () => {
+      git(["config", "core.fsmonitor", "true"]);
+      dirtyRepo();
+      const first = await statusTwins();
+      expect((await fsmnOf(first.oursIndex))?.token).toBe("builtin:fake");
+      await statusTwins({ keep: "ours" });
+    },
+  );
+
+  it("the monitor turned off removes the extension", async () => {
+    hook(NOTHING);
+    await statusTwins();
+    git(["config", "core.fsmonitor", ""]);
+    const { oursIndex } = await statusTwins();
+    expect(await fsmnOf(oursIndex)).toBeUndefined();
+  });
+
+  it('t7519-status-fsmonitor.sh: "splitting the index results in the same state"', async () => {
+    hook(INTEGRATION);
+    git(["config", "core.splitIndex", "true"]);
+    dirtyRepo();
+    // the split files' entries differ from native git's by their racy stat handling (with
+    // or without the monitor): the FSMN payloads and the bits native git reads are compared
+    for (let round = 0; round < 2; round++) {
+      const saved = saveIndex();
+      const nativeOut = git(["status", "--porcelain"]);
+      const nativeFsmn = await fsmnOf(readFileSync(indexPath()));
+      const nativeBits = git(["ls-files", "-f"]);
+      restoreIndex(saved);
+      const status = await (await openOurs(dir, host())).status().call();
+      expect(formatStatusPorcelain(status)).toBe(nativeOut);
+      expect(await fsmnOf(readFileSync(indexPath()))).toEqual(nativeFsmn);
+      expect(git(["ls-files", "-f"])).toBe(nativeBits);
+    }
+    expect(git(["ls-files", "-f"])).toContain("h dir1/tracked\n");
+  });
+
+  it("one working copy asks the monitor again for each command (a later change is seen)", async () => {
+    hook(LISTED);
+    report([]);
+    await statusTwins();
+    await statusTwins({ keep: "ours" });
+    const ours = await openOurs(dir, host());
+    expect(formatStatusPorcelain(await ours.status().call())).toBe("");
+    put("modified", "changed\n");
+    dateBack();
+    report(["modified"]);
+    const native = git(["status", "--porcelain"]);
+    expect(native).toContain(" M modified");
+    expect(formatStatusPorcelain(await ours.status().call())).toBe(native);
+  });
+
+  it("add writes the monitor's untracked-cache invalidations with its new token", async () => {
+    git(["config", "core.untrackedcache", "true"]);
+    git(["config", "status.showUntrackedFiles", "all"]);
+    hook(LISTED);
+    report([]);
+    await statusTwins();
+    await statusTwins({ keep: "ours" });
+    put("dir1/fresh", "x\n");
+    put("modified", "changed\n");
+    dateBack();
+    report(["dir1/fresh", "modified"]);
+    const saved = saveIndex();
+    git(["add", "modified"]);
+    const nativeIndex = readFileSync(indexPath());
+    restoreIndex(saved);
+    await (await openOurs(dir, host())).add().addFilepattern("modified").call();
+    expect(readFileSync(indexPath()).toString("hex")).toBe(nativeIndex.toString("hex"));
+    // the monitor has nothing more to say: the new file is still found
+    report([]);
+    expect(git(["status", "--porcelain"])).toContain("?? dir1/fresh");
+  });
+
+  it("with the monitor off, any index write drops the extension (tweak_fsmonitor)", async () => {
+    hook(NOTHING);
+    await statusTwins();
+    git(["config", "core.fsmonitor", ""]);
+    put("modified", "changed\n");
+    const ours = await openOurs(dir, host());
+    await ours.add().addFilepattern("modified").call();
+    expect(await fsmnOf(readFileSync(indexPath()))).toBeUndefined();
+    await ours.reset().call();
+    expect(await fsmnOf(readFileSync(indexPath()))).toBeUndefined();
+  });
+
+  it("a host callback answers as the hook would, and a throwing one checks every entry", async () => {
+    hook(INTEGRATION);
+    dirtyRepo();
+    const asked: FsmonitorQuery[] = [];
+    const integration = new TextEncoder().encode(
+      "last_update_token\0untracked\0dir1/untracked\0dir2/untracked\0modified\0dir1/modified\0dir2/modified\0new\0dir1/new\0dir2/new\0",
+    );
+    await statusTwins({
+      host: host({
+        fsmonitor: {
+          query: async (q) => {
+            asked.push(q);
+            return { exitCode: 0, stdout: integration };
+          },
+        },
+      }),
+    });
+    expect(asked.map((q) => [q.mode, q.command, q.version])).toEqual([
+      ["hook", ".git/hooks/fsmonitor-test", 2],
+    ]);
+    // a callback that throws is a failed query: v2, then v1, the token a nanosecond time
+    hook("#!/bin/sh\nexit 1\n");
+    await statusTwins({
+      zeroToken: true,
+      host: host({
+        fsmonitor: {
+          query: async () => {
+            throw new Error("watcher gone");
+          },
+        },
+      }),
+    });
+  });
+});

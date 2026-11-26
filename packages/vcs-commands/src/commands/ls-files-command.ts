@@ -82,8 +82,7 @@ const isRegularMode = (mode: number) => (mode & S_IFMT) === 0o100000;
  * `git ls-files`. Output is written as git writes it ({@link PlumbingCommand}); the exit
  * status is 1 when `--error-unmatch` finds an element matching nothing.
  *
- * Not supported: `--recurse-submodules` and `--debug` (refused), `-f` (fsmonitor: taken as
- * `-v` without fsmonitor-valid entries). `--sparse` has no effect: the index is always held
+ * Not supported: `--recurse-submodules` and `--debug` (refused). `--sparse` has no effect: the index is always held
  * expanded, so the directory entries of a sparse index are listed as their files, as git
  * lists them without `--sparse`.
  */
@@ -209,7 +208,7 @@ export class LsFilesCommand extends PlumbingCommand {
     });
   }
 
-  /** `-f`: tags, lowercase for fsmonitor-valid entries (none here: no fsmonitor). */
+  /** `-f`: tags, lowercase for fsmonitor-valid entries (`core.fsmonitor`, the monitor asked). */
   setShowFsmonitorBit(value: boolean): this {
     return this.set(() => {
       this.fsmonitorBit = value;
@@ -445,6 +444,8 @@ export class LsFilesCommand extends PlumbingCommand {
       );
 
     await this.readCurrentIndex(false);
+    // `-f`: the monitor asked as git asks it on reading the index (tweak_fsmonitor)
+    const fsm = this.fsmonitorBit ? await this.fsmonitorRefresh(this.staging) : undefined;
     // prune_index: only the entries under the pathspec's common leading directory
     const list: ListedEntry[] = [];
     for await (const e of this.staging.entryList?.() ?? this.staging.entries()) {
@@ -539,6 +540,7 @@ export class LsFilesCommand extends PlumbingCommand {
         }
         let t = tagged ? `${name} ` : "";
         if (t && this.validBit && e.assumeValid) t = lowerTag(t);
+        if (t && fsm && e.entry && fsm.state.isValid(e.entry)) t = lowerTag(t);
         let line = t;
         if (showStage) {
           line += `${e.mode.toString(8).padStart(6, "0")} ${await this.abbreviated(e.objectId)} ${e.stage}\t`;

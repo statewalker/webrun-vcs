@@ -4,6 +4,8 @@
 export * from "./cache-tree.js";
 // Utilities
 export * from "./conflict-utils.js";
+// fsmonitor state (FSMN extension)
+export * from "./fsmonitor.js";
 // Staging implementations
 export * from "./git-staging.js";
 // Index extensions kept or dropped on rewrite

@@ -945,9 +945,12 @@ export class AddCommand extends GitCommand<AddResult> {
     }
 
     const trust = worktreeModeTrust(this.workingCopy, worktree);
+    // the file system monitor, asked as git asks it on reading the index (tweak_fsmonitor)
+    const fsm = await this.fsmonitorRefresh(this.staging);
     const adder = await IndexAdder.open(this.staging, this.blobs, trust, {
       pretend: this.dryRun,
       pathRules: worktreePathRules(this.workingCopy),
+      ...(fsm ? { fsmonitor: fsm.state } : {}),
     });
     const failed: string[] = [];
     const errors: string[] = [];
