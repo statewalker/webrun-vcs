@@ -83,7 +83,7 @@ export function applyStatUpdate(
   update: IndexStatUpdate,
   now: number,
 ): StagingEntry | undefined {
-  if (!existing || existing.stage !== 0) return undefined;
+  if (existing?.stage !== 0) return undefined;
   if (existing.assumeValid || existing.skipWorktree || existing.intentToAdd) return undefined;
   if (existing.objectId !== update.objectId || existing.mode !== update.mode) return undefined;
   if (existing.size !== update.expectedSize || ms(existing.mtime) !== ms(update.expectedMtime)) {
@@ -140,6 +140,11 @@ export async function refreshIndexFile(
   updates: readonly IndexStatUpdate[],
   skipWorktreeCleared?: ReadonlySet<string>,
   untrackedCache?: UntrackedCache | null,
+  /**
+   * An untracked cache to write in place of the one read only if the index is written
+   * anyway (the paths the fsmonitor reported invalidated in it, git's in-core cache)
+   */
+  carriedUntrackedCache?: UntrackedCache,
 ): Promise<StagingEntry[] | undefined> {
   const untrackedChanged = untrackedCache !== undefined;
   if (current.currentChecksum === undefined) return undefined;
@@ -161,6 +166,9 @@ export async function refreshIndexFile(
     // invalidates the directory of every path they add or remove against the entries
     // written here, so the cache always describes the index on disk
     if (untrackedChanged) fresh.setUntrackedCache(untrackedCache, inMemory);
+    else if (carriedUntrackedCache) fresh.setUntrackedCache(carriedUntrackedCache, inMemory);
+    // the fsmonitor bits set since the read go with the write
+    fresh.useFsmonitorOf(current);
     fresh.version = current.version;
     await fresh.write(entries);
     current.adopt(fresh);
