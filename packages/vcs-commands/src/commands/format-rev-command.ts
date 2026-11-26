@@ -12,10 +12,12 @@
  *   .callOutput();
  * ```
  *
- * The formats are git's user formats (`format:`, `tformat:`, a text with `%`, a `pretty.<name>`
- * alias) and the builtin `reference`; the other builtin formats (`medium`, `oneline`, ...) are
- * refused. Each commit is formatted by `git log`'s pretty engine with no configuration of its
- * own: `log.*` settings do not apply, as format-rev starts from a fresh `rev_info`.
+ * The formats are git's: user formats (`format:`, `tformat:`, a text with `%`, a `pretty.<name>`
+ * alias) and the builtin ones (`reference`, `oneline`, `medium`, `short`, `full`, `fuller`,
+ * `raw`, `email`, `mboxrd`), the latter as pretty.c's `pretty_print_commit` prints them: no
+ * `commit <id>` line (log-tree's), no notes, tabs kept, a mail's subject without `[PATCH]`.
+ * Each commit is formatted by `git log`'s pretty engine with no configuration of its own:
+ * `log.*` settings do not apply, as format-rev starts from a fresh `rev_info`.
  */
 
 import type { ObjectId } from "@statewalker/vcs-core";
@@ -26,6 +28,9 @@ import { PlumbingCommand, PlumbingError } from "./plumbing-command.js";
 
 /** `--stdin-mode`: lines of revisions, or running text holding object ids. */
 export type FormatRevStdinMode = "text" | "revs";
+
+/** A format as get_commit_format reads it: a user format, or a builtin `CMIT_FMT_*` one. */
+type Pretty = { format: string; date?: string; builtin?: never } | { builtin: string };
 
 /** A builtin format git's get_commit_format knows, with its default date mode. */
 const BUILTIN_USER_FORMATS: Record<string, { format: string; date?: string }> = {
@@ -192,7 +197,7 @@ export class FormatRevCommand extends PlumbingCommand {
   }
 
   /** get_commit_format: the user format and its date mode. */
-  private prettyOf(format: string, depth = 0): { format: string; date?: string } {
+  private prettyOf(format: string, depth = 0): Pretty {
     if (format.startsWith("format:")) return { format: format.slice(7) };
     if (format.startsWith("tformat:")) return { format: format.slice(8) };
     if (format.includes("%")) return { format };
@@ -202,19 +207,30 @@ export class FormatRevCommand extends PlumbingCommand {
       const alias = RemoteConfigStore.from(this.workingCopy).value(`pretty.${format}`);
       if (alias !== undefined) return this.prettyOf(alias, depth + 1);
     }
-    if (BUILTIN_OTHER.has(format))
-      throw new PlumbingError(`fatal: format-rev: the '${format}' format is not supported`);
+    if (BUILTIN_OTHER.has(format)) return { builtin: format };
     throw new PlumbingError(`fatal: invalid --pretty format: ${format}`);
   }
 
   /** pretty_print_commit of one commit (with its notes when the format shows `%N`). */
-  private async formatOne(
-    id: ObjectId,
-    pretty: { format: string; date?: string },
-  ): Promise<string | undefined> {
+  private async formatOne(id: ObjectId, pretty: Pretty): Promise<string | undefined> {
     const log = new LogCommand(this.workingCopy).setNoWalk([{ id }]).setLogConfig(false);
-    const wantsNotes = /%N/.test(pretty.format);
     try {
+      if (pretty.builtin !== undefined) {
+        // pretty_print_commit with format-rev's context: fmt_output_email_subject of a
+        // rev_info without a subject prefix, encode_email_headers off, no mailmap, and the
+        // default date mode of a fresh rev_info (`log.date` is never read)
+        return decodeGitPath(
+          await log.callBytes({
+            pretty: pretty.builtin,
+            prettyOnly: true,
+            notes: false,
+            mailmap: false,
+            date: "default",
+            mail: { subject: () => "Subject: ", encodeHeaders: false },
+          }),
+        );
+      }
+      const wantsNotes = /%N/.test(pretty.format);
       return decodeGitPath(
         await log.callBytes({
           pretty: `format:${pretty.format}`,
