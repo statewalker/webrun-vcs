@@ -57,9 +57,24 @@ export function hasHistory(native: NativeGit): boolean {
   return /usage: git history split/.test(r.stdout + r.stderr);
 }
 
+/**
+ * Whether `binary`'s `git history` signs its rewrites (`-S`, `--[no-]gpg-sign`,
+ * `commit.gpgSign`): git master, after 2.56.1, whose `git history` signs nothing and refuses
+ * the options.
+ */
+export function historySigns(native: NativeGit): boolean {
+  const r = spawnSync(native.binary, ["history", "reword", "-h"], {
+    env: native.env(tmpdir()),
+    encoding: "utf8",
+  });
+  return /gpg-sign/.test(r.stdout + r.stderr);
+}
+
 /** The scenarios of t3450, t3451 and t3452 against `native`. */
 export function historyTwins(title: string, native: NativeGit | undefined): void {
   const describeGit = native && process.platform !== "win32" ? describe : describe.skip;
+  // the signing twins need a git whose `git history` signs (git master)
+  const itSigning = native && historySigns(native) ? it : it.skip;
 
   describeGit(title, () => {
     const nat = native as NativeGit;
@@ -685,36 +700,45 @@ export function historyTwins(title: string, native: NativeGit | undefined): void
     ];
     for (const [conf, args, signs] of signMatrix) {
       const will = signs ? "will" : "will not";
-      it(`t3451-history-reword.sh: 'reword ${args.join(" ")} with commit.gpgsign=${conf} ${will} sign rewritten history'`, async () => {
-        const t = twins(linear());
-        await step(t, ["reword", ...args, "HEAD~"], {
-          messages: ["second reworded"],
-          config: { "gpg.program": fakeGpg(), "commit.gpgsign": conf },
-        });
-        expect(ok(t.ours, "cat-file", "commit", "HEAD").includes("gpgsig ")).toBe(signs);
-      });
-      it(`t3452-history-split.sh: 'split ${args.join(" ")} with commit.gpgsign=${conf} ${will} sign rewritten history'`, async () => {
-        const dir = splitMe();
-        commit(dir, "tip");
-        const t = twins(dir);
-        await step(t, ["split", ...args, "HEAD~"], {
-          messages: ["first", "second"],
-          answers: ["y", "n"],
-          config: { "gpg.program": fakeGpg(), "commit.gpgsign": conf },
-        });
-        expect(ok(t.ours, "cat-file", "commit", "HEAD~2").includes("gpgsig ")).toBe(signs);
-      });
+      itSigning(
+        `t3451-history-reword.sh: 'reword ${args.join(" ")} with commit.gpgsign=${conf} ${will} sign rewritten history'`,
+        async () => {
+          const t = twins(linear());
+          await step(t, ["reword", ...args, "HEAD~"], {
+            messages: ["second reworded"],
+            config: { "gpg.program": fakeGpg(), "commit.gpgsign": conf },
+          });
+          expect(ok(t.ours, "cat-file", "commit", "HEAD").includes("gpgsig ")).toBe(signs);
+        },
+      );
+      itSigning(
+        `t3452-history-split.sh: 'split ${args.join(" ")} with commit.gpgsign=${conf} ${will} sign rewritten history'`,
+        async () => {
+          const dir = splitMe();
+          commit(dir, "tip");
+          const t = twins(dir);
+          await step(t, ["split", ...args, "HEAD~"], {
+            messages: ["first", "second"],
+            answers: ["y", "n"],
+            config: { "gpg.program": fakeGpg(), "commit.gpgsign": conf },
+          });
+          expect(ok(t.ours, "cat-file", "commit", "HEAD~2").includes("gpgsig ")).toBe(signs);
+        },
+      );
     }
 
-    it('t3451-history-reword.sh: "reword uses an explicit signing key for rewritten history"', async () => {
-      const t = twins(linear());
-      await step(t, ["reword", "-SB7227189", "HEAD~"], {
-        messages: ["second reworded"],
-        config: { "gpg.program": fakeGpg() },
-      });
-    });
+    itSigning(
+      't3451-history-reword.sh: "reword uses an explicit signing key for rewritten history"',
+      async () => {
+        const t = twins(linear());
+        await step(t, ["reword", "-SB7227189", "HEAD~"], {
+          messages: ["second reworded"],
+          config: { "gpg.program": fakeGpg() },
+        });
+      },
+    );
 
-    it("reword: a signing program that fails moves no ref", async () => {
+    itSigning("reword: a signing program that fails moves no ref", async () => {
       const t = twins(linear());
       await step(t, ["reword", "--gpg-sign", "HEAD~"], {
         messages: ["second reworded"],
