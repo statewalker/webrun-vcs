@@ -143,7 +143,10 @@ export interface WritePackOptions {
   objectFormat?: ObjectFormat;
   /**
    * pack-objects' progress (`--progress`): "Counting objects" over the objects to pack,
-   * "Compressing objects" over the delta search's targets (shown only when there are some),
+   * "Compressing objects" over git's delta candidates (prepare_pack's `should_attempt_deltas`:
+   * every object of 50 bytes or more up to `bigFileThreshold`, git's 512 MiB when not given,
+   * that is not a reused delta or `noDelta`; shown only when there are some), even those too
+   * large for this writer's search, which are counted as done when it ends,
    * "Writing objects" over the entries written. A monitor that throws ends the stream.
    */
   progress?: ProgressMonitor;
@@ -316,6 +319,7 @@ export async function* writePack(
       format.rawLength,
       islands,
       options.progress,
+      options.bigFileThreshold,
     );
   }
 
@@ -640,6 +644,9 @@ interface WindowEntry {
   bytes: number;
 }
 
+/** git's default core.bigFileThreshold, the limit of pack-objects' delta candidates. */
+const GIT_BIG_FILE_THRESHOLD = 512 * 2 ** 20;
+
 /**
  * git's find_deltas: candidates sorted by type, name hash, haves first and size (largest first), each tried
  * against the previous `window` ones of its type; the smallest delta within git's size limit
@@ -657,10 +664,13 @@ async function searchDeltas(
   rawLength: number,
   islands?: DeltaIslandRules,
   progress?: ProgressMonitor,
+  /** the core.bigFileThreshold git's count follows (git's default when none is given) */
+  progressBigFileThreshold?: number,
 ) {
   const windowSize = o.window ?? 10;
   const maxDepth = o.depth ?? 50;
   const maxObjectSize = Math.min(o.maxObjectSize ?? 16 * 2 ** 20, bigFileThreshold);
+  const gitBigFileThreshold = progressBigFileThreshold ?? GIT_BIG_FILE_THRESHOLD;
   const windowMemory = o.windowMemory ?? 256 * 2 ** 20;
   let cacheLeft = o.deltaCacheSize ?? 16 * 2 ** 20;
   if (windowSize <= 0 || maxDepth <= 0) return;
@@ -669,11 +679,25 @@ async function searchDeltas(
   const names = new Set(order.map((p) => p.nameHash));
   const bases = [...haves.values()].filter((h) => h.nameHash === 0 || names.has(h.nameHash));
   const candidates: Planned[] = [];
+  // prepare_pack's should_attempt_deltas, for "Compressing objects" only: git's targets
+  // (`nr_deltas`) and its list (`n`, the receiver's objects too) hold every object up to
+  // core.bigFileThreshold, of 50 bytes or more, where our search stops at `maxObjectSize`
+  let gitTargets = 0;
+  let gitListed = 0;
+  /** git's targets our search leaves out: counted as done once the search ends */
+  let unsearched = 0;
   for (const p of [...order, ...bases]) {
     if (p.reuse && p.reuse.kind > 4) continue; // a reused delta
     if (p.noDelta) continue; // the delta attribute unset: neither target nor base
     if (!(await header(objects, p))) continue;
     const size = p.size as number;
+    if (size >= MIN_DELTA_TARGET && size <= gitBigFileThreshold) {
+      gitListed++;
+      if (!p.have) {
+        gitTargets++;
+        if (size > maxObjectSize) unsearched++;
+      }
+    }
     if (size > maxObjectSize || (!p.have && size < MIN_DELTA_TARGET)) continue;
     candidates.push(p);
   }
@@ -689,12 +713,11 @@ async function searchDeltas(
       (rank.get(a) as number) - (rank.get(b) as number),
   );
 
-  // prepare_pack: "Compressing objects" over the targets (not the receiver's objects), shown
-  // only when there are targets and more than one candidate
-  const targets = candidates.reduce((n, p) => n + (p.have ? 0 : 1), 0);
+  // prepare_pack: "Compressing objects" over git's targets (not the receiver's objects), shown
+  // only when there are targets and more than one object listed (`nr_deltas && n > 1`)
   const compressing =
-    targets > 0 && candidates.length > 1
-      ? startProgress(progress, "Compressing objects", targets)
+    gitTargets > 0 && gitListed > 1
+      ? startProgress(progress, "Compressing objects", gitTargets)
       : startProgress(undefined, "");
   const window: WindowEntry[] = [];
   let held = 0;
@@ -770,6 +793,7 @@ async function searchDeltas(
       held -= (window.shift() as WindowEntry).bytes;
     }
   }
+  if (unsearched > 0) compressing.tick(unsearched);
   compressing.stop();
 }
 
