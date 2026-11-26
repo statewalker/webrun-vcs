@@ -14,6 +14,8 @@ import {
   type GitServeSettings,
   openDuplexConnection,
   openDuplexReceivePackConnection,
+  type PushCertSignatureCheck,
+  pushCertificateEnv,
   type ReceiveCommand,
   type ReceivePackConfig,
   type ReceivePackConnection,
@@ -47,6 +49,8 @@ import {
   refTransactionHookOf,
 } from "./git-hooks.js";
 import { ReadTreeCommand } from "./read-tree-command.js";
+import { checkSignatureWith } from "./signature-check.js";
+import { signingConfigFromEntries } from "./signing.js";
 import { StatusCommand } from "./status-command.js";
 import {
   repositoryPlaceOf,
@@ -258,6 +262,48 @@ export function servedMaxTreeDepth(remote: OpenedRepository): number | undefined
   const value = remote.config?.getAll("core.maxTreeDepth").at(-1);
   if (value === undefined || value === null) return undefined;
   return parseGitInt(value);
+}
+
+/**
+ * receive-pack's check of a push certificate's signature (`prepare_push_cert_sha1`'s
+ * `check_signature`): the served repository's `gpg.*`, the host's verifier (none: git's result
+ * when its program cannot run). A signature of no known format dies as git dies.
+ */
+function pushCertVerifierOf(
+  remote: OpenedRepository,
+  hooks: HookSession | undefined,
+): (payload: Uint8Array, signature: Uint8Array) => Promise<PushCertSignatureCheck> {
+  return async (payload, signature) => {
+    const environment = hooks?.hostEnvironment;
+    const entries = () =>
+      (
+        (remote.config?.listWithOrigin?.() ?? remote.config?.list() ?? []) as Array<{
+          key: string;
+          value: string | null;
+          file?: string;
+          line?: number;
+        }>
+      ).map((e) => ({
+        key: e.key.toLowerCase(),
+        text: e.value ?? undefined,
+        ...(e.file !== undefined ? { file: e.file } : {}),
+        ...(e.line !== undefined ? { line: e.line } : {}),
+      }));
+    // receive-pack runs its gpg / ssh-keygen in the git directory
+    const cwd = await hooks?.hostGitDir().catch(() => undefined);
+    const check = await checkSignatureWith(
+      () => signingConfigFromEntries(entries(), environment),
+      environment?.verifier,
+      payload,
+      signature,
+      { payloadType: "push-cert", ...(cwd !== undefined ? { cwd } : {}) },
+    );
+    return {
+      result: check.result,
+      ...(check.signer !== undefined ? { signer: check.signer } : {}),
+      ...(check.key !== undefined ? { key: check.key } : {}),
+    };
+  };
 }
 
 /** What git's upload-pack and receive-pack read from the served repository's config. */
@@ -554,6 +600,11 @@ export async function receivePackSettingsOf(
       ? { advertiseAtomic: settings.advertiseAtomic }
       : {}),
     ...(settings.maxInputSize !== undefined ? { maxInputSize: settings.maxInputSize } : {}),
+    // receive.certNonceSeed, receive.certNonceSlop: signed pushes, their signature checked with
+    // the repository's gpg.* through the host's verifier
+    ...(settings.certNonceSeed !== undefined ? { certNonceSeed: settings.certNonceSeed } : {}),
+    ...(settings.certNonceSlop !== undefined ? { certNonceSlop: settings.certNonceSlop } : {}),
+    pushCertificates: { verify: pushCertVerifierOf(remote, hooks) },
     ...(settings.unpackLimit !== undefined ? { unpackLimit: settings.unpackLimit } : {}),
     ...(settings.receiveKeepAliveMs !== undefined
       ? { receiveKeepAliveMs: settings.receiveKeepAliveMs }
@@ -924,6 +975,22 @@ function scriptReceiveHooks(hooks: HookSession): ReceivePackHooks {
     });
     return env;
   };
+  // prepare_push_cert_sha1: the push certificate's variables for pre-receive, post-receive and
+  // proc-receive (never update), computed when the first of them exists
+  const certEnv = async (name: string, ctx: ReceivePackHookContext) => {
+    if (!ctx.pushCertificate) return {};
+    try {
+      if (!(await hooks.exists(name))) return {};
+      return pushCertificateEnv(await ctx.pushCertificate());
+    } catch (error) {
+      // receive-pack dies: a broken hook.* configuration found looking the hook up, or
+      // check_signature on a signature of no known format (none at all)
+      if (error instanceof GitApiError && error.message.startsWith("fatal: ")) {
+        throw new ReceivePackDiedError(error.message.slice("fatal: ".length));
+      }
+      throw error;
+    }
+  };
   const run = async (
     name: string,
     ctx: ReceivePackHookContext,
@@ -936,6 +1003,7 @@ function scriptReceiveHooks(hooks: HookSession): ReceivePackHooks {
           ...hookClientEnv(hooks, ctx),
           GIT_DIR: ".",
           ...(await quarantineEnv(hooks, ctx)),
+          ...(name === "update" ? {} : await certEnv(name, ctx)),
           ...(options.env ?? {}),
         },
         prefix: false,
@@ -1001,9 +1069,13 @@ function scriptReceiveHooks(hooks: HookSession): ReceivePackHooks {
         }),
     // run_proc_receive_hook: its stdin and stdout piped, its stderr relayed to the user; the
     // objects are published by now (no quarantine variables) and no push option variables
-    procReceive: (ctx) =>
+    procReceive: async (ctx) =>
       hooks.start("proc-receive", {
-        env: { ...hookClientEnv(hooks, ctx), GIT_DIR: "." },
+        env: {
+          ...hookClientEnv(hooks, ctx),
+          GIT_DIR: ".",
+          ...(await certEnv("proc-receive", ctx)),
+        },
         prefix: false,
         onStderr: (text) => ctx.message(text),
       }),

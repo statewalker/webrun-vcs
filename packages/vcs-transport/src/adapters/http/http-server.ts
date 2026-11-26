@@ -49,6 +49,8 @@ import {
 } from "../../fsm/protocol-v2/types.js";
 import {
   DEFAULT_RECEIVE_PACK_WRITE_TIMEOUT_MS,
+  type PushCertSettings,
+  pushCertificatesOf,
   type ReceiveDenyAction,
   type ReceivePackConfig,
   type ReceivePackHooks,
@@ -59,10 +61,12 @@ import {
   releaseReceivePack,
   serverPushHandlers,
   serverPushTransitions,
+  withPushCertCapability,
 } from "../../fsm/push/server-push-fsm.js";
 import { receivePackRefs, visibleRefs } from "../../protocol/hidden-refs.js";
 import { formatOf, v0ObjectFormatCapabilities } from "../../protocol/object-format.js";
 import { encodeFlush, encodePacketLine } from "../../protocol/pkt-line-codec.js";
+import { pushCertNonce } from "../../protocol/push-cert.js";
 import { processSessionId, validSessionId } from "../../protocol/session-id.js";
 import { readStreamWithIdleTimeout, withWriteTimeout } from "../../utils/idle-timeout.js";
 import { createSimpleDuplex } from "./http-duplex.js";
@@ -314,6 +318,12 @@ export interface ReceivePackServerOptions {
   advertiseAtomic?: boolean;
   /** git's `receive.maxInputSize` (see `ReceivePackConfig.maxInputSize`) */
   maxInputSize?: number;
+  /** Signed pushes (see `ReceivePackConfig.pushCertificates`) */
+  pushCertificates?: PushCertSettings;
+  /** git's `receive.certNonceSeed` (over `pushCertificates.nonceSeed`) */
+  certNonceSeed?: string;
+  /** git's `receive.certNonceSlop` (over `pushCertificates.nonceSlop`) */
+  certNonceSlop?: number;
   /** git's `receive.keepAlive` in ms, over {@link keepAliveMs} (see `ServeOverDuplexOptions`) */
   receiveKeepAliveMs?: number;
   /** git's `receive.unpackLimit` (see `ReceivePackConfig.unpackLimit`) */
@@ -1078,7 +1088,21 @@ export async function handleReceivePackInfoRefs(
   // Default capabilities for receive-pack
   // `object-format=sha256` for a SHA-256 repository (a SHA-1 one advertises as before)
   const format = formatOf(repository);
-  const capabilities = v0ObjectFormatCapabilities(receivePackCapabilities(options), format);
+  // receive.certNonceSeed: this request's nonce (a later POST checks it statelessly)
+  const certs = pushCertificatesOf(options.receivePack ?? {}).pushCertificates;
+  const nonce =
+    certs?.nonceSeed !== undefined
+      ? pushCertNonce(
+          certs.nonceSeed,
+          certs.serviceDir ?? ".",
+          certs.now?.() ?? Math.floor(Date.now() / 1000),
+          format,
+        )
+      : undefined;
+  const capabilities = v0ObjectFormatCapabilities(
+    withPushCertCapability(receivePackCapabilities(options), nonce),
+    format,
+  );
 
   // First ref with capabilities
   if (refs.length > 0) {
@@ -1202,11 +1226,14 @@ export async function handleReceivePack(
     denyCurrentBranch: rp.denyCurrentBranch ?? true,
     currentBranch: rp.currentBranch,
     hiddenRefs,
+    // each POST is one request of a stateless push (git's --stateless-rpc)
+    statelessRpc: true,
     receivePack: {
       hooks: rp.hooks,
       maxCommands: rp.maxCommands,
       keepAliveMs: rp.receiveKeepAliveMs ?? rp.keepAliveMs,
       ...(rp.maxInputSize ? { maxInputSize: rp.maxInputSize } : {}),
+      ...pushCertificatesOf(rp),
       ...(rp.unpackLimit !== undefined ? { unpackLimit: rp.unpackLimit } : {}),
       ...(rp.afterPush ? { afterPush: rp.afterPush } : {}),
       hookTimeoutMs: rp.hookTimeoutMs,

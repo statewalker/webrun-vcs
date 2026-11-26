@@ -60,6 +60,10 @@ export interface ServerConfigSettings {
    * advertisement, and a client's `atomic` is then ignored (git's `use_atomic` needs both)
    */
   advertiseAtomic?: boolean;
+  /** `receive.certNonceSeed`: advertise `push-cert=<nonce>` (signed pushes) */
+  certNonceSeed?: string;
+  /** `receive.certNonceSlop` in seconds (git's default 0) */
+  certNonceSlop?: number;
   /**
    * `receive.maxInputSize` in bytes: a pushed pack larger than this is refused (index-pack and
    * unpack-objects `--max-input-size`); absent, 0 or negative: no limit (git's default)
@@ -397,6 +401,10 @@ export function explicitServerSettingsFromConfig(
     }
     return result;
   };
+  const seed = last(config, "receive.certNonceSeed");
+  if (seed !== undefined) out.certNonceSeed = String(seed);
+  const slop = numeric("receive.certNonceSlop", configInt);
+  if (slop !== undefined) out.certNonceSlop = slop;
   const maxInput = numeric("receive.maxInputSize", configInt64);
   if (maxInput !== undefined) out.maxInputSize = maxInput;
   const keepAlive = numeric("receive.keepAlive", configInt);
