@@ -52,6 +52,7 @@ import {
 } from "./pack/pack-write-settings.js";
 import { type PromisorExclusions, promisorExclusions } from "./promisor-objects.js";
 import { listReachableObjects } from "./reachable-objects.js";
+import { assertObjectsAtGitDir } from "./relocated-objects.js";
 import { geometricRepack } from "./repack-geometric.js";
 import { assertObjectsDeletable, readRepositoryFormat } from "./repository-format.js";
 import { updateServerInfo } from "./server-info.js";
@@ -442,6 +443,7 @@ export async function snapshotPacks(packs: PackSet): Promise<PackSnapshot> {
  * ```
  */
 export async function repack(options: RepackOptions): Promise<RepackResult | null> {
+  assertObjectsAtGitDir(options.gitDir ?? ".git", "repack", options.objects, options.packs);
   // repack deletes what the new pack replaces: not in a precious-objects repo (git: "cannot
   // delete packs in a precious-objects repo")
   // git's errors reading the alternates are printed and repack goes on (see gc)
