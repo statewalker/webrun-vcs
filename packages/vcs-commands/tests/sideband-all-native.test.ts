@@ -75,7 +75,10 @@ function fetchResponse(trace: string): string[] {
     .split("\n")
     .map((l) => /packet: +(fetch|clone)([<>]) (.*)$/.exec(l))
     .filter((m): m is RegExpExecArray => m !== null);
-  const start = lines.findLastIndex((m) => m[2] === ">" && m[3] === "command=fetch");
+  let start = -1;
+  lines.forEach((m, i) => {
+    if (m[2] === ">" && m[3] === "command=fetch") start = i;
+  });
   const out: string[] = [];
   for (const m of lines.slice(start + 1)) {
     if (m[2] !== "<") continue;
