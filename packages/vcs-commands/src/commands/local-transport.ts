@@ -189,6 +189,8 @@ export async function withLocalUploadPack<T>(
       ...(settings.allowRefInWant ? { allowRefInWant: true } : {}),
       // uploadpack.allowSidebandAll
       ...(settings.allowSidebandAll ? { allowSidebandAll: true } : {}),
+      // uploadpack.blobPackfileUri
+      ...(settings.blobPackfileUris?.length ? { blobPackfileUris: settings.blobPackfileUris } : {}),
       ...(settings.advertiseSID ? { advertiseSID: true } : {}),
       ...(head && "target" in head ? { currentBranch: head.target } : {}),
     }))().finally(() => server.close?.());

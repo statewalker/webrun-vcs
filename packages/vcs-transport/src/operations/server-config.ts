@@ -101,6 +101,8 @@ export interface ServerConfigSettings {
   allowRefInWant?: boolean;
   /** `uploadpack.allowSidebandAll` (git's default: false) */
   allowSidebandAll?: boolean;
+  /** `uploadpack.blobPackfileUri` values, in config order (valueless entries left out) */
+  blobPackfileUris?: string[];
   /** `transfer.advertiseSID` (git's default: false) */
   advertiseSID?: boolean;
   /**
@@ -427,6 +429,11 @@ export function explicitServerSettingsFromConfig(
   if (refInWant !== undefined) out.allowRefInWant = configBool(refInWant, false);
   const sidebandAll = last(config, "uploadpack.allowSidebandAll");
   if (sidebandAll !== undefined) out.allowSidebandAll = configBool(sidebandAll, false);
+  // upload_pack_config: a valued entry turns packfile-uris on (pack-objects parses them)
+  const uris = config
+    .getAll("uploadpack.blobPackfileUri")
+    .filter((v): v is string => typeof v === "string");
+  if (uris.length > 0) out.blobPackfileUris = uris;
   const sid = last(config, "transfer.advertiseSID");
   if (sid !== undefined) out.advertiseSID = configBool(sid, false);
   // uploadpack.packObjectsHook is never read here: git takes it only from protected config

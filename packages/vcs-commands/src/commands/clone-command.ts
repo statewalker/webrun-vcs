@@ -64,6 +64,7 @@ import { SparseUnpack } from "./sparse-checkout-support.js";
 import { SubmoduleCommandError, type SubmoduleCommandResult } from "./submodule-commands.js";
 import { SubmoduleUpdateCommand } from "./submodule-update-command.js";
 import { checkoutFreshTree } from "./tree-restore.js";
+import { uriProtocolsOption } from "./uri-protocols.js";
 import { worktreePathRules } from "./worktree-path-rules.js";
 import { repositoryPlaceOf, worktreeAdminWorkingCopy } from "./worktree-support.js";
 
@@ -1145,6 +1146,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     const sessionId = clientSessionIdOf(this.workingCopy);
     const fetchOptions: TransportFetchOptions = {
       ...(sessionId !== undefined ? { sessionId } : {}),
+      // fetch.uriProtocols: the packs a v2 server offloads to packfile URIs
+      ...uriProtocolsOption(RemoteConfigStore.from(this.workingCopy).value("fetch.uriprotocols")),
       url: sourceUrl,
       auth: this.credentials,
       headers: this.headers,

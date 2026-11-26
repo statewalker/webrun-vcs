@@ -131,6 +131,12 @@ export interface ExportPackOptions {
   shallow?: Set<string>;
   /** Write deltas on a base in the pack as OFS deltas (the client's `ofs-delta`; default true) */
   ofsDelta?: boolean;
+  /**
+   * Asked for each listed object before the pack is written (all of them before its first
+   * byte): true leaves it out (git's `pack-objects --uri-protocol`, an object offloaded to a
+   * packfile URI). A facade without it sends everything (and so offloads nothing)
+   */
+  leaveOut?: (id: string) => boolean;
 }
 
 /**

@@ -315,6 +315,7 @@ function httpOptionsOf(
     uploadPackRequestPolicy,
     allowRefInWant,
     allowSidebandAll,
+    blobPackfileUris,
     advertiseSID,
     sessionId,
     packObjectsHook,
@@ -338,6 +339,7 @@ function httpOptionsOf(
   if (uploadPackRequestPolicy !== undefined) out.uploadPackRequestPolicy = uploadPackRequestPolicy;
   if (allowRefInWant !== undefined) out.allowRefInWant = allowRefInWant;
   if (allowSidebandAll !== undefined) out.allowSidebandAll = allowSidebandAll;
+  if (blobPackfileUris !== undefined) out.blobPackfileUris = blobPackfileUris;
   if (advertiseSID !== undefined) out.advertiseSID = advertiseSID;
   if (sessionId !== undefined) out.sessionId = sessionId;
   if (packObjectsHook !== undefined) out.packObjectsHook = packObjectsHook;

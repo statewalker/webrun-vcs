@@ -48,7 +48,7 @@ export interface FetchV2Request {
   /** A second `filter` line came (git dies: "multiple filter-specs cannot be combined") */
   filterRepeated?: boolean;
 
-  /** Packfile-uri protocols (if packfile-uris capability) */
+  /** `packfile-uris <protocols>`: the protocols the client downloads packs over */
   packfileUriProtocols?: string[];
 }
 
@@ -106,12 +106,15 @@ export function serverV2Capabilities(
   // (upload_pack_advertise's order); `object-format=` names the repository's hash (serve.c's
   // object_format_advertise)
   const list = v2ObjectFormatCapabilities(
-    withSidebandAllFeature(
-      withRefInWantFeature(
-        withFilterFeature(capabilities, uploadPackFilter),
-        options.allowRefInWant === true,
+    withPackfileUrisFeature(
+      withSidebandAllFeature(
+        withRefInWantFeature(
+          withFilterFeature(capabilities, uploadPackFilter),
+          options.allowRefInWant === true,
+        ),
+        options.allowSidebandAll === true,
       ),
-      options.allowSidebandAll === true,
+      options.packfileUris === true,
     ),
     formatOf(repository),
   );
@@ -133,6 +136,8 @@ export interface ServerV2CapabilityOptions {
   allowRefInWant?: boolean;
   /** `fetch=... sideband-all` (git's `uploadpack.allowSidebandAll`) */
   allowSidebandAll?: boolean;
+  /** `fetch=... packfile-uris` (git's `uploadpack.blobPackfileUri`) */
+  packfileUris?: boolean;
   /** `session-id=<id>` (git's `transfer.advertiseSID`) */
   sessionId?: string;
 }
@@ -167,6 +172,20 @@ export function withSidebandAllFeature(capabilities: readonly string[], allow: b
     const before = features.indexOf("packfile-uris");
     features.splice(before >= 0 ? before : features.length, 0, "sideband-all");
     return `fetch=${features.join(" ")}`;
+  });
+}
+
+/**
+ * The `fetch=` capability with `packfile-uris` last (as git's upload_pack_advertise) when
+ * `allow`; the capabilities as they are otherwise.
+ */
+export function withPackfileUrisFeature(capabilities: readonly string[], allow: boolean): string[] {
+  if (!allow) return [...capabilities];
+  return capabilities.map((c) => {
+    if (c !== "fetch" && !c.startsWith("fetch=")) return c;
+    const features = c === "fetch" ? [] : c.slice("fetch=".length).split(" ").filter(Boolean);
+    if (features.includes("packfile-uris")) return c;
+    return `fetch=${[...features, "packfile-uris"].join(" ")}`;
   });
 }
 

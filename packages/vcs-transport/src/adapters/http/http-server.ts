@@ -156,6 +156,12 @@ export interface HttpServerOptions {
   allowRefInWant?: boolean;
   /** Protocol v2: `fetch=... sideband-all` (git's `uploadpack.allowSidebandAll`) */
   allowSidebandAll?: boolean;
+  /**
+   * Protocol v2: `fetch=... packfile-uris` and the `uploadpack.blobPackfileUri` values
+   * (`<object-hash> <pack-hash> <uri>`): objects left out of the pack for a client taking
+   * their URI's protocol (with `sideband-all`)
+   */
+  blobPackfileUris?: readonly string[];
   /** git's `transfer.advertiseSID`: `session-id=<sessionId>` advertised by both services */
   advertiseSID?: boolean;
   /** The id {@link advertiseSID} advertises (default `processSessionId()`) */
@@ -758,6 +764,7 @@ function v2CapabilityOptions(options: HttpServerOptions): ServerV2CapabilityOpti
   return {
     ...(options.allowRefInWant ? { allowRefInWant: true } : {}),
     ...(options.allowSidebandAll ? { allowSidebandAll: true } : {}),
+    ...(options.blobPackfileUris?.length ? { packfileUris: true } : {}),
     ...(sid !== undefined ? { sessionId: sid } : {}),
   };
 }
@@ -886,6 +893,7 @@ export async function handleUploadPackV2(
     requestPolicy: options.requestPolicy ?? "ANY",
     ...(options.allowRefInWant ? { allowRefInWant: true } : {}),
     ...(options.allowSidebandAll ? { allowSidebandAll: true } : {}),
+    ...(options.blobPackfileUris?.length ? { blobPackfileUris: options.blobPackfileUris } : {}),
     ...(advertisedSessionId(options) !== undefined
       ? { sessionId: advertisedSessionId(options) }
       : {}),
@@ -1434,6 +1442,12 @@ export interface HttpHandlerOptions {
   allowRefInWant?: boolean;
   /** v2 `sideband-all` (see {@link HttpServerOptions.allowSidebandAll}) */
   allowSidebandAll?: boolean;
+  /**
+   * Protocol v2: `fetch=... packfile-uris` and the `uploadpack.blobPackfileUri` values
+   * (`<object-hash> <pack-hash> <uri>`): objects left out of the pack for a client taking
+   * their URI's protocol (with `sideband-all`)
+   */
+  blobPackfileUris?: readonly string[];
   /** `session-id` advertised (see {@link HttpServerOptions.advertiseSID}) */
   advertiseSID?: boolean;
   /** The id {@link advertiseSID} advertises (see {@link HttpServerOptions.sessionId}) */
@@ -1489,6 +1503,7 @@ export function createHttpHandler(
     advertiseObjectInfo,
     allowRefInWant,
     allowSidebandAll,
+    blobPackfileUris,
     advertiseSID,
     sessionId,
     packObjectsHook,
@@ -1519,6 +1534,7 @@ export function createHttpHandler(
       advertiseObjectInfo,
       ...(allowRefInWant ? { allowRefInWant } : {}),
       ...(allowSidebandAll ? { allowSidebandAll } : {}),
+      ...(blobPackfileUris?.length ? { blobPackfileUris } : {}),
       ...(advertiseSID ? { advertiseSID } : {}),
       ...(sessionId !== undefined ? { sessionId } : {}),
       ...(packObjectsHook ? { packObjectsHook } : {}),

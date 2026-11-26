@@ -171,6 +171,7 @@ export class DefaultSerializationApi implements SerializationApi {
       ...(options.maxTreeDepth !== undefined ? { maxTreeDepth: options.maxTreeDepth } : {}),
       onBoundary: options.thinPack && !bitmap ? (b) => boundary.push(b) : undefined,
     })) {
+      if (options.leaveOut?.(o.id)) continue;
       listed.push(o);
     }
     yield* writePack(this.objects, listed, {

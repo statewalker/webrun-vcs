@@ -255,6 +255,15 @@ export class ProcessConfiguration {
   allowSidebandAll?: boolean;
 
   /**
+   * Protocol v2: git's `uploadpack.blobPackfileUri` values, `<object-hash> <pack-hash> <uri>`.
+   * Any value advertises `fetch=... packfile-uris` and takes a `packfile-uris <protocols>`
+   * argument; with `sideband-all`, each listed object the pack would hold whose URI is of one
+   * of those protocols is left out and named in a `packfile-uris` section instead (git's
+   * `pack-objects --uri-protocol`). A malformed value fails every pack, as pack-objects dies
+   */
+  blobPackfileUris?: readonly string[];
+
+  /**
    * Server side: the session id advertised as `session-id=<id>` (git's `transfer.advertiseSID`
    * advertises its trace2 session id); undefined: none advertised
    */

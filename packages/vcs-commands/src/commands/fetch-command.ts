@@ -1,6 +1,4 @@
 import type { ObjectId } from "@statewalker/vcs-core";
-// Import from the package root only: vcs-core ships a single runtime file
-// (dist/index.js); its subpaths resolve for types but not at runtime.
 import {
   type FilesApi,
   historyWithoutLazyFetch,
@@ -82,6 +80,9 @@ import {
   type SubmoduleFetchTask,
 } from "./submodule-fetch.js";
 import { defaultRemoteOf, SubmoduleModel } from "./submodule-model.js";
+// Import from the package root only: vcs-core ships a single runtime file
+// (dist/index.js); its subpaths resolve for types but not at runtime.
+import { uriProtocolsOption } from "./uri-protocols.js";
 import { worktreeUsingBranch } from "./worktree-support.js";
 
 /**
@@ -975,6 +976,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     const unpackLimit = unpackLimitOf({ getAll: (key) => store.values(key) }, "fetch");
     const fetchOptions: TransportFetchOptions = {
       ...(sessionId !== undefined ? { sessionId } : {}),
+      // fetch.uriProtocols: the packs a v2 server offloads to packfile URIs
+      ...uriProtocolsOption(store.value("fetch.uriprotocols")),
       url: remoteUrl,
       auth: this.credentials,
       headers: this.headers,

@@ -200,6 +200,8 @@ export interface ServeOverDuplexOptions {
    * an unexpected line
    */
   allowSidebandAll?: boolean;
+  /** Protocol v2 `packfile-uris` (git's `uploadpack.blobPackfileUri` values) */
+  blobPackfileUris?: readonly string[];
   /**
    * git's `transfer.advertiseSID`: upload-pack and receive-pack advertise `session-id=<id>`
    * (v0 capability, v2 capability line), the id {@link sessionId} names; the client's own
@@ -322,6 +324,7 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
       (useV2 || service === "git-receive-pack" ? undefined : options.uploadPackRequestPolicy),
     ...(options.allowRefInWant ? { allowRefInWant: true } : {}),
     ...(options.allowSidebandAll ? { allowSidebandAll: true } : {}),
+    ...(options.blobPackfileUris?.length ? { blobPackfileUris: options.blobPackfileUris } : {}),
     ...(options.advertiseSID
       ? { sessionId: validSessionId(options.sessionId) ?? processSessionId() }
       : {}),

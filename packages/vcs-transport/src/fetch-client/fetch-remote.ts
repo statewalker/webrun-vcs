@@ -37,6 +37,7 @@ import {
   serverSupportsFilter,
 } from "./fetch-pack.js";
 import type { NegotiationAlgorithm, NegotiatorSource } from "./negotiator.js";
+import { importPackfileUri } from "./packfile-uris.js";
 
 /** git's default `transfer.unpackLimit`: a fetched pack of this many objects is kept as is. */
 const DEFAULT_UNPACK_LIMIT = 100;
@@ -269,6 +270,14 @@ export interface FetchClientOptions {
    * server that advertises its own; undefined: none sent
    */
   sessionId?: string;
+  /**
+   * git's `fetch.uriProtocols`: the protocols packs may be downloaded over (protocol v2
+   * `packfile-uris`; only `http` and `https` are asked for). The packs a server names are
+   * downloaded after its own pack, kept, and checked to be what it said
+   */
+  uriProtocols?: readonly string[];
+  /** Downloads those packs (default `globalThis.fetch`); never given the remote's credentials */
+  packfileUriFetch?: (request: Request) => Promise<Response>;
 }
 
 /** A shallow remote refused under `rejectShallow` (git's "source repository is shallow"). */
@@ -625,14 +634,20 @@ export async function fetchFromConnection(
       ...(options.onWarning ? { onWarning: options.onWarning } : {}),
       ...(options.serverOptions?.length ? { serverOptions: options.serverOptions } : {}),
       ...(options.sessionId !== undefined ? { sessionId: options.sessionId } : {}),
+      ...(options.uriProtocols?.length ? { uriProtocols: options.uriProtocols } : {}),
       includeTag: autoTags,
       onProgress: options.onProgress,
       // a dry run stores the objects too (git's fetch_refs runs; only the refs are left)
-      importPack: (pack) =>
+      importPack: (pack, info) =>
         repository.importPack(pack, {
-          // a filtered or checked pack goes through index-pack (`--promisor`, `--strict`):
-          // kept, never unpacked; otherwise fetch.unpackLimit decides (0: always unpacked)
-          ...(options.keepPack || filter || options.fsckObjects || options.bundle
+          // a filtered or checked pack goes through index-pack (`--promisor`, `--strict`), and
+          // so does one beside packfile URIs: kept, never unpacked; otherwise
+          // fetch.unpackLimit decides (0: always unpacked)
+          ...(options.keepPack ||
+          filter ||
+          options.fsckObjects ||
+          options.bundle ||
+          info?.packfileUris
             ? { keepPack: true }
             : options.unpackLimit !== undefined
               ? {
@@ -691,13 +706,16 @@ export async function fetchFromConnection(
       wants.splice(0, wants.length, ...kept);
     }
     const { quarantine, ...imported } = fetched.imported;
+    // packfile URIs: the objects are split across packs, so index-pack checks objects only
+    // (fetch-pack's `--fsck-objects` instead of `--strict`, no self-contained check)
+    const uris = fetched.packfileUris ?? [];
     let committed = false;
     try {
       if (received) {
         // index-pack's --strict / --check-self-contained-and-connected
         const checked = await checkReceivedPack(quarantine?.repository ?? repository, received, {
           fsck: options.fsckObjects,
-          links,
+          links: links && uris.length === 0,
           ...(receivedLinks ? { receivedLinks } : {}),
           shallow: grafts(),
           // fetch-pack's do_keep (its lock on the pack), not whether index-pack ran: a
@@ -709,13 +727,45 @@ export async function fetchFromConnection(
               keepsBySize(fetched.packObjects, options.unpackLimit)),
         });
         packMessages.push(...checked.messages);
-        if (links && checked.selfContained) selfContained.push(received);
+        if (links && uris.length === 0 && checked.selfContained) selfContained.push(received);
       }
       await quarantine?.commit();
       committed = true;
     } finally {
       // a refused pack (or any failure before the commit) leaves no object behind
       if (!committed) await quarantine?.discard().catch(() => {});
+    }
+    // fetch-pack's http-fetch of each packfile URI, after the pack, before the checks of the
+    // refs (a dry run stores them too, as git's fetch_refs)
+    for (const entry of uris) {
+      // the server names the URI: ours downloads only over a protocol it asked for (git hands
+      // any URI to curl)
+      const asked = (options.uriProtocols ?? []).filter((p) => p === "http" || p === "https");
+      if (!asked.some((p) => entry.uri.toLowerCase().startsWith(`${p}:`))) {
+        throw new TransportError(
+          `fatal: fetch-pack: packfile URI ${entry.uri} is not of a protocol asked for (${asked.join(",")})`,
+        );
+      }
+      const fsck = options.fsckObjects;
+      const objects = fsck ? new ReceivedObjects(formatOf(repository).rawLength) : undefined;
+      const uriImport = await importPackfileUri(repository, entry, {
+        ...(options.packfileUriFetch ? { fetchImpl: options.packfileUriFetch } : {}),
+        ...(objects ? { onObject: (id, type, at) => objects.add(id, type, at) } : {}),
+        ...(objects
+          ? {
+              check: async (target) => {
+                const checked = await checkReceivedPack(target, objects, {
+                  fsck,
+                  links: false,
+                  shallow: grafts(),
+                  kept: true,
+                });
+                packMessages.push(...checked.messages);
+              },
+            }
+          : {}),
+      });
+      result.imports.push(uriImport);
     }
     if (filter && imported.packId !== undefined) {
       // a promisor pack: index-pack `--promisor` writes an empty `.promisor`, which fetch-pack
