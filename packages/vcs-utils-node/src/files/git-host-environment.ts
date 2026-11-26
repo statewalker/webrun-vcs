@@ -574,6 +574,12 @@ export function createNodeGitHostEnvironment(
     ...(env.GIT_DEFAULT_REF_FORMAT !== undefined
       ? { defaultRefFormat: env.GIT_DEFAULT_REF_FORMAT }
       : {}),
+    ...(env.GIT_DEFAULT_OBJECT_STORAGE_FORMAT !== undefined
+      ? { defaultObjectStorageFormat: env.GIT_DEFAULT_OBJECT_STORAGE_FORMAT }
+      : {}),
+    ...(env.GIT_OBJECT_STORAGE_FORMAT !== undefined
+      ? { objectStorageFormat: env.GIT_OBJECT_STORAGE_FORMAT }
+      : {}),
     ...(env.GIT_TEST_REFTABLE_AUTOCOMPACTION !== undefined
       ? {
           reftableAutoCompaction: !/^(false|no|off|0)$/i.test(env.GIT_TEST_REFTABLE_AUTOCOMPACTION),
