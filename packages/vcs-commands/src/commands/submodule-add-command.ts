@@ -3,14 +3,15 @@
  * `clone_submodule`, `configure_added_submodule`), over the submodule model of
  * `submodule-model.ts` and the clone, checkout and add commands.
  */
+
 import { FileMode } from "@statewalker/vcs-core";
 import type { GitTransportRegistry, HttpCredentialHelper } from "@statewalker/vcs-transport";
 import { wildmatch } from "@statewalker/vcs-working-tree";
-
 import { GitApiError } from "../errors/index.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { AddCommand } from "./add-command.js";
 import { CheckoutCommand } from "./checkout-command.js";
+import { unknownObjectStorageFormat } from "./default-branch.js";
 import { checkSubmoduleName } from "./fsck/fsck-object-checks.js";
 import { gitFileOf } from "./git-hooks.js";
 import { DO_MATCH_DIRECTORY, matchPathspec, parsePathspec } from "./pathspec.js";
@@ -153,6 +154,7 @@ export class SubmoduleAddCommand extends SubmoduleCommandBase {
   private force = false;
   private reference?: string;
   private depth?: number;
+  private objectStorageFormat?: string;
   private transports?: GitTransportRegistry;
   private credentialHelper?: HttpCredentialHelper;
   private warningCallback?: (line: string) => void;
@@ -199,6 +201,17 @@ export class SubmoduleAddCommand extends SubmoduleCommandBase {
     return this;
   }
 
+  /**
+   * `--object-storage-format=<name>` (git master): the object storage of the submodules
+   * cloned. Only `files` is a name git knows (the repository as always); anything else,
+   * `files://<dir>` included, dies `unknown object storage format '<v>'` before any work.
+   */
+  setObjectStorageFormat(format: string): this {
+    this.checkCallable();
+    this.objectStorageFormat = format;
+    return this;
+  }
+
   /** `--depth <n>`: a shallow clone (ignored, with git's warning, for a local path). */
   setDepth(depth: number): this {
     this.checkCallable();
@@ -232,6 +245,10 @@ export class SubmoduleAddCommand extends SubmoduleCommandBase {
 
   async call(): Promise<SubmoduleCommandResult> {
     this.start();
+    if (this.objectStorageFormat !== undefined) {
+      const unknown = unknownObjectStorageFormat(this.objectStorageFormat, "name");
+      if (unknown) this.die(unknown);
+    }
     if (!(await this.writingGitmodulesOk())) {
       this.die("fatal: please make sure that the .gitmodules file is in the working tree");
     }
