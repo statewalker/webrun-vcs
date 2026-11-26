@@ -29,6 +29,7 @@ import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-
 import {
   createNodeFilesApi,
   createNodeGitHostEnvironment,
+  createNodeSigner,
 } from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -138,7 +139,10 @@ export function historyTwins(title: string, native: NativeGit | undefined): void
 
     async function openOurs(dir: string, gitDir: string): Promise<Git> {
       const files = createNodeFilesApi({ rootDir: dir });
-      const environment = createNodeGitHostEnvironment({ env: env() });
+      const environment = createNodeGitHostEnvironment({
+        env: env(),
+        signer: createNodeSigner({ env: env() }),
+      });
       const { history } = await createGitFilesBackend({ files, gitDir, environment });
       const worktrees = await openGitLinkedWorktrees({ files, gitDir, history, environment });
       return gitDir === "."
@@ -653,6 +657,71 @@ export function historyTwins(title: string, native: NativeGit | undefined): void
       });
     });
 
+    /**
+     * A deterministic `gpg.program` (signing-native.test.ts's way): a fixed signature, so a
+     * signed commit has the same id in both twins and an unsigned one differs.
+     */
+    const fakeGpg = (): string => {
+      const path = join(root, `gpg-${counter++}.sh`);
+      writeFileSync(
+        path,
+        "#!/bin/sh\ncat >/dev/null\n" +
+          "printf '[GNUPG:] KEY_CONSIDERED 1234 2\\n[GNUPG:] SIG_CREATED D 22 10 00 1 2\\n' >&2\n" +
+          "printf -- '-----BEGIN PGP SIGNATURE-----\\n\\niHUEABYKAB0WIQRzSmc1\\n=AbCd\\n" +
+          "-----END PGP SIGNATURE-----\\n'\n",
+      );
+      chmodSync(path, 0o755);
+      return path;
+    };
+
+    // test_reword_gpg_sign / test_split_gpg_sign: [commit.gpgsign, options, signs]
+    const signMatrix: [string, string[], boolean][] = [
+      ["false", [], false],
+      ["true", [], true],
+      ["false", ["--gpg-sign"], true],
+      ["true", ["--no-gpg-sign"], false],
+      ["true", ["--gpg-sign", "--no-gpg-sign"], false],
+      ["false", ["--no-gpg-sign", "--gpg-sign"], true],
+    ];
+    for (const [conf, args, signs] of signMatrix) {
+      const will = signs ? "will" : "will not";
+      it(`t3451-history-reword.sh: 'reword ${args.join(" ")} with commit.gpgsign=${conf} ${will} sign rewritten history'`, async () => {
+        const t = twins(linear());
+        await step(t, ["reword", ...args, "HEAD~"], {
+          messages: ["second reworded"],
+          config: { "gpg.program": fakeGpg(), "commit.gpgsign": conf },
+        });
+        expect(ok(t.ours, "cat-file", "commit", "HEAD").includes("gpgsig ")).toBe(signs);
+      });
+      it(`t3452-history-split.sh: 'split ${args.join(" ")} with commit.gpgsign=${conf} ${will} sign rewritten history'`, async () => {
+        const dir = splitMe();
+        commit(dir, "tip");
+        const t = twins(dir);
+        await step(t, ["split", ...args, "HEAD~"], {
+          messages: ["first", "second"],
+          answers: ["y", "n"],
+          config: { "gpg.program": fakeGpg(), "commit.gpgsign": conf },
+        });
+        expect(ok(t.ours, "cat-file", "commit", "HEAD~2").includes("gpgsig ")).toBe(signs);
+      });
+    }
+
+    it('t3451-history-reword.sh: "reword uses an explicit signing key for rewritten history"', async () => {
+      const t = twins(linear());
+      await step(t, ["reword", "-SB7227189", "HEAD~"], {
+        messages: ["second reworded"],
+        config: { "gpg.program": fakeGpg() },
+      });
+    });
+
+    it("reword: a signing program that fails moves no ref", async () => {
+      const t = twins(linear());
+      await step(t, ["reword", "--gpg-sign", "HEAD~"], {
+        messages: ["second reworded"],
+        config: { "gpg.program": "false" },
+      });
+    });
+
     it("split: hunks within one file, help and quit", async () => {
       const dir = repository();
       const lines = Array.from({ length: 20 }, (_, i) => `line ${i + 1}`);
@@ -684,6 +753,10 @@ function historyArgs(git: Git, argv: string[]) {
     }
     if (options && arg.startsWith("-")) {
       if (arg === "--dry-run" || arg === "-n") command.setDryRun(true);
+      else if (arg === "--gpg-sign" || arg === "-S") command.setSign(true);
+      else if (arg === "--no-gpg-sign") command.setSign(false);
+      else if (arg.startsWith("--gpg-sign=")) command.setSigningKey(arg.slice(11));
+      else if (arg.startsWith("-S")) command.setSigningKey(arg.slice(2));
       else if (arg.startsWith("--update-refs=")) {
         command.setUpdateRefs(arg.slice("--update-refs=".length) as "branches" | "head");
       } else throw new Error(`unmapped option ${arg}`);
