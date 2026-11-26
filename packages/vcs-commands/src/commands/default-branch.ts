@@ -11,7 +11,7 @@
  * ```
  */
 import { isValidRefName } from "@statewalker/vcs-core";
-import { readProtectedConfig } from "@statewalker/vcs-store-files";
+import { objectStorageFormatByUri, readProtectedConfig } from "@statewalker/vcs-store-files";
 import { parseGitBool } from "@statewalker/vcs-utils";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 
@@ -193,4 +193,102 @@ export async function defaultRefFormat(
   }
   if (configured) return { format: configured, warnings };
   return { format: environment?.breakingChanges ? "reftable" : "files", warnings };
+}
+
+/**
+ * An object storage format git master does not know (`--object-storage-format`,
+ * `$GIT_OBJECT_STORAGE_FORMAT`, `$GIT_DEFAULT_OBJECT_STORAGE_FORMAT`): git dies (exit 128).
+ */
+export class UnknownObjectStorageFormatError extends Error {
+  override name = "UnknownObjectStorageFormatError";
+  readonly lines: string[];
+  constructor(
+    readonly value: string,
+    source: "GIT_OBJECT_STORAGE_FORMAT" | "GIT_DEFAULT_OBJECT_STORAGE_FORMAT",
+  ) {
+    const line = `fatal: unknown object storage format specified via ${source}: '${value}'`;
+    super(line);
+    this.lines = [line];
+  }
+}
+
+/**
+ * An object storage git knows but we do not read: `files://<directory>`, objects outside
+ * `objects/`. Refused before anything is created, so nothing is lost.
+ */
+export class UnsupportedObjectStorageError extends Error {
+  override name = "UnsupportedObjectStorageError";
+  readonly lines: string[];
+  constructor(readonly value: string) {
+    const line = `fatal: object storage format not supported by webrun-vcs: '${value}'`;
+    super(line);
+    this.lines = [line];
+  }
+}
+
+/** A reinitialization naming another object storage payload: git dies (exit 128). */
+export class ReinitializeObjectStorageError extends Error {
+  override name = "ReinitializeObjectStorageError";
+  readonly lines = [
+    "fatal: attempt to reinitialize repository with different object storage payload",
+  ];
+  constructor() {
+    super("fatal: attempt to reinitialize repository with different object storage payload");
+  }
+}
+
+/**
+ * Checks the object storage format git master would give a repository `git init` creates or
+ * reinitializes (setup.c `repository_format_configure`): `$GIT_OBJECT_STORAGE_FORMAT`, else
+ * (a new repository only) `$GIT_DEFAULT_OBJECT_STORAGE_FORMAT`, else
+ * `init.defaultObjectStorageFormat` from the system, global and command-line config, else
+ * `files`. An unknown name in the environment dies (`UnknownObjectStorageFormatError`), one in
+ * the config warns and is passed over; any payload (`files://objs`) is refused
+ * (`UnsupportedObjectStorageError`): plain `files`, which git writes no extension for, is
+ * the only storage we create. Returns git's warnings.
+ *
+ * @example
+ * ```typescript
+ * const warnings = await checkDefaultObjectStorage(environment, true);
+ * ```
+ */
+export async function checkDefaultObjectStorage(
+  environment: GitHostEnvironment | undefined,
+  fresh: boolean,
+): Promise<string[]> {
+  const warnings: string[] = [];
+  const fromEnv = (
+    value: string,
+    source: "GIT_OBJECT_STORAGE_FORMAT" | "GIT_DEFAULT_OBJECT_STORAGE_FORMAT",
+  ): string[] => {
+    const storage = objectStorageFormatByUri(value);
+    if (!storage) throw new UnknownObjectStorageFormatError(value, source);
+    if (storage.payload !== undefined) {
+      // a reinitialized repository has none (readRepositoryFormat refused any other)
+      if (!fresh) throw new ReinitializeObjectStorageError();
+      throw new UnsupportedObjectStorageError(value);
+    }
+    return warnings;
+  };
+  if (environment?.objectStorageFormat !== undefined) {
+    return fromEnv(environment.objectStorageFormat, "GIT_OBJECT_STORAGE_FORMAT");
+  }
+  // an existing repository keeps its own (readRepositoryFormat refused any other)
+  if (!fresh) return warnings;
+  if (environment?.defaultObjectStorageFormat !== undefined) {
+    return fromEnv(environment.defaultObjectStorageFormat, "GIT_DEFAULT_OBJECT_STORAGE_FORMAT");
+  }
+  let configured: string | undefined;
+  for (const e of await readProtectedConfig(environment)) {
+    if (e.key !== "init.defaultobjectstorageformat") continue;
+    const value = e.value ?? "";
+    // a later unknown value resets an earlier one (read_default_format_config)
+    configured = objectStorageFormatByUri(value) ? value : undefined;
+    if (configured === undefined)
+      warnings.push(`warning: unknown object storage format '${value}'`);
+  }
+  if (configured !== undefined && objectStorageFormatByUri(configured)?.payload !== undefined) {
+    throw new UnsupportedObjectStorageError(configured);
+  }
+  return warnings;
 }

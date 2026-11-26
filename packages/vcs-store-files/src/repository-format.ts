@@ -178,6 +178,23 @@ export function checkRepositoryFormat(config: RepositoryFormatConfig): Repositor
         format.refStorage = name;
         break;
       }
+      case "objectstorage": {
+        // git master's `extensions.objectStorage` (setup.c handle_extension): `files`, or
+        // `files://<objects directory>`, which we do not read (objects outside `objects/`)
+        if (value === true || value === undefined) {
+          throw new UnsupportedRepositoryFormatError(`missing value for '${key}'`);
+        }
+        const storage = objectStorageFormatByUri(String(value));
+        if (!storage) {
+          throw new UnsupportedRepositoryFormatError(
+            `invalid value for 'extensions.objectstorage': '${String(value)}'`,
+          );
+        }
+        if (storage.payload !== undefined) {
+          unsupported.push(`extensions.objectStorage = ${String(value)}`);
+        }
+        break;
+      }
       case "relativeworktrees":
         format.relativeWorktrees = configBool(value, key);
         break;
@@ -224,6 +241,59 @@ export function checkRepositoryFormat(config: RepositoryFormatConfig): Repositor
     }
   }
   return format;
+}
+
+/** An object storage format and its payload, as git's `object_storage_format_by_uri` reads them. */
+export interface ObjectStorageFormat {
+  /** the one format git knows: loose objects and packs */
+  format: "files";
+  /** the part after `://` when not empty: `files`' objects directory (relative to the common directory) */
+  payload?: string;
+}
+
+/**
+ * Reads an object storage format URI as git master's `object_storage_format_by_uri`
+ * (`extensions.objectStorage`, `$GIT_OBJECT_STORAGE_FORMAT`,
+ * `$GIT_DEFAULT_OBJECT_STORAGE_FORMAT`, `init.defaultObjectStorageFormat`): a name alone or
+ * `<name>://<payload>`, an empty payload counting as none; undefined for a name git does
+ * not know (only `files` exists).
+ *
+ * @example
+ * ```typescript
+ * objectStorageFormatByUri("files://objs"); // { format: "files", payload: "objs" }
+ * objectStorageFormatByUri("garbage"); // undefined
+ * ```
+ */
+export function objectStorageFormatByUri(uri: string): ObjectStorageFormat | undefined {
+  const end = uri.indexOf("://");
+  const name = end < 0 ? uri : uri.slice(0, end);
+  if (name !== "files") return undefined;
+  const payload = end < 0 ? "" : uri.slice(end + 3);
+  return payload ? { format: "files", payload } : { format: "files" };
+}
+
+/**
+ * Refuses an object storage format from the environment that we cannot honour, as git's
+ * `setup_git_directory_gently` reads `$GIT_OBJECT_STORAGE_FORMAT` over the repository's
+ * `extensions.objectStorage`: an unknown name is git's death (`unknown object storage
+ * format: '<v>'`), a payload (objects outside `objects/`) is not supported here.
+ *
+ * @example
+ * ```typescript
+ * assertObjectStorageOverride(environment.objectStorageFormat); // throws for "files://objs"
+ * ```
+ */
+export function assertObjectStorageOverride(uri: string | undefined): void {
+  if (uri === undefined) return;
+  const storage = objectStorageFormatByUri(uri);
+  if (!storage) {
+    throw new UnsupportedRepositoryFormatError(`unknown object storage format: '${uri}'`);
+  }
+  if (storage.payload !== undefined) {
+    throw new UnsupportedRepositoryFormatError(
+      `repository format not supported by webrun-vcs:\n\tGIT_OBJECT_STORAGE_FORMAT = ${uri}`,
+    );
+  }
 }
 
 /** A config value git reads as true; anything unparsable as false. */

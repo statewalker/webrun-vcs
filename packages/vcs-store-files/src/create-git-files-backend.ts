@@ -49,7 +49,7 @@ import {
 } from "./refs/index.js";
 import { markRelocatedObjects } from "./relocated-objects.js";
 import { repack } from "./repack.js";
-import { readRepositoryFormat } from "./repository-format.js";
+import { assertObjectStorageOverride, readRepositoryFormat } from "./repository-format.js";
 import { resolveLinkedGitDir } from "./resolve-linked-git-dir.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
 import { FileRawStorage } from "./storage/raw/file-raw-storage.js";
@@ -238,6 +238,9 @@ export async function createGitFilesBackend(
   // object format, an unknown v1 extension) is refused before anything is read or written.
   // Like git's read_repository_format it reads the config file alone, without includes.
   const format = await readRepositoryFormat(linked, gitDir);
+  // `$GIT_OBJECT_STORAGE_FORMAT` overrides `extensions.objectStorage` (git master): only a
+  // plain `files` is what we read
+  assertObjectStorageOverride(options.environment?.objectStorageFormat);
   const refStorage = create && options.refFormat === "reftable" ? "reftable" : format.refStorage;
   // the hash naming the objects (`extensions.objectFormat`): SHA-1, or SHA-256
   const objectFormat = options.objectFormat ?? format.objectFormat;
