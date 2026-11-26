@@ -1,5 +1,19 @@
 # @statewalker/vcs-working-tree
 
+## 0.11.0
+
+### Minor Changes
+
+- a0c4c58: fsmonitor: `core.fsmonitor=true` asks git's builtin daemon over a `MessagePort` the host opens (`GitHostEnvironment.openIpcPort`, `IpcPortRequest`; `queryFsmonitorDaemon` speaks simple-ipc's query), and `update-index --fsmonitor-valid` sets a gitlink's bit as git does. vcs-utils-node adds the Node socket adapter: `socketMessagePort`, `connectSocketPort` and `listenSocketPorts` turn a TCP or Unix-domain socket into one end of a `MessageChannel` (webrun-rpc's stream tier, with backpressure and an explicit half-close); the Node host environment opens IPC endpoints with it.
+- aac8a7d: fsmonitor: every command that reads the index asks the monitor as git's `tweak_fsmonitor` does (`GitCommand.readCurrentIndex`), so any index it writes carries the `FSMN` extension and a failed answer drops the valid bits; `reset --hard` and `checkout -f` neither stat nor rewrite an entry the monitor holds unchanged when the target keeps it (unpack-trees' `oneway_merge`; `fsmonitorKeptEntries`, `restoreKeptEntries`); a sparse index keeps `FSMN` with its positions over the collapsed entries, on read and write (`FsmonitorState.markSparseDirectoriesInvalid`).
+- bdb1463: fsmonitor: `UpdateIndexCommand.setFsmonitor` / `setFsmonitorValid` (`git update-index --[no-]fsmonitor`, `--[no-]fsmonitor-valid`, with git's warnings and its bare-repository refusal), `update-index --refresh` asks the monitor and skips and marks fsmonitor-valid entries, and diff-files, `git diff` and diff-index take entries the monitor reported nothing for as unchanged without an lstat. `FsmonitorState.writtenWhileDisabled` keeps an `FSMN` that `update-index --fsmonitor` added with `core.fsmonitor` off.
+- 7b5ef59: `Staging.indexLocation()` (optional; `GitStaging`, `FileStagingStore`): the index file a staging reads and writes, git's `repo_get_index_file`. `git repo info` reports a relative `$GIT_INDEX_FILE` as the file the working copy opened (read from where git's setup went), and finds `path.superprojectworkingtree.*` as submodule.c's `get_superproject_working_tree` does: a gitlink at the worktree's path in the index of the repository above it, so embedded submodules and a superproject's linked-worktree submodules are found and a dropped gitlink is not (statewalker/webrun-vcs#444, statewalker/webrun-vcs#445).
+
+### Patch Changes
+
+- Updated dependencies [9ad5c69]
+  - @statewalker/vcs-core@0.11.0
+
 ## 0.10.0
 
 ### Minor Changes
