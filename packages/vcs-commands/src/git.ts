@@ -56,6 +56,7 @@ import {
   FmtMergeMsgCommand,
   ForEachRefCommand,
   FormatPatchCommand,
+  FormatRevCommand,
   FsckCommand,
   GarbageCollectCommand,
   GrepCommand,
@@ -112,6 +113,8 @@ import {
   RepackCommand,
   ReplaceCommand,
   ReplayCommand,
+  RepoInfoCommand,
+  RepoStructureCommand,
   RequestPullCommand,
   RerereCommand,
   ResetCommand,
@@ -1478,6 +1481,49 @@ export class Git implements Disposable {
   showBranch(): ShowBranchCommand {
     this.checkClosed();
     return new ShowBranchCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a RepoInfoCommand (`git repo info`): the repository's layout, formats and paths as
+   * `key=value` lines.
+   *
+   * @example
+   * ```typescript
+   * const { stdout } = await git.repoInfo().addKeys("layout.bare").callOutput();
+   * // "layout.bare=false\n"
+   * ```
+   */
+  repoInfo(): RepoInfoCommand {
+    this.checkClosed();
+    return new RepoInfoCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a RepoStructureCommand (`git repo structure`): counts and sizes of the references
+   * and of the objects reachable from them.
+   *
+   * @example
+   * ```typescript
+   * const { stdout } = await git.repoStructure().setFormat("lines").callOutput();
+   * ```
+   */
+  repoStructure(): RepoStructureCommand {
+    this.checkClosed();
+    return new RepoStructureCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a FormatRevCommand (`git format-rev`, experimental): commits read from stdin, or
+   * object ids in running text, replaced by a pretty format.
+   *
+   * @example
+   * ```typescript
+   * const { stdout } = await git.formatRev().setStdinMode("revs").setFormat("%s").setInput("HEAD\n").callOutput();
+   * ```
+   */
+  formatRev(): FormatRevCommand {
+    this.checkClosed();
+    return new FormatRevCommand(this._workingCopy);
   }
 
   /**
