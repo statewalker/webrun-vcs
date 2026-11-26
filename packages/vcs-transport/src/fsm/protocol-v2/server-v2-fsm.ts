@@ -225,6 +225,8 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
 
         state.commandServed = true;
         ctx.state.currentCommand = command;
+        // a fetch's sideband-all ends with it: the next command answers as it would alone
+        state.fetchRequest = undefined;
         if (command === "ls-refs") return "LS_REFS";
         if (command === "fetch") return "FETCH";
         return "OBJECT_INFO";
