@@ -585,6 +585,33 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     this.removedSections.clear();
     this.loaded = true;
     await this.resolveOwnIncludes();
+    this.noteChanged();
+  }
+
+  private readonly changeListeners = new Set<() => void>();
+
+  /**
+   * Tells `listener` after each write of the configuration: a {@link save}, or a write of the
+   * file this configuration was not part of (`git config` editing it in place) reported
+   * through {@link noteChanged}. Returns what removes the listener.
+   */
+  addChangeListener(listener: () => void): () => void {
+    const entry = () => listener();
+    this.changeListeners.add(entry);
+    return () => {
+      this.changeListeners.delete(entry);
+    };
+  }
+
+  /** Tells the change listeners that a configuration file was written. */
+  noteChanged(): void {
+    for (const listener of [...this.changeListeners]) {
+      try {
+        listener();
+      } catch {
+        // a listener's failure never fails the write
+      }
+    }
   }
 
   /**

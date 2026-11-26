@@ -512,6 +512,8 @@ export class ConfigCommand extends GitCommand<ConfigCommandResult> {
       }
     }
     if (outcome.status === 0 || action.kind === "rename-section") await this.reloadConfig();
+    // one event per write: a refused edit wrote nothing
+    if (outcome.status === 0) this.noteConfigChanged();
     return result(outcome.status, outcome.stderr);
   }
 
@@ -1107,6 +1109,13 @@ export class ConfigCommand extends GitCommand<ConfigCommandResult> {
   private async reloadConfig(): Promise<void> {
     const config = this.workingCopy.config as { load?: () => Promise<void> } | undefined;
     if (config instanceof GitWorkingCopyConfig) await config.load();
+  }
+
+  /** Tells the working copy's configuration listeners about a file this command wrote. */
+  private noteConfigChanged(): void {
+    const config = this.workingCopy.config;
+    if (config instanceof GitWorkingCopyConfig) config.noteChanged();
+    else this.workingCopy.listeners?.dispatch({ type: "config-changed" });
   }
 
   /** git's `location_options_init`: the file the scope names. */

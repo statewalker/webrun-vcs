@@ -248,6 +248,61 @@ export class FileWorktree implements Worktree {
    * outer one (`options` still reach the content filter's operation).
    */
   async batch<T>(fn: () => Promise<T>, options?: OperationOptions): Promise<T> {
+    // the files a batch changes are told once, when the outermost batch ends
+    this.operationDepth++;
+    try {
+      return await this.batchScoped(fn, options);
+    } finally {
+      this.operationDepth--;
+      if (this.operationDepth === 0) this.tellModified();
+    }
+  }
+
+  /** Files changed and not told yet (see {@link addModifiedListener}) */
+  private pendingChanges?: { modified: Set<string>; deleted: Set<string> };
+  /** Batches in progress */
+  private operationDepth = 0;
+  private readonly modifiedListeners = new Set<
+    (modified: readonly string[], deleted: readonly string[]) => void
+  >();
+
+  addModifiedListener(
+    listener: (modified: readonly string[], deleted: readonly string[]) => void,
+  ): () => void {
+    const entry = (modified: readonly string[], deleted: readonly string[]) =>
+      listener(modified, deleted);
+    this.modifiedListeners.add(entry);
+    return () => {
+      this.modifiedListeners.delete(entry);
+    };
+  }
+
+  /** Notes a file written (`removed` false) or removed, told now outside a batch. */
+  private noteChanged(path: string, removed: boolean): void {
+    if (this.modifiedListeners.size === 0) return;
+    if (!this.pendingChanges) this.pendingChanges = { modified: new Set(), deleted: new Set() };
+    const { modified, deleted } = this.pendingChanges;
+    (removed ? modified : deleted).delete(path);
+    (removed ? deleted : modified).add(path);
+    if (this.operationDepth === 0) this.tellModified();
+  }
+
+  private tellModified(): void {
+    const pending = this.pendingChanges;
+    this.pendingChanges = undefined;
+    if (!pending || (pending.modified.size === 0 && pending.deleted.size === 0)) return;
+    const modified = [...pending.modified];
+    const deleted = [...pending.deleted];
+    for (const listener of [...this.modifiedListeners]) {
+      try {
+        listener(modified, deleted);
+      } catch {
+        // a listener's failure never fails the write
+      }
+    }
+  }
+
+  private async batchScoped<T>(fn: () => Promise<T>, options?: OperationOptions): Promise<T> {
     const filter = this.filter;
     if (this.batchIgnores) return options && filter?.batch ? filter.batch(fn, options) : fn();
     this.batchIgnores = new Set();
@@ -872,6 +927,7 @@ export class FileWorktree implements Worktree {
     if (asLink && this.files.symlink) {
       // the target as bytes, as the tree holds it (not necessarily UTF-8)
       await this.files.symlink(await collect(iterable), fullPath);
+      this.noteChanged(path, false);
       return;
     }
 
@@ -889,6 +945,7 @@ export class FileWorktree implements Worktree {
         if (wanted !== current) await this.files.chmod(fullPath, wanted);
       }
     }
+    this.noteChanged(path, false);
   }
 
   /**
@@ -928,6 +985,7 @@ export class FileWorktree implements Worktree {
     const removed = await this.files.remove(fullPath);
     // a removed directory takes its attributes files (and its subdirectories') with it
     if (removed) this.filter?.noteChanged?.(kind === "directory" ? `${path}/.gitattributes` : path);
+    if (removed) this.noteChanged(path, true);
     return removed;
   }
 
@@ -1647,7 +1705,11 @@ export class FileWorktree implements Worktree {
     }
     const fullOldPath = joinPath(this.rootPath, oldPath);
     const fullNewPath = joinPath(this.rootPath, newPath);
-    if (await this.files.move(fullOldPath, fullNewPath)) return;
+    if (await this.files.move(fullOldPath, fullNewPath)) {
+      this.noteChanged(oldPath, true);
+      this.noteChanged(newPath, false);
+      return;
+    }
     // the FilesApi says only that nothing moved: its errno is told where it can be found
     const code = !(await this.kindOf(fullOldPath).catch(() => undefined)) ? "ENOENT" : "EPERM";
     throw Object.assign(new Error(`${code}: cannot move '${oldPath}' to '${newPath}'`), { code });
@@ -1861,6 +1923,7 @@ export class FileWorktree implements Worktree {
       if (!kind) return;
       if (replace && kind !== "directory") {
         await this.files.remove(full);
+        this.noteChanged(prefix, true);
         if (await this.kindOf(full)) throw new Error(`Cannot replace ${prefix}`);
         return;
       }

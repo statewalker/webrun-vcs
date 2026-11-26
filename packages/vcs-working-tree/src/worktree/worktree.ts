@@ -343,6 +343,15 @@ export interface Worktree {
   ): Promise<void>;
   remove(path: string, options?: WorktreeRemoveOptions): Promise<boolean>;
   /**
+   * Tells `listener` which files {@link writeContent}, {@link remove} and `rename` changed:
+   * once per operation (at the end of the outermost `batch`, else after the call), paths
+   * worktree-relative. Returns what removes the listener. Absent: a worktree that tells
+   * nothing.
+   */
+  addModifiedListener?(
+    listener: (modified: readonly string[], deleted: readonly string[]) => void,
+  ): () => void;
+  /**
    * Removes the directory at `path` only if it holds nothing at all (git's `rmdir`): no
    * file, link, directory, `.git`, FIFO or ignored file. Returns whether it was removed.
    * Absent: callers fall back to a check through `walk`.

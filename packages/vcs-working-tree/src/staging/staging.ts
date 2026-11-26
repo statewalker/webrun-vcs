@@ -377,6 +377,14 @@ export interface Staging {
   getWriteHook?(): (() => Promise<void>) | undefined;
 
   /**
+   * Tells `listener` after each write of the index file is in place: `write()`, a lock's
+   * `commit()` after its `write()`, a `refreshStats` that stored something (unlike
+   * {@link setWriteHook}, a lock is told once committed). Any number of listeners, beside
+   * the hook; returns what removes this one. Absent: a staging with no index file.
+   */
+  addWriteListener?(listener: () => void): () => void;
+
+  /**
    * Gives an index file what git reads from the repository around it: the configuration a
    * write follows (`core.splitIndex`, `splitIndex.*`, `index.sparse` with the cone patterns,
    * `core.sharedRepository`) and the trees a sparse index expands from and collapses into.
