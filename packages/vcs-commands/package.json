@@ -58,7 +58,8 @@
     "@statewalker/vcs-store-mem": "workspace:^",
     "@statewalker/vcs-transport": "workspace:^",
     "@statewalker/vcs-utils": "workspace:^",
-    "@statewalker/vcs-working-tree": "workspace:^"
+    "@statewalker/vcs-working-tree": "workspace:^",
+    "@statewalker/webrun-rpc": "catalog:"
   },
   "devDependencies": {
     "@statewalker/vcs-store-kv": "workspace:^",
@@ -66,7 +67,6 @@
     "@statewalker/vcs-transport-adapters": "workspace:^",
     "@statewalker/vcs-transport-lfs": "workspace:^",
     "@statewalker/vcs-utils-node": "workspace:^",
-    "@statewalker/webrun-rpc": "catalog:",
     "@types/node": "catalog:",
     "@types/ws": "catalog:",
     "rolldown": "catalog:",
