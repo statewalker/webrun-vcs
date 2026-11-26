@@ -10,6 +10,7 @@
 import type { ObjectId, Trees } from "@statewalker/vcs-core";
 import type { UntrackedCache } from "../status/untracked-cache.js";
 import type { CacheTree } from "./cache-tree.js";
+import type { FsmonitorState } from "./fsmonitor.js";
 import type { ResolveUndoRecord } from "./index-extensions.js";
 import type { IndexHost } from "./index-file.js";
 import type { IndexStatUpdate, RacyCheck } from "./stat-refresh.js";
@@ -23,6 +24,11 @@ export interface RefreshStatsOptions {
    * stat to store; undefined keeps the one the index has
    */
   untrackedCache?: UntrackedCache | null;
+  /**
+   * An untracked cache written in place of the index's only when the index is written anyway
+   * (it alone does not ask for a write): the directories the fsmonitor reported, invalidated
+   */
+  carriedUntrackedCache?: UntrackedCache;
 }
 
 // Re-export types for consumers
@@ -233,6 +239,25 @@ export interface Staging {
    * (`null`: none, git's `remove_untracked_cache`).
    */
   setUntrackedCache?(cache: UntrackedCache | null): void;
+
+  /**
+   * `cache` as the untracked cache of the next write, without asking for one (git's in-core
+   * cache edited without `UNTRACKED_CHANGED`: the fsmonitor's invalidations)
+   */
+  carryUntrackedCache?(cache: UntrackedCache): void;
+
+  /**
+   * The index's fsmonitor state (`FSMN`): its token and the entries' valid bits, edited in
+   * place by the commands that ask the monitor (`markValid`); undefined when there is none.
+   * Absent: a staging area without an index file.
+   */
+  getFsmonitor?(): FsmonitorState | undefined;
+
+  /**
+   * Sets the fsmonitor state written with the index (git's `add_fsmonitor`), or removes it
+   * (`remove_fsmonitor`); either makes the index want a rewrite.
+   */
+  setFsmonitor?(state: FsmonitorState | undefined): void;
 
   // ========== Persistence ==========
 

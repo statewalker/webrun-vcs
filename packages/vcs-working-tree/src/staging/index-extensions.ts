@@ -15,7 +15,7 @@
  * |-----------|-----------|
  * | `TREE` (cache-tree) | rewritten by `IndexFile`: each path whose entries changed invalidated |
  * | `UNTR` (untracked cache) | rewritten by `IndexFile`: the directory of each path added or removed invalidated (`untracked_cache_invalidate_path`) |
- * | `FSMN` (fsmonitor) | the entries did not change; dropped otherwise |
+ * | `FSMN` (fsmonitor) | rewritten by `IndexFile` (`fsmonitor.ts`): the token kept, each entry dirty unless held valid exactly as it is; dropped under `core.fsmonitor` off and for a sparse index |
  * | `REUC` (resolve-undo) | always, every record (dropped only when it cannot be parsed) |
  * | `EOIE`, `IEOT` (offsets into the file) | never; git writes them again when configured to |
  * | `link` (split index) | read: merged with `sharedindex.<id>` (`split-index.ts`); written again while the index stays split (`core.splitIndex`, `splitIndex.*`), dropped when it is unsplit |

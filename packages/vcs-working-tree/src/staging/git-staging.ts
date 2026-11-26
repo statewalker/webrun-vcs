@@ -13,6 +13,7 @@ import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import type { UntrackedCache } from "../status/untracked-cache.js";
 import type { CacheTree } from "./cache-tree.js";
 import { verifyTreePaths } from "./conflict-utils.js";
+import type { FsmonitorState } from "./fsmonitor.js";
 import type { ResolveUndoRecord } from "./index-extensions.js";
 import {
   IndexFile,
@@ -385,6 +386,18 @@ export class GitStaging implements Staging {
     return this.indexFile.untrackedCache(this._entries);
   }
 
+  getFsmonitor(): FsmonitorState | undefined {
+    return this.indexFile.getFsmonitor();
+  }
+
+  carryUntrackedCache(cache: UntrackedCache): void {
+    this.indexFile.setUntrackedCache(cache, this._entries);
+  }
+
+  setFsmonitor(state: FsmonitorState | undefined): void {
+    this.indexFile.setFsmonitor(state);
+  }
+
   setUntrackedCache(cache: UntrackedCache | null): void {
     this.unwritten = true;
     this.indexFile.setUntrackedCache(cache, this._entries);
@@ -586,7 +599,7 @@ export class GitStaging implements Staging {
    */
   async refreshStats(
     updates: IndexStatUpdate[],
-    options?: { untrackedCache?: UntrackedCache | null },
+    options?: { untrackedCache?: UntrackedCache | null; carriedUntrackedCache?: UntrackedCache },
   ): Promise<boolean> {
     const entries = await refreshIndexFile(
       this.indexFile,
@@ -595,6 +608,7 @@ export class GitStaging implements Staging {
       updates,
       this.skipWorktreeCleared,
       options?.untrackedCache,
+      options?.carriedUntrackedCache,
     );
     if (!entries) return false;
     this.skipWorktreeCleared = new Set();
