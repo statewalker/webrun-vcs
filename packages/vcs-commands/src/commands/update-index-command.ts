@@ -12,6 +12,10 @@
  *
  * // git update-index --refresh
  * const { output, exitCode } = await git.updateIndex().refresh().call();
+ *
+ * // git update-index --fsmonitor, then --fsmonitor-valid a
+ * await git.updateIndex().setFsmonitor(true).call();
+ * await git.updateIndex().setFsmonitorValid(true).addPath("a").call();
  * ```
  */
 
@@ -26,6 +30,7 @@ import {
   basicStatMatches,
   compareWithWorktree,
   entryStatOf,
+  FsmonitorState,
   invalidateCacheTreePath,
   modeFromWorktree,
   type ResolveUndoRecord,
@@ -38,7 +43,11 @@ import {
 } from "@statewalker/vcs-working-tree";
 import { UpdateIndexFailedError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
+import { RemoteConfigStore } from "../remote-config/index.js";
 import { worktreeModeTrust } from "./core-config.js";
+import { fsmonitorModeOf } from "./fsmonitor-refresh.js";
+import { hookHostOf } from "./git-hooks.js";
+import { hostEnvironmentOf } from "./git-ident.js";
 import { configBool } from "./merge-config.js";
 import { inputLines, inputPaths, unquoteLine } from "./plumbing-input.js";
 import { worktreePathRules } from "./worktree-path-rules.js";
@@ -74,6 +83,8 @@ interface State {
   markValid?: boolean;
   /** `--[no-]skip-worktree` */
   markSkipWorktree?: boolean;
+  /** `--[no-]fsmonitor-valid` */
+  markFsmonitor?: boolean;
   ignoreSkipWorktreeEntries: boolean;
   chmod?: "+x" | "-x";
   quiet: boolean;
@@ -133,6 +144,7 @@ export class UpdateIndexCommand extends GitCommand<UpdateIndexResult> {
   private indexVersion?: number;
   private showIndexVersion = false;
   private forceWrite = false;
+  private fsmonitor?: boolean;
 
   private set(apply: (state: State) => void): this {
     this.checkCallable();
@@ -201,6 +213,28 @@ export class UpdateIndexCommand extends GitCommand<UpdateIndexResult> {
     return this.set((s) => {
       s.markSkipWorktree = mark;
     });
+  }
+
+  /**
+   * `--fsmonitor-valid` (true) / `--no-fsmonitor-valid` (false) for the paths after it: the
+   * entry's fsmonitor valid bit (`CE_FSMONITOR_VALID`) set or cleared.
+   */
+  setFsmonitorValid(mark: boolean): this {
+    return this.set((s) => {
+      s.markFsmonitor = mark;
+    });
+  }
+
+  /**
+   * `--fsmonitor` (true) / `--no-fsmonitor` (false), applied after the paths, as git does:
+   * the index's `FSMN` extension added (`add_fsmonitor`; a warning when `core.fsmonitor` is
+   * unset; git's death in a bare repository with `core.fsmonitor` set) or removed (a warning
+   * when `core.fsmonitor` is set).
+   */
+  setFsmonitor(enable: boolean): this {
+    this.checkCallable();
+    this.fsmonitor = enable;
+    return this;
   }
 
   /** `--ignore-skip-worktree-entries`: `--remove` leaves skip-worktree entries alone. */
@@ -315,8 +349,24 @@ export class UpdateIndexCommand extends GitCommand<UpdateIndexResult> {
   async call(): Promise<UpdateIndexResult> {
     this.checkCallable();
     this.setCallable(false);
+    // fsm_settings__get_reason: a bare repository is incompatible with a configured monitor
+    // (git dies after reading the index, which a bare working copy here does not give)
+    if (this.fsmonitor && !this.hasWorktree()) {
+      const mode = fsmonitorModeOf(
+        RemoteConfigStore.from(this.workingCopy).value("core.fsmonitor"),
+      );
+      if (mode.kind !== "disabled") {
+        throw new UpdateIndexFailedError(
+          `fatal: bare repository '${await this.currentDirectory()}' is incompatible with fsmonitor`,
+        );
+      }
+    }
     await this.readCurrentIndex();
-    const run = new UpdateIndexRun(this.context());
+    // tweak_fsmonitor on the index read: the monitor asked, the extension added or removed
+    const hadFsmonitor = !!this.staging.getFsmonitor?.();
+    const fsm = await this.fsmonitorRefresh(this.staging);
+    const run = new UpdateIndexRun(this.context(fsm?.state));
+    for (const warning of fsm?.warnings ?? []) run.stderr.push(`warning: ${warning}`);
     try {
       await this.inOneOperation(async () => {
         for (const step of this.steps) await run.step(step);
@@ -330,6 +380,7 @@ export class UpdateIndexCommand extends GitCommand<UpdateIndexResult> {
             await run.updateOne(path);
           }
         }
+        await this.applyFsmonitor(run);
       });
     } catch (error) {
       if (error instanceof Death) {
@@ -340,7 +391,10 @@ export class UpdateIndexCommand extends GitCommand<UpdateIndexResult> {
       }
       throw error;
     }
-    if (run.changed || this.forceWrite) {
+    // FSMONITOR_CHANGED: the extension added or removed, bits set
+    const fsmonitorNow = this.staging.getFsmonitor?.();
+    const fsmonitorChanged = !!fsmonitorNow?.changed || (hadFsmonitor && !fsmonitorNow);
+    if (run.changed || this.forceWrite || fsmonitorChanged) {
       try {
         await run.write();
       } catch (error) {
@@ -360,6 +414,50 @@ export class UpdateIndexCommand extends GitCommand<UpdateIndexResult> {
     };
   }
 
+  /** `--[no-]fsmonitor`: `add_fsmonitor` / `remove_fsmonitor` and their warnings. */
+  private async applyFsmonitor(run: UpdateIndexRun): Promise<void> {
+    if (this.fsmonitor === undefined) return;
+    const mode = fsmonitorModeOf(RemoteConfigStore.from(this.workingCopy).value("core.fsmonitor"));
+    const staging = this.staging;
+    if (this.fsmonitor) {
+      if (mode.kind === "disabled") {
+        run.stderr.push(
+          "warning: core.fsmonitor is unset; set it if you really want to enable fsmonitor",
+        );
+      }
+      if (!staging.getFsmonitor?.() && staging.setFsmonitor) {
+        // add_fsmonitor: a nanosecond token, every entry dirty; written although the
+        // monitor is off (the next read with it off removes it)
+        const state = new FsmonitorState(String(BigInt(Date.now()) * 1_000_000n));
+        state.changed = true;
+        state.writtenWhileDisabled = mode.kind === "disabled";
+        staging.setFsmonitor(state);
+      }
+      run.report("fsmonitor enabled");
+    } else {
+      if (mode.kind !== "disabled" && this.hasWorktree()) {
+        run.stderr.push(
+          "warning: core.fsmonitor is set; remove it if you really want to disable fsmonitor",
+        );
+      }
+      staging.setFsmonitor?.(undefined);
+      run.report("fsmonitor disabled");
+    }
+  }
+
+  /** git's `xgetcwd()` for a bare repository: the git directory's host path. */
+  private async currentDirectory(): Promise<string> {
+    const layout = await hookHostOf(this.workingCopy).layout();
+    if (!layout) return ".";
+    const root = (layout.files as { rootDirectory?: string }).rootDirectory;
+    if (!root) return layout.gitDir;
+    const base = root.replace(/\/+$/, "");
+    const rest = layout.gitDir.replace(/^\.?\/*|\/+$/g, "");
+    const path = rest ? `${base}/${rest}` : base || "/";
+    const environment = hostEnvironmentOf(this.workingCopy);
+    return (await environment?.realPath?.(path).catch(() => undefined)) ?? path;
+  }
+
   private applyIndexVersion(run: UpdateIndexRun): void {
     const staging = this.staging as unknown as {
       _getVersion?(): number;
@@ -376,9 +474,10 @@ export class UpdateIndexCommand extends GitCommand<UpdateIndexResult> {
     if (staging._setVersion) run.setVersion = (v) => staging._setVersion?.(v);
   }
 
-  private context(): RunContext {
+  private context(fsmonitor: FsmonitorState | undefined): RunContext {
     const worktree = this.worktreeAccess;
     return {
+      fsmonitor,
       staging: this.staging,
       worktree,
       blobs: this.blobs,
@@ -394,6 +493,8 @@ export class UpdateIndexCommand extends GitCommand<UpdateIndexResult> {
 }
 
 interface RunContext {
+  /** The index's fsmonitor state, the monitor asked (undefined while it is off) */
+  fsmonitor: FsmonitorState | undefined;
   staging: UpdateIndexCommand["staging"];
   worktree: Worktree | undefined;
   blobs: UpdateIndexCommand["blobs"];
@@ -607,7 +708,10 @@ class UpdateIndexRun {
   async updateOne(path: string): Promise<void> {
     await this.load();
     const s = this.state;
-    const markOnly = s.markValid !== undefined || s.markSkipWorktree !== undefined;
+    const markOnly =
+      s.markValid !== undefined ||
+      s.markSkipWorktree !== undefined ||
+      s.markFsmonitor !== undefined;
     let current: WorktreeEntry | undefined;
     let missing = false;
     let mode = 0;
@@ -628,6 +732,12 @@ class UpdateIndexRun {
     }
     if (s.markSkipWorktree !== undefined) {
       if (!this.markFlags(path, "skipWorktree", s.markSkipWorktree)) {
+        throw new Death(`Unable to mark file ${path}`);
+      }
+      return this.chmodAfter(path);
+    }
+    if (s.markFsmonitor !== undefined) {
+      if (!this.markFsmonitor(path, s.markFsmonitor)) {
         throw new Death(`Unable to mark file ${path}`);
       }
       return this.chmodAfter(path);
@@ -667,6 +777,21 @@ class UpdateIndexRun {
     if (pos < 0) return false;
     const ce = this.entries[pos] as Entry;
     this.entries[pos] = { ...ce, [flag]: mark };
+    this.invalidate(path);
+    this.changed = true;
+    return true;
+  }
+
+  /** `mark_ce_flags` with `CE_FSMONITOR_VALID`: false when the path has no stage-0 entry. */
+  private markFsmonitor(path: string, mark: boolean): boolean {
+    const pos = this.namePos(path);
+    if (pos < 0) return false;
+    const ce = this.entries[pos] as Entry;
+    const state = this.ctx.fsmonitor;
+    if (state) {
+      state.markInvalid(ce);
+      if (mark) state.markValid(ce);
+    }
     this.invalidate(path);
     this.changed = true;
     return true;
@@ -902,6 +1027,7 @@ class UpdateIndexRun {
     const worktree = this.ctx.worktree;
     if (!worktree) return;
     const trust = this.ctx.trust;
+    const fsmonitor = this.ctx.fsmonitor;
     for (let i = 0; i < this.entries.length; i++) {
       const ce = this.entries[i] as Entry;
       if (s.ignoreSubmodules && ce.mode === FileMode.GITLINK) continue;
@@ -916,6 +1042,8 @@ class UpdateIndexRun {
       // refresh_cache_ent: what the user promised not to have changed
       if (ce.skipWorktree) continue;
       if (!really && ce.assumeValid) continue;
+      // CE_FSMONITOR_VALID: the monitor reported nothing for it, taken as up to date unseen
+      if (fsmonitor?.isValid(ce)) continue;
       const current = await worktree.getEntry(ce.path).catch(() => undefined);
       if (!current && s.ignoreMissing) continue;
       let changed: boolean;
@@ -948,8 +1076,12 @@ class UpdateIndexRun {
         continue;
       }
       if (fresh && !sameStat(fresh, ce)) {
+        // replaced (its stat stored): no longer fsmonitor-valid (replace_index_entry)
         this.entries[i] = fresh;
         this.changed = true;
+      } else {
+        // up to date as it is: mark_fsmonitor_valid (gitlinks never)
+        fsmonitor?.markValid(ce);
       }
     }
     // has_racy_timestamp: written anyway, so the racy entries stop being racy
