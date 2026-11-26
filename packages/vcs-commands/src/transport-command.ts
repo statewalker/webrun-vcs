@@ -301,6 +301,12 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
   /** Bundles given by {@link addBundle}, by URL */
   protected readonly bundles = new Map<string, Uint8Array>();
 
+  /** Whether {@link addBundle} gave bytes for `url` that read as a bundle */
+  protected hasGivenBundle(url: string): boolean {
+    const bytes = this.bundles.get(url);
+    return bytes !== undefined && bundleRemoteOf(this._workingCopy, bytes, url) !== undefined;
+  }
+
   /** The bundle {@link addBundle} gave for `url`, as a prepared remote */
   private givenBundle(url: string): Promise<PreparedRemote> | undefined {
     const bytes = this.bundles.get(url);
@@ -314,7 +320,7 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
    * refused in git's words) now, the repository opened later by {@link openRemote}.
    */
   protected resolveRemote(url: string): ResolvedRemote {
-    if (this.bundles.has(url)) return { kind: "local", url, path: url };
+    if (this.hasGivenBundle(url)) return { kind: "local", url, path: url };
     return resolveRemote(url, remoteContextOf(this._workingCopy, this.getTransports()));
   }
 

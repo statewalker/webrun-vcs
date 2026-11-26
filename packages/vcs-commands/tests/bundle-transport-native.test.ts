@@ -350,7 +350,7 @@ git checkout -q main; m tags/v2 "Merge commit O"; c "Commit P" main.txt`,
     await ourClone(home, mine, (c) => c.setURI(join(home, "link")).setMirror(true), { bare: true });
     expect(showRef(mine)).toBe(showRef(native));
   });
-  it("a fetch keeps the bundle's pack whatever its size (unbundle runs index-pack)", async () => {
+  it("a fetch keeps the bundle's pack whatever its size (unbundle runs index-pack; our extension over t6020-bundle-misc.sh's history)", async () => {
     const all = bundle("all-main.bdl", ["main"]);
     // release's tip alone: its parent (v2) is in main's history, so three new objects, which
     // a fetch over the wire would unpack (below fetch.unpackLimit); a bundle's pack is kept
@@ -373,7 +373,7 @@ git checkout -q main; m tags/v2 "Merge commit O"; c "Commit P" main.txt`,
     expect(storage(join(mine, ".git")).kinds.filter((k) => k === "pack")).toHaveLength(2);
   });
 
-  it("fetching a filtered bundle writes a from-bundle promisor pack (t6020-bundle-misc filtered bundles)", async () => {
+  it("fetching a filtered bundle writes a from-bundle promisor pack (our extension: t6020-bundle-misc.sh's history and filtered bundles, git's unbundle --promisor=from-bundle)", async () => {
     const filtered = bundle("filtered.bdl", ["--all", "--filter=blob:none"]);
     // without a promisor remote: the pack is kept as a promisor pack, the check fails
     const native = join(home, "filtered-native");
@@ -427,7 +427,7 @@ git checkout -q main; m tags/v2 "Merge commit O"; c "Commit P" main.txt`,
     expect(run(po, ["fsck", "--no-dangling"]).status).toBe(0);
   });
 
-  it("a bundle given as bytes (addBundle) is fetched, cloned and listed as the file is", async () => {
+  it("a bundle given as bytes (addBundle) is fetched, cloned and listed as the file is (JGit TransportBundleStream as in BundleWriterTest; t6020-bundle-misc.sh's bundles)", async () => {
     const bytes = new Uint8Array(readFileSync(b1));
     const url = "memory/b1.bundle"; // nothing on disk names it
     const listed = await (await openWorktree(repo))

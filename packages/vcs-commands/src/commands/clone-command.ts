@@ -874,7 +874,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     // get_repo_path: then a regular file, `<path>.bundle` first (a bundle: the transport reads
     // it there, remote.<name>.url keeps the path as given)
     let bundleFile: string | undefined;
-    if (this.bundles.has(uri)) {
+    const givenBundle = this.hasGivenBundle(uri);
+    if (givenBundle) {
       // a bundle given as bytes (addBundle): its URL as given
       bundleFile = uri;
     } else if (!isRepositoryPath) {
@@ -887,7 +888,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       }
     }
     let repo: string;
-    if (this.bundles.has(uri)) repo = uri;
+    if (givenBundle) repo = uri;
     else if (isRepositoryPath || bundleFile !== undefined) repo = absolutePathOf(worktree, uri);
     else if (uri.includes(":")) repo = uri;
     else throw new TransportError(`fatal: repository '${uri}' does not exist`);
