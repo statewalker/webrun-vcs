@@ -30,6 +30,7 @@ import {
   type WorktreePathOptions,
 } from "@statewalker/vcs-core";
 import { decodeGitPath, decodeGitPatternFile } from "@statewalker/vcs-utils/encoding";
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { computeObjectIdFromStream } from "@statewalker/vcs-utils/pack";
 import { collect } from "@statewalker/vcs-utils/streams";
@@ -68,6 +69,8 @@ import {
   withoutCommandLineConfig,
 } from "@statewalker/vcs-working-tree";
 import { createGitFilesBackend } from "../../create-git-files-backend.js";
+import { createReftableStackReader, isPerWorktreeRef } from "../../refs/index.js";
+import { readRepositoryFormat } from "../../repository-format.js";
 import { assertValidOwnership, hostPathOf } from "../../safety/index.js";
 import { parseGitfile } from "../git-dir/index.js";
 import { openGitLinkedWorktrees } from "../linked-worktrees/index.js";
@@ -1297,13 +1300,25 @@ export class FileWorktree implements Worktree {
    * git's `resolve_gitlink_ref(path, "HEAD")`: the repository at `path` found as
    * {@link repositoryState} finds it, then its HEAD resolved (a link into `refs/` as
    * `ref: <target>`, as core.preferSymlinkRefs writes it), loose refs in its git directory
-   * then its common directory, then `packed-refs`. `"none"` when there is no repository or
-   * no commit there, `"unknown"` when it cannot be read here.
+   * then its common directory, then `packed-refs`; a repository whose config says
+   * `extensions.refStorage = reftable` through its reftable stacks (its `HEAD` file is a stub
+   * git never reads). `"none"` when there is no repository or no commit there, `"unknown"`
+   * when it cannot be read here.
    */
   async gitlinkHeadState(path: string): Promise<GitlinkHeadState> {
     const repo = await this.nestedGitDir(path);
     if (repo.state !== "repository") return { state: repo.state };
     const { gitDir, commonDir } = repo;
+    // the nested repository's own ref storage, as resolve_gitlink_ref opens its ref store
+    const format = await readRepositoryFormat(this.files, commonDir).catch(() => undefined);
+    if (format?.refStorage === "reftable") {
+      return this.reftableHeadState(gitDir, commonDir, format.objectFormat);
+    }
+    // a format we refuse (git may still read it): a reftable repository's HEAD file is a stub,
+    // so its HEAD cannot be read here; any other keeps the files reading below
+    if (format === undefined && (await this.refStorageOf(commonDir)) === "reftable") {
+      return { state: "unknown" };
+    }
     let head = await this.readRefFile(joinPath(gitDir, "HEAD"));
     for (let depth = 0; typeof head === "string" && head.startsWith("ref:"); depth++) {
       if (depth >= 5) return { state: "unknown" };
@@ -1327,6 +1342,61 @@ export class FileWorktree implements Worktree {
       return { state: "none" };
     }
     return { state: "commit", head: head.toLowerCase() };
+  }
+
+  /** `extensions.refStorage` of the repository at `commonDir`, read without any format check. */
+  private async refStorageOf(commonDir: string): Promise<string | undefined> {
+    try {
+      const config = await createWorkingCopyConfig(
+        configFilesApiOf(this.files, { readOnly: "only extensions.refStorage is read" }),
+        commonDir,
+        undefined,
+        { includes: false },
+      );
+      const value = config.get("extensions.refstorage");
+      return typeof value === "string" ? value.toLowerCase() : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * HEAD of a nested reftable repository, symbolic refs followed (at most five, as above):
+   * per-worktree names (HEAD, `refs/bisect/`, ...) from the git directory's own stack when it
+   * is a linked worktree's, every other name from the common directory's.
+   */
+  private async reftableHeadState(
+    gitDir: string,
+    commonDir: string,
+    objectFormat: ObjectFormat,
+  ): Promise<GitlinkHeadState> {
+    try {
+      const common = await createReftableStackReader(this.files, joinPath(commonDir, "reftable"), {
+        objectFormat,
+      }).read();
+      const own =
+        gitDir === commonDir
+          ? common
+          : await createReftableStackReader(this.files, joinPath(gitDir, "reftable"), {
+              objectFormat,
+            }).read();
+      let name = "HEAD";
+      for (let depth = 0; depth <= 5; depth++) {
+        const view = isPerWorktreeRef(name) ? own : common;
+        const value = view.getRef(name)?.value;
+        if (value === undefined || value.type === "deletion") return { state: "none" };
+        if (value.type === "symref") {
+          name = value.target;
+          continue;
+        }
+        if (/^0+$/.test(value.id)) return { state: "none" };
+        return { state: "commit", head: value.id.toLowerCase() };
+      }
+      return { state: "unknown" };
+    } catch {
+      // a stack we cannot read (corrupt, too large, another hash): no change reported
+      return { state: "unknown" };
+    }
   }
 
   /**
