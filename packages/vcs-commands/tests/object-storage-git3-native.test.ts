@@ -261,8 +261,20 @@ describe.skipIf(!git3)("extensions.objectStorage (git master)", () => {
     ).toBe(0);
     const sub = join(dir, "submodule");
     expect(git(sub, ["commit", "-q", "--allow-empty", "-m", "submodule"]).status).toBe(0);
+    // our `submodule add` of that existing repository, in a copy: as native git's
+    const twin = `${dir}-ours`;
+    expect(spawnSync("cp", ["-a", dir, twin]).status).toBe(0);
     expect(git(dir, ["submodule", "add", "./submodule"]).status).toBe(0);
     expect(git(sub, ["rev-parse", "--show-object-storage-format"]).out).toBe("files://objs\n");
+    const added = await (await openOurs(twin)).submoduleAdd().setURI("./submodule").call();
+    expect(added.exitCode).toBe(0);
+    for (const args of [
+      ["ls-files", "-s"],
+      ["status", "--porcelain"],
+      ["show", ":.gitmodules"],
+    ]) {
+      expect(git(twin, args).out).toBe(git(dir, args).out);
+    }
     // a new commit in the submodule: the superproject sees it through the submodule's refs
     expect(git(sub, ["commit", "-q", "--allow-empty", "-m", "two"]).status).toBe(0);
     const ours = await openOurs(dir);
@@ -337,6 +349,34 @@ describe.skipIf(!git3)("extensions.objectStorage (git master)", () => {
       expect(
         lines(git(up, ["submodule", "update", "--init", `--object-storage-format=${format}`]).err),
       ).toEqual([`fatal: unknown object storage format '${format}'`]);
+    }
+  });
+
+  it('t7427-submodule-object-storage-format.sh: "add submodules with explicit files storage format"', async () => {
+    const dir = upstreamAndSubmodule();
+    const url = `file://${dir}/submodule`;
+    expect(spawnSync("cp", ["-a", join(dir, "upstream"), join(dir, "ours")]).status).toBe(0);
+    const up = join(dir, "upstream");
+    const native = git(up, ["submodule", "add", "--object-storage-format=files", url], ALLOW_FILE);
+    expect(native.status).toBe(0);
+    const ours = await openOurs(
+      dir,
+      createNodeGitHostEnvironment({ env: env(ALLOW_FILE) }),
+      undefined,
+      "ours",
+    );
+    const result = await ours.submoduleAdd().setObjectStorageFormat("files").setURI(url).call();
+    expect(result.exitCode).toBe(0);
+    for (const side of ["upstream", "ours"]) {
+      expect(
+        git(join(dir, side, "submodule"), ["rev-parse", "--show-object-storage-format"]).out,
+      ).toBe("files\n");
+    }
+    for (const args of [
+      ["ls-files", "-s"],
+      ["show", ":.gitmodules"],
+    ]) {
+      expect(git(join(dir, "ours"), args).out).toBe(git(up, args).out);
     }
   });
 
