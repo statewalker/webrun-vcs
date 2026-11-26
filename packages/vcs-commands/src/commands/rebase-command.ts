@@ -277,6 +277,17 @@ const WORKTREE_CHECK_BATCH = 32;
 /** The state directory of git's merge backend. */
 const DIR = "rebase-merge";
 
+/** The state directory of git's apply backend (`git am --rebasing`'s). */
+const APPLY_DIR = "rebase-apply";
+
+/** sequencer.c's rebase_resolvemsg: the advice `git am --rebasing` gives where it stops. */
+const REBASE_RESOLVEMSG = [
+  "Resolve all conflicts manually, mark them as resolved with",
+  '"git add/rm <conflicted_files>", then run "git rebase --continue".',
+  'You can instead skip this commit: run "git rebase --skip".',
+  'To abort and get back to the state before "git rebase", run "git rebase --abort".',
+].join("\n");
+
 /** sequencer.c's GIT_MAX_LABEL_LENGTH (NAME_MAX - ".lock" - 16) */
 const MAX_LABEL_LENGTH = 255 - 5 - 16;
 
@@ -293,6 +304,8 @@ const sq = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
  * git's state (`.git/rebase-merge/`, `REBASE_HEAD`, `MERGE_MSG`, `AUTO_MERGE`), so native
  * `git rebase --continue / --skip / --abort` resumes what we started, and we resume what
  * native git started. A rebase is refused on unstaged or staged changes, as git refuses it.
+ * {@link RebaseCommand.setBackend}`("apply")` (`--apply`, also chosen by `--whitespace`/`-C`
+ * or `rebase.backend=apply`) runs git's am-based backend instead (`rebase-apply/`).
  * With {@link RebaseCommand.setRebaseMerges} (`--rebase-merges`) the merges are kept: git's
  * todo list of `label`, `reset` and `merge -C` commands, run as git's sequencer runs them.
  *
@@ -382,6 +395,65 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   private noVerify = false;
   /** `--trailer` arguments (kept in `rebase-merge/trailer`, one per line) */
   private trailerArgs: string[] = [];
+  /** `--apply` / `--merge` as given (undefined: implied by the options, else `rebase.backend`) */
+  private backend?: "apply" | "merge";
+  /** The death of `--apply` and `--merge` given together (in git's order of parsing) */
+  private backendConflict?: string;
+  /** `--whitespace=<action>`, passed to `git am` (apply backend) */
+  private whitespace?: string;
+  /** `-C<n>`, passed to `git am` (apply backend) */
+  private contextLines?: string;
+  /** `--ignore-whitespace`: am's `--ignore-whitespace`, or `-Xignore-space-change` */
+  private ignoreWhitespace = false;
+
+  /**
+   * `--apply` / `--merge` (`-m`): the backend. `apply` is git's am-based one (`git
+   * format-patch | git am --rebasing`, its state in `rebase-apply/`): each commit's diff
+   * is applied as a patch, with the three-way fallback, so `--whitespace`, `-C` and
+   * `--ignore-whitespace` act as on `git am`; commits empty from the start and commits
+   * upstream already has are dropped, merges are flattened away. Options only the merge
+   * backend has (`-i`, `--exec`, `--empty`, `-s`/`-X`, `--rebase-merges`, `--update-refs`,
+   * `--autosquash`, `--root` without `--onto`, `--trailer`, `--[no-]reapply-cherry-picks`
+   * without `--keep-base`) are refused with it (`<option> requires the merge backend`).
+   * Without either, `--whitespace`/`-C` choose `apply`, the merge-only options `merge`,
+   * else `rebase.backend` (default `merge`).
+   */
+  setBackend(backend: "apply" | "merge"): this {
+    this.checkCallable();
+    if (this.backend !== undefined && this.backend !== backend && !this.backendConflict) {
+      this.backendConflict = "fatal: apply options and merge options cannot be used together";
+    }
+    this.backend = backend;
+    return this;
+  }
+
+  /**
+   * `--whitespace=<action>` (`nowarn`, `warn`, `fix`, `strip`, `error`, `error-all`): passed
+   * to `git am` and so `git apply`; it implies the apply backend. `fix` and `strip` rewrite
+   * every commit (no fast-forward when already up to date).
+   */
+  setWhitespace(action: string): this {
+    this.checkCallable();
+    this.whitespace = action;
+    return this;
+  }
+
+  /** `-C<n>`: the context lines that must match, passed to `git am`; implies the apply backend. */
+  setContext(lines: number | string): this {
+    this.checkCallable();
+    this.contextLines = String(lines);
+    return this;
+  }
+
+  /**
+   * `--ignore-whitespace`: with `--apply`, `git am --ignore-whitespace` (context lines
+   * compared ignoring whitespace); otherwise the merge backend's `-X ignore-space-change`.
+   */
+  setIgnoreWhitespace(value: boolean): this {
+    this.checkCallable();
+    this.ignoreWhitespace = value;
+    return this;
+  }
 
   /**
    * `--trailer <token>[(=|:)<value>]` (git 2.46+): each rebased commit's message gets the
@@ -390,8 +462,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
    * git, it implies `--force-rebase` and is kept in `rebase-merge/trailer` for `--continue`;
    * an empty argument or one without a key is refused before anything is done, and under
    * 2.43 compatibility the option itself (`error: unknown option \`trailer'`, exit 129).
-   * git's apply backend refuses it (`--trailer requires the merge backend`); ours has only
-   * the merge backend.
+   * The apply backend refuses it (`--trailer requires the merge backend`).
    */
   addTrailer(trailer: string): this {
     this.checkCallable();
@@ -589,7 +660,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         : this.contentStrategy === ContentMergeStrategy.THEIRS
           ? ["theirs"]
           : [];
-    return [...favor, ...this.strategyOptions];
+    const space = this.ignoreWhitespace && this.backend !== "apply" ? ["ignore-space-change"] : [];
+    return [...favor, ...this.strategyOptions, ...space];
   }
 
   /** The run's `-s` (`ort` when only `-X` was given) as builtin/rebase.c settles it. */
@@ -1289,13 +1361,22 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     worktree: Worktree | undefined,
   ): Promise<RebaseResult> {
     const forkPoint = this.checkBeginOptions();
-    if (await this.inProgress(state)) {
+    if (this.backendConflict) throw new GitApiError(this.backendConflict);
+    const applyRunning = await this.applyInProgress(state);
+    if (applyRunning === "am") {
       return {
         status: RebaseStatus.FAILED,
-        message:
-          "fatal: It seems that there is already a rebase-merge directory, and\nI wonder if you are in the middle of another rebase.",
+        message: "fatal: It looks like 'git am' is in progress. Cannot rebase.",
       };
     }
+    if (applyRunning || (await this.inProgress(state))) {
+      const dir = applyRunning ? APPLY_DIR : DIR;
+      return {
+        status: RebaseStatus.FAILED,
+        message: `fatal: It seems that there is already a ${dir} directory, and\nI wonder if you are in the middle of another rebase.  If that is the\ncase, please try\n\tgit rebase (--continue | --abort | --skip)\nIf that is not the case, please\n\trm -fr ".git/${dir}"\nand run me again.  I am stopping in case you still have something\nvaluable there.`,
+      };
+    }
+    const backend = this.settleBackend();
     // check_exec_cmd
     for (const command of this.execCommands) {
       if (command.includes("\n")) {
@@ -1382,7 +1463,12 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       this.ignoreDate ||
       this.signoff ||
       this.trailerArgs.length > 0;
-    const preemptive = !interactive && execs.length === 0 && this.autosquash !== true;
+    const preemptive =
+      !interactive &&
+      execs.length === 0 &&
+      this.autosquash !== true &&
+      this.whitespace !== "fix" &&
+      this.whitespace !== "strip";
     if (preemptive && (await this.canFastForward(onto, upstream, restrict, origHead, branchBase))) {
       const upToDate =
         branchName === "HEAD" ? "HEAD is up to date" : `Current branch ${branchName} is up to date`;
@@ -1418,6 +1504,22 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
           output,
         };
       }
+    }
+
+    if (backend === "apply") {
+      return this.beginApply(state, worktree, {
+        headId,
+        origHead,
+        headName,
+        branchName,
+        onto,
+        ontoName,
+        base: upstream ?? onto,
+        restrict,
+        branchBase,
+        autostash,
+        output,
+      });
     }
 
     const headTree = await flatTree(this.trees, await this.commits.getTree(headId));
@@ -3358,7 +3460,10 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     state: OperationState,
     worktree: Worktree | undefined,
   ): Promise<RebaseResult> {
-    if (!(await this.inProgress(state))) throw new NoRebaseInProgressError();
+    const apply = await this.applyInProgress(state);
+    if (apply === "am")
+      throw new GitApiError("fatal: It looks like 'git am' is in progress. Cannot rebase.");
+    if (!apply && !(await this.inProgress(state))) throw new NoRebaseInProgressError();
     const { unmerged } = await readIndex(this.staging);
     if (unmerged.length > 0) {
       // builtin/rebase.c: refresh_index's `<path>: needs merge`, then has_unstaged_changes
@@ -3389,6 +3494,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         };
       }
     }
+    if (apply) return this.resumeApply(state, worktree, "continue");
     return this.resume(state, worktree);
   }
 
@@ -3615,7 +3721,10 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
 
   /** `git rebase --skip`: the stopped pick dropped (`reset --hard`), then as `--continue`. */
   private async skip(state: OperationState, worktree: Worktree | undefined): Promise<RebaseResult> {
-    if (!(await this.inProgress(state))) throw new NoRebaseInProgressError();
+    const apply = await this.applyInProgress(state);
+    if (apply === "am")
+      throw new GitApiError("fatal: It looks like 'git am' is in progress. Cannot rebase.");
+    if (!apply && !(await this.inProgress(state))) throw new NoRebaseInProgressError();
     await this.rerereClear();
     const headId = await this.resolveHead();
     const refused = await resetMerge(this.context(worktree), headId, "HEAD", { hard: true });
@@ -3628,7 +3737,272 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     // remove_branch_state (REBASE_HEAD stays: the next command removes it, so a skip of the
     // last one leaves it, as git does); AUTO_MERGE deleted twice, as git's hook hears it
     await removeBranchState(this.context(worktree), state);
+    if (apply) return this.resumeApply(state, worktree, "skip");
     return this.resume(state, worktree);
+  }
+
+  /**
+   * The apply backend's session found as cmd_rebase finds it: `rebase-apply/` (a rebase),
+   * `am` when it holds `applying` (git am's), else false.
+   */
+  private async applyInProgress(state: OperationState): Promise<false | "rebase" | "am"> {
+    if (!(await state.exists(APPLY_DIR))) return false;
+    return (await state.exists(`${APPLY_DIR}/applying`)) ? "am" : "rebase";
+  }
+
+  /**
+   * cmd_rebase's choice of backend: `--apply`/`--merge` as given, the options only one
+   * backend has (imply_merge dies on an explicit `--apply`), the am options (`--whitespace`,
+   * `-C`) choosing `apply`, then `rebase.backend`.
+   */
+  private settleBackend(): "apply" | "merge" {
+    const die = (message: string) => new GitApiError(`fatal: ${message}`);
+    let type = this.backend ?? (this.interactiveHandler ? "merge" : undefined);
+    if (this.backend === "apply" && this.interactiveHandler) {
+      throw die("apply options and merge options cannot be used together");
+    }
+    if (this.contextLines !== undefined && !/^\d*$/.test(this.contextLines)) {
+      throw die("switch `C' expects a numerical value");
+    }
+    const ws = this.whitespace;
+    if (
+      ws !== undefined &&
+      !["", "fix", "strip", "warn", "nowarn", "error", "error-all"].includes(ws)
+    ) {
+      throw die(`Invalid whitespace option: '${ws}'`);
+    }
+    const implyMerge = (option: string) => {
+      if (type === "apply") throw die(`${option} requires the merge backend`);
+      type = "merge";
+    };
+    if (this.emptyMode !== undefined) implyMerge("--empty");
+    if (this.reapplyCherryPicks !== undefined && !this.keepBase) {
+      implyMerge(this.reapplyCherryPicks ? "--reapply-cherry-picks" : "--no-reapply-cherry-picks");
+    }
+    if (this.execCommands.length > 0) implyMerge("--exec");
+    if (this.givenStrategyName() !== undefined) implyMerge("--strategy");
+    if (this.root && this.ontoName === undefined && this.upstreamCommit === undefined) {
+      implyMerge("--root without --onto");
+    }
+    if (this.trailerArgs.length > 0) implyMerge("--trailer");
+    const amOptions = this.whitespace !== undefined || this.contextLines !== undefined;
+    if (amOptions || type === "apply") {
+      if (type === "merge") throw die("apply options and merge options cannot be used together");
+      if (
+        this.rebaseMerges === undefined &&
+        configBool(this.workingCopy, "rebase.rebaseMerges", false)
+      ) {
+        throw die(
+          "apply options are incompatible with rebase.rebaseMerges.  Consider adding --no-rebase-merges",
+        );
+      }
+      if (
+        this.updateRefs === undefined &&
+        configBool(this.workingCopy, "rebase.updateRefs", false)
+      ) {
+        throw die(
+          "apply options are incompatible with rebase.updateRefs.  Consider adding --no-update-refs",
+        );
+      }
+      type = "apply";
+    }
+    if (this.updateRefs === true) implyMerge("--update-refs");
+    if (this.rebaseMerges === true) implyMerge("--rebase-merges");
+    if (this.autosquash === true) implyMerge("--autosquash");
+    if (type === undefined) {
+      const configured = configValue(this.workingCopy, "rebase.backend") ?? "merge";
+      if (configured === "merge") type = "merge";
+      else if (configured === "apply") type = "apply";
+      else throw die(`Unknown rebase backend: ${configured}`);
+    }
+    if (this.rescheduleFailedExec === true && type !== "merge") {
+      throw die("--reschedule-failed-exec requires --exec or --interactive");
+    }
+    this.backend = type;
+    return type;
+  }
+
+  /**
+   * The apply backend from HEAD's start on (cmd_rebase after the pre-rebase hook, then
+   * run_am): HEAD detached at onto (`rebase (start): checkout <onto>`, ORIG_HEAD the branch,
+   * post-checkout told), the commits upstream lacks (merges, commits empty from the start
+   * and those upstream has a copy of left out, as `format-patch --cherry-pick
+   * --right-only` lists them) applied by `git am --rebasing`, then the branch moved back
+   * (`move_to_original_branch`) and the state removed; a stop keeps `rebase-apply/` with
+   * the rebase's own files (`rebase_write_basic_state`).
+   */
+  private async beginApply(
+    state: OperationState,
+    worktree: Worktree | undefined,
+    run: {
+      headId: ObjectId;
+      origHead: ObjectId;
+      headName: string;
+      branchName: string;
+      onto: ObjectId;
+      ontoName: string;
+      base: ObjectId;
+      restrict?: ObjectId;
+      branchBase?: ObjectId;
+      autostash?: ObjectId;
+      output: string[];
+    },
+  ): Promise<RebaseResult> {
+    const { headId, origHead, headName, onto, output } = run;
+    const unstash = async () => {
+      if (run.autostash) {
+        output.push(...(await applyAutostash(this.context(worktree), run.autostash)));
+      }
+    };
+    output.push("First, rewinding head to replay your work on top of it...");
+    const headTree = await flatTree(this.trees, await this.commits.getTree(headId));
+    const ontoTreeId = await this.commits.getTree(onto);
+    const ontoTree = await flatTree(this.trees, ontoTreeId);
+    const refused = await switchTrees(this.context(worktree), headTree, ontoTree, {
+      action: "checkout",
+      operation: "rebase",
+      targetTree: ontoTreeId,
+    });
+    if (refused) {
+      await unstash();
+      return {
+        status: RebaseStatus.FAILED,
+        message: `${refused.message}\nerror: Could not detach HEAD`,
+        output,
+      };
+    }
+    await state.setRef("ORIG_HEAD", origHead);
+    await this.refsStore.set("HEAD", onto, this.startLog());
+    await runPostCheckoutHook(this.hooks, headId, onto, true);
+    if (run.autostash) await state.write(`${APPLY_DIR}/autostash`, `${run.autostash}\n`);
+    const basic = { headName, onto, origHead };
+    // onto a proper descendant of the branch: it was a fast-forward
+    if (run.branchBase === origHead) {
+      output.push(`Fast-forwarded ${run.branchName} to ${run.ontoName}.`);
+      return this.finishApply(state, worktree, basic, output);
+    }
+    // format-patch's list: no merges, no commits empty from the start, none upstream has
+    const excluded = [run.base, run.restrict].filter((id): id is ObjectId => id !== undefined);
+    const range = await this.commitsToRebase(origHead, excluded, false);
+    const skipped = await this.appliedUpstream(origHead, run.base, range, run.restrict);
+    const ids: ObjectId[] = [];
+    for (const id of range) {
+      if (!skipped.has(id) && !(await this.originallyEmpty(id))) ids.push(id);
+    }
+    // `git am --rebasing` reads nothing of a mail but its `From <id>` line (the commit gives
+    // the author, the message and the diff), so the mails carry only that
+    const mbox = ids.map((id) => `From ${id} Mon Sep 17 00:00:00 2001\n\n`).join("");
+    const am = this.amForRebase()
+      .addMbox(mbox)
+      .setPatchFormat("mboxrd")
+      .setApplyOptions({
+        ...(this.contextLines !== undefined ? { context: Number(this.contextLines || "0") } : {}),
+        ...(this.whitespace !== undefined ? { whitespace: this.whitespace } : {}),
+        ...(this.ignoreWhitespace ? { ignoreWhitespace: true } : {}),
+      })
+      .setIgnoreDate(this.ignoreDate)
+      .setCommitterDateIsAuthorDate(this.committerDateIsAuthorDate)
+      .setSignoff(this.signoff);
+    if (this.rerereAutoUpdate !== undefined) am.setRerereAutoUpdate(this.rerereAutoUpdate);
+    return this.runAmForRebase(state, worktree, am, basic, output, true);
+  }
+
+  /** `git am --rebasing`'s command as run_am starts it (`GIT_REFLOG_ACTION=rebase (pick)`). */
+  private amForRebase(): AmCommand {
+    const am = new AmCommand(this.workingCopy)
+      .shareHooksOf(this)
+      .setRebasing(true)
+      .setResolveMessage(REBASE_RESOLVEMSG)
+      .setReflogAction(`${this.reflogAction("rebase")} (pick)`)
+      .setLegacyMessages((this.compatibility ?? this.hooks.compatibility) === "2.43");
+    if (typeof this.sign === "string") am.setSigningKey(this.sign);
+    else am.setSign(this.sign);
+    if (this.committer) am.setCommitter(this.committer);
+    return am;
+  }
+
+  /**
+   * run_am's end: am's lines given on, the branch moved back and the state removed when it
+   * applied everything, else (a new run) the rebase's state written beside am's.
+   */
+  private async runAmForRebase(
+    state: OperationState,
+    worktree: Worktree | undefined,
+    am: AmCommand,
+    basic: { headName: string; onto: ObjectId; origHead: ObjectId },
+    output: string[],
+    writeBasicState: boolean,
+  ): Promise<RebaseResult> {
+    const result = await am.call();
+    const lines = (text: string) => text.split("\n").filter((l) => l !== "");
+    output.push(...lines(result.output), ...lines(result.errors));
+    if (result.exitCode === 0) return this.finishApply(state, worktree, basic, output);
+    if (writeBasicState && (await state.exists(APPLY_DIR))) {
+      // rebase_write_basic_state
+      await state.write(`${APPLY_DIR}/head-name`, `${basic.headName}\n`);
+      await state.write(`${APPLY_DIR}/onto`, `${basic.onto}\n`);
+      await state.write(`${APPLY_DIR}/orig-head`, `${basic.origHead}\n`);
+      if (this.rerereAutoUpdate !== undefined) {
+        await state.write(
+          `${APPLY_DIR}/allow_rerere_autoupdate`,
+          `--${this.rerereAutoUpdate ? "" : "no-"}rerere-autoupdate\n`,
+        );
+      }
+      const sign = signRequestOf(this.workingCopy, this.sign);
+      if (sign !== undefined) await state.write(`${APPLY_DIR}/gpg_sign_opt`, `-S${sign}\n`);
+      if (this.signoff) await state.write(`${APPLY_DIR}/signoff`, "--signoff\n");
+    }
+    const { unmerged } = await readIndex(this.staging);
+    return {
+      status: RebaseStatus.STOPPED,
+      ...(unmerged.length > 0 ? { conflicts: [...new Set(unmerged)] } : {}),
+      output,
+    };
+  }
+
+  /**
+   * `--continue` (`git am --resolved`) and `--skip` (`git am --skip`) of the apply backend,
+   * the state read back as read_basic_state reads it.
+   */
+  private async resumeApply(
+    state: OperationState,
+    worktree: Worktree | undefined,
+    mode: "continue" | "skip",
+  ): Promise<RebaseResult> {
+    const headName = (await state.read(`${APPLY_DIR}/head-name`))?.trim();
+    const onto = (await state.read(`${APPLY_DIR}/onto`))?.trim();
+    const origHead =
+      (await state.read(`${APPLY_DIR}/orig-head`))?.trim() ??
+      (await state.read(`${APPLY_DIR}/head`))?.trim();
+    if (headName === undefined || !onto || !origHead) {
+      return { status: RebaseStatus.FAILED, message: "error: could not read rebase-apply state" };
+    }
+    const saved = (await state.read(`${APPLY_DIR}/allow_rerere_autoupdate`))?.trim();
+    if (saved === "--rerere-autoupdate") this.rerereAutoUpdate = true;
+    else if (saved === "--no-rerere-autoupdate") this.rerereAutoUpdate = false;
+    const am = this.amForRebase().setResume(mode === "continue" ? "resolved" : "skip");
+    if (mode === "skip") am.setSign(undefined);
+    return this.runAmForRebase(state, worktree, am, { headName, onto, origHead }, [], false);
+  }
+
+  /**
+   * move_to_original_branch and finish_rebase: the branch at HEAD and HEAD on it again,
+   * REBASE_HEAD and AUTO_MERGE deleted, the autostash applied, `rebase-apply/` removed.
+   */
+  private async finishApply(
+    state: OperationState,
+    worktree: Worktree | undefined,
+    basic: { headName: string; onto: ObjectId },
+    output: string[],
+  ): Promise<RebaseResult> {
+    const head = await this.resolveHead();
+    if (basic.headName.startsWith("refs/"))
+      await this.finishBranch(basic.headName, head, basic.onto);
+    await state.deleteRef("REBASE_HEAD", "AUTO_MERGE");
+    const autostash = (await state.read(`${APPLY_DIR}/autostash`))?.trim();
+    if (autostash) output.push(...(await applyAutostash(this.context(worktree), autostash)));
+    await state.remove(APPLY_DIR);
+    return { status: RebaseStatus.OK, newHead: head, output };
   }
 
   /**
@@ -3641,7 +4015,6 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     worktree: Worktree | undefined,
     operation: RebaseOperation,
   ): Promise<RebaseResult> {
-    const APPLY_DIR = "rebase-apply";
     if (await state.exists(`${APPLY_DIR}/applying`)) {
       return {
         status: RebaseStatus.FAILED,
@@ -3693,10 +4066,14 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     state: OperationState,
     worktree: Worktree | undefined,
   ): Promise<RebaseResult> {
-    if (!(await this.inProgress(state))) return { status: RebaseStatus.ABORTED };
+    const apply = await this.applyInProgress(state);
+    if (apply === "am")
+      throw new GitApiError("fatal: It looks like 'git am' is in progress. Cannot rebase.");
+    if (!apply && !(await this.inProgress(state))) return { status: RebaseStatus.ABORTED };
+    const stateDir = apply ? APPLY_DIR : DIR;
     await this.rerereClear();
-    const origHead = (await state.read(`${DIR}/orig-head`))?.trim();
-    const headName = (await state.read(`${DIR}/head-name`))?.trim() ?? "detached HEAD";
+    const origHead = (await state.read(`${stateDir}/orig-head`))?.trim();
+    const headName = (await state.read(`${stateDir}/head-name`))?.trim() ?? "detached HEAD";
     if (!origHead)
       return { status: RebaseStatus.FAILED, message: "fatal: could not read orig-head" };
     const refused = await resetMerge(this.context(worktree), origHead, origHead, { hard: true });
@@ -3707,13 +4084,13 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       };
     }
     await this.finishBranch(headName, origHead, undefined, true);
-    const autostash = (await state.read(`${DIR}/autostash`))?.trim();
+    const autostash = (await state.read(`${stateDir}/autostash`))?.trim();
     // remove_branch_state, then finish_rebase's unconditional deletions of REBASE_HEAD and
     // AUTO_MERGE (git 2.5x's reference-transaction hook hears each)
     await removeBranchState(this.context(worktree), state);
     await state.deleteRef("REBASE_HEAD", "AUTO_MERGE");
-    await this.deleteRewrittenRefs(state);
-    await state.remove("MERGE_HEAD", "MERGE_MODE", "MERGE_MSG", "SQUASH_MSG", DIR);
+    if (!apply) await this.deleteRewrittenRefs(state);
+    await state.remove("MERGE_HEAD", "MERGE_MODE", "MERGE_MSG", "SQUASH_MSG", stateDir);
     const output = autostash ? await applyAutostash(this.context(worktree), autostash) : [];
     return { status: RebaseStatus.ABORTED, newHead: origHead, output };
   }

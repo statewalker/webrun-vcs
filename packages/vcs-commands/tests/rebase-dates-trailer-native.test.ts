@@ -10,7 +10,7 @@
  * `--ignore-date` dates the authors with the clock (not `GIT_AUTHOR_DATE`), so those twins
  * compare the histories with the dates of the run replaced.
  *
- * Only the merge backend exists here: the apply backend's scenarios (`--apply`) are left out.
+ * The apply backend's scenarios (`--apply`) are in `rebase-apply-native.test.ts`.
  */
 
 import { spawnSync } from "node:child_process";

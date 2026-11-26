@@ -36,6 +36,7 @@ import {
   textToLatin1,
 } from "../apply/latin1.js";
 import { coreBool } from "../core-config.js";
+import { DEFAULT_DATE_MODE, showDate } from "../date-format.js";
 import { DiffCommand } from "../diff-command.js";
 import { localTimezoneOffset, parseGitDate } from "../git-date.js";
 import { withoutCrud } from "../git-ident.js";
@@ -52,6 +53,7 @@ import {
   treeDelta,
 } from "../merge-support.js";
 import { stripspace } from "../message-cleanup.js";
+import { copyNotesForRebase } from "../notes-support.js";
 import { ortResultEntries } from "../ort-merge.js";
 import { mergeStoredTrees, storedBase } from "../ort-recursive.js";
 import { updateHead, updateHeadExpecting } from "../reflog-messages.js";
@@ -203,6 +205,11 @@ export class AmCommand extends GitCommand<AmResult> {
   private legacyMessages = false;
   private interactive?: AmInteractiveReader;
   private editor?: AmMessageEditor;
+  /** `--rebasing` (hidden): `git rebase --apply`'s session */
+  private rebasing = false;
+  /** `--resolvemsg=<msg>`: the advice given where a patch stops */
+  private resolveMessage?: string;
+  private committerOverride?: PersonIdent;
   private out = "";
   private err = "";
 
@@ -398,6 +405,41 @@ export class AmCommand extends GitCommand<AmResult> {
     return this;
   }
 
+  /**
+   * `--rebasing` (git's hidden option, given by `git rebase --apply`): each mail names the
+   * commit it came from (`From <id>`), whose author, message and diff (`diff-tree --binary
+   * --full-index`) are taken instead of the mail's (`parse_mail_rebase`, `original-commit`,
+   * REBASE_HEAD); the three-way fallback is always on, ORIG_HEAD is left to the rebase, each
+   * commit made is listed in `rewritten` (notes copied and post-rewrite told `rebase` at the
+   * end) and the state directory is left for the rebase to remove.
+   */
+  setRebasing(value: boolean): this {
+    this.checkCallable();
+    this.rebasing = value;
+    return this;
+  }
+
+  /**
+   * The committer of the commits made (a rebase's), in place of the one git resolves from
+   * the environment and configuration.
+   */
+  setCommitter(committer: PersonIdent): this {
+    this.checkCallable();
+    this.committerOverride = committer;
+    return this;
+  }
+
+  protected override resolveCommitter(fallback?: Pick<PersonIdent, "name" | "email">): PersonIdent {
+    return this.committerOverride ?? super.resolveCommitter(fallback);
+  }
+
+  /** `--resolvemsg=<msg>`: the advice given instead of am's where a patch stops. */
+  setResolveMessage(message: string | undefined): this {
+    this.checkCallable();
+    this.resolveMessage = message;
+    return this;
+  }
+
   /** git before 2.46 prints the resolve advice on stdout, not as hints. */
   setLegacyMessages(value: boolean): this {
     this.legacyMessages = value;
@@ -578,7 +620,7 @@ export class AmCommand extends GitCommand<AmResult> {
         return this.resolve(st, mode === "allow-empty");
       return this.amRun(st, true);
     }
-    if (await state.exists(DIR)) {
+    if (!this.rebasing && (await state.exists(DIR))) {
       if (this.resume === "abort" || this.resume === "quit") {
         await state.remove(DIR);
         return this.result(0);
@@ -615,7 +657,7 @@ export class AmCommand extends GitCommand<AmResult> {
       const v = configValue(this.workingCopy, k)?.toLowerCase();
       return v === undefined ? undefined : ["true", "yes", "on", "1", ""].includes(v);
     };
-    const threeway = this.threeWay ?? bool("am.threeWay") ?? false;
+    const threeway = this.rebasing || (this.threeWay ?? bool("am.threeWay") ?? false);
     const keepCr = this.keepCr ?? bool("am.keepcr") ?? false;
     const messageId = this.messageId ?? bool("am.messageid") ?? false;
     // detect_patch_format: standard input is a mailbox, a file is looked at
@@ -700,14 +742,14 @@ export class AmCommand extends GitCommand<AmResult> {
         .map((a) => ` ${sqQuote(a)}`)
         .join(""),
     );
-    await this.writeText("applying", "");
+    await this.writeText(this.rebasing ? "rebasing" : "applying", "");
     const head = await this.headId();
     if (head) {
       await this.writeText("abort-safety", head);
-      await state.setRef("ORIG_HEAD", head);
+      if (!this.rebasing) await state.setRef("ORIG_HEAD", head);
     } else {
       await this.writeText("abort-safety", "");
-      await state.removeRef("ORIG_HEAD");
+      if (!this.rebasing) await state.removeRef("ORIG_HEAD");
     }
     await this.writeText("next", "1");
     await this.writeText("last", String(n));
@@ -743,7 +785,10 @@ export class AmCommand extends GitCommand<AmResult> {
       scissors: await t("scissors"),
       quotedCr: await t("quoted-cr"),
       applyOpts: sqDequoteAll(await t("apply-opt")),
+      rebasing: (await this.read("rebasing")) !== undefined,
     };
+    const orig = await t("original-commit");
+    if (orig) st.origCommit = orig;
     const script = await this.read("author-script");
     if (script !== undefined) {
       const get = (k: string) => {
@@ -765,6 +810,7 @@ export class AmCommand extends GitCommand<AmResult> {
     const state = this.state();
     st.author = undefined;
     st.msg = undefined;
+    st.origCommit = undefined;
     await state.remove(`${DIR}/author-script`, `${DIR}/final-commit`, `${DIR}/original-commit`);
     // am_next: REBASE_HEAD deleted whether it exists or not (the hook hears it either way)
     await state.deleteRef("REBASE_HEAD");
@@ -796,6 +842,15 @@ export class AmCommand extends GitCommand<AmResult> {
       (await this.patchIsEmpty()) &&
       (await this.indexHasChanges()).length === 0;
     if (bool("advice.mergeConflict") === false && !this.legacyMessages) throw new AmStop(128);
+    if (this.resolveMessage !== undefined) {
+      const lines = this.resolveMessage.split("\n");
+      if (this.legacyMessages) this.out += `${lines.join("\n")}\n`;
+      else {
+        for (const l of lines) this.err += l ? `hint: ${l}\n` : "hint:\n";
+        this.err += 'hint: Disable this message with "git config set advice.mergeConflict false"\n';
+      }
+      throw new AmStop(128);
+    }
     const cmd = this.interactive ? "git am -i" : "git am";
     const lines = [
       `When you have resolved this problem, run "${cmd} --continue".`,
@@ -839,6 +894,20 @@ export class AmCommand extends GitCommand<AmResult> {
         if (st.msg === undefined)
           this.fatal(`cannot resume: .git/${DIR}/final-commit does not exist.`);
         if (!st.author) this.fatal(`cannot resume: .git/${DIR}/author-script does not exist.`);
+      } else if (st.rebasing) {
+        await this.parseMailRebase(st, mail, name);
+        let msg = st.msg as string;
+        if (st.signoff) {
+          const c = this.resolveCommitter();
+          msg = appendSignoff(msg, pathToLatin1(`Signed-off-by: ${c.name} <${c.email}>\n`));
+          st.msg = msg;
+        }
+        const a = st.author as { name: string; email: string; date: string };
+        await this.writeText(
+          "author-script",
+          `GIT_AUTHOR_NAME=${sqQuote(a.name)}\nGIT_AUTHOR_EMAIL=${sqQuote(a.email)}\nGIT_AUTHOR_DATE=${sqQuote(a.date)}\n`,
+        );
+        await this.write("final-commit", msg);
       } else {
         // setup_mailinfo: mailinfo.scissors and mailinfo.quotedCr, then the session's options
         const config = this.mailinfoConfig();
@@ -941,8 +1010,56 @@ export class AmCommand extends GitCommand<AmResult> {
       await this.next(st);
       resume = false;
     }
-    await state.remove(DIR);
+    // the commits a rebasing session made: their notes copied, post-rewrite told "rebase"
+    const rewritten = await this.read("rewritten");
+    if (rewritten) {
+      await copyNotesForRebase(this.notesContext(), latin1ToText(rewritten));
+      await this.hooks.run("post-rewrite", { args: ["rebase"], stdin: latin1ToText(rewritten) });
+    }
+    // a rebasing session's state is the rebase's to remove
+    if (!st.rebasing) await state.remove(DIR);
     return this.result(0);
+  }
+
+  /**
+   * `parse_mail_rebase`: the commit the mail names (`From <id>`) gives the author, the date
+   * (`show_ident_date`, git's default format), the message and the patch
+   * (`write_commit_patch`); `original-commit` and REBASE_HEAD name it.
+   */
+  private async parseMailRebase(st: AmState, mail: string, name: string): Promise<void> {
+    const m = /^From ([0-9a-f]+)/.exec(mail.slice(0, mail.indexOf("\n") >>> 0));
+    const id = m?.[1];
+    const commit =
+      id && id.length === this.objectFormat.hexLength
+        ? await this.commits.load(id).catch(() => undefined)
+        : undefined;
+    if (!id || !commit) this.fatal(`could not parse .git/${DIR}/${name}`);
+    const author = commit.author;
+    st.author = {
+      name: pathToLatin1(author.name),
+      email: pathToLatin1(author.email),
+      date: showDate(author.timestamp, author.tzOffset, DEFAULT_DATE_MODE),
+    };
+    st.msg = pathToLatin1(commit.message);
+    const parent = commit.parents[0];
+    const diff = new DiffCommand(this.workingCopy)
+      .setOldTree(parent ?? this.objectFormat.emptyTreeId)
+      .setNewTree(id)
+      .setRenames(true)
+      .setOptions({
+        binaryPatch: true,
+        fullIndex: true,
+        defaultPrefix: true,
+        ignoreConfigNoPrefix: true,
+        textconv: false,
+        uiConfig: false,
+        submoduleFormat: "short",
+        orderFile: "",
+      });
+    await this.write("patch", bytesToLatin1(await diff.callBytes("patch")));
+    st.origCommit = id;
+    await this.writeText("original-commit", id);
+    await this.state().setRef("REBASE_HEAD", id);
   }
 
   /**
@@ -1268,6 +1385,10 @@ export class AmCommand extends GitCommand<AmResult> {
       // the subject as the mail had it, before commit_tree's UTF-8 fixup
       this.reflogLine(`${action}: ${latin1ToPath(this.firstLine(st.msg as string))}`, committer),
     );
+    if (st.rebasing && st.origCommit) {
+      const rewritten = (await this.read("rewritten")) ?? "";
+      await this.write("rewritten", `${rewritten}${st.origCommit} ${id}\n`);
+    }
     await this.runAmHook("post-applypatch");
   }
 
@@ -1420,8 +1541,12 @@ interface AmState {
   /** `quoted-cr`: nowarn, warn, strip, or empty (`mailinfo.quotedCr`) */
   quotedCr: string;
   applyOpts: string[];
+  /** `rebasing`: a session of `git rebase --apply` (`am --rebasing`) */
+  rebasing: boolean;
   author?: { name: string; email: string; date: string };
   msg?: string;
+  /** `original-commit`: the commit the current patch came from (rebasing) */
+  origCommit?: ObjectId;
 }
 
 interface Fixed {
