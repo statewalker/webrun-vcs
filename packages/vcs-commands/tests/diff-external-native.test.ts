@@ -146,6 +146,36 @@ describeGit("external diff twins (t4020-diff-external.sh)", () => {
     expect(ext).not.toContain("diff --git");
   });
 
+  it('t4020-diff-external.sh: "diff.external should apply only to diff", "diff attribute should apply only to diff"', async () => {
+    const [native, ours] = setup("log-config");
+    for (const twin of [native, ours]) {
+      gitOut(root, twin.dir, ["config", "diff.external", record]);
+      gitOut(root, twin.dir, ["config", "diff.parrot.command", record]);
+      putFile(twin.dir, ".gitattributes", "file diff=parrot\n");
+    }
+    const git: Git = await oursIn(ours);
+    const plain = nativeIn(native, root, ["log", "-p", "-1", "HEAD"]).stdout;
+    expect(await git.log().setMaxCount(1).callText({ patch: true })).toBe(plain);
+    expect(plain).toContain("diff --git a/file b/file");
+  });
+
+  it('t4020-diff-external.sh: "no diff with -diff"', async () => {
+    const twins = setup("no-diff");
+    for (const twin of twins) putFile(twin.dir, ".gitattributes", "file -diff\n");
+    const { ours } = await twinDiff(twins, [], (d) => d);
+    expect(ours.stdout).toContain("Binary");
+  });
+
+  it("t4020-diff-external.sh: 'force diff with \"diff\"'", async () => {
+    const twins = setup("force-diff");
+    for (const twin of twins) {
+      putFile(twin.dir, "file", "NUL\0between\0words\n");
+      putFile(twin.dir, ".gitattributes", "file diff\n");
+    }
+    const { ours } = await twinDiff(twins, [], (d) => d);
+    expect(ours.stdout).toContain("+NUL");
+  });
+
   it('t4020-diff-external.sh: "typechange diff"', async () => {
     const twins = setup("typechange");
     for (const twin of twins) {
@@ -193,26 +223,41 @@ describeGit("external diff twins (t4020-diff-external.sh)", () => {
 
   // check_external_diff: each row via the attribute, diff.external and GIT_EXTERNAL_DIFF
   const rows: Array<[code: number, trust: "on" | "off", options: string[]]> = [
+    // t4020-diff-external.sh: "external diff 'echo output; exit 0;' with trustExitCode=off via attribute", "external diff 'echo output; exit 0;' with trustExitCode=off via diff.external", "external diff 'echo output; exit 0;' with trustExitCode=off via GIT_EXTERNAL_DIFF"
     [0, "off", []],
+    // t4020-diff-external.sh: "external diff 'echo output; exit 1;' with trustExitCode=off via attribute", "external diff 'echo output; exit 1;' with trustExitCode=off via diff.external", "external diff 'echo output; exit 1;' with trustExitCode=off via GIT_EXTERNAL_DIFF"
     [1, "off", []],
+    // t4020-diff-external.sh: "external diff 'echo output; exit 0;' with trustExitCode=on via attribute", "external diff 'echo output; exit 0;' with trustExitCode=on via diff.external", "external diff 'echo output; exit 0;' with trustExitCode=on via GIT_EXTERNAL_DIFF"
     [0, "on", []],
+    // t4020-diff-external.sh: "external diff 'echo output; exit 1;' with trustExitCode=on via attribute", "external diff 'echo output; exit 1;' with trustExitCode=on via diff.external", "external diff 'echo output; exit 1;' with trustExitCode=on via GIT_EXTERNAL_DIFF"
     [1, "on", []],
+    // t4020-diff-external.sh: "external diff 'echo output; exit 2;' with trustExitCode=on via attribute", "external diff 'echo output; exit 2;' with trustExitCode=on via diff.external", "external diff 'echo output; exit 2;' with trustExitCode=on via GIT_EXTERNAL_DIFF"
     [2, "on", []],
+    // t4020-diff-external.sh: "external diff 'echo output; exit 0;' with trustExitCode=off via attribute with --exit-code", "external diff 'echo output; exit 0;' with trustExitCode=off via diff.external with --exit-code", "external diff 'echo output; exit 0;' with trustExitCode=off via GIT_EXTERNAL_DIFF with --exit-code"
     [0, "off", ["--exit-code"]],
+    // t4020-diff-external.sh: "external diff 'echo output; exit 1;' with trustExitCode=off via attribute with --exit-code", "external diff 'echo output; exit 1;' with trustExitCode=off via diff.external with --exit-code", "external diff 'echo output; exit 1;' with trustExitCode=off via GIT_EXTERNAL_DIFF with --exit-code"
     [1, "off", ["--exit-code"]],
+    // t4020-diff-external.sh: "external diff 'echo output; exit 0;' with trustExitCode=on via attribute with --exit-code", "external diff 'echo output; exit 0;' with trustExitCode=on via diff.external with --exit-code", "external diff 'echo output; exit 0;' with trustExitCode=on via GIT_EXTERNAL_DIFF with --exit-code"
     [0, "on", ["--exit-code"]],
+    // t4020-diff-external.sh: "external diff 'echo output; exit 1;' with trustExitCode=on via attribute with --exit-code", "external diff 'echo output; exit 1;' with trustExitCode=on via diff.external with --exit-code", "external diff 'echo output; exit 1;' with trustExitCode=on via GIT_EXTERNAL_DIFF with --exit-code"
     [1, "on", ["--exit-code"]],
+    // t4020-diff-external.sh: "external diff 'echo output; exit 2;' with trustExitCode=on via attribute with --exit-code", "external diff 'echo output; exit 2;' with trustExitCode=on via diff.external with --exit-code", "external diff 'echo output; exit 2;' with trustExitCode=on via GIT_EXTERNAL_DIFF with --exit-code"
     [2, "on", ["--exit-code"]],
+    // t4020-diff-external.sh: "external diff 'echo output; exit 0;' with trustExitCode=off via attribute with --quiet", "external diff 'echo output; exit 0;' with trustExitCode=off via diff.external with --quiet", "external diff 'echo output; exit 0;' with trustExitCode=off via GIT_EXTERNAL_DIFF with --quiet"
     [0, "off", ["--quiet"]],
+    // t4020-diff-external.sh: "external diff 'echo output; exit 1;' with trustExitCode=off via attribute with --quiet", "external diff 'echo output; exit 1;' with trustExitCode=off via diff.external with --quiet", "external diff 'echo output; exit 1;' with trustExitCode=off via GIT_EXTERNAL_DIFF with --quiet"
     [1, "off", ["--quiet"]],
+    // t4020-diff-external.sh: "external diff 'echo output; exit 0;' with trustExitCode=on via attribute with --quiet", "external diff 'echo output; exit 0;' with trustExitCode=on via diff.external with --quiet", "external diff 'echo output; exit 0;' with trustExitCode=on via GIT_EXTERNAL_DIFF with --quiet"
     [0, "on", ["--quiet"]],
+    // t4020-diff-external.sh: "external diff 'echo output; exit 1;' with trustExitCode=on via attribute with --quiet", "external diff 'echo output; exit 1;' with trustExitCode=on via diff.external with --quiet", "external diff 'echo output; exit 1;' with trustExitCode=on via GIT_EXTERNAL_DIFF with --quiet"
     [1, "on", ["--quiet"]],
+    // t4020-diff-external.sh: "external diff 'echo output; exit 2;' with trustExitCode=on via attribute with --quiet", "external diff 'echo output; exit 2;' with trustExitCode=on via diff.external with --quiet", "external diff 'echo output; exit 2;' with trustExitCode=on via GIT_EXTERNAL_DIFF with --quiet"
     [2, "on", ["--quiet"]],
   ];
   for (const [code, trust, options] of rows) {
     const command = `echo output; exit ${code};`;
     const run = trust === "off" || hasTrustExitCode ? it : it.skip;
-    // t4020-diff-external.sh: check_external_diff "external diff '<command>' with trustExitCode=<trust> via ..."
+    // each row: t4020's check_external_diff, its three tests cited above the row
     run(`external diff '${command}' with trustExitCode=${trust} ${options.join(" ")}`, async () => {
       const configure = (d: DiffCommand) =>
         d.setExitCode(options.includes("--exit-code")).setQuiet(options.includes("--quiet"));
@@ -236,6 +281,7 @@ describeGit("external diff twins (t4020-diff-external.sh)", () => {
     });
   }
 
+  // t4020-diff-external.sh: "GIT_EXTERNAL_DIFF with more than one changed files"
   it('t4020-diff-external.sh: "GIT_EXTERNAL_DIFF path counter/total"', async () => {
     const twins = setup("counter");
     for (const twin of twins) {
@@ -291,6 +337,7 @@ describeGit("external diff twins (t4020-diff-external.sh)", () => {
     expect(ours.stdout).toContain("Subproject commit ");
   });
 
+  // Not ported from git's t/ (t4020 has no such case): argument shapes checked against native git
   it("a rename gets the new path and the extended header lines", async () => {
     const twins = setup("rename");
     for (const twin of twins) {
@@ -350,6 +397,8 @@ describeGit("external diff twins (t4020-diff-external.sh)", () => {
   });
 });
 
+// Not ported from git's t/: no t/ test checks what GIT_DIFF_OPTS or GIT_MERGE_VERBOSITY change
+// (t/ scripts only set them); native git decides each case.
 describeGit("GIT_DIFF_OPTS and GIT_MERGE_VERBOSITY twins", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "diff-opts-twins-"));
