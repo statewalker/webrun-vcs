@@ -88,6 +88,13 @@ jobs:
         if: steps.needs.outputs.test == 'true'
         run: pnpm --filter "@statewalker/vcs-commands..." run build
 
+      # THROWAWAY (#437): how many test files and tests the whole suite registers under this git.
+      - name: Count the whole suite
+        if: steps.needs.outputs.test == 'true' && matrix.shard == 1
+        run: |
+          pnpm --filter @statewalker/vcs-commands exec vitest list --json="$RUNNER_TEMP/list.json" > /dev/null || true
+          node -e 'const l=require(process.argv[1]);console.log(`whole suite: ${new Set(l.map(t=>t.file)).size} files with tests, ${l.length} tests`)' "$RUNNER_TEMP/list.json"
+
       - name: Test (shard ${{ matrix.shard }}/4)
         if: steps.needs.outputs.test == 'true'
         run: pnpm --filter @statewalker/vcs-commands exec vitest run --shard=${{ matrix.shard }}/$SHARDS
@@ -95,23 +102,6 @@ jobs:
       - name: Skipped
         if: steps.needs.outputs.test != 'true'
         run: echo "packages/vcs-commands is recorded as tested at this hash; nothing to run"
-
-  # THROWAWAY (#437): the whole vcs-commands suite in one vitest process, as the ci job ran it
-  # before, to compare its counts with the shards'. Reverted before merge.
-  commands-full:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v7
-      - uses: pnpm/action-setup@v6
-      - uses: actions/setup-node@v7
-        with:
-          node-version: "24"
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter "@statewalker/vcs-commands..." run build
-      - run: git --version && pnpm --filter @statewalker/vcs-commands exec vitest run
 
   # The lockfile-only pull request that .github/workflows/statewalker-update.yml opens: merged
   # once every other check on it passes, after checking it changes pnpm-lock.yaml alone
