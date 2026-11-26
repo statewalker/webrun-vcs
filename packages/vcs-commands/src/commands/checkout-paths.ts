@@ -797,6 +797,7 @@ async function checkoutMerged(
       ...(config.drivers ? { drivers: config.drivers } : {}),
       ...(config.defaultDriver ? { defaultDriver: config.defaultDriver } : {}),
       ...(config.driverCommand ? { driverCommand: config.driverCommand } : {}),
+      ...(config.configuredDriver ? { configuredDriver: config.configuredDriver } : {}),
       style: o.conflictStyle ?? conflictStyleOf(ctx.workingCopy),
       ...(config.bigFileThreshold !== undefined
         ? { bigFileThreshold: config.bigFileThreshold }

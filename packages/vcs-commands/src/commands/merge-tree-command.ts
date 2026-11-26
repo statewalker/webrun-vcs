@@ -555,7 +555,7 @@ export class MergeTreeCommand extends PlumbingCommand {
     }
     const list: TrivialEntry[] = [];
     await this.trivialMergeTrees(trees as [ObjectId, ObjectId, ObjectId], "", list);
-    const attributes = ortConfigOptions(this.workingCopy, this.worktreeOrNone()).attributes;
+    const config = ortConfigOptions(this.workingCopy, this.worktreeOrNone());
     for (const entry of list) {
       let text = `${explanation(entry)}\n`;
       const desc = ["result", "base", "our", "their"];
@@ -564,7 +564,7 @@ export class MergeTreeCommand extends PlumbingCommand {
       }
       await this.write(text);
       const ours = await this.origin(entry);
-      const result = await this.result(entry, attributes);
+      const result = await this.result(entry, config);
       const diff = unifiedDiff(ours, result, {
         context: 3,
         algorithm: "myers",
@@ -655,7 +655,7 @@ export class MergeTreeCommand extends PlumbingCommand {
   /** merge-tree.c's result: the merged version, merge_blobs for a conflict. */
   private async result(
     entry: TrivialEntry,
-    attributes: ReturnType<typeof ortConfigOptions>["attributes"],
+    config: ReturnType<typeof ortConfigOptions>,
   ): Promise<Uint8Array> {
     if (entry.stage === 0) return this.content(entry.id);
     let e: TrivialEntry | undefined = entry;
@@ -688,7 +688,12 @@ export class MergeTreeCommand extends PlumbingCommand {
       },
       {
         algorithm: "myers",
-        attributes: attributes ? await attributes(entry.path) : {},
+        // merge_blobs' ll_merge: the path's attributes and the configured merge drivers
+        attributes: config.attributes ? await config.attributes(entry.path) : {},
+        ...(config.drivers ? { drivers: config.drivers } : {}),
+        ...(config.defaultDriver ? { defaultDriver: config.defaultDriver } : {}),
+        ...(config.driverCommand ? { driverCommand: config.driverCommand } : {}),
+        ...(config.configuredDriver ? { configuredDriver: config.configuredDriver } : {}),
       },
     );
     if (merged.status === "binary") {

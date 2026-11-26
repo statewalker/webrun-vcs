@@ -21,7 +21,8 @@ import {
   parseGitBool,
 } from "@statewalker/vcs-utils";
 import type { WorkingCopy, Worktree } from "@statewalker/vcs-working-tree";
-
+import { GitApiError } from "../errors/index.js";
+import { RemoteConfigStore } from "../remote-config/index.js";
 import { SimilarityIndex } from "../rename/index.js";
 import { configBool, configValue } from "./merge-config.js";
 import type { MergeAttributes, OrtMergeOptions } from "./ort-merge.js";
@@ -111,6 +112,22 @@ export class MergeDriverFailedError extends Error {
   }
 }
 
+/**
+ * A path's merge driver is configured (`merge.<name>.*`) without a command
+ * (`merge.<name>.driver`) and the host registers none of that name: git's `ll_ext_merge`
+ * dies `fatal: custom merge driver <name> lacks command line.` (exit 128) before the merge
+ * writes anything.
+ */
+export class MergeDriverCommandMissingError extends GitApiError {
+  constructor(
+    /** The driver's name */
+    readonly driver: string,
+  ) {
+    super(`fatal: custom merge driver ${driver} lacks command line.`, { exitCode: 128 });
+    this.name = "MergeDriverCommandMissingError";
+  }
+}
+
 /** The driver registered under `name`, if any. */
 export function lookupMergeDriver(
   registry: MergeDriverRegistry | undefined,
@@ -137,13 +154,16 @@ export function mergeDriversOf(workingCopy: WorkingCopy): MergeDriverRegistry | 
 /**
  * The driver for a path's `merge` attribute (git's `find_ll_merge_driver`): `text` when set
  * (or unspecified without `merge.default`), `binary` when unset, else the named driver: a
- * registered one, a builtin (`text`, `binary`, `union`), or `text` for an unknown name.
+ * registered one, one the configuration names (`configured`: any `merge.<name>.*` key makes
+ * `<name>` a user driver in git, winning over a builtin of that name), a builtin (`text`,
+ * `binary`, `union`), or `text` for an unknown name.
  */
 export function findMergeDriver(
   attr: MergeAttributeValue,
   drivers: MergeDriverRegistry | undefined,
   defaultDriver?: string,
-): { name: string; custom?: MergeDriver } {
+  isConfigured?: (name: string) => boolean,
+): { name: string; custom?: MergeDriver; configured?: boolean } {
   let name: string;
   if (attr === true) return { name: "text" };
   if (attr === false) return { name: "binary" };
@@ -153,6 +173,7 @@ export function findMergeDriver(
   } else name = attr;
   const custom = lookupMergeDriver(drivers, name);
   if (custom) return { name, custom };
+  if (isConfigured?.(name)) return { name, configured: true };
   if (name === "binary" || name === "text" || name === "union") return { name };
   return { name: "text" };
 }
@@ -178,6 +199,13 @@ export interface LowLevelMergeOptions {
   recursiveDriver?: (name: string) => string | undefined;
   /** merge.<driver>.driver: the command a registered driver is given ({@link MergeDriverInput.command}) */
   driverCommand?: (name: string) => string | undefined;
+  /**
+   * Whether the configuration has a `merge.<name>` section (any `merge.<name>.*` key): such a
+   * driver without a registered one dies when it has no `merge.<name>.driver`
+   * ({@link MergeDriverCommandMissingError}), else merges as the builtin of its name (`text`
+   * for any other name), since a host that registers no driver cannot run the command
+   */
+  configuredDriver?: (name: string) => boolean;
   /** A merge of merge bases (`virtual_ancestor`): the recursive driver, the base on binary */
   virtualAncestor?: boolean;
   /** `-X ours` / `-X theirs` / `-X union` (ignored for a merge of merge bases) */
@@ -219,11 +247,17 @@ export async function lowLevelMerge(
     const parsed = /^[+-]?\d+$/.test(size.trim()) ? Number.parseInt(size, 10) : Number.NaN;
     markerSize = Number.isNaN(parsed) || parsed <= 0 ? 7 : parsed;
   }
-  let driver = findMergeDriver(attrs.merge, options.drivers, options.defaultDriver);
-  if (options.virtualAncestor) {
-    // merge.<driver>.recursive wins over the registered driver's own
+  const find = (attr: MergeAttributeValue) =>
+    findMergeDriver(attr, options.drivers, options.defaultDriver, options.configuredDriver);
+  let driver = find(attrs.merge);
+  if (options.virtualAncestor && (driver.custom || driver.configured)) {
+    // merge.<driver>.recursive wins over the registered driver's own; only user drivers
+    // have one (the builtins' `recursive` is always NULL in git)
     const recursive = options.recursiveDriver?.(driver.name) ?? driver.custom?.recursive;
-    if (recursive) driver = findMergeDriver(recursive, options.drivers, options.defaultDriver);
+    if (recursive) driver = find(recursive);
+  }
+  if (driver.configured && options.driverCommand?.(driver.name) === undefined) {
+    throw new MergeDriverCommandMissingError(driver.name);
   }
   markerSize += options.extraMarkerSize ?? 0;
   const favor = options.virtualAncestor ? undefined : options.favor;
@@ -335,6 +369,9 @@ export function ortConfigOptions(
   if (defaultDriver) out.defaultDriver = defaultDriver;
   out.recursiveDriver = (name) => configValue(workingCopy, `merge.${name}.recursive`);
   out.driverCommand = (name) => configValue(workingCopy, `merge.${name}.driver`);
+  // read_merge_config: every `merge.<name>.<key>` makes <name> a user driver
+  const configured = new Set(RemoteConfigStore.from(workingCopy).subsections("merge"));
+  out.configuredDriver = (name) => configured.has(name);
   const drivers = mergeDriversOf(workingCopy);
   if (drivers) out.drivers = drivers;
   const filter = worktree?.contentFilter as AttributeReader | undefined;
