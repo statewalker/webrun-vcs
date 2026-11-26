@@ -631,6 +631,41 @@ describeGit("fsmonitor against native git (t7519-status-fsmonitor.sh)", () => {
     }
   });
 
+  it("diff-index still sees an fsmonitor-valid file deleted, diff-files does not", async () => {
+    hook(NOTHING);
+    await updateIndexTwins(["--fsmonitor"], (c) => c.setFsmonitor(true));
+    await updateIndexTwins(["--fsmonitor-valid", "modified", "tracked"], (c) =>
+      c.setFsmonitorValid(true).addPath("modified").addPath("tracked"),
+    );
+    rmSync(join(dir, "tracked"));
+    put("modified", "changed\n");
+    dateBack();
+    const saved = saveIndex();
+    const nativeIndexDiff = git(["diff-index", "--name-status", "HEAD"]);
+    restoreIndex(saved);
+    const nativeDiffHead = git(["diff", "--name-status", "HEAD"]);
+    restoreIndex(saved);
+    const nativeFiles = git(["diff-files", "--name-status"]);
+    // the valid entries: the deleted one listed, the modified one not (other entries' stats
+    // were dated back: plumbing lists them)
+    expect(nativeIndexDiff).toContain("D\ttracked\n");
+    expect(nativeIndexDiff).not.toMatch(/^M\tmodified$/m);
+    expect(nativeFiles).not.toMatch(/\t(tracked|modified)$/m);
+    restoreIndex(saved);
+    const ours = await openOurs(dir, host());
+    expect(await ours.diffIndex().setTree("HEAD").setFormats(["name-status"]).callText()).toBe(
+      nativeIndexDiff,
+    );
+    restoreIndex(saved);
+    expect(
+      await (await openOurs(dir, host())).diff().setOldTree("HEAD").callText("name-status"),
+    ).toBe(nativeDiffHead);
+    restoreIndex(saved);
+    expect(
+      await (await openOurs(dir, host())).diffFiles().setFormats(["name-status"]).callText(),
+    ).toBe(nativeFiles);
+  });
+
   it("commit -a leaves a change the monitor reported nothing for unstaged", async () => {
     hook(LISTED);
     report([]);

@@ -3875,16 +3875,24 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const indexTime = this.staging.getUpdateTime();
     const ignoreOf = await this.submoduleIgnoreOf();
     // the file system monitor, asked as git asks it on reading the index (tweak_fsmonitor,
-    // run_diff_files' refresh_fsmonitor): an entry it reported nothing for since its token is
-    // unchanged, its file never stat'ed (CE_FSMONITOR_VALID, as CE_VALID)
+    // refresh_fsmonitor): an entry it reported nothing for since its token is unchanged.
+    // diff-files never stats it (run_diff_files, as CE_VALID); diff-index still lstats it
+    // (get_stat_data's check_removed: a deleted file is a deletion), only ie_match_stat's
+    // comparison is skipped
     const fsm = await this.fsmonitorRefresh(this.staging);
     const fsmValid = (entry: StageEntry) => !!fsm && entry.stage === 0 && fsm.state.isValid(entry);
+    const fsmUnstated = (entry: StageEntry) => !unmergedAsFiles && fsmValid(entry);
     const compareWith = async (
       entry: StageEntry,
       current?: WorktreeEntry | null,
     ): Promise<Side | undefined> => {
       const indexSide: Side = { mode: entry.mode, id: entry.objectId };
-      if (entry.skipWorktree || entry.assumeValid || fsmValid(entry)) return indexSide;
+      if (entry.skipWorktree || entry.assumeValid || fsmUnstated(entry)) return indexSide;
+      if (fsmValid(entry)) {
+        const file =
+          current !== undefined ? current : await worktree.getEntry(entry.path).catch(() => null);
+        return file ? indexSide : undefined;
+      }
       const ignore = entry.mode === GITLINK ? ignoreOf(entry.path) : undefined;
       if (entry.mode === GITLINK && ignore === "all") return indexSide;
       const result = await compareWithWorktree(worktree, entry, { trust, indexTime }, current);
@@ -3955,7 +3963,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       !entry.skipWorktree &&
       !entry.assumeValid &&
       entry.mode !== GITLINK &&
-      !fsmValid(entry) &&
+      !fsmUnstated(entry) &&
       this.matches(entry.path);
     for await (const { item: entry, current } of withWorktreeEntries(
       worktree,
