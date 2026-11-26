@@ -47,6 +47,7 @@ import {
   type ReftableRefStore,
   type ReftableStackWriteOptions,
 } from "./refs/index.js";
+import { markRelocatedObjects } from "./relocated-objects.js";
 import { repack } from "./repack.js";
 import { readRepositoryFormat } from "./repository-format.js";
 import { resolveLinkedGitDir } from "./resolve-linked-git-dir.js";
@@ -428,6 +429,10 @@ export async function createGitFilesBackend(
     commitGraph,
   });
 
+  // gc, repack and prune work on <gitDir>/objects: they refuse stores opened elsewhere
+  if (options.objectsDir !== undefined) {
+    markRelocatedObjects(objectsDir, objects, packs, history.objects, history.packs);
+  }
   return { history, objects, packs, looseStorage, files, gitDir };
 }
 

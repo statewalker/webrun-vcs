@@ -6,6 +6,7 @@
  * pack directories, and the shallow commits nothing reached (`prune_shallow`).
  */
 
+import { assertObjectsAtGitDir } from "./relocated-objects.js";
 import type { FilesApi, GitObjects, History, ObjectId, PackSet } from "@statewalker/vcs-core";
 import {
   graftFileBaseDir,
@@ -75,6 +76,7 @@ const FANOUT = /^[0-9a-f]{2}$/;
  */
 export async function prune(options: PruneOptions): Promise<PruneResult> {
   const { history, files, gitDir = ".git" } = options;
+  assertObjectsAtGitDir(gitDir, "prune", options.objects, history.objects, history.packs);
   const dryRun = options.dryRun ?? false;
   const show = dryRun || (options.verbose ?? false);
   const expire = options.expire ?? Number.POSITIVE_INFINITY;

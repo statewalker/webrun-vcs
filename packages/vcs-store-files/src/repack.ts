@@ -10,6 +10,7 @@
  * installed during the walk (a push, a fetch) may hold objects the walk did not see.
  */
 
+import { assertObjectsAtGitDir } from "./relocated-objects.js";
 import type {
   DeltaIslandRules,
   DeltaSearchOptions,
@@ -442,6 +443,7 @@ export async function snapshotPacks(packs: PackSet): Promise<PackSnapshot> {
  * ```
  */
 export async function repack(options: RepackOptions): Promise<RepackResult | null> {
+  assertObjectsAtGitDir(options.gitDir ?? ".git", "repack", options.objects, options.packs);
   // repack deletes what the new pack replaces: not in a precious-objects repo (git: "cannot
   // delete packs in a precious-objects repo")
   // git's errors reading the alternates are printed and repack goes on (see gc)

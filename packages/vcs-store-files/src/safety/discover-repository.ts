@@ -422,7 +422,7 @@ export async function setupGitDirectory(
   const commonDir =
     environment?.commonDir !== undefined
       ? at(environment.commonDir)
-      : await commonDirOf(files, core.gitDir);
+      : await commonDirWithoutEnvironment(files, core.gitDir);
   return {
     ...core,
     commonDir,
@@ -451,7 +451,7 @@ interface WorktreeSettings {
  * `config.worktree` may set them.
  */
 async function worktreeSettings(files: FilesApi, gitDir: string): Promise<WorktreeSettings> {
-  const commonDir = await commonDirOf(files, gitDir);
+  const commonDir = await commonDirWithoutEnvironment(files, gitDir);
   const read = async (path: string) => {
     if ((await files.stats(path).catch(() => undefined))?.kind !== "file") return undefined;
     return parseConfigText(decodeGitPath(await readFile(files, path)));
@@ -539,8 +539,16 @@ function configValueText(value: string): string {
   return out;
 }
 
-/** git's `get_common_dir_noenv`: `commondir`, relative to the git directory unless absolute. */
-async function commonDirOf(files: FilesApi, gitDir: string): Promise<string> {
+/**
+ * git's `get_common_dir_noenv`: `commondir`, relative to the git directory unless absolute;
+ * else the git directory. git's files ref store takes its common directory from here, never
+ * from `$GIT_COMMON_DIR` (`files_ref_store_create`), while the objects and the config follow
+ * the variable (`GitDirectorySetup.commonDir`).
+ */
+export async function commonDirWithoutEnvironment(
+  files: FilesApi,
+  gitDir: string,
+): Promise<string> {
   const path = joinPath(gitDir, "commondir");
   if ((await files.stats(path).catch(() => undefined))?.kind !== "file") return gitDir;
   const value = decodeGitPath(await readFile(files, path)).replace(/[\r\n]+$/, "");
@@ -644,13 +652,31 @@ async function setupExplicit(
     const resolved = target.startsWith("/")
       ? paths.resolve("/", target)
       : paths.resolve(dir, target);
-    if (!(await isGitDirectory(files, resolved, paths.environment?.objectDirectory, paths, cwd))) {
+    if (
+      !(await isGitDirectory(
+        files,
+        resolved,
+        paths.environment?.objectDirectory,
+        paths,
+        cwd,
+        paths.environment?.commonDir,
+      ))
+    ) {
       throw new GitSetupError(`fatal: not a git repository: ${target}`);
     }
     gitfile = gitDir;
     gitDir = await paths.realPath(resolved);
   }
-  if (!(await isGitDirectory(files, gitDir, paths.environment?.objectDirectory, paths, cwd))) {
+  if (
+    !(await isGitDirectory(
+      files,
+      gitDir,
+      paths.environment?.objectDirectory,
+      paths,
+      cwd,
+      paths.environment?.commonDir,
+    ))
+  ) {
     throw new GitSetupError(`fatal: not a git repository: '${gitDirValue}'`);
   }
   const settings = known ?? (await worktreeSettings(files, gitDir));
@@ -813,6 +839,8 @@ export async function isGitDirectory(
   /** Resolves a relative `objectDirectory` (from `cwd`) */
   paths?: { resolve(dir: string, value: string): string },
   cwd = "/",
+  /** `$GIT_COMMON_DIR` as set: git's `get_common_dir` takes it in place of `commondir` */
+  commonDirectory?: string,
 ): Promise<boolean> {
   const kindOf = async (path: string) => (await files.stats(path).catch(() => undefined))?.kind;
   const head = joinPath(dir, "HEAD");
@@ -827,7 +855,9 @@ export async function isGitDirectory(
   if (!symbolic && !/^([0-9a-fA-F]{64}|[0-9a-fA-F]{40})/.test(text)) return false;
   let common = dir;
   const commondir = joinPath(dir, "commondir");
-  if ((await kindOf(commondir)) === "file") {
+  if (commonDirectory !== undefined) {
+    common = paths ? paths.resolve(cwd, commonDirectory) : normalizePath(commonDirectory);
+  } else if ((await kindOf(commondir)) === "file") {
     const value = decodeGitPath(await readFile(files, commondir)).replace(/[\r\n]+$/, "");
     if (value === "") return false;
     const resolved = gitfileTarget(files, dir, value);

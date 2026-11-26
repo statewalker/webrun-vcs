@@ -118,11 +118,6 @@ export interface GitLinkedWorktreesOptions
    * Only the current worktree's working copy reads it; the other worktrees keep their own.
    */
   indexFile?: string;
-  /**
-   * The common git directory (`$GIT_COMMON_DIR`, `setupGitDirectory`'s `commonDir`), a
-   * FilesApi path; default the `commondir` file's, else `gitDir`.
-   */
-  commonDir?: string;
 }
 
 /**
@@ -134,10 +129,7 @@ export async function openGitLinkedWorktrees(
 ): Promise<GitLinkedWorktrees> {
   const paths = new HostPaths(hostRootOf(options.files, options.rootPath));
   const gitDir = normalizePath(options.gitDir);
-  const commonDir =
-    options.commonDir !== undefined
-      ? normalizePath(options.commonDir)
-      : await resolveCommonDir(options.files, paths, gitDir);
+  const commonDir = await resolveCommonDir(options.files, paths, gitDir);
   return new GitLinkedWorktrees(options, paths, commonDir, gitDir);
 }
 
@@ -1188,6 +1180,10 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
         : `${gitDir}/index`;
     const staging = new FileStagingStore(this.files, indexFile, {
       defaultTrees: this.history.trees,
+      // shared indexes in the git directory and the repository's object format, wherever
+      // $GIT_INDEX_FILE puts the index
+      gitDir,
+      objectFormat: objectFormatOf(this.history.objects),
     });
     await staging.read();
     const checkout = new GitCheckout({

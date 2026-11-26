@@ -20,7 +20,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
-import { openRepositoryFromEnvironment } from "@statewalker/vcs-store-files";
+import { gc, openRepositoryFromEnvironment } from "@statewalker/vcs-store-files";
 import {
   createNodeFilesApi,
   createNodeGitHostEnvironment,
@@ -113,9 +113,9 @@ describeGit("opening the repository with a hook's variables (#375)", () => {
   });
 
   /** A repository with a committed a.txt and b.txt, both changed, and an untracked u.txt. */
-  function repository(): string {
+  function repository(objectFormat = "sha1"): string {
     const repo = newDir("repo");
-    git(repo, ["init", "-q", "-b", "main"]);
+    git(repo, ["init", "-q", "-b", "main", `--object-format=${objectFormat}`]);
     writeFileSync(join(repo, "a.txt"), "a\n");
     writeFileSync(join(repo, "b.txt"), "b\n");
     git(repo, ["add", "-A"]);
@@ -175,40 +175,80 @@ describeGit("opening the repository with a hook's variables (#375)", () => {
     }
   });
 
-  it("GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE name a separate repository, worktree and index", async () => {
-    const repo = repository();
-    git(repo, ["add", "b.txt"]);
-    // the index of the staged change, kept apart; the repository's own index is reset
-    renameSync(join(repo, ".git", "index"), join(repo, "other-index"));
-    git(repo, ["read-tree", "HEAD"]);
-    const work = newDir("work");
-    for (const name of ["a.txt", "b.txt", "u.txt"]) {
-      writeFileSync(join(work, name), readFileSync(join(repo, name)));
-    }
-    const sub = join(work, "sub");
-    mkdirSync(sub);
-    const vars = {
-      GIT_DIR: join(repo, ".git"),
-      GIT_WORK_TREE: "..",
-      GIT_INDEX_FILE: join(repo, "other-index"),
-    };
-    const r = spawnSync("git", ["status", "--porcelain"], {
-      cwd: sub,
-      env: { ...nativeGitEnv(root), ...vars },
-      encoding: "utf8",
-    });
+  type Vars = Record<string, string>;
+
+  /** Native `git status --porcelain` and ours, both run in `cwd` with these variables. */
+  async function statusTwins(cwd: string, vars: Vars) {
+    const env = { ...nativeGitEnv(root), ...vars };
+    const r = spawnSync("git", ["status", "--porcelain"], { cwd, env, encoding: "utf8" });
+    expect(r.stderr).toBe("");
     expect(r.status).toBe(0);
-    const files = createNodeFilesApi({ rootDir: root });
-    const environment = createNodeGitHostEnvironment({ env: { ...nativeGitEnv(root), ...vars } });
     const opened = await openRepositoryFromEnvironment({
-      files,
-      cwd: `/${relative(root, sub)}`,
-      environment,
+      files: createNodeFilesApi({ rootDir: root }),
+      cwd: `/${relative(root, cwd)}`,
+      environment: createNodeGitHostEnvironment({ env }),
     });
-    expect(opened.setup.workTree).toBe(`/${relative(root, work)}`);
     const ours = await Git.fromWorkingCopy(opened.admin as WorkingCopy)
       .status()
       .callText({ format: "porcelain" });
-    expect(ours.text).toBe(r.stdout);
+    return { native: r.stdout, ours: ours.text, opened };
+  }
+
+  it.each(["sha1", "sha256"])(
+    "GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE name a separate repository, worktree and index (%s)",
+    async (objectFormat) => {
+      const repo = repository(objectFormat);
+      git(repo, ["add", "b.txt"]);
+      // the index of the staged change, kept outside the git directory; the repository's
+      // own index is reset
+      renameSync(join(repo, ".git", "index"), join(repo, "other-index"));
+      git(repo, ["read-tree", "HEAD"]);
+      const work = newDir("work");
+      for (const name of ["a.txt", "b.txt", "u.txt"]) {
+        writeFileSync(join(work, name), readFileSync(join(repo, name)));
+      }
+      const sub = join(work, "sub");
+      mkdirSync(sub);
+      const { native, ours, opened } = await statusTwins(sub, {
+        GIT_DIR: join(repo, ".git"),
+        GIT_WORK_TREE: "..",
+        GIT_INDEX_FILE: join(repo, "other-index"),
+      });
+      expect(opened.setup.workTree).toBe(`/${relative(root, work)}`);
+      expect(native).toContain("M  b.txt");
+      expect(ours).toBe(native);
+    },
+  );
+
+  it("GIT_COMMON_DIR without a commondir file: the objects follow it, the refs do not (files_ref_store_create)", async () => {
+    const repo = repository();
+    const wt = join(root, `wt${counter++}`);
+    git(repo, ["worktree", "add", "-q", "-b", "side", wt]);
+    writeFileSync(join(wt, "a.txt"), "changed in the worktree\n");
+    git(wt, ["add", "a.txt"]);
+    writeFileSync(join(wt, "w.txt"), "untracked\n");
+    const admin = join(repo, ".git", "worktrees", relative(root, wt));
+    rmSync(join(admin, "commondir"));
+    const { native, ours, opened } = await statusTwins(wt, {
+      GIT_DIR: admin,
+      GIT_COMMON_DIR: join(repo, ".git"),
+      GIT_WORK_TREE: wt,
+    });
+    expect(opened.setup.commonDir).toBe(`/${relative(root, join(repo, ".git"))}`);
+    expect(ours).toBe(native);
+  });
+
+  it("gc refuses stores opened at another GIT_OBJECT_DIRECTORY", async () => {
+    const repo = repository();
+    const objects = newDir("objects");
+    spawnSync("cp", ["-a", join(repo, ".git", "objects", "."), objects]);
+    const env = { ...nativeGitEnv(root), GIT_OBJECT_DIRECTORY: objects };
+    const opened = await openRepositoryFromEnvironment({
+      files: createNodeFilesApi({ rootDir: root }),
+      cwd: `/${relative(root, repo)}`,
+      environment: createNodeGitHostEnvironment({ env }),
+    });
+    const { history, files, gitDir } = opened.backend;
+    await expect(gc({ history, files, gitDir })).rejects.toThrow(/GIT_OBJECT_DIRECTORY/);
   });
 });

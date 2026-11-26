@@ -9,6 +9,7 @@ import type { WorktreeAdmin } from "@statewalker/vcs-working-tree";
 
 import { createGitFilesBackend, type GitFilesBackendResult } from "./create-git-files-backend.js";
 import {
+  commonDirWithoutEnvironment,
   type DiscoverRepositoryOptions,
   type GitDirectorySetup,
   setupGitDirectory,
@@ -30,7 +31,10 @@ export interface OpenRepositoryFromEnvironmentOptions extends DiscoverRepository
 export interface RepositoryFromEnvironment {
   /** git's setup: git directory, common directory, worktree, prefix, index and objects */
   setup: GitDirectorySetup;
-  /** The stores, over `setup.commonDir` with the objects of `setup.objectDirectory` */
+  /**
+   * The stores: the refs of the `commondir` file's common directory (git's files ref store
+   * ignores `$GIT_COMMON_DIR`), the objects of `setup.objectDirectory` (which follows it)
+   */
   backend: GitFilesBackendResult;
   /** The repository's worktrees, seen from `setup.gitDir` */
   worktrees: GitLinkedWorktrees;
@@ -46,8 +50,9 @@ export interface RepositoryFromEnvironment {
  * discovery with its ownership, `safe.bareRepository`, ceiling and file-system checks, or
  * `$GIT_DIR` as given) and opens it where the variables put its parts: the objects at
  * `$GIT_OBJECT_DIRECTORY` (a pre-receive hook's quarantine; the alternates and
- * `$GIT_ALTERNATE_OBJECT_DIRECTORIES` read from there), the common directory at
- * `$GIT_COMMON_DIR`, the index at `$GIT_INDEX_FILE` (`index.lock` in a `commit -a`
+ * `$GIT_ALTERNATE_OBJECT_DIRECTORIES` read from there), else `<$GIT_COMMON_DIR>/objects`;
+ * the refs, as git's files ref store reads them, in the `commondir` file's common directory
+ * whatever `$GIT_COMMON_DIR` says (its config too: a divergence where the two differ); the index at `$GIT_INDEX_FILE` (`index.lock` in a `commit -a`
  * pre-commit hook, `next-index-*.lock` under `commit --only`) and the worktree at
  * `$GIT_WORK_TREE`. This is the opener for a tool that runs where git does (a hook, a git
  * alias, a program started with git's variables); a server opening other people's
@@ -70,7 +75,7 @@ export async function openRepositoryFromEnvironment(
     options.configIncludes === undefined ? {} : { configIncludes: options.configIncludes };
   const backend = await createGitFilesBackend({
     files,
-    gitDir: setup.commonDir,
+    gitDir: await commonDirWithoutEnvironment(files, setup.gitDir),
     objectsDir: setup.objectDirectory,
     // relative $GIT_ALTERNATE_OBJECT_DIRECTORIES entries: from where git's setup went
     workTree: setup.cwd,
@@ -80,7 +85,6 @@ export async function openRepositoryFromEnvironment(
   const worktrees = await openGitLinkedWorktrees({
     files,
     gitDir: setup.gitDir,
-    commonDir: setup.commonDir,
     indexFile: setup.indexFile,
     history: backend.history,
     ...(setup.workTree !== undefined
