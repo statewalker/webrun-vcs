@@ -36,4 +36,9 @@ export interface ServeResult {
    * `transfer.advertiseSID`), as git's trace2 `client-sid`
    */
   clientSessionId?: string;
+  /**
+   * The promisor remotes the client accepted from the `promisor-remote` capability (protocol
+   * v2, `promisorRemoteInfo`)
+   */
+  acceptedPromisorRemotes?: string[];
 }
