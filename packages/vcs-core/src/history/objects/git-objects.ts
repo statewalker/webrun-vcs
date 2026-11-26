@@ -326,6 +326,13 @@ export interface CompatObjects {
    */
   compatIdsWithPrefix(prefix: string): Promise<ObjectId[]>;
   /**
+   * `content`, an object of the storage format not yet written, as the compatibility format
+   * sees it (git's `convert_object_file`): what a signer signs for that format (commit.c
+   * `commit_tree_extended`, builtin/tag.c `do_sign`). Throws where git's conversion fails
+   * (an id the map does not have).
+   */
+  convertToCompat(type: ObjectTypeString, content: Uint8Array): Promise<Uint8Array>;
+  /**
    * The object `compatId` names, as the compatibility format sees it: its storage object
    * converted (git's `odb_read_object_info_extended` for an id of the other format); undefined
    * when unmapped or absent. Throws where git's conversion dies.

@@ -14,10 +14,18 @@
  *   in both (`unable to map tree ... in commit object`) before any ref moves.
  */
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
+import { createNodeGitHostEnvironment, createNodeSigner } from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Git } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
@@ -486,4 +494,87 @@ describe.skipIf(!git3)("extensions.compatObjectFormat (git master)", () => {
       expect(error).toContain(n.err.split("fatal:")[0]?.trim());
     }
   });
+
+  /**
+   * A `gpg.program` whose signature is a hash of what it is given: a signature over the wrong
+   * buffer shows as another signature (and another object id)
+   */
+  const hashingGpg = () => {
+    const path = join(root, "hashing-gpg");
+    writeFileSync(
+      path,
+      [
+        "#!/bin/sh",
+        "h=$(sha256sum | cut -c1-48)",
+        'echo "[GNUPG:] SIG_CREATED D 22 10 00 1 2" >&2',
+        "printf -- '-----BEGIN PGP SIGNATURE-----\\n\\n%s\\n-----END PGP SIGNATURE-----\\n' \"$h\"",
+        "",
+      ].join("\n"),
+    );
+    chmodSync(path, 0o755);
+    return path;
+  };
+
+  for (const [storage, compat] of [
+    ["sha256", "sha1"],
+    ["sha1", "sha256"],
+  ] as const) {
+    it(`commit -S and tag -s sign both formats' views (${storage} with ${compat}; commit.c commit_tree_extended, builtin/tag.c do_sign)`, async () => {
+      const program = hashingGpg();
+      const twins = ["n", "o"].map((name) => {
+        const dir = fresh(name);
+        mkdirSync(dir);
+        ok(dir, ["init", "-q", "-b", "main", `--object-format=${storage}`]);
+        ok(dir, ["config", "core.repositoryformatversion", "1"]);
+        ok(dir, ["config", "extensions.compatObjectFormat", compat]);
+        ok(dir, ["config", "gpg.program", program]);
+        mkdirSync(join(dir, "d"));
+        writeFileSync(join(dir, "a"), "hello\n");
+        writeFileSync(join(dir, "d/b"), "x\n");
+        return dir;
+      });
+      const [native, mine] = twins as [string, string];
+      ok(native, ["add", "."]);
+      ok(native, ["commit", "-q", "-S", "-m", "one"]);
+      ok(native, ["tag", "-s", "-m", "release", "v1"]);
+      writeFileSync(join(native, "a"), "again\n");
+      ok(native, ["commit", "-q", "-S", "-am", "two"]);
+      const g = await openOurs(
+        mine,
+        createNodeGitHostEnvironment({
+          env: env(),
+          effectiveUid: null,
+          signer: createNodeSigner({ env: env() }),
+        }),
+      );
+      await g.add().addFilepattern(".").call();
+      await g.commit().setMessage("one\n").setSign(true).call();
+      await g.tag().setName("v1").setMessage("release\n").setSigned(true).call();
+      writeFileSync(join(mine, "a"), "again\n");
+      await g.add().addFilepattern("a").call();
+      await g.commit().setMessage("two\n").setSign(true).call();
+      // the same objects in both formats, so the same ids and map lines
+      for (const name of ["HEAD", "HEAD~1", "v1"]) {
+        for (const format of [storage, compat]) {
+          expect(
+            ok(mine, ["rev-parse", `--output-object-format=${format}`, name]),
+            `${format} ${name}`,
+          ).toBe(ok(native, ["rev-parse", `--output-object-format=${format}`, name]));
+        }
+        const compatId = ok(native, ["rev-parse", `--output-object-format=${compat}`, name]).trim();
+        expect(ok(mine, ["cat-file", "-p", compatId])).toBe(
+          ok(native, ["cat-file", "-p", compatId]),
+        );
+      }
+      expect(mapLines(mine)).toEqual(mapLines(native));
+      // each view carries both signatures, and they differ: each signs its own view
+      const head = ok(mine, ["cat-file", "-p", "HEAD"]);
+      const sigs = [
+        ...head.matchAll(/^(gpgsig(?:-sha256)?) -----BEGIN PGP SIGNATURE-----\n \n (\w+)$/gm),
+      ];
+      expect(sigs.map((m) => m[1])).toEqual(["gpgsig", "gpgsig-sha256"]);
+      expect(sigs[0]?.[2]).not.toBe(sigs[1]?.[2]);
+      expect(git(mine, ["fsck", "--strict"])).toMatchObject({ status: 0, err: "" });
+    });
+  }
 });

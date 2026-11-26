@@ -38,6 +38,13 @@ export interface AnnotatedTag {
   encoding?: string;
   /** GPG signature (optional) */
   gpgSignature?: string;
+  /**
+   * In a repository with a compatibility object format (`extensions.compatObjectFormat`):
+   * the signature over the tag as that format sees it, written as a header under that
+   * format's name (`gpgsig` for SHA-1, `gpgsig-sha256`) while the storage format's signature
+   * ends the message, as git's `do_sign` writes it. Only written: a loaded tag never has it.
+   */
+  compatSignature?: { header: "gpgsig" | "gpgsig-sha256"; value: string };
 }
 
 /**

@@ -27,7 +27,12 @@
  * alternative, warning and going on unsigned (friendlier to hosts that set `gpgSign`
  * globally), was not taken; switch only on the human's word.
  */
-import { type Commit, collectCommitBytes, type PersonIdent } from "@statewalker/vcs-core";
+import {
+  type AnnotatedTag,
+  type Commit,
+  collectCommitBytes,
+  type PersonIdent,
+} from "@statewalker/vcs-core";
 import { createSha256, parseGitBool } from "@statewalker/vcs-utils";
 import {
   expandUserPath,
@@ -386,18 +391,60 @@ export async function signCommit(
   options: Omit<SignPayloadOptions, "committer"> = {},
 ): Promise<Commit> {
   if (sign === undefined) return commit;
-  const { gpgSignature: _dropped, ...unsigned } = commit;
+  const { gpgSignature: _dropped, compatSignature: _droppedCompat, ...unsigned } = commit;
   const payload = await collectCommitBytes(unsigned);
+  const signOptions = { ...options, committer: commit.committer };
   const signature = new TextDecoder().decode(
-    await signPayload(workingCopy, sign, payload, { ...options, committer: commit.committer }),
+    await signPayload(workingCopy, sign, payload, signOptions),
   );
   // add_header_signature: every line of the signature with its newline, the first after the
   // header's name and a space, the others after a space; the header ends with the
   // signature's last newline (the commit model holds the lines without it)
-  return {
-    ...unsigned,
-    gpgSignature: signature.endsWith("\n") ? signature.slice(0, -1) : signature,
-  };
+  const signed: Commit = { ...unsigned, gpgSignature: headerSignature(signature) };
+  // commit_tree_extended in a repository with a compatibility object format: the commit as
+  // that format sees it (its ids mapped) signed too, and both signatures in both objects, so
+  // the compatibility id the store computes covers a signature in its own format
+  const compat = workingCopy.history.objects?.compat;
+  if (compat) {
+    const compatPayload = await compat.convertToCompat("commit", payload);
+    const compatSignature = new TextDecoder().decode(
+      await signPayload(workingCopy, sign, compatPayload, signOptions),
+    );
+    signed.compatSignature = {
+      header: compat.compat.signatureHeader,
+      value: headerSignature(compatSignature),
+    };
+  }
+  return signed;
+}
+
+/**
+ * A signature as a header holds it: its lines without the last newline (add_header_signature
+ * writes each line with its newline).
+ */
+function headerSignature(signature: string): string {
+  return signature.endsWith("\n") ? signature.slice(0, -1) : signature;
+}
+
+/**
+ * builtin/tag.c `do_sign` in a repository with a compatibility object format: the tag as
+ * that format sees it signed too, its signature to go in the tag's header (the storage
+ * signature ends the message), so the tag's compatibility id covers a signature in its own
+ * format. Undefined without a compatibility format.
+ */
+export async function signTagCompat(
+  workingCopy: WorkingCopy,
+  sign: string,
+  payload: Uint8Array,
+  options: SignPayloadOptions,
+): Promise<AnnotatedTag["compatSignature"]> {
+  const compat = workingCopy.history.objects?.compat;
+  if (!compat) return undefined;
+  const compatPayload = await compat.convertToCompat("tag", payload);
+  const signature = new TextDecoder().decode(
+    await signPayload(workingCopy, sign, compatPayload, options),
+  );
+  return { header: compat.compat.signatureHeader, value: headerSignature(signature) };
 }
 
 /** A uint32 length-prefixed string of an ssh wire buffer at `at`. */
