@@ -248,6 +248,13 @@ export class ProcessConfiguration {
   allowRefInWant?: boolean;
 
   /**
+   * Protocol v2: advertise `fetch=... sideband-all` and take a `sideband-all` argument, after
+   * which every packet of the fetch response is sent on side band 1 (errors on band 3), as
+   * git's `uploadpack.allowSidebandAll` (default false: the argument is an unexpected line)
+   */
+  allowSidebandAll?: boolean;
+
+  /**
    * Server side: the session id advertised as `session-id=<id>` (git's `transfer.advertiseSID`
    * advertises its trace2 session id); undefined: none advertised
    */
