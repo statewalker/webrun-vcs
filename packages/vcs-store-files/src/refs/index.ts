@@ -16,4 +16,5 @@ export * from "./ref-writer.js";
 export * from "./reflog-reader.js";
 export * from "./refs-verify.js";
 export * from "./reftable/index.js";
+export * from "./retired-ref-store.js";
 export * from "./worktree-refs.js";
