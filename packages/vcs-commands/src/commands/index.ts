@@ -125,6 +125,7 @@ export {
 export * from "./refs-command.js";
 export * from "./remerge-diff.js";
 export * from "./remote-command.js";
+export * from "./remote-object-info-command.js";
 export * from "./remote-show-command.js";
 export * from "./repack-command.js";
 export * from "./replace-command.js";

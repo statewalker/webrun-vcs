@@ -114,12 +114,30 @@ function unknownAtom(atom: string, compatibility: "2.43" | "2.56"): PlumbingErro
   );
 }
 
-/** The format expanded for one object. */
-export function expandBatchFormat(format: BatchFormat, data: BatchObjectData): string {
+/**
+ * The format expanded for one object. With `remote` (an object `remote-object-info` asked
+ * about), an atom the server did not answer expands to nothing, as git's `expand_atom` with
+ * `is_remote`: `%(objectname)` always, `%(objectsize)` and `%(objecttype)` when answered.
+ */
+export function expandBatchFormat(
+  format: BatchFormat,
+  data: BatchObjectData,
+  remote?: { size: boolean; type: boolean },
+): string {
   let out = "";
   for (const part of format.parts) {
     if (typeof part === "string") {
       out += part;
+      continue;
+    }
+    if (
+      remote &&
+      !(
+        part.atom === "objectname" ||
+        (part.atom === "objectsize" && remote.size) ||
+        (part.atom === "objecttype" && remote.type)
+      )
+    ) {
       continue;
     }
     switch (part.atom) {
