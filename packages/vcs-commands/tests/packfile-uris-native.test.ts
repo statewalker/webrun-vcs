@@ -588,7 +588,13 @@ describeGit("protocol v2 packfile URIs, as native git", () => {
   it(`t5702-protocol-v2.sh: "reject client packfile-uris if not advertised" (a malformed value with wants): pack-objects dies, as upload-pack's`, async () => {
     const main = git(join(srv, "anything"), "rev-parse", "main").trim();
     const body = request(`want ${main}`, "done");
-    const theirs = await rawV2(nativeDaemon(), "/anything", body);
+    // git daemon's answer sometimes stops after `packfile` (the death races the client's
+    // half-close, as "Refused wants race the client's write"): take the first whole one
+    const whole = (lines: string[]) => lines.join("\n").includes("must be of the form");
+    let theirs = await rawV2(nativeDaemon(), "/anything", body);
+    for (let tries = 0; tries < 5 && !whole(theirs); tries++) {
+      theirs = await rawV2(nativeDaemon(), "/anything", body);
+    }
     const mine = await rawV2(await openTcpSocket("127.0.0.1", ours.port), "/anything", body);
     // (ours ends the answer with a flush after the abort, as for every pack-objects death)
     expect(mine.slice(0, theirs.length)).toEqual(theirs);

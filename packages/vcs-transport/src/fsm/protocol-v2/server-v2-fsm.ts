@@ -859,10 +859,20 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           const it = packStream[Symbol.asyncIterator]();
           let first: IteratorResult<Uint8Array> | undefined;
           let failure: unknown;
+          // upload-pack's keep-alive while pack-objects lists: an empty band-1 packet (`0005\1`)
+          const keepAliveMs = ctx.config.keepAliveMs ?? 0;
+          const timer =
+            keepAliveMs > 0
+              ? setInterval(() => {
+                  void ctx.transport.writeSideband(1, new Uint8Array(0)).catch(() => {});
+                }, keepAliveMs)
+              : undefined;
           try {
             first = await it.next();
           } catch (error) {
             failure = error ?? new Error("pack-objects failed");
+          } finally {
+            if (timer !== undefined) clearInterval(timer);
           }
           if (failure === undefined) {
             if (offloaded.length > 0) {
