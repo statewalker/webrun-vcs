@@ -7,7 +7,7 @@
  * - createMemoryGitStaging() for in-memory/testing
  */
 
-import type { ObjectId, Trees } from "@statewalker/vcs-core";
+import type { FilesApi, ObjectId, Trees } from "@statewalker/vcs-core";
 import type { UntrackedCache } from "../status/untracked-cache.js";
 import type { CacheTree } from "./cache-tree.js";
 import type { FsmonitorState } from "./fsmonitor.js";
@@ -332,6 +332,13 @@ export interface Staging {
    * Get last update time (ms since epoch)
    */
   getUpdateTime(): number;
+
+  /**
+   * The index file this staging reads and writes (git's `repo_get_index_file`): its storage
+   * and its path there (`$GIT_INDEX_FILE` when opened from the environment). Absent for
+   * stores without an index file (memory, KV, SQL).
+   */
+  indexLocation?(): { files: FilesApi; path: string };
 
   /**
    * Whether this instance's last read found no index file and nothing has been written

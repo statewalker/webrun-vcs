@@ -1357,7 +1357,7 @@ export abstract class GitCommand<T> {
     });
   }
 
-  private resolveStaging(): Staging {
+  protected resolveStaging(): Staging {
     // Try new architecture first (checkout.staging)
     if (this._workingCopy.checkout?.staging) {
       return this._workingCopy.checkout.staging as unknown as Staging;
