@@ -6,9 +6,9 @@
  * native `--keys` lists (2.54/2.55, 2.56, master).
  */
 
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -305,13 +305,19 @@ function describeRepo(native: NativeGit) {
         keys: string[],
       ): Promise<Outcome> {
         const nativeOut = shell.run(cwd, ["repo", "info", ...keys], { env });
-        const { git, prefix } = await openOursFromEnvironment(shell.home, cwd, env);
+        const {
+          git,
+          prefix,
+          cwd: setupDirectory,
+        } = await openOursFromEnvironment(shell.home, cwd, env);
         const ours = await outcomeOf(() =>
           git
             .repoInfo()
             .setCompatibility(compatibility as RepoCompatibility)
+            .setSetupDirectory(setupDirectory)
             .setCurrentDirectory(prefix.replace(/\/$/, ""))
-            .addKeys(...keys)
+            .setAll(keys.includes("--all"))
+            .addKeys(...keys.filter((key) => key !== "--all"))
             .callOutput(),
         );
         expect(ours).toEqual(nativeOut);
@@ -369,15 +375,34 @@ function describeRepo(native: NativeGit) {
           { GIT_DIR: "../.git", GIT_INDEX_FILE: "idx" },
           keys,
         );
-        // outside the worktree git's setup stays where it started: the index is read there
-        // (absolute key only: `setCurrentDirectory` names no directory outside the worktree)
+        // outside the worktree git's setup stays where it started: the index is read there,
+        // and the relative keys are relative to it (statewalker/webrun-vcs#457)
         const out = join(shell.home, `out${counter++}`);
         mkdirSync(out);
-        await infoFromEnvironment(
+        const outside = await infoFromEnvironment(
           out,
           { GIT_DIR: join(dir, ".git"), GIT_WORK_TREE: dir, GIT_INDEX_FILE: "idx" },
-          ["path.index.absolute"],
+          [...keys, "path.gitdir.relative", "path.workingtree.relative"],
         );
+        expect(outside.stdout).toContain("path.index.relative=idx\n");
+        await infoFromEnvironment(
+          out,
+          {
+            GIT_DIR: `../${basename(dir)}/.git`,
+            GIT_WORK_TREE: `../${basename(dir)}`,
+            GIT_INDEX_FILE: "idx",
+          },
+          ["--all"],
+        );
+        // a bare `$GIT_DIR`: git stays where it started, and so does a relative index
+        const bare = init("--bare");
+        const bareOut = await infoFromEnvironment(
+          out,
+          { GIT_DIR: `../${basename(bare)}`, GIT_INDEX_FILE: "idx" },
+          [...keys, ...gitdirKeys],
+        );
+        expect(bareOut.stdout).toContain(`path.index.absolute=${realpathSync(out)}/idx\n`);
+        await infoFromEnvironment(out, { GIT_DIR: `../${basename(bare)}` }, ["--all"]);
       });
 
       /** `repo info`'s superproject keys in `dir`, native and ours. */
