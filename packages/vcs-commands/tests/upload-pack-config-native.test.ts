@@ -131,6 +131,20 @@ function refusals(stderr: string): string[] {
   return stderr.split(/\r?\n/).filter((l) => /^fatal: remote error: /.test(l));
 }
 
+/**
+ * A v0 upload-pack dies right after the wants it refuses, while the fetching client may
+ * still be writing (`done`): the client then dies on the write (`unable to write to remote:
+ * Broken pipe`, or a reset connection) before it reads the ERR packet. Native git races so
+ * against itself (file://) and against our server alike, so such a run tells nothing.
+ */
+function lostRefusal(r: { status: number | null; stderr: string }): boolean {
+  return (
+    r.status !== 0 &&
+    refusals(r.stderr).length === 0 &&
+    /unable to write to remote|Broken pipe|Connection reset/.test(r.stderr)
+  );
+}
+
 /** pkt-lines of `bytes`, as text (`0000` flush, `0001` delim), up to the `packfile` line. */
 function pktLines(bytes: Uint8Array): string[] {
   const out: string[] = [];
@@ -289,15 +303,18 @@ describeGit("upload-pack configuration, as native git", () => {
         for (const want of WANTS) {
           const id = ids[want] as string;
           const fetchFrom = async (url: string) => {
-            const dir = emptyRepo("f");
-            return gitAsync(root, dir, [
-              "-c",
-              `protocol.version=${version}`,
-              "fetch",
-              "-q",
-              url,
-              id,
-            ]);
+            for (let attempt = 1; ; attempt++) {
+              const dir = emptyRepo("f");
+              const r = await gitAsync(root, dir, [
+                "-c",
+                `protocol.version=${version}`,
+                "fetch",
+                "-q",
+                url,
+                id,
+              ]);
+              if (!lostRefusal(r) || attempt === 10) return r;
+            }
           };
           const theirs = await fetchFrom(`file://${join(srv, policy)}`);
           const mine = await fetchFrom(`git://127.0.0.1:${ours.port}/${policy}`);
