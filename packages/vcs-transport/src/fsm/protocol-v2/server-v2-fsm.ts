@@ -56,6 +56,7 @@ export const serverV2Transitions: FsmTransition[] = [
   ["READ_COMMAND", "LS_REFS", "HANDLE_LS_REFS"],
   ["READ_COMMAND", "FETCH", "HANDLE_FETCH"],
   ["READ_COMMAND", "OBJECT_INFO", "HANDLE_OBJECT_INFO"],
+  ["READ_COMMAND", "BUNDLE_URI", "HANDLE_BUNDLE_URI"],
   ["READ_COMMAND", "FLUSH", ""], // Client done
   ["READ_COMMAND", "ERROR", ""],
 
@@ -117,6 +118,10 @@ export const serverV2Transitions: FsmTransition[] = [
   // Handle object-info command
   ["HANDLE_OBJECT_INFO", "OBJECT_INFO_DONE", "READ_COMMAND"],
   ["HANDLE_OBJECT_INFO", "ERROR", ""],
+
+  // Handle bundle-uri command
+  ["HANDLE_BUNDLE_URI", "BUNDLE_URI_DONE", "READ_COMMAND"],
+  ["HANDLE_BUNDLE_URI", "ERROR", ""],
 
   // Send error
   ["SEND_ERROR", "ERROR_SENT", ""],
@@ -231,6 +236,7 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
         state.fetchRequest = undefined;
         if (command === "ls-refs") return "LS_REFS";
         if (command === "fetch") return "FETCH";
+        if (command === "bundle-uri") return "BUNDLE_URI";
         return "OBJECT_INFO";
       } catch (e) {
         ctx.output.error = String(e);
@@ -983,6 +989,31 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
     },
   ],
 
+  // Handle bundle-uri command (bundle-uri.c's bundle_uri_command): no arguments, then the
+  // served repository's `bundle.*` settings as `<key>=<value>` lines and a flush
+  [
+    "HANDLE_BUNDLE_URI",
+    async (ctx) => {
+      try {
+        const pkt = await readArgument(ctx);
+        if (pkt.type === "data") {
+          ctx.output.error = `bundle-uri: unexpected argument: '${pkt.text}'`;
+          return "ERROR";
+        }
+        if (pkt.type !== "flush") {
+          ctx.output.error = "bundle-uri: expected flush after arguments";
+          return "ERROR";
+        }
+        for (const line of ctx.config.bundleUris ?? []) await writeRaw(ctx, line);
+        await ctx.transport.writeFlush();
+        return "BUNDLE_URI_DONE";
+      } catch (e) {
+        ctx.output.error = String(e);
+        return "ERROR";
+      }
+    },
+  ],
+
   // Send error
   [
     "SEND_ERROR",
@@ -1046,7 +1077,7 @@ function uploadRequest(ctx: ProcessContext): UploadPackRequestParts {
 }
 
 /** The commands the v2 server implements. */
-const V2_COMMANDS = new Set(["ls-refs", "fetch", "object-info"]);
+const V2_COMMANDS = new Set(["ls-refs", "fetch", "object-info", "bundle-uri"]);
 
 /** Object formats git knows (`object-format=` of a request). */
 const KNOWN_OBJECT_FORMATS = new Set(["sha1", "sha256"]);
@@ -1097,6 +1128,7 @@ function advertisedCapabilities(ctx: ProcessContext): string[] {
       ...(ctx.config.allowSidebandAll ? { allowSidebandAll: true } : {}),
       ...(ctx.config.blobPackfileUris?.length ? { packfileUris: true } : {}),
       ...(ctx.config.sessionId !== undefined ? { sessionId: ctx.config.sessionId } : {}),
+      ...(ctx.config.bundleUris !== undefined ? { bundleUri: true } : {}),
     },
   );
 }

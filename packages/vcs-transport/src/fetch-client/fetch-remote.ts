@@ -1165,6 +1165,38 @@ export async function lsRefs(
   return refs;
 }
 
+/**
+ * The v2 `bundle-uri` command (connect.c's `get_remote_bundle_uri`): the server's bundle list
+ * as its `key=value` lines, in order. The capabilities are sent as for every v2 command
+ * (`agent`, the server's `object-format`); the caller parses the lines (bundle-uri.c's
+ * `bundle_uri_parse_line`).
+ *
+ * @throws TransportError when the server does not advertise `bundle-uri` (git dies there)
+ */
+export async function bundleUriLines(connection: UploadPackConnection): Promise<string[]> {
+  const caps = connection.capabilities;
+  if (!caps.has("bundle-uri")) {
+    throw new TransportError("fatal: server does not support 'bundle-uri'");
+  }
+  const body: Uint8Array[] = [encodePacketLine("command=bundle-uri")];
+  if (caps.has("agent")) body.push(encodePacketLine(`agent=${CLIENT_AGENT}`));
+  const format = remoteObjectFormat(caps);
+  if (!format) {
+    throw new TransportError(
+      `unknown object format '${caps.get("object-format")}' specified by server`,
+    );
+  }
+  if (caps.has("object-format")) body.push(encodePacketLine(`object-format=${format.name}`));
+  body.push(encodeDelim());
+  body.push(encodeFlush());
+  const pkts = await connection.request(body);
+  const lines: string[] = [];
+  for (let line = await pkts.readLine(); line !== undefined; line = await pkts.readLine()) {
+    lines.push(line);
+  }
+  return lines;
+}
+
 /** The shallow file after the server's update (the same array when nothing changed). */
 function applyShallow(before: string[], update: ServerShallowUpdate): string[] {
   if (update.shallow.length === 0 && update.unshallow.length === 0) return before;

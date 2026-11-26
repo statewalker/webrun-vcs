@@ -933,6 +933,10 @@ export class FetchCommand extends TransportCommand<FetchResult> {
         ? this.followRemoteHead(store)
         : null;
     const messages: string[] = [...legacyMessages];
+    // cmd_fetch: fetch.bundleURI's bundles before the remote is asked
+    messages.push(
+      ...(await this.fetchConfiguredBundles(this.compatibility ?? this.hooks.compatibility)),
+    );
     const errors: string[] = [];
     const trackingUpdates: TrackingRefUpdate[] = [];
 

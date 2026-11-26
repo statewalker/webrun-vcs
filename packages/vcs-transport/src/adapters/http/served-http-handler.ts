@@ -316,6 +316,7 @@ function httpOptionsOf(
     allowRefInWant,
     allowSidebandAll,
     blobPackfileUris,
+    bundleUris,
     advertiseSID,
     sessionId,
     packObjectsHook,
@@ -340,6 +341,7 @@ function httpOptionsOf(
   if (allowRefInWant !== undefined) out.allowRefInWant = allowRefInWant;
   if (allowSidebandAll !== undefined) out.allowSidebandAll = allowSidebandAll;
   if (blobPackfileUris !== undefined) out.blobPackfileUris = blobPackfileUris;
+  if (bundleUris !== undefined) out.bundleUris = bundleUris;
   if (advertiseSID !== undefined) out.advertiseSID = advertiseSID;
   if (sessionId !== undefined) out.sessionId = sessionId;
   if (packObjectsHook !== undefined) out.packObjectsHook = packObjectsHook;
