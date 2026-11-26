@@ -11,6 +11,7 @@ import {
   parseExpiryDate,
   prunePacked,
   readPackWriteSettings,
+  readRepositoryFormat,
   rerereGc,
   rerereGcNeeded,
   writeCommitGraph,
@@ -771,6 +772,8 @@ export class MaintenanceRunCommand extends GuardedTransportCommand<MaintenanceRu
 
   /** maintenance_task_geometric_repack (odb_source_files_optimize, ODB_OPTIMIZE_GEOMETRIC). */
   private async geometricRepack(store: RemoteConfigStore, repo: Repo): Promise<boolean> {
+    // odb_source_files_optimize: nothing in a precious-objects repository
+    if ((await readRepositoryFormat(repo.files, repo.gitDir)).preciousObjects) return false;
     const factor = configInt(store, "maintenance.geometric-repack.splitFactor", 2);
     const { split, count } = await this.geometry(repo, factor);
     const repack = new RepackCommand(this.workingCopy).shareHooksOf(this);

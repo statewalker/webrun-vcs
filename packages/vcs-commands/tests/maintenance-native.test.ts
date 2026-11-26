@@ -409,6 +409,14 @@ describeGit("git maintenance run twins", () => {
         { args: ["--task=prefetch"], ours: (c) => c.addTask("prefetch") },
         "all",
       );
+      // fetch.pruneTags adds the tag refspec, which --prefetch drops: a local tag stays
+      r.git(["config", "fetch.pruneTags", "true"]);
+      r.git(["tag", "v-local"]);
+      await twins(
+        caseDir,
+        { args: ["--task=prefetch"], ours: (c) => c.addTask("prefetch") },
+        "prune-tags",
+      );
       r.git(["config", "remote.remote1.skipFetchAll", "true"]);
       await twins(
         caseDir,
@@ -640,6 +648,23 @@ describeGit("git maintenance run twins", () => {
         await run("one-stale");
         utimesSync(join(entries[1] as string, "preimage"), old, old);
         await run("two-stale");
+      },
+    );
+
+    it25x(
+      't7900-maintenance.sh: "geometric repacking task" in a precious-objects repository',
+      async () => {
+        const { caseDir, r } = history("geometric-precious");
+        r.git(["repack", "-dq"]);
+        r.commit("four", { "d.txt": "d\n".repeat(50) });
+        r.git(["repack", "-dq"]);
+        r.git(["config", "core.repositoryformatversion", "1"]);
+        r.git(["config", "extensions.preciousObjects", "true"]);
+        const o = await twins(caseDir, {
+          args: ["--task=geometric-repack"],
+          ours: (c) => c.addTask("geometric-repack"),
+        });
+        expect(o.ours.stderr).toBe("");
       },
     );
 

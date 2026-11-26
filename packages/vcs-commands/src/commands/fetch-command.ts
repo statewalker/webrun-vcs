@@ -881,7 +881,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     const explicitSpecs = prefetchSpecs([...this.refSpecs]);
     // fetch.c fetch_one: --prune-tags (only without command-line refspecs) adds the tag
     // refspec to the configured ones, or for a URL to those of the fetch
-    if (pruneTags && this.refSpecs.length === 0) {
+    // (under --prefetch filter_prefetch_refspec drops the tag refspec again: refs/tags/ untouched)
+    if (pruneTags && this.refSpecs.length === 0 && !this.prefetch) {
       if (viaConfig) configured.push(TAG_REFSPEC);
       else explicitSpecs.push(TAG_REFSPEC);
     }
