@@ -109,6 +109,7 @@ import {
   RenameBranchCommand,
   RepackCommand,
   ReplaceCommand,
+  ReplayCommand,
   RerereCommand,
   ResetCommand,
   RestoreCommand,
@@ -468,6 +469,21 @@ export class Git implements Disposable {
   mergeTree(): MergeTreeCommand {
     this.checkClosed();
     return new MergeTreeCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a ReplayCommand (`git replay`): replays a range of commits onto a new base
+   * (`--onto`, `--advance`, `--revert`) with merge-ort in memory, then moves the refs or
+   * prints `update-ref --stdin` lines. The worktree and the index are never touched.
+   *
+   * @example
+   * ```typescript
+   * await git.replay().setOnto("main").addRevision("topic1..topic2").call();
+   * ```
+   */
+  replay(): ReplayCommand {
+    this.checkClosed();
+    return new ReplayCommand(this._workingCopy);
   }
 
   /**
