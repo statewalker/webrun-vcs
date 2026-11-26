@@ -8,10 +8,19 @@
 
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { chmodSync, writeFileSync } from "node:fs";
-import { connect, createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import type { Readable, Writable } from "node:stream";
-import type { Duplex, SshTarget } from "@statewalker/vcs-transport";
+import {
+  DEFAULT_PORT_DRAIN_TIMEOUT,
+  type Duplex,
+  messagePortDuplex,
+  type SshTarget,
+} from "@statewalker/vcs-transport";
+import {
+  connectSocketPort,
+  listenSocketPorts,
+  type SocketPeer,
+} from "@statewalker/vcs-utils-node/files";
 
 import { testEnv } from "./status-native-support.js";
 
@@ -65,22 +74,6 @@ export function nodeDuplex(
   };
 }
 
-/** A duplex over a TCP socket: `end` sends FIN, `close` ends it and waits until it closes. */
-export function socketDuplex(socket: Socket): Duplex {
-  const closed = new Promise<void>((resolve) => socket.once("close", () => resolve()));
-  return nodeDuplex(socket, socket, {
-    end: async () => {
-      if (!socket.writableEnded) socket.end();
-    },
-    close: async () => {
-      if (!socket.writableEnded) socket.end();
-      const timer = setTimeout(() => socket.destroy(), 5000);
-      await closed;
-      clearTimeout(timer);
-    },
-  });
-}
-
 /** A duplex over a child's stdin and stdout: `end` closes stdin, `close` waits for its exit. */
 export function childDuplex(child: ChildProcessWithoutNullStreams): Duplex {
   const exited = new Promise<void>((resolve) => child.once("close", () => resolve()));
@@ -127,15 +120,20 @@ export function daemonOpener(
   };
 }
 
-/** `openSocket` over a real TCP connection. */
+/**
+ * `openSocket` over a real TCP connection, through the socket adapter (vcs-utils-node's
+ * `connectSocketPort`): the socket is a `MessagePort`, read and written as a duplex.
+ */
 export async function openTcpSocket(host: string, port: number): Promise<Duplex> {
-  // half-open: our end() sends FIN while the answer still comes back
-  const socket = connect({ port, host, allowHalfOpen: true });
-  await new Promise<void>((resolve, reject) => {
-    socket.once("connect", resolve);
-    socket.once("error", reject);
-  });
-  return socketDuplex(socket);
+  return messagePortDuplex(await connectSocketPort({ host, port }));
+}
+
+/**
+ * A duplex over an accepted connection's port (`listenSocketPorts`), the serving side's:
+ * `close` lets the far end take all of the answer before it abandons the rest.
+ */
+export function servedPortDuplex(port: MessagePort): Duplex {
+  return messagePortDuplex(port, { drainTimeout: DEFAULT_PORT_DRAIN_TIMEOUT });
 }
 
 /** git's search path for helper programs first, as a git build run from elsewhere needs. */
@@ -218,25 +216,22 @@ export function gitAsync(
   });
 }
 
-/** A TCP server on 127.0.0.1 handing each connection, as a duplex, to `serve`. */
+/**
+ * A TCP server on 127.0.0.1 handing each connection, as a duplex, to `serve` (through the
+ * socket adapter, `listenSocketPorts`); the duplex is closed once `serve` settles.
+ */
 export async function startTcpServer(
-  serve: (duplex: Duplex) => Promise<unknown>,
+  serve: (duplex: Duplex, peer: SocketPeer) => Promise<unknown>,
 ): Promise<{ port: number; close(): Promise<void> }> {
-  const sockets = new Set<Socket>();
-  // half-open: a client's FIN (after its request) must not end our answer
-  const server: Server = createServer({ allowHalfOpen: true }, (socket) => {
-    sockets.add(socket);
-    socket.once("close", () => sockets.delete(socket));
-    void serve(socketDuplex(socket)).catch(() => socket.destroy());
+  const server = await listenSocketPorts({ host: "127.0.0.1", port: 0 }, (port, peer) => {
+    const duplex = servedPortDuplex(port);
+    void serve(duplex, peer)
+      .catch(() => {})
+      .finally(() => duplex.close?.());
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  const port = typeof address === "object" && address ? address.port : 0;
+  const address = server.address;
   return {
-    port,
-    close: async () => {
-      for (const socket of sockets) socket.destroy();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    },
+    port: typeof address === "object" ? address.port : 0,
+    close: () => server.close(),
   };
 }

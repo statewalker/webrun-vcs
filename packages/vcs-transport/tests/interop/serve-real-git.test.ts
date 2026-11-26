@@ -13,7 +13,6 @@
 
 import { type ChildProcess, execFile } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { type AddressInfo, createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -26,6 +25,7 @@ import {
   makeTmpDir,
   type TransportRepo,
 } from "./helpers.js";
+import { type DuplexServer, listenDuplexes } from "./socket-server.js";
 
 const HAS_GIT = gitAvailable();
 const describeGit = HAS_GIT ? describe : describe.skip;
@@ -125,55 +125,53 @@ async function commitAt(
 let relayPolicy: UploadPackRequestPolicy | undefined;
 
 /** Serves `repo` to each relay connection, v2 when its header says GIT_PROTOCOL=version=2. */
-function serveRelay(repo: TransportRepo): Server {
-  return createServer({ allowHalfOpen: true }, (socket: Socket) => {
-    void (async () => {
-      const it = socket[Symbol.asyncIterator]() as AsyncIterator<Buffer>;
-      let buffered = Buffer.alloc(0);
-      let newline = -1;
-      while (newline < 0) {
-        const next = await it.next();
-        if (next.done) return;
-        buffered = Buffer.concat([buffered, next.value]);
-        newline = buffered.indexOf(10);
-      }
-      const header = JSON.parse(buffered.subarray(0, newline).toString("utf8")) as {
-        protocol: string;
-      };
-      const rest = buffered.subarray(newline + 1);
-      const v2 = header.protocol.split(":").includes("version=2");
-      const v1 = !v2 && header.protocol.split(":").includes("version=1");
-      await serveOverDuplex({
-        duplex: {
-          async *[Symbol.asyncIterator]() {
-            if (rest.length) yield new Uint8Array(rest);
-            while (true) {
-              const next = await it.next();
-              if (next.done) return;
-              yield new Uint8Array(next.value);
-            }
-          },
-          write: (data: Uint8Array) =>
-            new Promise<void>((resolve) => {
-              socket.write(data, () => resolve());
-            }),
+function serveRelay(repo: TransportRepo): Promise<DuplexServer> {
+  return listenDuplexes(async (duplex) => {
+    // the relay's header line, then git's bytes (what came with the header first)
+    const it = duplex[Symbol.asyncIterator]();
+    let buffered = new Uint8Array(0);
+    let newline = -1;
+    while (newline < 0) {
+      const next = await it.next();
+      if (next.done) return;
+      const joined = new Uint8Array(buffered.length + next.value.length);
+      joined.set(buffered);
+      joined.set(next.value, buffered.length);
+      buffered = joined;
+      newline = buffered.indexOf(10);
+    }
+    const header = JSON.parse(new TextDecoder().decode(buffered.subarray(0, newline))) as {
+      protocol: string;
+    };
+    const rest = buffered.slice(newline + 1);
+    const v2 = header.protocol.split(":").includes("version=2");
+    const v1 = !v2 && header.protocol.split(":").includes("version=1");
+    await serveOverDuplex({
+      duplex: {
+        ...duplex,
+        async *[Symbol.asyncIterator]() {
+          if (rest.length) yield rest;
+          while (true) {
+            const next = await it.next();
+            if (next.done) return;
+            yield next.value;
+          }
         },
-        repository: repo.facade,
-        refStore: repo.refStore,
-        service: "git-upload-pack",
-        protocolVersion: v2 ? "2" : "1",
-        ...(v1 ? { announceVersion1: true } : {}),
-        requestPolicy: relayPolicy,
-      });
-      socket.end();
-    })().catch(() => socket.destroy());
+      },
+      repository: repo.facade,
+      refStore: repo.refStore,
+      service: "git-upload-pack",
+      protocolVersion: v2 ? "2" : "1",
+      ...(v1 ? { announceVersion1: true } : {}),
+      requestPolicy: relayPolicy,
+    });
   });
 }
 
 describeGit("Interop · real git client ← our upload-pack", { timeout: TEST_TIMEOUT }, () => {
   let root: string;
   let repo: TransportRepo;
-  let server: Server;
+  let server: DuplexServer;
   let uploadPack: string;
   let commits: string[];
   let dangling: string;
@@ -193,9 +191,8 @@ describeGit("Interop · real git client ← our upload-pack", { timeout: TEST_TI
     await repo.refStore.update("refs/heads/main", commits[3] as string);
     await repo.history.refs.setSymbolic("HEAD", "refs/heads/main");
 
-    server = serveRelay(repo);
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    const port = (server.address() as AddressInfo).port;
+    server = await serveRelay(repo);
+    const port = server.port;
     const relay = join(root, "relay.mjs");
     writeFileSync(relay, RELAY);
     uploadPack = `${shellQuote(process.execPath)} ${shellQuote(relay)} ${port}`;
@@ -207,7 +204,7 @@ describeGit("Interop · real git client ← our upload-pack", { timeout: TEST_TI
   });
 
   afterAll(async () => {
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await server.close();
     await repo.close();
     cleanupDir(root);
   });

@@ -70,3 +70,20 @@ export async function endDuplex(duplex: Duplex): Promise<void> {
     // the other end is gone already
   }
 }
+
+/**
+ * A byte stream as a host hands one over: a {@link Duplex}, or a `MessagePort` whose other
+ * end serves one stream on webrun-rpc's stream tier (`serveDuplexOverPort`: a socket through
+ * vcs-utils-node's `socketMessagePort`, a `serveGitOverPort`/`serveOverPort` session, a
+ * worker, a WebSocket bridge). A port is read and written through `messagePortDuplex`
+ * (adapters/messageport), so a socket, a `MessageChannel` or any other port serve alike.
+ */
+export type ByteStream = Duplex | MessagePort;
+
+/** Whether `stream` is a {@link Duplex} (an async iterable with `write`), not a port. */
+export function isDuplex(stream: ByteStream): stream is Duplex {
+  return (
+    typeof (stream as Partial<Duplex>)[Symbol.asyncIterator] === "function" &&
+    typeof (stream as Partial<Duplex>).write === "function"
+  );
+}
