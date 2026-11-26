@@ -25,9 +25,11 @@ import type {
   Worktree,
 } from "@statewalker/vcs-working-tree";
 import {
+  connectRepositoryListeners,
   createStatusCalculator,
   getStateCapabilities,
   installContentFilter,
+  RepositoryListeners,
   type RepositoryStateValue,
   type RepositoryStatus,
   type StateCapabilities,
@@ -86,6 +88,9 @@ export class GitWorkingCopy implements WorkingCopy {
   readonly stash: StashStore;
   readonly config: WorkingCopyConfig;
   readonly worktrees?: LinkedWorktrees;
+  /** Told after each write of the refs, the index, the configuration and the worktree */
+  readonly listeners = new RepositoryListeners();
+  private readonly disconnectListeners: () => void;
 
   private readonly files: WorkingCopyFilesApi;
   private readonly gitDir: string;
@@ -101,6 +106,7 @@ export class GitWorkingCopy implements WorkingCopy {
     if (options.worktrees) this.worktrees = options.worktrees;
     // git's clean / smudge (attributes, core.autocrlf, ...) on the worktree's content
     installContentFilter(this, options);
+    this.disconnectListeners = connectRepositoryListeners(this, this.listeners);
   }
 
   /**
@@ -255,6 +261,7 @@ export class GitWorkingCopy implements WorkingCopy {
    * Close working copy and release resources.
    */
   async close(): Promise<void> {
+    this.disconnectListeners();
     await this.checkout.close();
     await this.history.close();
   }

@@ -460,6 +460,7 @@ export class GitStaging implements Staging {
     this.asRead.reset(this._entries);
     this.updateTime = await this.indexMtime();
     await this.writeHook?.();
+    this.tellWritten();
   }
 
   /**
@@ -493,6 +494,7 @@ export class GitStaging implements Staging {
         this.skipWorktreeCleared = new Set();
         this.asRead.reset(written);
         this.updateTime = await this.indexMtime();
+        this.tellWritten();
       },
       rollback: () => lock.rollback(),
       reread: async () => {
@@ -541,6 +543,26 @@ export class GitStaging implements Staging {
 
   /** Told after each write of the index file (see `Staging.setWriteHook`). */
   private writeHook?: () => Promise<void>;
+  /** Told after each write of the index file (see `Staging.addWriteListener`). */
+  private readonly writeListeners = new Set<() => void>();
+
+  addWriteListener(listener: () => void): () => void {
+    const entry = () => listener();
+    this.writeListeners.add(entry);
+    return () => {
+      this.writeListeners.delete(entry);
+    };
+  }
+
+  private tellWritten(): void {
+    for (const listener of [...this.writeListeners]) {
+      try {
+        listener();
+      } catch {
+        // a listener's failure never fails the write
+      }
+    }
+  }
 
   setWriteHook(hook: (() => Promise<void>) | undefined): void {
     this.writeHook = hook;
@@ -615,6 +637,7 @@ export class GitStaging implements Staging {
     this._entries = entries;
     this.updateTime = await this.indexMtime();
     await this.writeHook?.();
+    this.tellWritten();
     return true;
   }
 

@@ -6,6 +6,7 @@
 export * from "./attributes/index.js";
 export * from "./checkout/index.js";
 export * from "./convert/index.js";
+export * from "./events/index.js";
 export * from "./ignore/index.js";
 export * from "./linked-worktrees/index.js";
 export * from "./staging/index.js";

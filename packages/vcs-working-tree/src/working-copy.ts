@@ -14,6 +14,7 @@
 
 import type { History, ObjectId } from "@statewalker/vcs-core";
 import type { Checkout } from "./checkout/checkout.js";
+import type { RepositoryListeners } from "./events/index.js";
 import type { LinkedWorktrees } from "./linked-worktrees/index.js";
 import type { RepositoryStatus, StatusOptions } from "./status/index.js";
 import type { RepositoryStateValue, StateCapabilities } from "./working-copy/repository-state.js";
@@ -217,6 +218,13 @@ export interface WorkingCopy {
    * them; undefined for a backend without linked worktrees.
    */
   readonly worktrees?: LinkedWorktrees;
+
+  /**
+   * Listeners told after each write of the refs, the index, the configuration and the
+   * worktree's files (JGit's `Repository.getListenerList()`); undefined for a working copy
+   * that tells nothing.
+   */
+  readonly listeners?: RepositoryListeners;
 
   // ============ HEAD Management ============
 
