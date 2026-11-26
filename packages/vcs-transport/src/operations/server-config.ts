@@ -103,6 +103,12 @@ export interface ServerConfigSettings {
   /** `transfer.advertiseSID` (git's default: false) */
   advertiseSID?: boolean;
   /**
+   * `uploadpack.advertiseBundleURIs` true: the `bundle.*` lines the v2 `bundle-uri` command
+   * answers with (`<key>=<value>`, config order; a key without a value or with an empty one is
+   * left out, as git warns it away)
+   */
+  bundleUris?: string[];
+  /**
    * The v2 `promisor-remote` capability's value (git 2.49+'s `promisor.advertise`, with the
    * fields `promisor.sendFields` names): {@link promisorRemoteAdvertisement}; absent: not
    * advertised
@@ -496,6 +502,11 @@ export function explicitServerSettingsFromConfig(
   if (refInWant !== undefined) out.allowRefInWant = configBool(refInWant, false);
   const sid = last(config, "transfer.advertiseSID");
   if (sid !== undefined) out.advertiseSID = configBool(sid, false);
+  // bundle_uri_advertise / bundle_uri_command
+  const advertiseBundles = last(config, "uploadpack.advertiseBundleURIs");
+  if (advertiseBundles !== undefined && configBool(advertiseBundles, false)) {
+    out.bundleUris = bundleUriLinesOf(config);
+  }
   const promisorInfo = promisorRemoteAdvertisement(config);
   if (promisorInfo !== undefined) out.promisorRemoteInfo = promisorInfo;
   // uploadpack.packObjectsHook is never read here: git takes it only from protected config
@@ -609,4 +620,27 @@ export function httpServerSettings(settings: ServerConfigSettings): {
     },
     uploadPack: { hideRefs: settings.uploadPackHideRefs },
   };
+}
+
+/**
+ * bundle-uri.c's `config_to_packet_line`: every `bundle.*` entry with a value, as
+ * `<key>=<value>` in config order (keys canonical: section and name lower-cased).
+ */
+function bundleUriLinesOf(config: ServerConfigReader): string[] {
+  const out: string[] = [];
+  if (!config.list) return out;
+  for (const { key, value } of config.list()) {
+    if (!key.toLowerCase().startsWith("bundle.")) continue;
+    if (typeof value !== "string" || value === "") continue;
+    out.push(`${canonicalConfigKey(key)}=${value}`);
+  }
+  return out;
+}
+
+/** git's canonical config key: the section and the name lower-cased, a subsection kept. */
+function canonicalConfigKey(key: string): string {
+  const first = key.indexOf(".");
+  const last = key.lastIndexOf(".");
+  if (first < 0) return key.toLowerCase();
+  return `${key.slice(0, first).toLowerCase()}${key.slice(first, last)}.${key.slice(last + 1).toLowerCase()}`;
 }

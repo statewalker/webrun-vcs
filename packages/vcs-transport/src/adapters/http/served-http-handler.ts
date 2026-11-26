@@ -314,6 +314,7 @@ function httpOptionsOf(
     uploadPackFilter,
     uploadPackRequestPolicy,
     allowRefInWant,
+    bundleUris,
     advertiseSID,
     sessionId,
     promisorRemoteInfo,
@@ -337,6 +338,7 @@ function httpOptionsOf(
   if (uploadPackFilter !== undefined) out.uploadPackFilter = uploadPackFilter;
   if (uploadPackRequestPolicy !== undefined) out.uploadPackRequestPolicy = uploadPackRequestPolicy;
   if (allowRefInWant !== undefined) out.allowRefInWant = allowRefInWant;
+  if (bundleUris !== undefined) out.bundleUris = bundleUris;
   if (advertiseSID !== undefined) out.advertiseSID = advertiseSID;
   if (sessionId !== undefined) out.sessionId = sessionId;
   if (promisorRemoteInfo !== undefined) out.promisorRemoteInfo = promisorRemoteInfo;

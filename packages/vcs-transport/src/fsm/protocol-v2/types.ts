@@ -119,6 +119,8 @@ export function serverV2Capabilities(
     const attributes = objectInfoAttributes(repository);
     if (attributes.length > 0) list.push(`object-info=${attributes.join(" ")}`);
   }
+  // serve.c's order: ... object-info, bundle-uri
+  if (options.bundleUri && !list.includes("bundle-uri")) list.push("bundle-uri");
   // serve.c's last capability: `promisor-remote=<pr-info>` (promisor.advertise)
   if (
     options.promisorRemote !== undefined &&
@@ -135,6 +137,8 @@ export interface ServerV2CapabilityOptions {
   allowRefInWant?: boolean;
   /** `session-id=<id>` (git's `transfer.advertiseSID`) */
   sessionId?: string;
+  /** `bundle-uri` (git's `uploadpack.advertiseBundleURIs`), after `object-info` */
+  bundleUri?: boolean;
   /** `promisor-remote=<pr-info>` (git's `promisor.advertise`: `promisorRemoteAdvertisement`) */
   promisorRemote?: string;
 }

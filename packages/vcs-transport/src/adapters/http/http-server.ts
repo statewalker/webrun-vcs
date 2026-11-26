@@ -154,6 +154,12 @@ export interface HttpServerOptions {
   uploadPackRequestPolicy?: UploadPackRequestPolicy;
   /** Protocol v2: `fetch=... ref-in-want` and `want-ref` (git's `uploadpack.allowRefInWant`) */
   allowRefInWant?: boolean;
+  /**
+   * Protocol v2: git's `uploadpack.advertiseBundleURIs`: `bundle-uri` advertised and answered
+   * with these lines, the served repository's `bundle.*` settings as `<key>=<value>` in config
+   * order (`bundle_uri_command`). Undefined: not advertised, and the command refused
+   */
+  bundleUris?: readonly string[];
   /** git's `transfer.advertiseSID`: `session-id=<sessionId>` advertised by both services */
   advertiseSID?: boolean;
   /** The id {@link advertiseSID} advertises (default `processSessionId()`) */
@@ -762,6 +768,7 @@ function v2CapabilityOptions(options: HttpServerOptions): ServerV2CapabilityOpti
   return {
     ...(options.allowRefInWant ? { allowRefInWant: true } : {}),
     ...(sid !== undefined ? { sessionId: sid } : {}),
+    ...(options.bundleUris !== undefined ? { bundleUri: true } : {}),
     ...(options.promisorRemoteInfo !== undefined
       ? { promisorRemote: options.promisorRemoteInfo }
       : {}),
@@ -891,6 +898,7 @@ export async function handleUploadPackV2(
     // git's v2 upload-pack serves any object it has
     requestPolicy: options.requestPolicy ?? "ANY",
     ...(options.allowRefInWant ? { allowRefInWant: true } : {}),
+    ...(options.bundleUris !== undefined ? { bundleUris: options.bundleUris } : {}),
     ...(advertisedSessionId(options) !== undefined
       ? { sessionId: advertisedSessionId(options) }
       : {}),
@@ -1440,6 +1448,8 @@ export interface HttpHandlerOptions {
   advertiseObjectInfo?: boolean;
   /** v2 `ref-in-want` (see {@link HttpServerOptions.allowRefInWant}) */
   allowRefInWant?: boolean;
+  /** v2 `bundle-uri` (see {@link HttpServerOptions.bundleUris}) */
+  bundleUris?: readonly string[];
   /** `session-id` advertised (see {@link HttpServerOptions.advertiseSID}) */
   advertiseSID?: boolean;
   /** The id {@link advertiseSID} advertises (see {@link HttpServerOptions.sessionId}) */
@@ -1496,6 +1506,7 @@ export function createHttpHandler(
     v2Capabilities,
     advertiseObjectInfo,
     allowRefInWant,
+    bundleUris,
     advertiseSID,
     sessionId,
     promisorRemoteInfo,
@@ -1526,6 +1537,7 @@ export function createHttpHandler(
       v2Capabilities,
       advertiseObjectInfo,
       ...(allowRefInWant ? { allowRefInWant } : {}),
+      ...(bundleUris !== undefined ? { bundleUris } : {}),
       ...(advertiseSID ? { advertiseSID } : {}),
       ...(sessionId !== undefined ? { sessionId } : {}),
       ...(promisorRemoteInfo !== undefined ? { promisorRemoteInfo } : {}),

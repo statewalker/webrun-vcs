@@ -195,6 +195,12 @@ export interface ServeOverDuplexOptions {
    */
   allowRefInWant?: boolean;
   /**
+   * Protocol v2: git's `uploadpack.advertiseBundleURIs`: `bundle-uri` advertised and answered
+   * with these lines, the served repository's `bundle.*` settings as `<key>=<value>` in config
+   * order (`bundle_uri_command`). Undefined: not advertised, and the command refused
+   */
+  bundleUris?: readonly string[];
+  /**
    * git's `transfer.advertiseSID`: upload-pack and receive-pack advertise `session-id=<id>`
    * (v0 capability, v2 capability line), the id {@link sessionId} names; the client's own
    * session id comes back as `ServeResult.clientSessionId`. Default false
@@ -321,6 +327,9 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
       options.requestPolicy ??
       (useV2 || service === "git-receive-pack" ? undefined : options.uploadPackRequestPolicy),
     ...(options.allowRefInWant ? { allowRefInWant: true } : {}),
+    ...(options.bundleUris !== undefined && service !== "git-receive-pack"
+      ? { bundleUris: options.bundleUris }
+      : {}),
     ...(options.advertiseSID
       ? { sessionId: validSessionId(options.sessionId) ?? processSessionId() }
       : {}),

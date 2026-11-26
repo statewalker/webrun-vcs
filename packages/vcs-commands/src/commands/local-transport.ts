@@ -187,6 +187,8 @@ export async function withLocalUploadPack<T>(
         ? { uploadPackRequestPolicy: settings.uploadPackRequestPolicy }
         : {}),
       ...(settings.allowRefInWant ? { allowRefInWant: true } : {}),
+      // uploadpack.advertiseBundleURIs and bundle.*
+      ...(settings.bundleUris !== undefined ? { bundleUris: settings.bundleUris } : {}),
       ...(settings.advertiseSID ? { advertiseSID: true } : {}),
       // promisor.advertise (with promisor.sendFields)
       ...(settings.promisorRemoteInfo !== undefined
