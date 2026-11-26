@@ -20,8 +20,10 @@ import {
   type Pack,
   packNameOf,
 } from "@statewalker/vcs-core";
-import { readRepositoryFormat } from "@statewalker/vcs-store-files";
+import { readRepositoryFormat, setupGitDirectory } from "@statewalker/vcs-store-files";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
+import { normalizePath } from "@statewalker/vcs-utils/files";
+import { type GitHostEnvironment, readIndexFileEntries } from "@statewalker/vcs-working-tree";
 import { quotePath } from "../results/quote-path.js";
 import { hookHostOf } from "./git-hooks.js";
 import { hostEnvironmentOf } from "./git-ident.js";
@@ -165,11 +167,17 @@ function hostPathOf(files: FilesApi, path: string): string | undefined {
  * `git repo info [--format=(lines|nul) | -z] [--all | <key>...]` and `git repo info --keys`.
  *
  * Paths are host paths: the FilesApi's root directory joined with its paths, resolved through
- * the host's `realPath`; without a root directory the path keys are empty. Not followed:
- * `$GIT_DIR`/`$GIT_COMMON_DIR` given apart from the working copy (the working copy's own
- * directories are reported). `path.superprojectworkingtree.*` is found where the repository's
- * git directory is `<super>/.git/modules/<name>` and the superproject's worktree holds the
- * repository at its place (git asks the superproject's index).
+ * the host's `realPath`; without a root directory the path keys are empty. The git directory
+ * and worktree are the working copy's: open it where git's setup puts them
+ * (`openRepositoryFromEnvironment` for `$GIT_DIR`/`$GIT_WORK_TREE`) and pass its `prefix` to
+ * {@link setCurrentDirectory}; `$GIT_COMMON_DIR` and `$GIT_INDEX_FILE` are read from the host
+ * environment (a relative index is the file the working copy opened: git's setup reads it from
+ * the worktree top, or from where it started outside the worktree). Relative keys are
+ * computed from {@link setCurrentDirectory}, so a git started outside the worktree is not
+ * expressed.
+ * `path.superprojectworkingtree.*` is submodule.c's `get_superproject_working_tree`: the
+ * repository of the worktree's parent directory (reached through `hostFilesOf`, else the
+ * FilesApi) must hold a gitlink at the worktree's path in its index.
  */
 export class RepoInfoCommand extends PlumbingCommand {
   private format = "lines";
@@ -306,7 +314,11 @@ export class RepoInfoCommand extends PlumbingCommand {
       : named
         ? await real(named.startsWith("/") ? named : `${facts.gitDir}/${named}`)
         : facts.gitDir;
+    // repo_get_index_file: `$GIT_INDEX_FILE` (an absolute one as given; a relative one is the
+    // file the working copy opened, which git's setup read from the directory it went to:
+    // the worktree top, else where it started), else `<git dir>/index`
     const indexFile = environment?.indexFile;
+    const location = indexFile && !indexFile.startsWith("/") ? this.indexLocation() : undefined;
     facts.index =
       indexFile === undefined
         ? facts.gitDir
@@ -314,35 +326,100 @@ export class RepoInfoCommand extends PlumbingCommand {
           : undefined
         : indexFile.startsWith("/")
           ? indexFile
-          : // relative to the directory git was started in
-            await real(
-              `${hostPathOf(files, layout.bare ? layout.gitDir : layout.top) ?? ""}/${facts.prefix}${indexFile}`,
+          : await real(
+              location
+                ? hostPathOf(location.files, location.path)
+                : `${hostPathOf(files, layout.bare ? layout.gitDir : layout.top) ?? ""}/${indexFile}`,
             );
     if (!layout.bare) {
       facts.workTree = await real(hostPathOf(files, layout.top));
-      facts.superproject = await this.superprojectOf(facts.gitDir, facts.workTree);
+      facts.superproject = await this.superprojectOf(files, layout.top, facts.workTree);
     }
     return facts;
   }
 
-  /** get_superproject_working_tree, for a git directory under `<super>/.git/modules/`. */
+  /** The index file of the working copy's staging; undefined without one (bare, memory). */
+  private indexLocation(): { files: FilesApi; path: string } | undefined {
+    try {
+      return this.resolveStaging().indexLocation?.();
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * submodule.c's `get_superproject_working_tree`: the repository found from the directory
+   * above the worktree (discovered as git's child `git -C <parent> ls-files` discovers it,
+   * the repository variables cleared) must hold a gitlink at the worktree's path in its
+   * index; the superproject is the worktree less that path. Whatever the submodule's git
+   * directory is (embedded `.git`, `.git/modules/<name>`, a linked worktree's modules).
+   */
   private async superprojectOf(
-    gitDir: string | undefined,
+    files: FilesApi,
+    top: string,
     workTree: string | undefined,
   ): Promise<string | undefined> {
-    if (!gitDir || !workTree) return undefined;
-    const at = gitDir.lastIndexOf("/.git/modules/");
-    if (at < 0) return undefined;
-    const superTop = gitDir.slice(0, at);
-    if (!workTree.startsWith(`${superTop}/`)) return undefined;
-    // the superproject's worktree must hold this one (git asks its index for the gitlink)
+    if (!workTree) return undefined;
     const environment = hostEnvironmentOf(this.workingCopy);
-    if (environment?.statFile) {
-      const s = await environment.statFile(`${superTop}/.git`).catch(() => undefined);
-      if (!s) return undefined;
+    const real = async (path: string) =>
+      (await environment?.realPath?.(path).catch(() => undefined)) ?? path;
+    const oneUp = await real(parentHostPath(workTree));
+    const subpath = gitRelativePath(workTree, oneUp).replace(/\/$/, "");
+    if (!subpath || subpath === "./" || subpath.startsWith("../")) return undefined;
+    // the parent directory through the host, else inside the repository's own storage
+    const host = await environment?.hostFilesOf?.(oneUp).catch(() => undefined);
+    const parent = host
+      ? { files: host.files, cwd: host.path }
+      : top
+        ? { files, cwd: normalizePath(top.slice(0, Math.max(0, top.lastIndexOf("/")))) }
+        : undefined;
+    if (!parent) return undefined;
+    // prepare_submodule_repo_env: none of the repository variables reach the child
+    const {
+      gitDir: _gitDir,
+      workTree: _workTree,
+      commonDir: _commonDir,
+      indexFile: _indexFile,
+      objectDirectory: _objectDirectory,
+      implicitWorkTree: _implicitWorkTree,
+      ...childEnvironment
+    } = environment ?? ({} as GitHostEnvironment);
+    let setup: Awaited<ReturnType<typeof setupGitDirectory>>;
+    try {
+      setup = await setupGitDirectory({
+        files: parent.files,
+        cwd: parent.cwd,
+        ...(environment ? { environment: childEnvironment as GitHostEnvironment } : {}),
+      });
+    } catch {
+      return undefined; // not a git repository (ls-files' exit 128)
     }
-    return superTop;
+    if (setup.workTree === undefined) return undefined; // ls-files needs a worktree
+    const format = await readRepositoryFormat(parent.files, setup.commonDir).catch(() => undefined);
+    const index = await readIndexFileEntries(parent.files, setup.indexFile, {
+      gitDir: setup.gitDir,
+      ...(format ? { objectFormat: format.objectFormat } : {}),
+    }).catch(() => undefined);
+    if (!index) return undefined;
+    // `ls-files --stage --full-name -- <subpath>`: the first entry at or below the path
+    const fullName = `${setup.prefix ?? ""}${subpath}`;
+    const first = index.entries.find(
+      (e) => e.path === fullName || e.path.startsWith(`${fullName}/`),
+    );
+    if (!first || first.mode !== S_IFGITLINK) return undefined;
+    if (!workTree.endsWith(`/${fullName}`)) return undefined; // git's BUG()
+    const superTop = workTree.slice(0, workTree.length - fullName.length - 1) || "/";
+    return real(superTop);
   }
+}
+
+const S_IFGITLINK = 0o160000;
+
+/** The host directory holding `path` (`/a/b` → `/a`). */
+function parentHostPath(path: string): string {
+  const trimmed = path.replace(/\/+$/, "");
+  const at = trimmed.lastIndexOf("/");
+  return at <= 0 ? "/" : trimmed.slice(0, at);
 }
 
 /** Counts and sizes `repo structure` prints of each object type. */

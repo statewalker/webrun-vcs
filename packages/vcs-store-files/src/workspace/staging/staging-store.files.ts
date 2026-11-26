@@ -771,6 +771,10 @@ export class FileStagingStore implements Staging {
     return checksum === undefined ? undefined : checksum === null;
   }
 
+  indexLocation(): { files: FilesApi; path: string } {
+    return { files: this.files, path: this.indexPath };
+  }
+
   getUpdateTime(): number {
     return this.updateTime;
   }
