@@ -11,6 +11,10 @@ import type { RefStore } from "../context/process-context.js";
 import { INFINITE_DEPTH } from "../fsm/index.js";
 import { encodeDelim, encodeFlush, encodePacketLine, TransportError } from "../protocol/index.js";
 import { formatOf, isObjectIdOf, remoteObjectFormat } from "../protocol/object-format.js";
+import {
+  PROMISOR_REMOTE_CAPABILITY,
+  type PromisorRemoteReply,
+} from "../protocol/promisor-remote.js";
 import { validSessionId } from "../protocol/session-id.js";
 import { type AbbrevLengths, abbrevLengthsOf, transportSummaryWidth } from "../summary/index.js";
 import { parseRefSpec } from "../utils/index.js";
@@ -269,6 +273,13 @@ export interface FetchClientOptions {
    * server that advertises its own; undefined: none sent
    */
   sessionId?: string;
+  /**
+   * The answer to a server's v2 `promisor-remote` capability (git 2.49+): asked in `ls-refs`,
+   * whose request then names the accepted remotes, and again before the `fetch` command
+   * (do_fetch_pack_v2). Undefined: the capability is ignored, as with git's
+   * `promisor.acceptFromServer=None`.
+   */
+  promisorRemote?: PromisorRemoteReply;
 }
 
 /** A shallow remote refused under `rejectShallow` (git's "source repository is shallow"). */
@@ -447,6 +458,7 @@ export async function fetchFromConnection(
             ...(listTags ? ["refs/tags/"] : []),
           ],
           connection.version === 2 ? options.serverOptions : undefined,
+          options.promisorRemote,
         )
       : [...(connection.advertisedRefs ?? [])];
   const head = remoteRefs.find((r) => r.name === "HEAD");
@@ -611,6 +623,7 @@ export async function fetchFromConnection(
         deepen: deepening,
       });
     }
+    await askPromisorRemote(connection, options.promisorRemote);
     const fetched = await fetchPack(connection, source, {
       wants,
       ...(repository.objectFormat ? { objectFormat: repository.objectFormat } : {}),
@@ -1073,6 +1086,8 @@ export async function lsRefs(
   prefixes: string[],
   /** `server-option=` lines sent after the capabilities (connect.c's get_remote_refs) */
   serverOptions?: readonly string[],
+  /** The answer to the server's `promisor-remote` capability (send_capabilities) */
+  promisorRemote?: PromisorRemoteReply,
 ): Promise<RemoteRef[]> {
   const caps = connection.capabilities;
   const body: Uint8Array[] = [encodePacketLine("command=ls-refs")];
@@ -1086,6 +1101,11 @@ export async function lsRefs(
     );
   }
   if (caps.has("object-format")) body.push(encodePacketLine(`object-format=${format.name}`));
+  const info = caps.get(PROMISOR_REMOTE_CAPABILITY);
+  if (info !== undefined && promisorRemote) {
+    const reply = await promisorRemote(info);
+    if (reply !== undefined) body.push(encodePacketLine(`promisor-remote=${reply}`));
+  }
   body.push(...serverOptionLines(connection, serverOptions));
   body.push(encodeDelim());
   body.push(encodePacketLine("symrefs"));
@@ -1148,6 +1168,19 @@ export async function bundleUriLines(connection: UploadPackConnection): Promise<
 }
 
 /** The shallow file after the server's update (the same array when nothing changed). */
+/**
+ * do_fetch_pack_v2's call of promisor_remote_reply before a `fetch` (v2 only): the answer is
+ * not sent, but the client's side effects (`promisor.storeFields`) happen again.
+ */
+async function askPromisorRemote(
+  connection: UploadPackConnection,
+  promisorRemote: PromisorRemoteReply | undefined,
+): Promise<void> {
+  if (connection.version !== 2 || !promisorRemote) return;
+  const info = connection.capabilities.get(PROMISOR_REMOTE_CAPABILITY);
+  if (info !== undefined) await promisorRemote(info);
+}
+
 function applyShallow(before: string[], update: ServerShallowUpdate): string[] {
   if (update.shallow.length === 0 && update.unshallow.length === 0) return before;
   const set = new Set(before);
@@ -1181,6 +1214,8 @@ export interface FetchPromisedOptions {
   url?: string;
   /** git 2.43 prints an empty line after that error */
   compatibility?: "2.43" | "2.56";
+  /** The answer to the server's `promisor-remote` capability (asked before the fetch) */
+  promisorRemote?: PromisorRemoteReply;
   /**
    * The child fetch's `fetch.unpackLimit` (else `transfer.unpackLimit`; default 100): whether
    * fetch-pack keeps the promisor pack itself, which decides what its `.promisor` names
@@ -1222,6 +1257,7 @@ export async function fetchPromisedObjects(
   if (wants.length === 0) throw new Error("fetchPromisedObjects: nothing to fetch");
   const received = new ReceivedObjects(formatOf(repository).rawLength);
   const outgoing = new Set<string>();
+  await askPromisorRemote(connection, options.promisorRemote);
   const fetched = await fetchPack(connection, negotiatorSource(repository), {
     wants,
     ...(repository.objectFormat ? { objectFormat: repository.objectFormat } : {}),

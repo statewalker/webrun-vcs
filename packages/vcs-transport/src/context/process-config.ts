@@ -265,6 +265,11 @@ export class ProcessConfiguration {
    * advertises its trace2 session id); undefined: none advertised
    */
   sessionId?: string;
+  /**
+   * Server side (v2): the `promisor-remote` capability's value (git's `promisor.advertise`);
+   * the remotes a client accepts come back in `HandlerOutput.acceptedPromisorRemotes`
+   */
+  promisorRemote?: string;
 
   /**
    * Protocol v2: advertise and serve `object-info` (git's `transfer.advertiseObjectInfo`,

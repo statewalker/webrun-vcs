@@ -194,6 +194,10 @@ export async function withLocalUploadPack<T>(
       ...(settings.advertiseSID ? { advertiseSID: true } : {}),
       // transfer.advertiseObjectInfo: v2 object-info
       ...(settings.advertiseObjectInfo ? { advertiseObjectInfo: true } : {}),
+      // promisor.advertise (with promisor.sendFields)
+      ...(settings.promisorRemoteInfo !== undefined
+        ? { promisorRemoteInfo: settings.promisorRemoteInfo }
+        : {}),
       ...(head && "target" in head ? { currentBranch: head.target } : {}),
     }))().finally(() => server.close?.());
   try {

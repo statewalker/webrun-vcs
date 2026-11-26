@@ -109,6 +109,7 @@ export * from "./patch-id-command.js";
 export * from "./plumbing-command.js";
 export * from "./pretty-format.js";
 export * from "./promisor-remote.js";
+export * from "./promisor-remote-reply.js";
 export * from "./pull-command.js";
 export * from "./push-command.js";
 export * from "./range-diff/index.js";
