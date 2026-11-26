@@ -694,6 +694,20 @@ C ba ""
     await importTwin(emptyRepo("l"), stream);
   });
 
+  it('t9300-fast-import.sh: "F: non-fast-forward update skips" (through the symbolic ref HEAD)', async () => {
+    const stream = `commit HEAD\n${C}\ndata 2\nH\nfrom refs/heads/main\nM 644 inline f\ndata 2\nf\n\nreset HEAD\nfrom refs/heads/main\n\n`;
+    await importTwin(base, stream);
+    await importTwin(base, `commit HEAD\n${C}\ndata 2\nH\nM 644 inline f\ndata 2\nf\n\n`, [
+      "--force",
+    ]);
+    const head = (d: string) => readFileSync(join(d, ".git/HEAD"), "latin1");
+    const { nativeDir, oursDir } = await importTwin(
+      base,
+      `commit HEAD\n${C}\ndata 2\nH\nfrom refs/heads/main\nM 644 inline g\ndata 2\ng\n\n`,
+    );
+    expect(head(oursDir)).toBe(head(nativeDir));
+  });
+
   it('t9300-fast-import.sh: "O: comments are all skipped", "P: superproject & submodule mix", "Q: commit notes" (merge)', async () => {
     const stream = `#we will
 commit refs/heads/O1

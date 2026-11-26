@@ -12,7 +12,7 @@
  */
 
 import type { ObjectId } from "@statewalker/vcs-core";
-import { isValidRefName, isValidWorktreePath } from "@statewalker/vcs-core";
+import { isSymbolicRef, isValidRefName, isValidWorktreePath } from "@statewalker/vcs-core";
 import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { cUnquote } from "../apply/latin1.js";
 import { localTimezoneOffset, parseGitDate } from "../git-date.js";
@@ -1358,17 +1358,26 @@ export class FastImportCommand extends PlumbingCommand {
         return true;
       }
     }
-    await this.refsStore.set(name, b.oid, this.reflogLine("fast-import"));
+    // a ref transaction without REF_NO_DEREF: a symbolic ref (`commit HEAD`) moves its target
+    await this.refsStore.set(await this.symrefTarget(name), b.oid, this.reflogLine("fast-import"));
     return false;
+  }
+
+  /** The ref a name ends at through symbolic refs (what a dereferencing update writes). */
+  private async symrefTarget(name: string): Promise<string> {
+    let current = name;
+    for (let depth = 0; depth < 5; depth++) {
+      const ref = await this.refsStore.get(current).catch(() => undefined);
+      if (!ref || !isSymbolicRef(ref)) break;
+      current = ref.target;
+    }
+    return current;
   }
 
   private async dumpTags(): Promise<void> {
     for (const t of this.tags) {
-      await this.refsStore.set(
-        `refs/tags/${this.refName(t.name)}`,
-        t.id,
-        this.reflogLine("fast-import"),
-      );
+      const name = await this.symrefTarget(`refs/tags/${this.refName(t.name)}`);
+      await this.refsStore.set(name, t.id, this.reflogLine("fast-import"));
     }
   }
 }
