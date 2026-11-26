@@ -625,7 +625,8 @@ export class IndexFile {
     entries: readonly StagingEntry[],
     settings: IndexSettings,
   ): IndexExtension | undefined {
-    if (!this.fsmonitor || settings.fsmonitor === false) return undefined;
+    if (!this.fsmonitor) return undefined;
+    if (settings.fsmonitor === false && !this.fsmonitor.writtenWhileDisabled) return undefined;
     return {
       signature: FSMONITOR_EXTENSION,
       data: encodeFsmonitorExtension(this.fsmonitor, entries),
