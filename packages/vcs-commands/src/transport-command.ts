@@ -11,6 +11,7 @@ import { hostEnvironmentOf } from "./commands/git-ident.js";
 import { httpClientSettingsOf } from "./commands/http-config.js";
 import { createPromisorFetcher, promisorOf } from "./commands/promisor-remote.js";
 import {
+  bundleRemoteOf,
   httpSessionSettings,
   openResolvedRemote,
   type PreparedRemote,
@@ -277,7 +278,41 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
    * `protocol.allow` refuses, a URL nothing here reaches, a path holding no repository.
    */
   protected prepareRemote(url: string): Promise<PreparedRemote> {
-    return prepareRemote(this._workingCopy, url, this.getTransports());
+    return this.givenBundle(url) ?? prepareRemote(this._workingCopy, url, this.getTransports());
+  }
+
+  /**
+   * The remote at `url` is this bundle (git's bundle transport, for hosts without files, or
+   * bytes already in memory): fetch, clone, pull and ls-remote of `url` read it as they read
+   * a bundle file at a path, with git's checks (prerequisites, a filtered bundle's clone
+   * refused). Bytes that do not read as a bundle leave `url` to its usual transport.
+   *
+   * @example
+   * ```ts
+   * await git.fetch().addBundle("repo.bundle", bytes).setRemote("repo.bundle").call();
+   * ```
+   */
+  addBundle(url: string, bundle: Uint8Array): this {
+    this.checkCallable();
+    this.bundles.set(url, bundle);
+    return this;
+  }
+
+  /** Bundles given by {@link addBundle}, by URL */
+  protected readonly bundles = new Map<string, Uint8Array>();
+
+  /** Whether {@link addBundle} gave bytes for `url` that read as a bundle */
+  protected hasGivenBundle(url: string): boolean {
+    const bytes = this.bundles.get(url);
+    return bytes !== undefined && bundleRemoteOf(this._workingCopy, bytes, url) !== undefined;
+  }
+
+  /** The bundle {@link addBundle} gave for `url`, as a prepared remote */
+  private givenBundle(url: string): Promise<PreparedRemote> | undefined {
+    const bytes = this.bundles.get(url);
+    if (!bytes) return undefined;
+    const remote = bundleRemoteOf(this._workingCopy, bytes, url);
+    return remote ? Promise.resolve({ kind: "bundle", url, path: url, remote }) : undefined;
   }
 
   /**
@@ -285,11 +320,14 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
    * refused in git's words) now, the repository opened later by {@link openRemote}.
    */
   protected resolveRemote(url: string): ResolvedRemote {
+    if (this.hasGivenBundle(url)) return { kind: "local", url, path: url };
     return resolveRemote(url, remoteContextOf(this._workingCopy, this.getTransports()));
   }
 
   /** Opens the local repository of a remote {@link resolveRemote} resolved. */
   protected openRemote(resolved: ResolvedRemote): Promise<PreparedRemote> {
+    const given = this.givenBundle(resolved.url);
+    if (given) return given;
     return openResolvedRemote(this._workingCopy, resolved);
   }
 
@@ -325,6 +363,7 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
   protected configureChild<C extends TransportCommand<unknown>>(child: C): C {
     child.shareHooksOf(this);
     child.setTransports(this.getTransports());
+    for (const [url, bytes] of this.bundles) child.addBundle(url, bytes);
     if (this.credentials) child.setCredentials(this.credentials);
     if (this.headers) child.setHeaders(this.headers);
     if (this.timeout) child.setTimeout(this.timeout);
