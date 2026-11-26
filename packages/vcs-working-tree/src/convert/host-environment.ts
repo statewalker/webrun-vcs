@@ -261,9 +261,21 @@ export interface GitHostEnvironment {
    * fsmonitor.c): a host with a watcher of its own answers here, for the hook protocol
    * (`core.fsmonitor=<program>`) or for git's builtin daemon (`core.fsmonitor=true`).
    * Absent: a hook is run through {@link hookRunner} (none: the query fails), and the
-   * builtin daemon is never there (git's token `builtin:fake`, every entry checked).
+   * builtin daemon is asked through {@link openIpcPort} (none, or no daemon listening: git's
+   * token `builtin:fake`, every entry checked).
    */
   fsmonitor?: FsmonitorProvider;
+  /**
+   * Opens a byte port to a local IPC endpoint git talks to over simple-ipc: today the builtin
+   * file system monitor daemon (`core.fsmonitor=true`), at `<git dir>/fsmonitor--daemon.ipc`.
+   * The port speaks webrun-rpc's stream tier (`duplexOverPort` on the commands' side, one
+   * stream per port); a rejection is a daemon that is not there. Absent: no daemon is ever
+   * asked. `connectSocketPort` of `@statewalker/vcs-utils-node` opens a Unix socket so (the
+   * Node host environment's default); a browser host may bridge a worker or a WebSocket.
+   * The commands never start a daemon (git spawns `git fsmonitor--daemon start` when none
+   * listens): that is the host's to do.
+   */
+  openIpcPort?: (request: IpcPortRequest) => Promise<MessagePort>;
   /**
    * Signs what git signs (commits now; tags and push certificates later): the commands
    * resolve what git's `sign_buffer` would run (`gpg.format`, the program, the key) and hand
@@ -683,6 +695,18 @@ export function withoutCommandLineConfig<T extends GitHostEnvironment | undefine
     commandLineConfig: { value: undefined, enumerable: true },
     commandLineConfigError: { value: undefined, enumerable: true },
   }) as T;
+}
+
+/** What {@link GitHostEnvironment.openIpcPort} is asked to open. */
+export interface IpcPortRequest {
+  /** The service behind the endpoint (git's simple-ipc users: the fsmonitor daemon) */
+  service: "fsmonitor--daemon";
+  /**
+   * The endpoint's host path (`<git dir>/fsmonitor--daemon.ipc`, git's
+   * `fsmonitor_ipc__get_default_path`; a host on a remote file system may redirect it as
+   * git's `fsmonitor.socketDir` does)
+   */
+  path: string;
 }
 
 /** A question to the file system monitor: what changed since `token`. */

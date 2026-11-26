@@ -43,6 +43,7 @@ export * from "./fmt-merge-msg-command.js";
 export * from "./format-patch-command.js";
 export * from "./format-rev-command.js";
 export * from "./fsck/index.js";
+export * from "./fsmonitor-ipc.js";
 export * from "./gc-command.js";
 export * from "./git-describe.js";
 export * from "./git-hooks.js";

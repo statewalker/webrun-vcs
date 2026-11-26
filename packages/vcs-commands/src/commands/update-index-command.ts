@@ -790,7 +790,7 @@ class UpdateIndexRun {
     const state = this.ctx.fsmonitor;
     if (state) {
       state.markInvalid(ce);
-      if (mark) state.markValid(ce);
+      if (mark) state.markValid(ce, { gitlinks: true });
     }
     this.invalidate(path);
     this.changed = true;
