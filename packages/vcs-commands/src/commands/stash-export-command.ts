@@ -254,10 +254,13 @@ export class StashExportCommand extends StashChainCommand<StashExportResult> {
     return { commit: tip, errors };
   }
 
-  /** The ids `refs/stash`'s reflog records, newest first (the ref alone without reflogs) */
+  /** The ids `refs/stash`'s reflog records, newest first (the ref alone for a store keeping no reflogs) */
   private async stashReflog(): Promise<ObjectId[]> {
-    const reflog = await this.refsStore.getReflog?.(STASH_REF);
-    if (reflog) return (await reflog.getReverseEntries()).map((e) => e.newId);
+    // git walks the reflog alone: a refs/stash without one exports no stash
+    if (this.refsStore.getReflog) {
+      const reflog = await this.refsStore.getReflog(STASH_REF);
+      return reflog ? (await reflog.getReverseEntries()).map((e) => e.newId) : [];
+    }
     const top = await this.refsStore.resolve(STASH_REF).catch(() => undefined);
     return top?.objectId ? [top.objectId] : [];
   }

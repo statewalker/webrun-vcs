@@ -201,6 +201,14 @@ describeGit("stash export and import against native git", () => {
     },
   );
 
+  it51("refs/stash without a reflog: nothing exported, as git walks only the reflog", async () => {
+    await twin(
+      'echo 4 >>file\ngit update-ref refs/stash "$(git stash create)"\ngit checkout -q -- file',
+      ["stash", "export", "--print"],
+      (g) => g.stashExport().setPrint(true),
+    );
+  });
+
   it51('t3903-stash.sh: "stash export rejects invalid arguments"', async () => {
     await twin(TWO_STASHES, ["stash", "export", "--print", "--to-ref", "refs/heads/invalid"], (g) =>
       g.stashExport().setPrint(true).setToRef("refs/heads/invalid"),
