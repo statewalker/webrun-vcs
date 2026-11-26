@@ -11,6 +11,9 @@
  *    result is exactly `reach(wants) \ reach(haves)`. (The plain walk, `listObjects`, marks
  *    only the trees of the boundary commits uninteresting, as git's revision walk does, so it
  *    may list a few more objects; both give a valid pack.)
+ *  - pseudo-merges (`pseudo-merge.ts`) apply as git's `cascade_pseudo_merges`: one whose
+ *    parents are all among the roots adds what they reach before the walk, and once the walk
+ *    is over any whose parents it found adds its bitmap too (until none applies);
  *  - filters git's bitmaps support (`blob:none`, `tree:0`, `object:type=<t>`) clear their
  *    types from the result, wants themselves kept; any other filter is not handled here.
  *
@@ -18,7 +21,7 @@
  * ones, each with the name hash of its path from the bitmap's name-hash cache (git feeds those
  * to the delta search), as `traverse_bitmap_commit_list` lists them.
  */
-import { RawBitmap } from "@statewalker/vcs-utils";
+import { type EwahBitmap, RawBitmap } from "@statewalker/vcs-utils";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import type { ObjectId } from "../common/id/index.js";
@@ -84,6 +87,8 @@ export interface BitmapWalkResult {
   readonly count: number;
   /** Commits walked because no stored bitmap covered them. */
   readonly walkedCommits: number;
+  /** Pseudo-merges applied (git's trace2 `pseudo_merges_satisfied`). */
+  readonly pseudoMergesSatisfied: number;
   has(id: ObjectId): boolean;
   /** The objects, by type (commits, trees, blobs, tags) in pack order, then the extended ones. */
   objects(): Generator<BitmapListedObject>;
@@ -116,6 +121,8 @@ export async function bitmapWalk(
   const extHashes: number[] = [];
   const extPos = new Map<ObjectId, number>();
   let walkedCommits = 0;
+  let pseudoMergesSatisfied = 0;
+  const pseudoParents = index.pseudoMerges.map((m) => RawBitmap.fromEwah(m.commits));
 
   const posOf = (id: ObjectId): number => {
     const p = index.position(id);
@@ -178,6 +185,32 @@ export async function bitmapWalk(
     const known = (p: number) => p >= 0 && (out.get(p) || (seen?.get(p) ?? false));
     const commitStack: ObjectId[] = [];
     const treeStack: { id: ObjectId; path: string }[] = [];
+    // git's cascade_pseudo_merges: a pseudo-merge whose parents are all among `against`
+    // (the roots, or what was found) adds what they reach, until none applies
+    const satisfied = new Uint8Array(pseudoParents.length);
+    const cascade = (against: RawBitmap) => {
+      for (let any = true; any; ) {
+        any = false;
+        for (let i = 0; i < pseudoParents.length; i++) {
+          if (satisfied[i] || !(pseudoParents[i] as RawBitmap).isSubsetOf(against)) continue;
+          const bitmap = (index.pseudoMerges[i] as { bitmap: EwahBitmap }).bitmap;
+          out.orEwah(bitmap, count);
+          if (against !== out) against.orEwah(bitmap, count);
+          satisfied[i] = 1;
+          pseudoMergesSatisfied++;
+          any = true;
+        }
+      }
+    };
+    const rootList = [...roots];
+    if (pseudoParents.length) {
+      const rootBits = new RawBitmap(Math.ceil(count / 64) + 1);
+      for (const id of rootList) {
+        const p = index.position(id);
+        if (p >= 0) rootBits.set(p);
+      }
+      cascade(rootBits);
+    }
 
     const addTree = async (root: ObjectId, rootPath: string) => {
       treeStack.push({ id: root, path: rootPath });
@@ -207,7 +240,7 @@ export async function bitmapWalk(
       }
     };
 
-    for (const root of roots) {
+    for (const root of rootList) {
       let id = root;
       for (let depth = 0; depth < 64; depth++) {
         // git's prepare_bitmap_walk lists each tag of a want and what it peels to
@@ -253,6 +286,7 @@ export async function bitmapWalk(
       trees.push(info.tree);
       for (const parent of info.parents) if (!known(posOf(parent))) commitStack.push(parent);
     }
+    if (pseudoParents.length) cascade(out);
     for (const t of trees) await addTree(t, "");
     return out;
   };
@@ -358,6 +392,7 @@ export async function bitmapWalk(
   return {
     count: total,
     walkedCommits,
+    pseudoMergesSatisfied,
     has(id) {
       const p = posOf(id);
       return p >= 0 && result.get(p);
