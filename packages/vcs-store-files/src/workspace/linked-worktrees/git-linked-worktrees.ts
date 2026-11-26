@@ -106,6 +106,18 @@ export interface GitLinkedWorktreesOptions
    * or empty, so the worktree is not listed; without it such a worktree is refused.
    */
   workTree?: string;
+  /**
+   * The current worktree's top as git's setup found it (`$GIT_WORK_TREE`, `core.worktree`;
+   * `setupGitDirectory`'s `workTree`): {@link GitLinkedWorktrees.openCurrent} opens it in
+   * place of the listed directory. A FilesApi path, or a host path below the root.
+   */
+  currentWorkTree?: string;
+  /**
+   * The current worktree's index file (`$GIT_INDEX_FILE`, as `setupGitDirectory` resolves
+   * it: `index.lock` in a `commit -a` hook), a FilesApi path; default `<gitDir>/index`.
+   * Only the current worktree's working copy reads it; the other worktrees keep their own.
+   */
+  indexFile?: string;
 }
 
 /**
@@ -1006,6 +1018,11 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
    */
   async openCurrent(): Promise<WorkingCopy> {
     const current = (await this.list()).find((wt) => wt.current);
+    // $GIT_WORK_TREE gives even a bare repository a work tree (GIT_DIR=x.git GIT_WORK_TREE=.)
+    const { currentWorkTree } = this.options;
+    if (current && currentWorkTree !== undefined) {
+      return this.open({ ...current, bare: false, path: this.hostPath(currentWorkTree) });
+    }
     if (current?.bare) throw new Error("this operation must be run in a work tree");
     if (current) return this.open(current);
     const id = this.gitDir.slice(this.gitDir.lastIndexOf("/") + 1);
@@ -1074,7 +1091,9 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
   async openAdmin(): Promise<WorktreeAdmin> {
     const current = (await this.list()).find((wt) => wt.current);
     // the current working copy (open() gives every one its worktrees)
-    if (!current?.bare) return (await this.openCurrent()) as WorkingCopy & WorktreeAdmin;
+    if (!current?.bare || this.options.currentWorkTree !== undefined) {
+      return (await this.openCurrent()) as WorkingCopy & WorktreeAdmin;
+    }
     const config = await createWorkingCopyConfig(this.configFiles(), this.commonDir, undefined, {
       ...(this.options.environment ? { environment: this.options.environment } : {}),
       ...this.includeOptions(),
@@ -1154,8 +1173,17 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
             objects: base.objects,
             packs: base.packs,
           });
-    const staging = new FileStagingStore(this.files, `${gitDir}/index`, {
+    // $GIT_INDEX_FILE: the current worktree's index where git's setup put it
+    const indexFile =
+      entry.current && this.options.indexFile !== undefined
+        ? normalizePath(this.options.indexFile)
+        : `${gitDir}/index`;
+    const staging = new FileStagingStore(this.files, indexFile, {
       defaultTrees: this.history.trees,
+      // shared indexes in the git directory and the repository's object format, wherever
+      // $GIT_INDEX_FILE puts the index
+      gitDir,
+      objectFormat: objectFormatOf(this.history.objects),
     });
     await staging.read();
     const checkout = new GitCheckout({
