@@ -1,6 +1,0 @@
----
-"@statewalker/vcs-transport": minor
-"@statewalker/vcs-commands": minor
----
-
-`git daemon`'s front end (statewalker/statewalker-root#385), the socket left to the host: `createGitDaemon` serves the connections a host accepts with `--max-connections` (git-daemon's child list: over the limit the newest idle connection of a doubled address is cut off, a connection already being served is not, and the new one waits a second, then is dropped without an answer), on top of `serveGitConnection`'s `--init-timeout`/`--timeout`. `createBasePathResolver` takes `interpolatedPath` (`%H`, `%CH`, `%IP`, `%P`, `%D`, `%%`; only for requests with `host=`, the expansion kept inside `basePath` and the whitelist) and `lookupHost` (default `lookupLiteralHost`), sets `ServedRepository.path`/`gitDir`, and throws `RepositoryNotExportedError` for a repository without `git-daemon-export-ok` (the informative refusal is now git's "repository not exported"; the smart-HTTP handler still answers 404). `serveGitConnection`/`serveGitService` take `accessHook` (git-daemon's `--access-hook`: refused with the hook's first stdout line or "service rejected") and the client's `remoteAddress`/`remotePort`; vcs-commands' `daemonAccessHookOf` runs the hook through a `HookRunner` as git-daemon starts it.
