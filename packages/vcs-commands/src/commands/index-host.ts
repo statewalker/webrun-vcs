@@ -10,6 +10,7 @@
  * staging.setIndexHost?.(indexHostOf(workingCopy, staging, history.trees));
  * ```
  */
+
 import type { Trees } from "@statewalker/vcs-core";
 import { parseGitBool, parseGitInt } from "@statewalker/vcs-utils";
 import {
@@ -22,9 +23,9 @@ import {
   untrackedCacheIdent,
   type WorkingCopy,
 } from "@statewalker/vcs-working-tree";
-
 import { InvalidConfigError } from "../errors/index.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
+import { fsmonitorModeOf } from "./fsmonitor-refresh.js";
 import { approxidateCareful } from "./git-date.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { peekIndexUpdate } from "./post-index-change.js";
@@ -213,6 +214,10 @@ export async function indexSettingsOf(
   const skipHash = configValueOf(config, "index.skipHash");
   if (skipHash === undefined ? manyFilesOn : (parseGitBool(skipHash) ?? manyFilesOn)) {
     settings.skipHash = true;
+  }
+  // tweak_fsmonitor's remove_fsmonitor: with the monitor off, no FSMN is written
+  if (fsmonitorModeOf(configValueOf(config, "core.fsmonitor")).kind === "disabled") {
+    settings.fsmonitor = false;
   }
   const environment = hostEnvironmentOf(workingCopy);
   const configured = configValueOf(config, "index.version");

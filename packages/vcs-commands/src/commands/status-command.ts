@@ -1077,13 +1077,11 @@ export class StatusCommand extends GitCommand<Status> {
       host,
       this.objectFormat,
     );
-    // the directories of the paths the monitor reported, and of the entries refreshed, are
-    // read again (untracked_cache_invalidate_path on the cache as read)
+    // the directories of the paths the monitor reported (invalidated in the staging's cache
+    // by the refresh) and of the entries refreshed are read again
     const fsmInvalidated = !!fsm && (fsm.untrackedPaths.length > 0 || replacedPaths.length > 0);
     if (fsm && untrackedCache.cache) {
-      for (const path of [...fsm.untrackedPaths, ...replacedPaths]) {
-        invalidateUntrackedPath(untrackedCache.cache, path);
-      }
+      for (const path of replacedPaths) invalidateUntrackedPath(untrackedCache.cache, path);
     }
     if (worktree && this.resolvedUntracked !== "no") {
       // git's wt_status_collect_untracked: the dir flags of the modes

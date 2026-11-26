@@ -91,6 +91,15 @@ const NOTHING = `#!/bin/sh
 printf "last_update_token\\0"
 `;
 
+/** A version 2 hook answering the paths `report` listed (`.git/fsm-list`). */
+const LISTED = `#!/bin/sh
+printf "listed_token\\0"
+cat .git/fsm-list 2>/dev/null
+`;
+function report(paths: string[]) {
+  writeFileSync(join(dir, ".git/fsm-list"), paths.map((p) => `${p}\0`).join(""));
+}
+
 /** t7519/fsmonitor-all: version 1 only, the trivial answer (everything may have changed). */
 const ALL_V1 = `#!/bin/sh
 if test "$#" -ne 2
@@ -383,6 +392,55 @@ describeGit("fsmonitor against native git (t7519-status-fsmonitor.sh)", () => {
       expect(git(["ls-files", "-f"])).toBe(nativeBits);
     }
     expect(git(["ls-files", "-f"])).toContain("h dir1/tracked\n");
+  });
+
+  it("one working copy asks the monitor again for each command (a later change is seen)", async () => {
+    hook(LISTED);
+    report([]);
+    await statusTwins();
+    await statusTwins({ keep: "ours" });
+    const ours = await openOurs(dir, host());
+    expect(formatStatusPorcelain(await ours.status().call())).toBe("");
+    put("modified", "changed\n");
+    dateBack();
+    report(["modified"]);
+    const native = git(["status", "--porcelain"]);
+    expect(native).toContain(" M modified");
+    expect(formatStatusPorcelain(await ours.status().call())).toBe(native);
+  });
+
+  it("add writes the monitor's untracked-cache invalidations with its new token", async () => {
+    git(["config", "core.untrackedcache", "true"]);
+    git(["config", "status.showUntrackedFiles", "all"]);
+    hook(LISTED);
+    report([]);
+    await statusTwins();
+    await statusTwins({ keep: "ours" });
+    put("dir1/fresh", "x\n");
+    put("modified", "changed\n");
+    dateBack();
+    report(["dir1/fresh", "modified"]);
+    const saved = saveIndex();
+    git(["add", "modified"]);
+    const nativeIndex = readFileSync(indexPath());
+    restoreIndex(saved);
+    await (await openOurs(dir, host())).add().addFilepattern("modified").call();
+    expect(readFileSync(indexPath()).toString("hex")).toBe(nativeIndex.toString("hex"));
+    // the monitor has nothing more to say: the new file is still found
+    report([]);
+    expect(git(["status", "--porcelain"])).toContain("?? dir1/fresh");
+  });
+
+  it("with the monitor off, any index write drops the extension (tweak_fsmonitor)", async () => {
+    hook(NOTHING);
+    await statusTwins();
+    git(["config", "core.fsmonitor", ""]);
+    put("modified", "changed\n");
+    const ours = await openOurs(dir, host());
+    await ours.add().addFilepattern("modified").call();
+    expect(await fsmnOf(readFileSync(indexPath()))).toBeUndefined();
+    await ours.reset().call();
+    expect(await fsmnOf(readFileSync(indexPath()))).toBeUndefined();
   });
 
   it("a host callback answers as the hook would, and a throwing one checks every entry", async () => {

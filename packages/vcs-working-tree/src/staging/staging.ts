@@ -241,6 +241,12 @@ export interface Staging {
   setUntrackedCache?(cache: UntrackedCache | null): void;
 
   /**
+   * `cache` as the untracked cache of the next write, without asking for one (git's in-core
+   * cache edited without `UNTRACKED_CHANGED`: the fsmonitor's invalidations)
+   */
+  carryUntrackedCache?(cache: UntrackedCache): void;
+
+  /**
    * The index's fsmonitor state (`FSMN`): its token and the entries' valid bits, edited in
    * place by the commands that ask the monitor (`markValid`); undefined when there is none.
    * Absent: a staging area without an index file.

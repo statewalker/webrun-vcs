@@ -454,6 +454,7 @@ export abstract class GitCommand<T> {
     const environment = hostEnvironmentOf(this._workingCopy);
     return refreshFsmonitor({
       staging,
+      owner: this,
       config: (key) => config.value(key),
       ignoreCase: parseGitBool(config.value("core.ignorecase")) === true,
       query: async (query) => {

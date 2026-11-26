@@ -390,6 +390,10 @@ export class GitStaging implements Staging {
     return this.indexFile.getFsmonitor();
   }
 
+  carryUntrackedCache(cache: UntrackedCache): void {
+    this.indexFile.setUntrackedCache(cache, this._entries);
+  }
+
   setFsmonitor(state: FsmonitorState | undefined): void {
     this.indexFile.setFsmonitor(state);
   }

@@ -22,6 +22,7 @@ import {
   type FsmonitorAnswer,
   type FsmonitorQuery,
   FsmonitorState,
+  invalidateUntrackedPath,
   type Staging,
   type StagingEntry,
 } from "@statewalker/vcs-working-tree";
@@ -70,9 +71,14 @@ export interface RefreshFsmonitorOptions {
   ignoreCase?: boolean;
   /** The current time in nanoseconds since the epoch (git's `getnanotime`), for tests */
   nanotime?: () => bigint;
+  /**
+   * The command run asking (git: the process that read the index): the monitor is asked
+   * once per owner, again for the next one, even over the same index in memory
+   */
+  owner?: object;
 }
 
-const runs = new WeakMap<FsmonitorState, FsmonitorRun>();
+const runs = new WeakMap<FsmonitorState, { owner: object | undefined; run: FsmonitorRun }>();
 
 /**
  * git's `tweak_fsmonitor` for the index `staging` holds: with the monitor off, its `FSMN`
@@ -94,7 +100,7 @@ export async function refreshFsmonitor(
   }
   if (state) {
     const done = runs.get(state);
-    if (done) return done;
+    if (done && done.owner === options.owner) return done.run;
   }
   const nanotime = options.nanotime ?? (() => BigInt(Date.now()) * 1_000_000n);
   if (!state) {
@@ -104,9 +110,19 @@ export async function refreshFsmonitor(
     staging.setFsmonitor(state);
   }
   const run: FsmonitorRun = { state, untrackedPaths: [], warnings: [] };
-  runs.set(state, run);
+  runs.set(state, { owner: options.owner, run });
   state.hasRun = true;
   await refresh(run, mode, options, nanotime);
+  // the untracked cache in memory loses the reported directories (refresh_fsmonitor's
+  // untracked_cache_invalidate_trimmed_path), carried by whatever writes the index next:
+  // the new token must never be written beside directories the monitor reported
+  if (run.untrackedPaths.length > 0 && staging.carryUntrackedCache) {
+    const cache = staging.getUntrackedCache?.();
+    if (cache) {
+      for (const path of run.untrackedPaths) invalidateUntrackedPath(cache, path);
+      staging.carryUntrackedCache(cache);
+    }
+  }
   return run;
 }
 
