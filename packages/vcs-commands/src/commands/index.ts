@@ -149,6 +149,7 @@ export { SequencerOperation } from "./sequencer-pick.js";
 export * from "./serve-repository.js";
 export * from "./shortlog.js";
 export * from "./shortlog-command.js";
+export * from "./show-branch-command.js";
 export * from "./show-command.js";
 export * from "./show-ref-command.js";
 export * from "./signature-check.js";
