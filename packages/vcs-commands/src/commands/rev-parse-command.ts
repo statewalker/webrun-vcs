@@ -143,6 +143,8 @@ export class RevParseCommand extends GitCommand<RevParseResult> {
     const lines: string[] = [];
     // git's as_is: 1 after the first path (later ones verified), 2 after `--`
     let asIs = 0;
+    // --output-object-format: the format the revisions after it are printed in
+    let output: "storage" | "compat" | undefined;
     for (const arg of this.args) {
       if (asIs) {
         lines.push(arg);
@@ -154,22 +156,54 @@ export class RevParseCommand extends GitCommand<RevParseResult> {
         lines.push(arg);
         continue;
       }
-      // --show-object-format[=storage|input|output]: the repository's hash (all three agree
-      // without a compatibility format)
+      // --show-object-format[=storage|input|output|compat]: the repository's hash, or its
+      // compatibility hash (an empty line without one)
       if (arg === "--show-object-format" || arg.startsWith("--show-object-format=")) {
         const mode = arg.slice("--show-object-format=".length);
-        if (arg.includes("=") && mode !== "storage" && mode !== "input" && mode !== "output") {
+        if (
+          arg.includes("=") &&
+          mode !== "storage" &&
+          mode !== "input" &&
+          mode !== "output" &&
+          mode !== "compat"
+        ) {
           throw new RevisionError(arg, `fatal: unknown mode for --show-object-format: ${mode}`);
         }
-        lines.push(this.objectFormat.name);
+        lines.push(
+          arg.includes("=") && mode === "compat"
+            ? (this.compatObjects?.compat.name ?? "")
+            : this.objectFormat.name,
+        );
+        continue;
+      }
+      // --output-object-format=<format>: the revisions after it printed in that format
+      // (the storage one, or the compatibility one), full ids of either format taken as
+      // given (GET_OID_HASH_ANY)
+      if (arg === "--output-object-format" || arg.startsWith("--output-object-format=")) {
+        if (arg === "--output-object-format") {
+          throw new RevisionError(arg, "fatal: no object format specified");
+        }
+        const name = arg.slice("--output-object-format=".length);
+        const compat = this.compatObjects;
+        if (name === this.objectFormat.name || name === "storage") output = "storage";
+        else if (compat && name === compat.compat.name) output = "compat";
+        else throw new RevisionError(arg, `fatal: unsupported object format: ${name}`);
         continue;
       }
       if (await this.tryDifference(resolver, arg, lines)) continue;
       if (await this.tryParentShorthands(resolver, arg, lines)) continue;
       const reversed = arg.startsWith("^");
       let id: ObjectId | undefined;
+      if (output !== undefined) {
+        const translated = await this.translatedRevision(reversed ? arg.slice(1) : arg, output);
+        if (translated !== undefined) {
+          lines.push(reversed ? `^${translated}` : translated);
+          continue;
+        }
+      }
       try {
         id = await resolver.resolve(reversed ? arg.slice(1) : arg);
+        if (id !== undefined && output === "compat") id = await this.outputCompat(id);
       } catch (error) {
         if (error instanceof RevisionError && resolver.warnings.length > 0) {
           throw new RevisionError(arg, [...resolver.warnings, error.message].join("\n"));
@@ -200,6 +234,30 @@ export class RevParseCommand extends GitCommand<RevParseResult> {
       warnings: [...(await this.replacementMessages()), ...resolver.warnings],
       lines,
     };
+  }
+
+  /**
+   * A full id of the compatibility format under `--output-object-format` (git's
+   * `GET_OID_HASH_ANY`): printed as given in that format, else as the storage id the map
+   * gives (as given when it has none, as git's ignored `repo_oid_to_algop` failure leaves it).
+   * Undefined for anything else.
+   */
+  private async translatedRevision(
+    name: string,
+    output: "storage" | "compat",
+  ): Promise<string | undefined> {
+    const compat = this.compatObjects;
+    if (!compat || name.length !== compat.compat.hexLength || !/^[0-9a-fA-F]+$/.test(name)) {
+      return undefined;
+    }
+    const id = name.toLowerCase();
+    if (output === "compat") return id;
+    return (await compat.toStorage(id)) ?? id;
+  }
+
+  /** `id` in the compatibility format, as the map gives it (else as it is, as git) */
+  private async outputCompat(id: ObjectId): Promise<ObjectId> {
+    return (await this.compatObjects?.toCompat(id)) ?? id;
   }
 
   /**

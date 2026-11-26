@@ -47,6 +47,7 @@ import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { assertAlternatesReadable } from "./alternates/index.js";
+import { CompatObjectConversionError, LooseObjectMap } from "./compat/index.js";
 import { objectLinks, recentPackedObjects, writeCruftPacks } from "./cruft-pack.js";
 import { type MultiPackIndexWriteOptions, multiPackIndexWrite } from "./multi-pack-index.js";
 import { keepPackNames, objectIdPattern } from "./object-names.js";
@@ -1106,7 +1107,20 @@ async function unpackUnreachable(o: {
   // Straight into the loose store: the object kernel would skip an object it finds packed
   const objectsDir = joinPath(o.gitDir, "objects");
   const staging = filesStagingStore(o.files, objectsDir);
-  const loose = createGitObjects(staging);
+  const objectFormat = objectFormatOf(o.objects);
+  const loose = createGitObjects(staging, { objectFormat });
+  // extensions.compatObjectFormat: pack-objects' force_object_loose writes an object loose
+  // only with its compatibility id, which a packed object has only from an earlier loose
+  // write (the map keeps it); one never mapped stops the repack, as git dies
+  const { compatObjectFormat } = await readRepositoryFormat(o.files, o.gitDir);
+  const compatMap = compatObjectFormat
+    ? new LooseObjectMap({
+        files: o.files,
+        objectsDir,
+        storage: objectFormat,
+        compat: compatObjectFormat,
+      })
+    : undefined;
   // git compares whole seconds; an unknown age is never expired
   const cutoffSeconds = Math.floor(o.cutoff / 1000);
   const young = (modified: number | undefined) =>
@@ -1126,6 +1140,12 @@ async function unpackUnreachable(o: {
       const kept = await staging.renew(id);
       if (kept === "renewed") written++;
       if (kept) continue;
+      if (compatMap && (await compatMap.toCompat(id)) === undefined) {
+        throw new CompatObjectConversionError([
+          `error: cannot map object ${id} to ${compatMap.compat.name}`,
+          "fatal: unable to force loose object",
+        ]);
+      }
       await loose.putRaw(id, o.objects.getRaw(id));
       written++;
     }

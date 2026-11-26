@@ -21,6 +21,7 @@ import {
 } from "@statewalker/vcs-core";
 import { timestampedId, timestampOfId } from "@statewalker/vcs-utils";
 import { type FilesApi, moveCompleting } from "@statewalker/vcs-utils/files";
+import { LooseObjectMap, withCompatWrites } from "../compat/index.js";
 import { skipPacked, withPacks } from "../pack/with-packs.js";
 import { filesStagingStore } from "../storage/loose/files-staging-store.js";
 
@@ -52,6 +53,11 @@ export interface FilesQuarantineOptions {
   objects: GitObjects;
   /** The repository's packs, rescanned once a quarantined pack is moved in */
   packs: PackSet;
+  /**
+   * The repository's loose object map (`extensions.compatObjectFormat`): the quarantine's
+   * loose writes keep a map of their own over it, merged into it on commit
+   */
+  compatMap?: LooseObjectMap;
   /** Passed to the quarantine's loose store and packs (see `createGitFilesBackend`) */
   freshenMaxAgeMs?: number;
 }
@@ -121,11 +127,34 @@ export async function beginFilesQuarantine(
       ? { writeReverseIndex: options.packs.writeReverseIndex }
       : {}),
   });
+  // extensions.compatObjectFormat: the quarantine's loose objects get their compatibility ids
+  // in its own loose-object-idx (mapping through the repository's), merged into the
+  // repository's on commit, as tmp-objdir's loose_object_idx_merge
+  const compatMap = options.compatMap
+    ? new LooseObjectMap({
+        files,
+        objectsDir: dir,
+        storage: options.compatMap.storage,
+        compat: options.compatMap.compat,
+        parent: options.compatMap,
+      })
+    : undefined;
+  const quarantineLoose = createGitObjects(
+    skipPacked(staging, packs),
+    sha1 ? {} : { objectFormat },
+  );
+  let overlayRef: GitObjects | undefined;
   const quarantined = withPacks(
-    createGitObjects(skipPacked(staging, packs), sha1 ? {} : { objectFormat }),
+    compatMap
+      ? withCompatWrites(quarantineLoose, {
+          map: compatMap,
+          has: (id) => (overlayRef ?? quarantineLoose).has(id),
+        })
+      : quarantineLoose,
     packs,
   );
   const overlay = overlayObjects(quarantined, options.objects);
+  overlayRef = overlay;
 
   const close = async () => {
     closed = true;
@@ -173,6 +202,9 @@ export async function beginFilesQuarantine(
   };
 
   const migrate = async () => {
+    // the loose objects' compatibility ids first: a crash before the objects move leaves
+    // lines for absent objects (harmless, as after a prune), never an unmapped loose object
+    if (compatMap && options.compatMap) await options.compatMap.addAll(await compatMap.entries());
     // loose objects: an object the repository already has is dropped
     const fanouts: string[] = [];
     for await (const e of files.list(dir)) {

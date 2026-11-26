@@ -3,6 +3,7 @@ import type {
   Blobs,
   Commit,
   Commits,
+  CompatObjects,
   ObjectId,
   PersonIdent,
   Ref,
@@ -695,6 +696,14 @@ export abstract class GitCommand<T> {
    */
   protected get objectFormat(): ObjectFormat {
     return objectFormatOf(this._workingCopy.history);
+  }
+
+  /**
+   * The repository's compatibility object format (`extensions.compatObjectFormat`): its id
+   * map and converted objects; undefined without one.
+   */
+  protected get compatObjects(): CompatObjects | undefined {
+    return this._workingCopy.history.objects?.compat;
   }
 
   /** Whether `id` is a full lowercase hex id of the repository's format (40, or 64 digits) */

@@ -10,8 +10,10 @@
  * ignores every other extension, except the version-1 ones, which it refuses; version 1
  * refuses any extension it does not know; a version above 1 is refused.
  *
- * Beyond git's own check, what git knows but we do not implement is refused too: a
- * compatibility object format (`extensions.compatObjectFormat`). A SHA-256 repository
+ * Beyond git's own check, what git knows but we do not implement is refused too (a payload
+ * of `extensions.objectStorage`). A compatibility object format
+ * (`extensions.compatObjectFormat`) opens: loose writes keep `objects/loose-object-idx` as git
+ * does (`compat/`). A SHA-256 repository
  * (`extensions.objectFormat = sha256`) opens: its objects, refs and reflogs are read and
  * written with 32-byte ids, its packs, `.idx`, `.rev`, `.mtimes` and index file too; what has
  * no SHA-256 path yet (the commit-graph, the multi-pack-index, bitmaps, reftable tables, the
@@ -74,6 +76,11 @@ export interface RepositoryFormat {
    * directory is `submodule.<name>.gitdir`, which `git submodule init` writes
    */
   submodulePathConfig: boolean;
+  /**
+   * `extensions.compatObjectFormat` (version 1): the other hash whose ids the repository keeps
+   * for its loose objects (`objects/loose-object-idx`), absent when unset
+   */
+  compatObjectFormat?: ObjectFormat;
 }
 
 /** A repository whose format version or extensions we cannot read or write safely. */
@@ -159,13 +166,20 @@ export function checkRepositoryFormat(config: RepositoryFormatConfig): Repositor
         break;
       }
       case "compatobjectformat": {
-        const name = String(value);
-        if (name !== "sha1" && name !== "sha256") {
+        // git's handle_extension: the compatibility format whose ids the loose object map
+        // keeps (`compat/`)
+        if (value === true || value === undefined) {
+          throw new UnsupportedRepositoryFormatError(
+            "missing value for 'extensions.compatobjectformat'",
+          );
+        }
+        const found = typeof value === "string" ? objectFormatByName(value) : undefined;
+        if (!found) {
           throw new UnsupportedRepositoryFormatError(
             `invalid value for 'extensions.compatobjectformat': '${String(value)}'`,
           );
         }
-        unsupported.push(`extensions.compatObjectFormat = ${name}`);
+        format.compatObjectFormat = found;
         break;
       }
       case "refstorage": {
@@ -216,6 +230,12 @@ export function checkRepositoryFormat(config: RepositoryFormatConfig): Repositor
   if (version === 0 && v1Only.length > 0) {
     throw new UnsupportedRepositoryFormatError(
       `${v1Only.length === 1 ? "repo version is 0, but v1-only extension found:" : "repo version is 0, but v1-only extensions found:"}${v1Only.map((e) => `\n\t${e}`).join("")}`,
+    );
+  }
+  if (format.compatObjectFormat?.name === format.objectFormat.name) {
+    // git aborts here (repo_set_compat_hash_algo's BUG)
+    throw new UnsupportedRepositoryFormatError(
+      "BUG: repository.c:203: hash_algo and compat_hash_algo match",
     );
   }
   if (unsupported.length > 0) {

@@ -172,6 +172,12 @@ export interface GitObjects {
    */
   beginQuarantine?(): Promise<ObjectQuarantine>;
   /**
+   * The repository's compatibility object format (`extensions.compatObjectFormat`), when it
+   * has one: the map between its ids and the other format's (git's loose object map), kept by
+   * the store's loose writes. Present on the files backend of such a repository only.
+   */
+  compat?: CompatObjects;
+  /**
    * The object directories this store borrows from (git's alternates: `objects/info/alternates`
    * and `$GIT_ALTERNATE_OBJECT_DIRECTORIES`), when the store reads any: present on the files
    * backend. Reads (`get`, `has`, `list`, `listPrefix`, `approximateCount`) see their objects
@@ -298,6 +304,29 @@ export interface ObjectQuarantine {
   commit(): Promise<void>;
   /** Remove every quarantined object and close the quarantine. Safe to call more than once. */
   discard(): Promise<void>;
+}
+
+/**
+ * Ids and objects translated between a repository's object format and its compatibility
+ * format (git's `repo_oid_to_algop`, `convert_object_file`).
+ */
+export interface CompatObjects {
+  /** The repository's format (`extensions.objectFormat`) */
+  readonly storage: ObjectFormat;
+  /** The compatibility format (`extensions.compatObjectFormat`) */
+  readonly compat: ObjectFormat;
+  /** The compatibility id of `id` (a storage id), undefined when the map has none */
+  toCompat(id: ObjectId): Promise<ObjectId | undefined>;
+  /** The storage id of `compatId`, undefined when the map has none */
+  toStorage(compatId: ObjectId): Promise<ObjectId | undefined>;
+  /**
+   * The object `compatId` names, as the compatibility format sees it: its storage object
+   * converted (git's `odb_read_object_info_extended` for an id of the other format); undefined
+   * when unmapped or absent. Throws where git's conversion dies.
+   */
+  readAsCompat(
+    compatId: ObjectId,
+  ): Promise<{ type: ObjectTypeString; content: Uint8Array } | undefined>;
 }
 
 /** Options of `createGitObjects`. */

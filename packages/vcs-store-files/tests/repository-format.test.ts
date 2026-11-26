@@ -70,9 +70,24 @@ describe("repository format check", () => {
       /repo version is 0, but v1-only extension found:\n\trefstorage/,
     ],
     [
-      "a compatibility object format",
-      v(1, "\tobjectFormat = sha1\n\tcompatObjectFormat = sha256\n"),
-      /extensions\.compatObjectFormat = sha256/,
+      "a compatibility object format equal to the storage one (git aborts)",
+      v(1, "\tobjectFormat = sha1\n\tcompatObjectFormat = sha1\n"),
+      /hash_algo and compat_hash_algo match/,
+    ],
+    [
+      "an invalid compatibility object format",
+      v(1, "\tcompatObjectFormat = sha3\n"),
+      /invalid value for 'extensions.compatobjectformat': 'sha3'/,
+    ],
+    [
+      "a compatibility object format without a value",
+      v(1, "\tcompatObjectFormat\n"),
+      /missing value for 'extensions.compatobjectformat'/,
+    ],
+    [
+      "a compatibility object format in version 0",
+      v(0, "\tcompatObjectFormat = sha256\n"),
+      /repo version is 0, but v1-only extension found:\n\tcompatobjectformat/,
     ],
     [
       "an invalid object format",
@@ -105,7 +120,7 @@ describe("repository format check", () => {
   });
 
   it("refuses before writing anything, even with create", async () => {
-    const config = v(1, "\tobjectFormat = sha1\n\tcompatObjectFormat = sha256\n");
+    const config = v(1, "\tobjectFormat = sha1\n\tcompatObjectFormat = sha1\n");
     const files = await repoWithConfig(config);
     await expect(createGitFilesBackend({ files, create: true })).rejects.toBeInstanceOf(
       UnsupportedRepositoryFormatError,
