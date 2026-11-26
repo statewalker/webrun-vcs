@@ -295,15 +295,29 @@ export class RepoInfoCommand extends PlumbingCommand {
     facts.gitDir = await real(
       layout.gitDirEnv?.startsWith("/") ? layout.gitDirEnv : hostPathOf(files, layout.gitDir),
     );
-    const objects = await this.hooks.commonGitFile("objects");
-    if (objects) {
-      const common = objects.path.replace(/\/?objects$/, "");
-      facts.commonDir =
-        common.replace(/^\/+|\/+$/g, "") === layout.gitDir.replace(/^\/+|\/+$/g, "")
-          ? facts.gitDir
-          : await real(hostPathOf(objects.files, common));
-    }
-    facts.index = environment?.indexFile ?? (facts.gitDir ? `${facts.gitDir}/index` : undefined);
+    // repo_get_common_dir: $GIT_COMMON_DIR, else the git directory's `commondir` file
+    // (a linked worktree's), else the git directory itself
+    const commondirFile = facts.gitDir
+      ? await environment?.readFile(`${facts.gitDir}/commondir`).catch(() => undefined)
+      : undefined;
+    const named = commondirFile ? new TextDecoder().decode(commondirFile).trim() : undefined;
+    facts.commonDir = environment?.commonDir
+      ? await real(environment.commonDir)
+      : named
+        ? await real(named.startsWith("/") ? named : `${facts.gitDir}/${named}`)
+        : facts.gitDir;
+    const indexFile = environment?.indexFile;
+    facts.index =
+      indexFile === undefined
+        ? facts.gitDir
+          ? `${facts.gitDir}/index`
+          : undefined
+        : indexFile.startsWith("/")
+          ? indexFile
+          : // relative to the directory git was started in
+            await real(
+              `${hostPathOf(files, layout.bare ? layout.gitDir : layout.top) ?? ""}/${facts.prefix}${indexFile}`,
+            );
     if (!layout.bare) {
       facts.workTree = await real(hostPathOf(files, layout.top));
       facts.superproject = await this.superprojectOf(facts.gitDir, facts.workTree);

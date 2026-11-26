@@ -236,6 +236,19 @@ function describeRepo(native: NativeGit) {
         }
       });
 
+      it("t1900-repo-info.sh: 'absolute: gitdir standard'", async ({ skip: s }) => {
+        if (skip() || compatibility === "2.54") s();
+        // the same keys in a linked worktree (git worktree add)
+        const dir = init();
+        shell.commit(dir, "base");
+        const wt = join(shell.home, `wt${counter++}`);
+        shell.ok(dir, "worktree", "add", "-q", wt);
+        const nativeOut = shell.run(wt, ["repo", "info", "--all"]);
+        expect(await oursInfo(shell, wt, ["--all"], compatibility as RepoCompatibility)).toEqual(
+          nativeOut,
+        );
+      });
+
       it("t1900-repo-info.sh: 'path.prefix in subdirectory'", async ({ skip: s }) => {
         if (compatibility !== "2.57") s();
         const dir = init();
