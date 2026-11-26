@@ -58,7 +58,12 @@ import { atomicFilesOver } from "@statewalker/vcs-utils/files";
 import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { createGitFilesBackend } from "./create-git-files-backend.js";
-import { type BitmapSettings, isPreferredBitmapTip, readBitmapSettings } from "./repack.js";
+import {
+  type BitmapSettings,
+  isPreferredBitmapTip,
+  pseudoMergeInput,
+  readBitmapSettings,
+} from "./repack.js";
 import { readRepositoryFormat } from "./repository-format.js";
 import {
   configFilesApiOf,
@@ -609,8 +614,10 @@ async function writeMidxBitmap(
     if (o.type !== "commit") break; // commits come first
     if (midx.find(o.id) >= 0) listed.push({ id: o.id, type: "commit", nameHash: 0 });
   }
+  const pseudoMerges = await pseudoMergeInput(settings, refs, objects, c.compatibility);
   const bytes = await writePackBitmap({
     pack: multiPackIndexBitmapPack(midx),
+    ...(pseudoMerges ? { pseudoMerges } : {}),
     objects,
     listed,
     hashCache: settings.hashCache,

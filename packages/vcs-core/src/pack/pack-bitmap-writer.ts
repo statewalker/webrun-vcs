@@ -7,8 +7,8 @@
  *    window whose size grows with the distance from the newest (git's `next_commit_index`:
  *    every commit up to index 100, one in up to 100 to index 20000, then one in up to 5000), the
  *    window's last commit unless a merge comes before it or a preferred tip
- *    (`pack.preferBitmapTips`, git's NEEDS_BITMAP) is in it. Pseudo-merges (2.5x's
- *    `bitmapPseudoMerge.*`) are not written;
+ *    (`pack.preferBitmapTips`, git's NEEDS_BITMAP) is in it. Then the pseudo-merges
+ *    (`bitmapPseudoMerge.*`, `pseudo-merge.ts`), written after the selected commits;
  *  - each selected commit's bitmap: the commits it reaches and their trees and blobs (gitlinks
  *    left out), compressed as `bitmap_to_ewah` does;
  *  - the entries in commit date order, oldest first, as 2.5x sorts them (2.43 keeps the
@@ -43,8 +43,16 @@ import {
   BITMAP_OPT_FULL_DAG,
   BITMAP_OPT_HASH_CACHE,
   BITMAP_OPT_LOOKUP_TABLE,
+  BITMAP_OPT_PSEUDO_MERGES,
   type BitmapPack,
 } from "./pack-bitmap.js";
+import {
+  encodePseudoMerges,
+  type PseudoMergeGroup,
+  type PseudoMergeLayout,
+  type PseudoMergeRef,
+  selectPseudoMerges,
+} from "./pseudo-merge.js";
 import { packNameHash, packNameHashBytes } from "./write-pack.js";
 
 /** A pack the bitmap cannot describe: an object it reaches is not in it (git's warning). */
@@ -85,6 +93,16 @@ export interface PackBitmapWriteOptions {
    * them).
    */
   nameTags?: boolean;
+  /**
+   * Pseudo-merges (git 2.46+'s `bitmapPseudoMerge.*`): the configured groups, the refs in
+   * name order with their fully peeled ids, and the table layout (2.55's by default).
+   * Without groups (or with no ref matching) the file has no pseudo-merge section.
+   */
+  pseudoMerges?: {
+    groups: readonly PseudoMergeGroup[];
+    refs: Iterable<PseudoMergeRef>;
+    layout?: PseudoMergeLayout;
+  };
 }
 
 interface CommitData {
@@ -277,14 +295,15 @@ export async function writePackBitmap(options: PackBitmapWriteOptions): Promise<
   // oldest first: ancestors are usually built before their descendants and reused whole
   const buildOrder = [...selected];
   stableSort(buildOrder, (a, b) => a.date - b.date);
-  for (const sc of buildOrder) {
+  /** What `roots` reach; `self` (a selected commit) is never taken from `built`. */
+  const reach = async (roots: number[], self?: number): Promise<RawBitmap> => {
     const bitmap = new RawBitmap();
-    const stack = [sc.pos];
+    const stack = [...roots];
     const trees: number[] = [];
     while (stack.length) {
       const c = stack.pop() as number;
       if (bitmap.get(c)) continue;
-      const done = c !== sc.pos && selectedSet.has(c) ? built.get(c) : undefined;
+      const done = c !== self && selectedSet.has(c) ? built.get(c) : undefined;
       if (done) {
         bitmap.or(done);
         continue;
@@ -299,7 +318,25 @@ export async function writePackBitmap(options: PackBitmapWriteOptions): Promise<
       }
     }
     for (const t of trees) await fillTree(bitmap, t);
-    built.set(sc.pos, bitmap);
+    return bitmap;
+  };
+  for (const sc of buildOrder) built.set(sc.pos, await reach([sc.pos], sc.pos));
+
+  // ---- pseudo-merges (select_pseudo_merges), after the selected commits ----
+  const pseudo = options.pseudoMerges
+    ? selectPseudoMerges(options.pseudoMerges.groups, options.pseudoMerges.refs, (id) => {
+        const p = posOf(id);
+        const c = p < 0 ? undefined : commits.get(p);
+        return c ? { pos: p, date: c.date, hasBitmap: selectedSet.has(p) } : undefined;
+      })
+    : undefined;
+  const pseudoParents: EwahBitmap[] = [];
+  const pseudoBitmaps: EwahBitmap[] = [];
+  for (const m of pseudo?.merges ?? []) {
+    const parents = new RawBitmap();
+    for (const p of m.parents) parents.set(p);
+    pseudoParents.push(parents.toEwah());
+    pseudoBitmaps.push((await reach(m.parents)).toEwah());
   }
 
   // ---- entry order and XOR offsets (compute_xor_offsets) ----
@@ -332,6 +369,7 @@ export async function writePackBitmap(options: PackBitmapWriteOptions): Promise<
   let flags = BITMAP_OPT_FULL_DAG;
   if (hashCache) flags |= BITMAP_OPT_HASH_CACHE;
   if (lookupTable) flags |= BITMAP_OPT_LOOKUP_TABLE;
+  if (pseudoParents.length) flags |= BITMAP_OPT_PSEUDO_MERGES;
   const headerSize = 12 + raw;
   let size = headerSize;
   for (const b of typeBitmaps) size += b.serializedSize;
@@ -340,6 +378,18 @@ export async function writePackBitmap(options: PackBitmapWriteOptions): Promise<
     offsets.push(size);
     size += 6 + b.serializedSize;
   }
+  const pseudoSection =
+    pseudo && pseudoParents.length
+      ? encodePseudoMerges({
+          start: size,
+          parents: pseudoParents,
+          bitmaps: pseudoBitmaps,
+          commits: pseudo.commits,
+          idOf: (p) => pack.idAt(order[p] as number),
+          ...(options.pseudoMerges?.layout ? { layout: options.pseudoMerges.layout } : {}),
+        })
+      : undefined;
+  if (pseudoSection) size += pseudoSection.length;
   if (lookupTable) size += entries.length * 16;
   if (hashCache) size += count * 4;
   size += raw;
@@ -358,6 +408,10 @@ export async function writePackBitmap(options: PackBitmapWriteOptions): Promise<
     out[at + 4] = xorOffsets[i] as number;
     out[at + 5] = 0;
     at = (writeAs[i] as EwahBitmap).writeTo(out, at + 6);
+  }
+  if (pseudoSection) {
+    out.set(pseudoSection, at);
+    at += pseudoSection.length;
   }
   if (lookupTable) {
     const table = entries.map((_, i) => i);

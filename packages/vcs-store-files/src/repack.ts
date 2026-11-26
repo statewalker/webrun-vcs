@@ -17,9 +17,13 @@ import type {
   GitObjects,
   History,
   ListedObject,
+  ListObjectsSource,
   ObjectId,
   Pack,
+  PackBitmapWriteOptions,
   PackSet,
+  PseudoMergeRef,
+  Refs,
   ResolvedObjectFilter,
 } from "@statewalker/vcs-core";
 import {
@@ -33,6 +37,7 @@ import {
   type PackFile,
   packNameOf,
   parseObjectFilter,
+  parseTagTarget,
   resolveObjectFilter,
   writePack,
   writePackBitmap,
@@ -51,6 +56,7 @@ import {
   readPackWriteSettings,
 } from "./pack/pack-write-settings.js";
 import { type PromisorExclusions, promisorExclusions } from "./promisor-objects.js";
+import { type PseudoMergeConfigEntry, pseudoMergeGroupsOf } from "./pseudo-merge-config.js";
 import { listReachableObjects } from "./reachable-objects.js";
 import { assertObjectsAtGitDir } from "./relocated-objects.js";
 import { geometricRepack } from "./repack-geometric.js";
@@ -254,6 +260,8 @@ export interface BitmapSettings {
   preferredTips: string[];
   /** `repack.packKeptObjects`, undefined when unset */
   packKeptObjects?: boolean;
+  /** The `bitmapPseudoMerge.*` entries in reading order (read only when a bitmap is written) */
+  pseudoMergeConfig?: PseudoMergeConfigEntry[];
 }
 
 /** git's warning when a bitmap cannot cover every object. */
@@ -328,7 +336,58 @@ export async function readBitmapSettings(
     preferredTips: config
       .getAll("pack.preferBitmapTips")
       .filter((v): v is string => typeof v === "string"),
+    pseudoMergeConfig: config
+      .listWithOrigin()
+      .filter((e) => e.key.toLowerCase().startsWith("bitmappseudomerge.")),
   };
+}
+
+/**
+ * The writer's pseudo-merge input (git 2.46+): the configured groups and every ref under
+ * `refs/` in name order with its fully peeled id. Undefined without groups, or under 2.43
+ * compatibility (no pseudo-merges there). Throws `PseudoMergeConfigError` as git dies on a
+ * bad group.
+ */
+export async function pseudoMergeInput(
+  settings: Pick<BitmapSettings, "pseudoMergeConfig">,
+  refs: Refs,
+  objects: ListObjectsSource,
+  compatibility: "2.43" | "2.56" = "2.56",
+  now = Date.now() / 1000,
+): Promise<PackBitmapWriteOptions["pseudoMerges"]> {
+  if (compatibility === "2.43" || !settings.pseudoMergeConfig?.length) return undefined;
+  const { groups } = pseudoMergeGroupsOf(settings.pseudoMergeConfig, now);
+  if (groups.length === 0) return undefined;
+  const list: PseudoMergeRef[] = [];
+  for await (const ref of refs.list()) {
+    if (!ref.name.startsWith("refs/")) continue;
+    const resolved = await refs.resolve(ref.name).catch(() => undefined);
+    let id = resolved?.peeledObjectId ?? resolved?.objectId;
+    // peel tags fully (peel_iterated_oid)
+    for (let depth = 0; id && depth < 64; depth++) {
+      const o = await objects.get(id).catch(() => undefined);
+      if (!o) break;
+      if (o.type !== "tag") {
+        if (!o.bytes) await o.content[Symbol.asyncIterator]().return?.();
+        break;
+      }
+      let data = o.bytes;
+      if (!data) {
+        const chunks: Uint8Array[] = [];
+        for await (const c of o.content) chunks.push(c);
+        data = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+        let at = 0;
+        for (const c of chunks) {
+          data.set(c, at);
+          at += c.length;
+        }
+      }
+      id = parseTagTarget(id, data);
+    }
+    if (id) list.push({ name: ref.name, id });
+  }
+  list.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  return { groups, refs: list };
 }
 
 /** A config value's place in git's reading order. */
@@ -982,6 +1041,12 @@ async function installBitmap(
   }
   let bytes: Uint8Array;
   try {
+    const pseudoMerges = await pseudoMergeInput(
+      plan.settings,
+      options.history.refs,
+      options.objects,
+      plan.compatibility,
+    );
     bytes = await writePackBitmap({
       pack,
       objects: options.objects,
@@ -989,6 +1054,7 @@ async function installBitmap(
       hashCache: plan.settings.hashCache,
       lookupTable: plan.settings.lookupTable,
       preferredTips: preferred,
+      ...(pseudoMerges ? { pseudoMerges } : {}),
       ...(options.compatibility ? { compatibility: options.compatibility } : {}),
     });
   } catch (e) {
