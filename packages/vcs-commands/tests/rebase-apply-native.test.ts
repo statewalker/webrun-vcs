@@ -564,13 +564,14 @@ describeSigned("signed git rebase --apply resumed against native git", () => {
       "side",
     ]);
     expect(native.status, native.stderr).toBe(1);
-    const result = await (await fx.ours(dirs.ours))
+    const command = (await fx.ours(dirs.ours))
       .rebase()
       .setBackend("apply")
-      .setSign(key ?? true)
       .setUpstream("main")
-      .setBranch("side")
-      .call();
+      .setBranch("side");
+    if (key === undefined) command.setSign(true);
+    else command.setSigningKey(key);
+    const result = await command.call();
     expect(result.status).toBe("stopped");
     for (const dir of [dirs.native, dirs.ours]) {
       expect(readFileSync(join(dir, ".git/rebase-apply/gpg_sign_opt"), "utf8")).toBe(
