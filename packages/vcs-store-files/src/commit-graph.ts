@@ -118,6 +118,8 @@ export async function readCommitGraphSettings(
 export function createFilesCommitGraphProvider(options: {
   files: FilesApi;
   gitDir?: string;
+  /** The objects directory (default `<gitDir>/objects`): `$GIT_OBJECT_DIRECTORY` */
+  objectsDir?: string;
   refs?: Pick<Refs, "list">;
   /** The user's environment: the global and system config files are read too */
   environment?: GitHostEnvironment;
@@ -142,6 +144,7 @@ export function createFilesCommitGraphProvider(options: {
     return loadRepositoryCommitGraph({
       files,
       gitDir,
+      ...(options.objectsDir !== undefined ? { objectsDir: options.objectsDir } : {}),
       refs,
       settings: options.objectFormat
         ? { ...settings, objectFormat: options.objectFormat }

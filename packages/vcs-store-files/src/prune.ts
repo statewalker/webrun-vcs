@@ -18,6 +18,7 @@ import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { objectLinks, recentPackedObjects, typeOfObject } from "./cruft-pack.js";
 import { promisorExclusions } from "./promisor-objects.js";
 import { listReachableObjects, rebaseFileRoots } from "./reachable-objects.js";
+import { assertObjectsAtGitDir } from "./relocated-objects.js";
 import { assertObjectsDeletable, readRepositoryFormat } from "./repository-format.js";
 
 /** Options of {@link prune}. */
@@ -75,6 +76,7 @@ const FANOUT = /^[0-9a-f]{2}$/;
  */
 export async function prune(options: PruneOptions): Promise<PruneResult> {
   const { history, files, gitDir = ".git" } = options;
+  assertObjectsAtGitDir(gitDir, "prune", options.objects, history.objects, history.packs);
   const dryRun = options.dryRun ?? false;
   const show = dryRun || (options.verbose ?? false);
   const expire = options.expire ?? Number.POSITIVE_INFINITY;
