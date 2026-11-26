@@ -57,6 +57,8 @@ import {
   FsckCommand,
   GarbageCollectCommand,
   GrepCommand,
+  HistoryRewordCommand,
+  HistorySplitCommand,
   HookListCommand,
   HookRunCommand,
   InitCommand,
@@ -479,6 +481,35 @@ export class Git implements Disposable {
   showRef(): ShowRefCommand {
     this.checkClosed();
     return new ShowRefCommand(this._workingCopy);
+  }
+
+  /**
+   * `git history reword <commit>`: the commit's message edited (the editor given with
+   * `setEditor`), its descendants replayed, the branches on them moved.
+   *
+   * @example
+   * ```typescript
+   * await git.historyReword().addArgument("HEAD~1").setEditor(async () => "Better subject\n").call();
+   * ```
+   */
+  historyReword(): HistoryRewordCommand {
+    this.checkClosed();
+    return new HistoryRewordCommand(this._workingCopy);
+  }
+
+  /**
+   * `git history split <commit> [<pathspec>...]`: the hunks chosen become a new commit
+   * under the original one.
+   *
+   * @example
+   * ```typescript
+   * await git.historySplit().addArgument("HEAD")
+   *   .setPatchSelector((r) => (r.type === "hunk" ? "y" : undefined)).call();
+   * ```
+   */
+  historySplit(): HistorySplitCommand {
+    this.checkClosed();
+    return new HistorySplitCommand(this._workingCopy);
   }
 
   /**
