@@ -66,6 +66,15 @@ export interface GitFilesBackendOptions {
   files: FilesApi;
   /** Path to .git directory relative to files root (default: ".git") */
   gitDir?: string;
+  /**
+   * The objects directory in `files` (git's `$GIT_OBJECT_DIRECTORY`, as `setupGitDirectory`
+   * resolves it: a pre-receive hook's quarantine); default `<gitDir>/objects`. Loose objects,
+   * packs, `info/alternates` and the commit-graph are read there; the refs and the config
+   * stay in `gitDir`. Never derived from the environment here: a caller opening a repository
+   * of its own passes `setupGitDirectory`'s `objectDirectory` (`openRepositoryFromEnvironment`),
+   * a served repository never does.
+   */
+  objectsDir?: string;
   /** Whether to create the .git directory structure if it doesn't exist (default: false) */
   create?: boolean;
   /**
@@ -221,7 +230,7 @@ export async function createGitFilesBackend(
   // a `.git` or `.git/objects` the user linked elsewhere is followed, as git follows it
   const linked = await resolveLinkedGitDir(options.files, gitDir);
 
-  const objectsDir = joinPath(gitDir, "objects");
+  const objectsDir = options.objectsDir?.replace(/(.)\/+$/, "$1") ?? joinPath(gitDir, "objects");
   const packDir = joinPath(objectsDir, "pack");
 
   // git's check_repository_format: a version or extension we cannot honour (a compatibility
@@ -396,6 +405,7 @@ export async function createGitFilesBackend(
   const commitGraph = createFilesCommitGraphProvider({
     files,
     gitDir,
+    objectsDir,
     refs: refStore,
     environment: options.environment,
     ...(options.configIncludes === undefined ? {} : { configIncludes: options.configIncludes }),

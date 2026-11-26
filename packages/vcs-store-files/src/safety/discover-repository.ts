@@ -63,8 +63,11 @@ export interface DiscoveredRepository {
   warnings: string[];
   /**
    * With `$GIT_DIR`/`$GIT_WORK_TREE` in the environment ({@link setupGitDirectory}): the
-   * common directory, index file and objects directory the variables give. Opening a backend
-   * or staging at them is the caller's: `createGitFilesBackend` still takes `gitDir` alone.
+   * common directory, index file and objects directory the variables give. Open a repository
+   * at them with `openRepositoryFromEnvironment` (or pass them on: `createGitFilesBackend`'s
+   * `gitDir` and `objectsDir`, `openGitLinkedWorktrees`' `commonDir` and `indexFile`); a
+   * discovery without those two variables reports none, though `$GIT_INDEX_FILE` and the
+   * others may still be set (a hook): `setupGitDirectory` always resolves them.
    */
   commonDir?: string;
   indexFile?: string;
