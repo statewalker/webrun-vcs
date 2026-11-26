@@ -15,6 +15,7 @@
  */
 import type { ObjectId } from "@statewalker/vcs-core";
 
+import type { TextconvRequest, TextconvRunner } from "./diff-textconv.js";
 import { initNotes, type NotesContext, type NotesHandle, updateNotesRef } from "./notes-support.js";
 import { combineNotesOverwrite, readNoteBytes } from "./notes-tree.js";
 
@@ -99,5 +100,44 @@ export class TextconvCache {
       }
     });
     return this.queue;
+  }
+}
+
+/**
+ * diff.c's fill_textconv over the drivers' caches of one command (git's per-process
+ * caches, by driver and command): the runner's output, read from and written to the
+ * driver's notes cache when it asks for one (`diff.<driver>.cachetextconv`) and the
+ * content has an object id git knows (a blob of a tree or the index, never a worktree
+ * file's).
+ *
+ * @example
+ * ```typescript
+ * const caches = new TextconvCaches(() => this.notesContext());
+ * const text = await caches.run(runner, request, blobId);
+ * ```
+ */
+export class TextconvCaches {
+  private readonly opened = new Map<string, Promise<TextconvCache | undefined>>();
+
+  constructor(private readonly context: () => NotesContext) {}
+
+  async run(
+    runner: TextconvRunner,
+    request: TextconvRequest,
+    id: ObjectId | undefined,
+  ): Promise<Uint8Array> {
+    if (!request.cache || id === undefined) return runner(request);
+    const key = `${request.driver}\0${request.command}`;
+    let opened = this.opened.get(key);
+    if (!opened) {
+      opened = TextconvCache.open(this.context(), request.driver, request.command);
+      this.opened.set(key, opened);
+    }
+    const cache = await opened;
+    const cached = await cache?.get(id);
+    if (cached) return cached;
+    const output = await runner(request);
+    await cache?.put(id, output);
+    return output;
   }
 }
