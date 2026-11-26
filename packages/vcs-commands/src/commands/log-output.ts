@@ -216,6 +216,12 @@ export interface LogOutputOptions {
    * `mergetag`'s, after the commit's header
    */
   showSignature?: boolean;
+  /**
+   * pretty.c's `pretty_print_commit` alone, as `git format-rev` prints a commit: no
+   * `commit <id>` (or mail `From <id>`) header line, no separator between commits, no notes,
+   * and tabs not expanded (format-rev's pretty context is zeroed: `expand_tabs_in_log` 0)
+   */
+  prettyOnly?: boolean;
 }
 
 /** What `git format-patch` adds to the `email` format (log-tree.c, pretty.c). */
@@ -913,6 +919,7 @@ export class LogPrinter {
     this.verboseHeader = !options.diffTree || prettyGiven;
     const pretty = options.oneline ? "oneline" : (options.pretty ?? host.config("format.pretty"));
     this.format = parseCommitFormat(pretty, host);
+    if (options.prettyOnly) this.format = { ...this.format, expandTabs: 0 };
     const dateSpec = options.date ?? host.config("log.date");
     this.dateMode = dateSpec
       ? parseDateMode(dateSpec)
@@ -1406,6 +1413,10 @@ export class LogPrinter {
     log.pending = false;
     const { fmt } = this.format;
     if (this.options.noCommitId) return;
+    if (this.options.prettyOnly) {
+      this.out.text(await this.prettyPrint(entry, ""));
+      return;
+    }
     if (!this.verboseHeader) {
       // show_log without verbose_header: the id (and parents), the line termination
       if (this.graph) this.out.text(this.graph.showCommit());
