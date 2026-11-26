@@ -631,7 +631,7 @@ describeGit("fsmonitor against native git (t7519-status-fsmonitor.sh)", () => {
     }
   });
 
-  it("diff-index still sees an fsmonitor-valid file deleted, diff-files does not", async () => {
+  it("diff-index sees an fsmonitor-valid file deleted only as 2.43 does, diff-files never", async () => {
     hook(NOTHING);
     await updateIndexTwins(["--fsmonitor"], (c) => c.setFsmonitor(true));
     await updateIndexTwins(["--fsmonitor-valid", "modified", "tracked"], (c) =>
@@ -646,9 +646,10 @@ describeGit("fsmonitor against native git (t7519-status-fsmonitor.sh)", () => {
     const nativeDiffHead = git(["diff", "--name-status", "HEAD"]);
     restoreIndex(saved);
     const nativeFiles = git(["diff-files", "--name-status"]);
-    // the valid entries: the deleted one listed, the modified one not (other entries' stats
-    // were dated back: plumbing lists them)
-    expect(nativeIndexDiff).toContain("D\ttracked\n");
+    // the valid entries: the modified one never listed, the deleted one only by 2.43, whose
+    // check_removed still lstats it (2.5x: fake_lstat); other entries' stats were dated back
+    if (nativeIs25x) expect(nativeIndexDiff).not.toContain("\ttracked\n");
+    else expect(nativeIndexDiff).toContain("D\ttracked\n");
     expect(nativeIndexDiff).not.toMatch(/^M\tmodified$/m);
     expect(nativeFiles).not.toMatch(/\t(tracked|modified)$/m);
     restoreIndex(saved);

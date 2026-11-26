@@ -3876,12 +3876,13 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const ignoreOf = await this.submoduleIgnoreOf();
     // the file system monitor, asked as git asks it on reading the index (tweak_fsmonitor,
     // refresh_fsmonitor): an entry it reported nothing for since its token is unchanged.
-    // diff-files never stats it (run_diff_files, as CE_VALID); diff-index still lstats it
-    // (get_stat_data's check_removed: a deleted file is a deletion), only ie_match_stat's
-    // comparison is skipped
+    // diff-files never stats it (run_diff_files, as CE_VALID); diff-index of git 2.5x neither
+    // (check_removed's fake_lstat), while 2.43's check_removed still lstats it (a deleted file
+    // is a deletion there), only ie_match_stat's comparison skipped
     const fsm = await this.fsmonitorRefresh(this.staging);
     const fsmValid = (entry: StageEntry) => !!fsm && entry.stage === 0 && fsm.state.isValid(entry);
-    const fsmUnstated = (entry: StageEntry) => !unmergedAsFiles && fsmValid(entry);
+    const statsValid = unmergedAsFiles && this.hooks.compatibility === "2.43";
+    const fsmUnstated = (entry: StageEntry) => !statsValid && fsmValid(entry);
     const compareWith = async (
       entry: StageEntry,
       current?: WorktreeEntry | null,
