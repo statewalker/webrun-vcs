@@ -195,6 +195,8 @@ export function copyTwin(caseDir: string, name: string): string {
 /** The pack files of a git directory, grouped by pack. */
 interface PackState {
   kind: "cruft" | "promisor" | "keep" | "pack";
+  /** the base name's prefix when not `pack` (`loose` for `loose-<id>.pack`) */
+  prefix?: string;
   /** the object ids, sorted (with their `.mtimes` time for a cruft pack: `id@time`) */
   ids: string[];
   /** the other files beside the `.pack` and `.idx` */
@@ -273,17 +275,21 @@ export function gcSnapshot(
       multiPackIndex.push(name.replace(/[0-9a-f]{40}/, "<id>"));
       continue;
     }
-    const m = /^pack-([0-9a-f]{40})\.(\w+)$/.exec(name);
-    if (!m) {
+    // `pack-<id>`, or another base name (`loose-<id>` of the maintenance loose-objects task)
+    const named = /^([A-Za-z0-9_.]+(?:-[A-Za-z0-9_.]+)*?)-([0-9a-f]{40})\.(\w+)$/.exec(name);
+    if (!named) {
       other.push(`pack/${name}`);
       continue;
     }
+    const prefix = named[1] as string;
+    const m = [named[0], named[2], named[3]];
     if (m[2] !== "idx") continue;
-    const base = join(packDir, `pack-${m[1]}`);
+    const stem = `${prefix}-${m[1]}`;
+    const base = join(packDir, stem);
     const ids = packIds(`${base}.idx`);
     const exts = names
-      .filter((n) => n.startsWith(`pack-${m[1]}.`))
-      .map((n) => n.slice(`pack-${m[1]}.`.length))
+      .filter((n) => n.startsWith(`${stem}.`))
+      .map((n) => n.slice(`${stem}.`.length))
       .filter((e) => e !== "idx" && e !== "pack")
       .sort();
     if (!existsSync(`${base}.pack`)) exts.push("<no .pack>");
@@ -308,6 +314,7 @@ export function gcSnapshot(
       if (exts.includes(e)) extra[e] = readFileSync(`${base}.${e}`, "latin1");
     packs.push({
       kind,
+      ...(prefix !== "pack" ? { prefix } : {}),
       ids: [...listed].sort(),
       files: exts,
       ...(Object.keys(extra).length ? { extra } : {}),

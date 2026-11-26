@@ -666,18 +666,21 @@ function autoMaintenanceEnabled(remote: OpenedRepository): boolean {
 
 /**
  * What git's receive-pack does once a push is done (`ReceivePackConfig.afterPush`), after
- * post-receive and post-update: `receive.autogc` (default true) runs the auto maintenance as
- * `gc --auto --quiet` (git's `maintenance run --auto` with the `gc` strategy: git 2.5x's
- * default `geometric` strategy is not reproduced), `receive.updateServerInfo` (default false)
+ * post-receive and post-update: `receive.autogc` (default true) runs the auto maintenance:
+ * git 2.5x's `maintenance run --auto --quiet` when `prepare_auto_maintenance` allows it
+ * (`maintenance.auto`, else `gc.auto` above 0), with the maintenance strategy and each task's
+ * condition (`MaintenanceRunCommand`), git 2.43's `gc --auto --quiet` (the receive side's
+ * hook runner tells the version); `receive.updateServerInfo` (default false)
  * `update-server-info`. Nothing when neither applies.
  */
 function afterPushOf(
   remote: OpenedRepository,
   hooks: HookSession | undefined,
 ): { afterPush?: ReceivePackConfig["afterPush"] } {
+  const v243 = hooks?.compatibility === "2.43";
   const autoGc =
     remoteBool(remote, "receive.autogc", true) &&
-    autoMaintenanceEnabled(remote) &&
+    (v243 || autoMaintenanceEnabled(remote)) &&
     remote.worktrees !== undefined &&
     remote.history.packs !== undefined;
   const serverInfo =
@@ -691,14 +694,27 @@ function afterPushOf(
       if (autoGc && remote.worktrees) {
         const admin = await remote.worktrees.openAdmin();
         // receive-pack's environment (its hook runner: pre-auto-gc, the git version followed)
-        const result = await new GarbageCollectCommand(
-          withEnvironment(worktreeAdminWorkingCopy(admin), hooks?.hostEnvironment),
-        )
-          .setAuto(true)
-          .setQuiet(true)
-          .call();
+        const workingCopy = withEnvironment(
+          worktreeAdminWorkingCopy(admin),
+          hooks?.hostEnvironment,
+        );
         // the child's stderr reaches the pusher on the side-band
-        const lines = [...(result.errors ?? []), ...(result.warnings ?? [])];
+        let lines: string[];
+        if (v243) {
+          const result = await new GarbageCollectCommand(workingCopy)
+            .setAuto(true)
+            .setQuiet(true)
+            .call();
+          lines = [...(result.errors ?? []), ...(result.warnings ?? [])];
+        } else {
+          // loaded lazily: maintenance-run-command reaches this module again (through fetch)
+          const { MaintenanceRunCommand } = await import("./maintenance-run-command.js");
+          const result = await new MaintenanceRunCommand(workingCopy)
+            .setAuto(true)
+            .setQuiet(true)
+            .call();
+          lines = result.stderr.split("\n").filter((l) => l.length > 0);
+        }
         if (lines.length > 0) await ctx.message(`${lines.join("\n")}\n`);
       }
       const { files } = remote;

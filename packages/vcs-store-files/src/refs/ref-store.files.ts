@@ -340,6 +340,7 @@ export class FileRefStore implements Refs {
       prune: options?.deleteLoose ?? true,
       ...(options?.prefixes ? { prefixes: options.prefixes } : {}),
       ...(options?.auto ? { auto: true } : {}),
+      ...(options?.auto && options.checkOnly ? { checkOnly: true } : {}),
       ...(options?.onError ? { onError: options.onError } : {}),
     });
   }
