@@ -475,13 +475,32 @@ export class MaintenanceRunCommand extends GuardedTransportCommand<MaintenanceRu
 
   /** The loose object ids, in fan-out order, at most `limit` (git's for_each_loose_file). */
   private async looseObjectIds(repo: Repo, limit = Number.POSITIVE_INFINITY): Promise<ObjectId[]> {
-    const storage = new FileRawStorage(repo.files, repo.objectsDir);
     const pattern = new RegExp(`^[0-9a-f]{${objectFormatOf(repo.history.objects).hexLength}}$`);
+    // for_each_loose_file_in_objdir: fan-out directories 00..ff, each in readdir order
+    // (which decides the objects a batch takes; sorted where the FilesApi cannot tell)
+    const posix = repo.files as FilesApi & {
+      listKinds?(path: string, o?: { readdirOrder?: boolean }): Promise<{ name: string }[]>;
+    };
     const out: ObjectId[] = [];
-    for await (const key of storage.keys()) {
-      if (!pattern.test(key)) continue;
-      out.push(key);
-      if (out.length >= limit) break;
+    for (let i = 0; i < 256; i++) {
+      const fan = i.toString(16).padStart(2, "0");
+      const dir = `${repo.objectsDir}/${fan}`;
+      let names: string[] = [];
+      try {
+        if (posix.listKinds) {
+          names = (await posix.listKinds(dir, { readdirOrder: true })).map((e) => e.name);
+        } else {
+          for await (const e of repo.files.list(dir)) names.push(e.name);
+        }
+      } catch {
+        continue;
+      }
+      for (const name of names) {
+        const key = fan + name;
+        if (!pattern.test(key)) continue;
+        out.push(key);
+        if (out.length >= limit) return out;
+      }
     }
     return out;
   }
