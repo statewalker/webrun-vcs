@@ -33,6 +33,8 @@ import {
 } from "./blame-ignore.js";
 import { parseGitColor } from "./config-value-types.js";
 import { abbrevLengths } from "./core-config.js";
+import { DiffCommand } from "./diff-command.js";
+import { type TextconvRunner, textconvRunnerOf } from "./diff-textconv.js";
 import { localTimezoneOffset } from "./git-date.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { type Mailmap, readMailmapFile, readRepositoryMailmap } from "./mailmap.js";
@@ -230,6 +232,13 @@ export interface BlameContentsOptions {
    * standard input, the index entry's mode at the path, else `100644`
    */
   mode?: number;
+  /**
+   * The file's bytes as read, before the clean filters made `content` of them: what a
+   * textconv converts (git converts the file as it lies, then cleans the output with the
+   * blamed path's attributes); default `content`. Standard input (`name` `-`) is never
+   * converted.
+   */
+  file?: Uint8Array;
 }
 
 /** A version of the file in a commit (`struct blame_origin`) */
@@ -600,6 +609,10 @@ export class BlameCommand extends GitCommand<BlameResult> {
   /** `--reverse`: the commit whose lines are followed forward */
   private reverseFrom?: ObjectId;
   private firstParent = false;
+  /** `--textconv` / `--no-textconv` (git's blame converts by default) */
+  private textconv = true;
+  /** The diff command whose textconv (and its caches) blame's reads go through */
+  private textconvDiff?: DiffCommand;
   /** The buffer blamed instead of the start commit's file (`--contents`) */
   private contents?: { content: Uint8Array } & BlameContentsOptions;
   /** Commits older than this (committer time, seconds) are boundaries (`--since`) */
@@ -622,11 +635,14 @@ export class BlameCommand extends GitCommand<BlameResult> {
   private finalStarts: Int32Array = new Int32Array(1);
   private finalAlnum: Int32Array = new Int32Array(1);
   private originSeq = 0;
-  /** Files looked in for copies, interned, the most recently used last (`copySourceText`) */
-  private copySources = new Map<ObjectId, InternedText>();
+  /**
+   * Files looked in for copies, interned, the most recently used last (`copySourceText`),
+   * by `copyKey`
+   */
+  private copySources = new Map<string, InternedText>();
   private copySourceBytes = 0;
   /** Line hashes of the files looked in for copies (null: over the big file threshold) */
-  private copyHashes = new Map<ObjectId, Int32Array | null>();
+  private copyHashes = new Map<string, Int32Array | null>();
   private copyHashBytes = 0;
   private copyHashCacheBytes = COPY_HASH_CACHE_BYTES;
   private copySourceCacheBytes = COPY_SOURCE_CACHE_BYTES;
@@ -849,6 +865,19 @@ export class BlameCommand extends GitCommand<BlameResult> {
   }
 
   /**
+   * `--textconv` (the default) / `--no-textconv`: every version of a regular file is read
+   * through its `diff.<driver>.textconv` (blame.c's textconv_object, with the runner the
+   * host installed, `installTextconvRunner`), a blob through the driver's notes cache
+   * (`diff.<driver>.cachetextconv`); the `--contents` file too, unless read from standard
+   * input, without the cache.
+   */
+  setTextconv(on: boolean): this {
+    this.checkCallable();
+    this.textconv = on;
+    return this;
+  }
+
+  /**
    * Stop at commits older than `timestamp` (seconds, committer time; `--since`): they and
    * their ancestors are boundaries, as git's `revs->max_age`
    */
@@ -979,7 +1008,7 @@ export class BlameCommand extends GitCommand<BlameResult> {
     const finalOrigin = this.getOrigin(startId, resultPath);
     finalOrigin.blobId = entry.id;
     finalOrigin.mode = entry.mode;
-    const content = await this.readBlob(entry.id);
+    const content = await this.originBlob(entry.id, resultPath, entry.mode);
     finalOrigin.lines = this.lineInterner().text(content);
     const lineCount = countLines(content);
     if (this.detectMoves || this.copyLevel > 0) this.prepareLines(content, lineCount);
@@ -1403,11 +1432,12 @@ export class BlameCommand extends GitCommand<BlameResult> {
         ? "standard input"
         : contents.name;
     const id = this.objectFormat.nullId;
-    const blobId = await computeObjectId("blob", contents.content, this.objectFormat);
-    this.pretend.set(blobId, contents.content);
     // without a mode (standard input): the index's stage-0 entry's, else a regular file's
     const staged = index.find((e) => e.path === path && e.stage === 0);
     const mode = contents.mode ?? staged?.mode ?? 0o100644;
+    const content = (await this.textconvContents(contents, path, mode)) ?? contents.content;
+    const blobId = await computeObjectId("blob", content, this.objectFormat);
+    this.pretend.set(blobId, content);
     this.fakeEntry = { id: blobId, mode };
     // the index with the path replaced: what git diffs the parents against (do_diff_cache)
     const files = new Map<string, { id: ObjectId; mode: number }>();
@@ -1760,15 +1790,16 @@ export class BlameCommand extends GitCommand<BlameResult> {
       for (const c of candidates) {
         // find_move already dealt with this path
         if (porigin && c.path === porigin.path) continue;
-        let hashes = this.copyHashes.get(c.id);
+        const key = this.copyKey(c);
+        let hashes = this.copyHashes.get(key);
         let content: Uint8Array | undefined;
         if (hashes === undefined) {
           if (c.id !== target.blobId && (await this.isBig(c.id))) hashes = null;
           else {
-            content = await this.readBlob(c.id, true);
+            content = await this.originBlob(c.id, c.path, c.mode, true);
             hashes = this.lineHashesOf(content);
           }
-          this.keepCopyHashes(c.id, hashes);
+          this.keepCopyHashes(key, hashes);
         }
         if (hashes === null) continue;
         if (!sharesLine(hashes, wanted)) {
@@ -1785,13 +1816,15 @@ export class BlameCommand extends GitCommand<BlameResult> {
         const file = {
           text:
             norigin.lines ??
-            this.copySources.get(c.id) ??
-            this.lineInterner().text(content ?? (await this.readBlob(c.id, true))),
+            this.copySources.get(key) ??
+            this.lineInterner().text(
+              content ?? (await this.originBlob(c.id, c.path, c.mode, true)),
+            ),
         };
         for (const item of list) {
           this.copySplitIfBetter(item.split, this.findCopyInBlob(item.ent, norigin, file));
         }
-        this.keepCopySourceText(c.id, file.text);
+        this.keepCopySourceText(key, file.text);
       }
       for (const { ent, split } of list) {
         if (split[1].suspect && this.copyScore < this.entryScore(split[1].lno, split[1].numLines)) {
@@ -1830,22 +1863,22 @@ export class BlameCommand extends GitCommand<BlameResult> {
    * the order the next one scans them, so evicting the oldest would evict every file before
    * its next use
    */
-  private keepCopyHashes(blobId: ObjectId, hashes: Int32Array | null): void {
+  private keepCopyHashes(key: string, hashes: Int32Array | null): void {
     const size = 64 + (hashes ? hashes.byteLength : 0);
     if (this.copyHashBytes + size > this.copyHashCacheBytes) return;
-    this.copyHashes.set(blobId, hashes);
+    this.copyHashes.set(key, hashes);
     this.copyHashBytes += size;
   }
 
   /** A file a copy was looked for in, interned, kept as `keepCopyHashes` keeps hashes */
-  private keepCopySourceText(blobId: ObjectId, text: InternedText): void {
-    const old = this.copySources.get(blobId);
+  private keepCopySourceText(key: string, text: InternedText): void {
+    const old = this.copySources.get(key);
     if (old) {
-      this.copySources.set(blobId, text);
+      this.copySources.set(key, text);
       return;
     }
     if (this.copySourceBytes + text.content.length > this.copySourceCacheBytes) return;
-    this.copySources.set(blobId, text);
+    this.copySources.set(key, text);
     this.copySourceBytes += text.content.length;
   }
 
@@ -2107,7 +2140,7 @@ export class BlameCommand extends GitCommand<BlameResult> {
   }
 
   private async originContent(o: Origin): Promise<InternedText> {
-    o.lines ??= this.lineInterner().text(await this.readBlob(o.blobId, true));
+    o.lines ??= this.lineInterner().text(await this.originBlob(o.blobId, o.path, o.mode, true));
     return o.lines;
   }
 
@@ -2134,6 +2167,72 @@ export class BlameCommand extends GitCommand<BlameResult> {
   private async blobSize(blobId: ObjectId): Promise<number> {
     const pretended = this.pretend.get(blobId);
     return pretended ? pretended.length : this.blobs.size(blobId);
+  }
+
+  /** The textconv runner blame reads through, if textconv is on and the host installed one */
+  private textconvRunner(): TextconvRunner | undefined {
+    return this.textconv ? textconvRunnerOf(this._workingCopy) : undefined;
+  }
+
+  private textconvDiffCommand(): DiffCommand {
+    this.textconvDiff ??= new DiffCommand(this._workingCopy);
+    return this.textconvDiff;
+  }
+
+  /**
+   * The key of a file looked in for copies: its blob, and with textconv its path and mode
+   * too (the path's driver decides the converted content)
+   */
+  private copyKey(c: { id: ObjectId; path: string; mode: number }): string {
+    return this.textconvRunner() ? `${c.id}\0${c.path}\0${c.mode}` : c.id;
+  }
+
+  /**
+   * blame.c's fill_origin_blob: a version of the file as blame compares it, the blob
+   * through the path's textconv (textconv_object, the driver's cache keyed by the blob)
+   * when one applies; the `--contents` buffer as it was made
+   */
+  private async originBlob(
+    blobId: ObjectId,
+    path: string,
+    mode: number,
+    shared = false,
+  ): Promise<Uint8Array> {
+    if (this.pretend.has(blobId) || !this.textconvRunner()) return this.readBlob(blobId, shared);
+    let raw: Uint8Array | undefined;
+    const read = async () => {
+      raw ??= await this.readBlob(blobId, shared);
+      return raw;
+    };
+    const converted = await this.textconvDiffCommand().textconvBlob(path, mode, read, blobId);
+    return converted ?? read();
+  }
+
+  /**
+   * fake_working_tree_commit's textconv: the `--contents` file (the working tree's at
+   * `path`, or the named one; never standard input) through its textconv, the output then
+   * cleaned as git's convert_to_git cleans it for `path`; undefined when none applies
+   */
+  private async textconvContents(
+    contents: { content: Uint8Array } & BlameContentsOptions,
+    path: string,
+    mode: number,
+  ): Promise<Uint8Array | undefined> {
+    if (!this.textconvRunner()) return undefined;
+    const from = contents.workingTree ? path : contents.name;
+    if (from === undefined || from === "-") return undefined;
+    const file = contents.file ?? contents.content;
+    const converted = await this.textconvDiffCommand().textconvBlob(
+      from,
+      mode,
+      async () => file,
+      undefined,
+      { worktreeFile: true },
+    );
+    if (!converted) return undefined;
+    const worktree = "worktree" in this._workingCopy ? this.worktreeAccess : undefined;
+    const conversion = await worktree?.contentFilter?.checkin(path);
+    return conversion ? conversion.apply(converted) : converted;
   }
 
   /**

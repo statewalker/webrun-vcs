@@ -120,7 +120,7 @@ import {
   showSubmoduleDiffSummary,
   submoduleHeader,
 } from "./submodule-summary.js";
-import { TextconvCache } from "./textconv-cache.js";
+import { TextconvCaches } from "./textconv-cache.js";
 
 /** An index without in-tree attributes files: the attribute stack of a diff of two trees. */
 const WITHOUT_INDEX_ATTRIBUTES: { direction: "checkin"; index: AttributesIndex } = {
@@ -2072,13 +2072,16 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
    * when no textconv applies (not a regular file, no driver, no command or no runner
    * installed, `textconv: false`). The attributes are the worktree's alone (git show reads
    * no index). With the blob's `id`, the driver's textconv cache applies
-   * (`diff.<driver>.cachetextconv`).
+   * (`diff.<driver>.cachetextconv`). `worktreeFile`: `read` gives a file as it lies in the
+   * worktree (blame's working-tree file, `--contents <file>`), converted as it is, never
+   * smudged nor cached (git's prepare_temp_file reuses the file; its object id is unknown).
    */
   async textconvBlob(
     path: string,
     mode: number,
     read: () => Promise<Uint8Array>,
     id?: string,
+    options: { worktreeFile?: boolean } = {},
   ): Promise<Uint8Array | undefined> {
     if ((mode & S_IFMT) !== 0o100000) return undefined;
     const runner =
@@ -2103,38 +2106,23 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         driver: driver.name ?? "",
         command,
         path,
-        content: await this.smudged(path, mode, read),
+        content: options.worktreeFile ? await read() : await this.smudged(path, mode, read),
         cache: driver.cacheTextconv ?? false,
       },
-      id,
+      options.worktreeFile ? undefined : id,
     );
   }
 
-  /** The textconv caches of this command, by driver and command (git's per-process caches) */
-  private textconvCaches = new Map<string, Promise<TextconvCache | undefined>>();
+  /** The textconv caches of this command (git's per-process caches) */
+  private textconvCaches = new TextconvCaches(() => this.notesContext());
 
-  /**
-   * diff.c's fill_textconv: the runner's output, through the driver's notes cache
-   * (`diff.<driver>.cachetextconv`) when the content has an id git knows.
-   */
-  private async runTextconv(
+  /** diff.c's fill_textconv: the runner's output, through the driver's notes cache */
+  private runTextconv(
     runner: TextconvRunner,
     request: TextconvRequest,
     id: string | undefined,
   ): Promise<Uint8Array> {
-    if (!request.cache || id === undefined) return runner(request);
-    const key = `${request.driver}\0${request.command}`;
-    let opened = this.textconvCaches.get(key);
-    if (!opened) {
-      opened = TextconvCache.open(this.notesContext(), request.driver, request.command);
-      this.textconvCaches.set(key, opened);
-    }
-    const cache = await opened;
-    const cached = await cache?.get(id);
-    if (cached) return cached;
-    const output = await runner(request);
-    await cache?.put(id, output);
-    return output;
+    return this.textconvCaches.run(runner, request, id);
   }
 
   /** A blob's content as checkout writes it to the worktree (the worktree's smudge filter) */
