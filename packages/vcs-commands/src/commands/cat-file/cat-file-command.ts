@@ -12,7 +12,12 @@
  * ```
  */
 
-import type { GitObjects, ObjectId } from "@statewalker/vcs-core";
+import {
+  type CompatObjects,
+  decodeTreeBytes,
+  type GitObjects,
+  type ObjectId,
+} from "@statewalker/vcs-core";
 import { ObjectInfoError } from "@statewalker/vcs-transport";
 import { parseGitBool } from "@statewalker/vcs-utils";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
@@ -296,6 +301,12 @@ export class CatFileCommand extends PlumbingCommand {
 
   /** cat_one_file */
   private async catOne(name: string): Promise<number> {
+    const compat = this.compatObjects;
+    // GET_OID_HASH_ANY: a full id of the compatibility format names the object as that
+    // format sees it (its storage object converted)
+    if (compat && name.length === compat.compat.hexLength && /^[0-9a-f]+$/.test(name)) {
+      return this.catOneCompat(name, compat);
+    }
     const resolver = this.revisionResolver();
     let id: ObjectId | undefined;
     try {
@@ -332,6 +343,76 @@ export class CatFileCommand extends PlumbingCommand {
         return this.pretty(name, await this.replaced(id));
       default:
         return this.catTyped(name, id, this.type as string);
+    }
+  }
+
+  /**
+   * cat_one_file for an id of the compatibility format: the object read through the map and
+   * converted (`odb_read_object_info_extended` with an id of the other format).
+   */
+  private async catOneCompat(name: string, compat: CompatObjects): Promise<number> {
+    const read = (id: string) => compat.readAsCompat(id);
+    if (this.mode === "exists")
+      return (await compat.toStorage(name)) !== undefined && (await read(name)) !== undefined
+        ? 0
+        : 1;
+    const object = await read(name);
+    if (!object) {
+      if (this.mode === "type" || this.mode === "size") {
+        throw new PlumbingError("fatal: git cat-file: could not get object info");
+      }
+      throw new PlumbingError(`fatal: Not a valid object name ${name}`);
+    }
+    switch (this.mode) {
+      case "type":
+        await this.write(`${object.type}\n`);
+        return 0;
+      case "size":
+        await this.write(`${object.content.length}\n`);
+        return 0;
+      case "pretty":
+        if (object.type === "tree") {
+          const config = RemoteConfigStore.from(this._workingCopy);
+          const quoteFully = parseGitBool(config.value("core.quotePath")) ?? true;
+          let out = "";
+          for (const entry of decodeTreeBytes(object.content, {
+            idLength: compat.compat.rawLength,
+            checkNames: false,
+          })) {
+            const kind = entry.mode & S_IFMT;
+            const type = kind === 0o040000 ? "tree" : kind === S_IFGITLINK ? "commit" : "blob";
+            const mode = entry.mode.toString(8).padStart(6, "0");
+            out += `${mode} ${type} ${entry.id}\t${quotePath(entry.name, quoteFully)}\n`;
+          }
+          await this.write(out);
+          return 0;
+        }
+        await this.write(
+          object.type === "blob" ? object.content : await this.mapIdents(object.content),
+        );
+        return 0;
+      default: {
+        const type = this.type as string;
+        if (!OBJECT_TYPES.has(type)) {
+          throw new PlumbingError(`fatal: invalid object type "${type}"`);
+        }
+        // odb_read_object_peeled, through the compatibility ids
+        let current: { type: string; content: Uint8Array } | undefined = object;
+        while (current && current.type !== type) {
+          const text = new TextDecoder().decode(current.content.subarray(0, 200));
+          let next: RegExpExecArray | null = null;
+          if (current.type === "tag") next = /^object ([0-9a-f]+)/.exec(text);
+          else if (current.type === "commit" && type === "tree") {
+            next = /^tree ([0-9a-f]+)/.exec(text);
+          }
+          current = next ? await read(next[1] as string) : undefined;
+        }
+        if (!current) throw new PlumbingError(`fatal: git cat-file ${name}: bad file`);
+        await this.write(
+          current.type === "blob" ? current.content : await this.mapIdents(current.content),
+        );
+        return 0;
+      }
     }
   }
 
