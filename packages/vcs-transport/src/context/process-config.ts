@@ -151,6 +151,21 @@ export class ProcessConfiguration {
    */
   hiddenRefs?: string[];
 
+  /**
+   * Server side: the prefix of the ref namespace served (git's `GIT_NAMESPACE`, as
+   * `gitNamespacePrefix` gives it, e.g. `refs/namespaces/a/`). The context's ref store is
+   * then the namespace's view (`namespacedRefStore`), and `^` hidden ref patterns match the
+   * names with this prefix.
+   */
+  namespace?: string;
+
+  /**
+   * Server side, with {@link namespace}: the branch the repository's own HEAD names (git's
+   * receive-pack `head_name`, which the namespace's view does not show), when no
+   * `currentBranch` is given
+   */
+  namespaceHead?: string;
+
   // Protocol V2 configuration
 
   /**

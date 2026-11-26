@@ -22,6 +22,7 @@ import {
   setTransport,
 } from "../../context/context-adapters.js";
 import { HandlerOutput } from "../../context/handler-output.js";
+import { namespacedRefStore } from "../../context/namespaced-ref-store.js";
 import type {
   ProcessConfiguration,
   UploadPackRequestPolicy,
@@ -67,6 +68,7 @@ import { receivePackRefs, visibleRefs } from "../../protocol/hidden-refs.js";
 import { formatOf, v0ObjectFormatCapabilities } from "../../protocol/object-format.js";
 import { encodeFlush, encodePacketLine } from "../../protocol/pkt-line-codec.js";
 import { pushCertNonce } from "../../protocol/push-cert.js";
+import { gitNamespacePrefix } from "../../protocol/ref-namespace.js";
 import { processSessionId, validSessionId } from "../../protocol/session-id.js";
 import { readStreamWithIdleTimeout, withWriteTimeout } from "../../utils/idle-timeout.js";
 import { createSimpleDuplex } from "./http-duplex.js";
@@ -187,6 +189,12 @@ export interface HttpServerOptions {
    * "TIP" and reachable request policies, and HEAD naming a hidden branch is still advertised.
    */
   hideRefs?: string[];
+  /**
+   * The ref namespace served (http-backend's `GIT_NAMESPACE`; see
+   * `ServeOverDuplexOptions.namespace`): both services see and write only its refs, named
+   * without its prefix. A value git refuses answers 500, as http-backend dies.
+   */
+  namespace?: string;
   /** Logs hook failures that cannot reach the client (default: console.error) */
   logger?: ReceivePackLogger;
 }
@@ -376,6 +384,42 @@ function uploadPackHiddenRefs(options: HttpServerOptions): string[] {
 /** receive-pack's hidden ref patterns: `transfer.hideRefs`, then `receive.hideRefs`. */
 function receivePackHiddenRefs(options: HttpServerOptions): string[] {
   return [...(options.hideRefs ?? []), ...(options.receivePack?.hideRefs ?? [])];
+}
+
+/** The refs a request sees: a namespace's (`options.namespace`), else all of them. */
+interface ServedRefView {
+  refStore: RefStore;
+  /** The namespace's prefix ("" without one) */
+  namespace: string;
+  /** What the request's `ProcessConfiguration` gets of the namespace */
+  config: Pick<ProcessConfiguration, "namespace" | "namespaceHead">;
+}
+
+/**
+ * `options.namespace` applied to `refStore` (`namespacedRefStore`); with `head`, receive-pack's
+ * `head_name` (the repository's own HEAD) too. A bad namespace is http-backend's death: 500.
+ */
+async function servedRefView(
+  refStore: RefStore,
+  options: HttpServerOptions,
+  head = false,
+): Promise<ServedRefView | HttpResponse> {
+  let namespace: string;
+  try {
+    namespace = gitNamespacePrefix(options.namespace);
+  } catch (error) {
+    return plain(500, (error as Error).message);
+  }
+  if (!namespace) return { refStore, namespace, config: {} };
+  const namespaceHead =
+    head && options.receivePack?.currentBranch === undefined
+      ? await refStore.getSymrefTarget?.("HEAD")
+      : undefined;
+  return {
+    refStore: namespacedRefStore(refStore, namespace),
+    namespace,
+    config: { namespace, ...(namespaceHead !== undefined ? { namespaceHead } : {}) },
+  };
 }
 
 /** upload-pack's hooks with the request they run for. */
@@ -633,15 +677,18 @@ function allowWantCapabilities(policy: UploadPackRequestPolicy): string[] {
  * @returns HTTP response
  */
 export async function handleInfoRefs(
-  refStore: RefStore,
+  servedRefs: RefStore,
   options: HttpServerOptions = {},
   repository?: RepositoryFacade,
   version1 = false,
 ): Promise<HttpResponse> {
   const unreadable = uploadPackConfigError(options);
   if (unreadable) return unreadable;
+  const view = await servedRefView(servedRefs, options);
+  if ("status" in view) return view;
+  const { refStore, namespace } = view;
   // Get all refs but the hidden ones
-  const refs = visibleRefs(await refStore.listAll(), uploadPackHiddenRefs(options));
+  const refs = visibleRefs(await refStore.listAll(), uploadPackHiddenRefs(options), namespace);
 
   // Build ref advertisement
   const chunks: Uint8Array[] = [];
@@ -820,12 +867,15 @@ export function handleInfoRefsV2(
 export async function handleUploadPack(
   request: HttpRequest,
   repository: RepositoryFacade,
-  refStore: RefStore,
+  servedRefs: RefStore,
   options: HttpServerOptions = {},
   context: HttpHandlerContext = {},
 ): Promise<HttpResponse> {
   const unreadable = uploadPackConfigError(options);
   if (unreadable) return unreadable;
+  const view = await servedRefView(servedRefs, options);
+  if ("status" in view) return view;
+  const { refStore, namespace } = view;
   const requestBytes = await readUploadPackRequest(request, options);
   if (!(requestBytes instanceof Uint8Array)) return requestBytes;
 
@@ -833,7 +883,7 @@ export async function handleUploadPack(
 
   // What GET /info/refs advertised: the refs but the hidden ones
   const hiddenRefs = uploadPackHiddenRefs(options);
-  for (const [refName, oid] of visibleRefs(await refStore.listAll(), hiddenRefs)) {
+  for (const [refName, oid] of visibleRefs(await refStore.listAll(), hiddenRefs, namespace)) {
     state.refs.set(refName, oid);
   }
 
@@ -849,6 +899,7 @@ export async function handleUploadPack(
     maxEmptyBatches: 10,
     keepAliveMs: options.keepAliveMs,
     hiddenRefs,
+    ...view.config,
     uploadPack: uploadPackConfig(options, request, context.repoPath),
     // each POST is one request of a stateless negotiation (git's --stateless-rpc)
     statelessRpc: true,
@@ -881,12 +932,15 @@ export async function handleUploadPack(
 export async function handleUploadPackV2(
   request: HttpRequest,
   repository: RepositoryFacade,
-  refStore: RefStore,
+  servedRefs: RefStore,
   options: HttpServerOptions = {},
   context: HttpHandlerContext = {},
 ): Promise<HttpResponse> {
   const unreadable = uploadPackConfigError(options);
   if (unreadable) return unreadable;
+  const view = await servedRefView(servedRefs, options);
+  if ("status" in view) return view;
+  const { refStore } = view;
   const requestBytes = await readUploadPackRequest(request, options);
   if (!(requestBytes instanceof Uint8Array)) return requestBytes;
 
@@ -911,6 +965,7 @@ export async function handleUploadPackV2(
       : {}),
     keepAliveMs: options.keepAliveMs,
     hiddenRefs: uploadPackHiddenRefs(options),
+    ...view.config,
     uploadPack: uploadPackConfig(options, request, context.repoPath),
     // one command per request (git's serve loop with --stateless-rpc); more are ignored
     statelessRpc: true,
@@ -1072,7 +1127,7 @@ function receivePackCapabilities(options: HttpServerOptions): string[] {
  * @returns HTTP response
  */
 export async function handleReceivePackInfoRefs(
-  refStore: RefStore,
+  servedRefs: RefStore,
   options: HttpServerOptions = {},
   version1 = false,
   repository?: Pick<RepositoryFacade, "alternateRefs" | "objectFormat">,
@@ -1081,8 +1136,11 @@ export async function handleReceivePackInfoRefs(
   // is advertised, the response a server error
   const unreadable = options.receivePack?.receivePackConfigError;
   if (unreadable !== undefined) return plain(500, unreadable);
+  const view = await servedRefView(servedRefs, options);
+  if ("status" in view) return view;
+  const { refStore, namespace } = view;
   // The refs under refs/ but the hidden ones (write_head_info: never HEAD)
-  const refs = receivePackRefs(await refStore.listAll(), receivePackHiddenRefs(options));
+  const refs = receivePackRefs(await refStore.listAll(), receivePackHiddenRefs(options), namespace);
   // write_head_info: then the alternates' refs as `.have`, each object id once and none an
   // advertised ref names
   const seen = new Set(refs.map(([, oid]) => oid));
@@ -1181,13 +1239,16 @@ export async function handleReceivePackInfoRefs(
 export async function handleReceivePack(
   request: HttpRequest,
   repository: RepositoryFacade,
-  refStore: RefStore,
+  servedRefs: RefStore,
   options: HttpServerOptions = {},
   context: HttpHandlerContext = {},
 ): Promise<HttpResponse> {
   if (!request.body) return plain(400, "Missing request body");
   const unreadable = options.receivePack?.receivePackConfigError;
   if (unreadable !== undefined) return plain(500, unreadable);
+  const view = await servedRefView(servedRefs, options, true);
+  if ("status" in view) return view;
+  const { refStore, namespace } = view;
 
   const limit = options.maxRequestBodyBytes ?? DEFAULT_MAX_RECEIVE_PACK_REQUEST_BYTES;
   const input = requestBody(request, request.body, limit);
@@ -1197,7 +1258,7 @@ export async function handleReceivePack(
   const state = new ProtocolState();
   // what GET /info/refs advertised: the refs under refs/ but the hidden ones
   const hiddenRefs = receivePackHiddenRefs(options);
-  for (const [refName, oid] of receivePackRefs(await refStore.listAll(), hiddenRefs)) {
+  for (const [refName, oid] of receivePackRefs(await refStore.listAll(), hiddenRefs, namespace)) {
     state.refs.set(refName, oid);
   }
   // state.capabilities stays empty: READ_COMMANDS takes the client's request from the first
@@ -1242,6 +1303,7 @@ export async function handleReceivePack(
     denyCurrentBranch: rp.denyCurrentBranch ?? true,
     currentBranch: rp.currentBranch,
     hiddenRefs,
+    ...view.config,
     // each POST is one request of a stateless push (git's --stateless-rpc)
     statelessRpc: true,
     receivePack: {

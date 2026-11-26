@@ -28,6 +28,7 @@
  * ```
  */
 
+import { namespacedRefStore } from "../../context/namespaced-ref-store.js";
 import type { UploadPackRequestPolicy } from "../../context/process-config.js";
 import { defaultUploadPackCapabilities } from "../../fsm/fetch/server-fetch-fsm.js";
 import { peelFully } from "../../fsm/fetch/upload-pack-graph.js";
@@ -45,6 +46,7 @@ import type { ServedGitFileStats } from "../../operations/served-git-files.js";
 import { configBoolOf } from "../../operations/server-config.js";
 import { parseGitProtocolEnv } from "../../protocol/git-daemon-request.js";
 import { visibleRefs } from "../../protocol/hidden-refs.js";
+import { gitNamespacePrefix } from "../../protocol/ref-namespace.js";
 import {
   fetchRequestToHttpRequest,
   type HttpHandlerContext,
@@ -321,6 +323,7 @@ function httpOptionsOf(
     promisorRemoteInfo,
     packObjectsHook,
     logger,
+    namespace,
     capabilities: _capabilities,
     ...receive
   } = settings;
@@ -333,6 +336,7 @@ function httpOptionsOf(
   };
   if (receivePackHideRefs && out.receivePack) out.receivePack.hideRefs = receivePackHideRefs;
   if (hideRefs) out.hideRefs = hideRefs;
+  if (namespace) out.namespace = namespace;
   const policy = requestPolicy ?? options.requestPolicy;
   if (policy !== undefined) out.requestPolicy = policy;
   if (advertiseObjectInfo !== undefined) out.advertiseObjectInfo = advertiseObjectInfo;
@@ -444,9 +448,13 @@ function selectService(
  * under `refs/`, an annotated tag followed by its peeled `^{}` line; unlike http-backend,
  * without the refs upload-pack hides (`hidden`).
  */
-async function textRefs(served: ServedRepository, hidden: readonly string[]): Promise<Uint8Array> {
+async function textRefs(
+  served: ServedRepository,
+  hidden: readonly string[],
+  namespace: string,
+): Promise<Uint8Array> {
   let text = "";
-  for (const [name, oid] of visibleRefs(await served.refStore.listAll(), hidden)) {
+  for (const [name, oid] of visibleRefs(await served.refStore.listAll(), hidden, namespace)) {
     if (!name.startsWith("refs/")) continue;
     text += `${oid}\t${name}\n`;
     const peeled = await peelFully(served.repository, oid);
@@ -638,8 +646,13 @@ export function createServedHttpHandler(
       try {
         const settings = resolveServeSettings(options.settings, served);
         const hidden = [...(settings.hideRefs ?? []), ...(settings.uploadPackHideRefs ?? [])];
+        // GIT_NAMESPACE: http-backend's info/refs and HEAD are the namespace's (a bad one dies)
+        const namespace = gitNamespacePrefix(settings.namespace);
+        const view = namespace
+          ? { ...served, refStore: namespacedRefStore(served.refStore, namespace) }
+          : served;
         if (match.route === "info-refs") {
-          const body = await textRefs(served, hidden);
+          const body = await textRefs(view, hidden, namespace);
           return answer({
             status: 200,
             headers: {
@@ -651,7 +664,7 @@ export function createServedHttpHandler(
           });
         }
         if (match.route === "head") {
-          const body = await textHead(served);
+          const body = await textHead(view);
           return answer({
             status: 200,
             headers: { "Content-Length": String(body.length), "Content-Type": "text/plain" },
@@ -667,8 +680,11 @@ export function createServedHttpHandler(
         const operatorHidden =
           (operatorHides.hideRefs?.length ?? 0) + (operatorHides.uploadPackHideRefs?.length ?? 0) >
           0;
-        const optedIn = options.getAnyFile === true || (explicit === true && !operatorHidden);
-        if (hidden.length > 0 && !optedIn) {
+        // a namespace is the operator's: only the operator opens the objects under one
+        const optedIn =
+          options.getAnyFile === true || (explicit === true && !operatorHidden && !namespace);
+        // under a namespace too: the objects of every other namespace are there
+        if ((hidden.length > 0 || namespace) && !optedIn) {
           logger?.info("Unsupported service: getanyfile");
           return refusal(403);
         }
