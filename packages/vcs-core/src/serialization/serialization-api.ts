@@ -105,6 +105,12 @@ export interface PackOptions {
 export interface ExportOptions extends PackOptions {
   /** A thin pack: deltas against objects the receiver has, not sent (default: false) */
   thinPack?: boolean;
+  /**
+   * Objects neither listed nor walked (`listObjects`' `excludeObjects`): upload-pack's
+   * `--missing=allow-promisor` leaves out the absent promisor objects this way. A bitmap is
+   * not used with them
+   */
+  excludeObjects?: Iterable<ObjectId>;
   /** The receiver's shallow commits: their parents are not walked */
   shallow?: Iterable<ObjectId>;
   /**

@@ -63,6 +63,7 @@ const CONFIG_KEYS = [
   "shallowUpdate",
   "advertisePushOptions",
   "advertiseSID",
+  "promisorRemoteInfo",
   "advertiseAtomic",
   "maxInputSize",
   "certNonceSeed",

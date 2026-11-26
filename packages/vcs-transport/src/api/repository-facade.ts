@@ -137,6 +137,12 @@ export interface ExportPackOptions {
    * packfile URI). A facade without it sends everything (and so offloads nothing)
    */
   leaveOut?: (id: string) => boolean;
+  /**
+   * pack-objects' `--missing=allow-promisor` (upload-pack's, once the client accepted a
+   * promisor remote of the `promisor-remote` capability): promisor objects the repository
+   * lacks are left out instead of failing the pack (nor fetched)
+   */
+  missingAllowPromisor?: boolean;
 }
 
 /**

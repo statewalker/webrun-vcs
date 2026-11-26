@@ -1,9 +1,22 @@
 export type { BasePathResolverOptions } from "./base-path-resolver.js";
-export { createBasePathResolver } from "./base-path-resolver.js";
+export { createBasePathResolver, RepositoryNotExportedError } from "./base-path-resolver.js";
+export type {
+  DaemonHostInfo,
+  DaemonHostLookup,
+  DaemonHostLookupResult,
+  InterpolationValues,
+} from "./daemon-host.js";
+export { daemonHostInfo, expandInterpolatedPath, lookupLiteralHost } from "./daemon-host.js";
 export type { FetchOptions } from "./fetch.js";
 export { fetch } from "./fetch.js";
 export type { FetchOverDuplexOptions } from "./fetch-over-duplex.js";
 export { fetchOverDuplex } from "./fetch-over-duplex.js";
+export type {
+  GitDaemon,
+  GitDaemonConnectionInfo,
+  GitDaemonOptions,
+} from "./git-daemon.js";
+export { createGitDaemon } from "./git-daemon.js";
 export type { LsRemoteOptions } from "./ls-remote.js";
 export { lsRemote } from "./ls-remote.js";
 export type {
@@ -21,6 +34,9 @@ export type {
 } from "./push-over-duplex.js";
 export { pushOverDuplex } from "./push-over-duplex.js";
 export type {
+  DaemonAccessHook,
+  DaemonAccessHookOutcome,
+  DaemonAccessHookRequest,
   GitServeOptions,
   GitServeSettings,
   GitServiceRequest,
@@ -49,6 +65,7 @@ export {
   GIT_SERVER_SETTINGS_DEFAULTS,
   httpServerSettings,
   parseConfigInt,
+  promisorRemoteAdvertisement,
   serverSettingsFromConfig,
   unpackLimitOf,
   uploadPackRequestPolicyOf,

@@ -255,7 +255,7 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
         // upload-pack's symref=HEAD:<branch> (as the smart-HTTP advertisement has it): a
         // client cloning in v0 learns the remote HEAD's branch from it
         // hidden refs are neither advertised nor "ours" under the ADVERTISED policy
-        const refsArray = visibleRefs(refs, config.hiddenRefs);
+        const refsArray = visibleRefs(refs, config.hiddenRefs, config.namespace);
         // (only a HEAD that resolves: an unborn one is not advertised, nor its symref)
         const headTarget = refsArray.some(([name]) => name === "HEAD")
           ? await refStore.getSymrefTarget?.("HEAD")
@@ -460,7 +460,9 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
             case "REACHABLE_COMMIT_TIP":
               // Reachable from any ref tip (a shallow repository's grafted view withholds
               // isReachableFromAnyTip: its graph is walked from the ref store's tips)
-              if (repository.isReachableFromAnyTip) {
+              // under a namespace only its own tips count (git's OUR_REF marks come from
+              // for_each_namespaced_ref): the facade's check walks every ref of the repository
+              if (repository.isReachableFromAnyTip && !getConfig(ctx).namespace) {
                 valid = await repository.isReachableFromAnyTip(oid);
               } else if (repository.getCommitInfo) {
                 const tips = [...(await refStore.listAll())].map(([, id]) => id);

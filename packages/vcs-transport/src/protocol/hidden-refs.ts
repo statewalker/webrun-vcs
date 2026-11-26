@@ -12,9 +12,17 @@
  * and `refs/pull/...`, never `refs/pullx`); trailing slashes are ignored. A leading `!`
  * negates it: a ref it matches is shown. The last pattern that matches decides, so a later
  * pattern overrides an earlier one, as in git's config (where `transfer.hideRefs` and the
- * service's own setting form one list in file order). A `^` after the optional `!` matches the
- * full ref name before git's namespace is stripped; without namespaces (we serve none) it is
- * the same name.
+ * service's own setting form one list in file order). Under a ref namespace (`GIT_NAMESPACE`)
+ * the name matched is the one the client sees, the namespace stripped; a `^` after the
+ * optional `!` matches the full ref name instead, the namespace's prefix included (git's
+ * `ref_is_hidden(refname, refname_full)`):
+ *
+ * ```ts
+ * const ns = "refs/namespaces/a/";
+ * isRefHidden("refs/tags/v1", ["refs/tags"], ns); // true
+ * isRefHidden("refs/tags/v1", ["refs/namespaces/a/refs/tags"], ns); // false
+ * isRefHidden("refs/tags/v1", ["^refs/namespaces/a/refs/tags"], ns); // true
+ * ```
  *
  * Hidden refs are left out of the advertisement (v0/v1) and of `ls-refs` (v2), a v2
  * `want-ref` of one is refused as an unknown ref, an id wanted only through a hidden ref is
@@ -27,8 +35,15 @@
  * repository, or the "ADVERTISED" policy plus an upload-pack `authorize` hook.
  */
 
-/** Whether `refName` is hidden by `patterns` (git's `ref_is_hidden`). */
-export function isRefHidden(refName: string, patterns: readonly string[] | undefined): boolean {
+/**
+ * Whether `refName` is hidden by `patterns` (git's `ref_is_hidden`); `namespace` is the
+ * served namespace's prefix (`gitNamespacePrefix`), which `^` patterns see in front of the name.
+ */
+export function isRefHidden(
+  refName: string,
+  patterns: readonly string[] | undefined,
+  namespace = "",
+): boolean {
   if (!patterns) return false;
   for (let i = patterns.length - 1; i >= 0; i--) {
     let match = patterns[i] as string;
@@ -37,12 +52,16 @@ export function isRefHidden(refName: string, patterns: readonly string[] | undef
       negated = true;
       match = match.slice(1);
     }
-    // `^`: the full name, namespace included; we serve no namespaces, so the same name
-    if (match.startsWith("^")) match = match.slice(1);
+    // `^`: the full name, namespace included
+    let subject = refName;
+    if (match.startsWith("^")) {
+      match = match.slice(1);
+      subject = namespace + refName;
+    }
     // git's parse_hide_refs_config drops trailing slashes
     while (match.endsWith("/")) match = match.slice(0, -1);
-    if (!refName.startsWith(match)) continue;
-    const rest = refName.charAt(match.length);
+    if (!subject.startsWith(match)) continue;
+    const rest = subject.charAt(match.length);
     if (rest === "" || rest === "/") return !negated;
   }
   return false;
@@ -52,9 +71,10 @@ export function isRefHidden(refName: string, patterns: readonly string[] | undef
 export function visibleRefs<T extends readonly [string, ...unknown[]]>(
   refs: Iterable<T>,
   patterns: readonly string[] | undefined,
+  namespace = "",
 ): T[] {
   const out: T[] = [];
-  for (const ref of refs) if (!isRefHidden(ref[0], patterns)) out.push(ref);
+  for (const ref of refs) if (!isRefHidden(ref[0], patterns, namespace)) out.push(ref);
   return out;
 }
 
@@ -67,10 +87,11 @@ export function visibleRefs<T extends readonly [string, ...unknown[]]>(
 export function receivePackRefs<T extends readonly [string, ...unknown[]]>(
   refs: Iterable<T>,
   patterns: readonly string[] | undefined,
+  namespace = "",
 ): T[] {
   const out: T[] = [];
   for (const ref of refs) {
-    if (ref[0].startsWith("refs/") && !isRefHidden(ref[0], patterns)) out.push(ref);
+    if (ref[0].startsWith("refs/") && !isRefHidden(ref[0], patterns, namespace)) out.push(ref);
   }
   return out;
 }

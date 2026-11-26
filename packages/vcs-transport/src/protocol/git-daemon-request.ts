@@ -23,6 +23,12 @@ export interface GitDaemonRequest {
   path: string;
   /** The `host=` value's host, canonicalized as git-daemon does (lowercase, no `/`, no leading dots) */
   host?: string;
+  /**
+   * The request carried extended arguments (a non-empty field after the line's NUL, which
+   * can only be `host=`): git-daemon's `saw_extended_args`, under which `--interpolated-path`
+   * applies, even to an empty `host=`
+   */
+  extendedArgs?: boolean;
   /** The `host=` value's port, when it names one */
   port?: string;
   /** The parameters after the second NUL joined with `:` (git-daemon's `GIT_PROTOCOL`) */
@@ -38,7 +44,7 @@ export class GitDaemonRequestError extends Error {
 }
 
 /** daemon.c's `sanitize_client`: directory separators dropped, leading and doubled dots too. */
-function sanitizeClient(input: string): string {
+export function sanitizeDaemonClient(input: string): string {
   let out = "";
   for (const ch of input) {
     if (ch === "/") continue;
@@ -89,12 +95,13 @@ export function parseGitDaemonRequest(payload: Uint8Array): GitDaemonRequest {
     let at = 0;
     const first = fields[0];
     if (first !== undefined && first !== "") {
+      request.extendedArgs = true;
       if (first.slice(0, 5).toLowerCase() === "host=") {
         const value = first.slice(5);
         if (value) {
           const { host, port } = parseHostAndPort(value);
-          if (port !== undefined) request.port = sanitizeClient(port);
-          request.host = sanitizeClient(host).toLowerCase();
+          if (port !== undefined) request.port = sanitizeDaemonClient(port);
+          request.host = sanitizeDaemonClient(host).toLowerCase();
         }
         at = 1;
       }
@@ -112,6 +119,7 @@ export function parseGitDaemonRequest(payload: Uint8Array): GitDaemonRequest {
     path: match[2] as string,
     ...(request.host !== undefined ? { host: request.host } : {}),
     ...(request.port !== undefined ? { port: request.port } : {}),
+    ...(request.extendedArgs ? { extendedArgs: true } : {}),
     ...(request.gitProtocol !== undefined ? { gitProtocol: request.gitProtocol } : {}),
   };
 }

@@ -12,6 +12,7 @@ export * from "./fetch-head.js";
 export * from "./fetch-pack.js";
 export * from "./fetch-remote.js";
 export * from "./negotiator.js";
+export * from "./object-info.js";
 export * from "./packfile-uris.js";
 export * from "./pkt-stream.js";
 export * from "./ref-updates.js";

@@ -13,11 +13,17 @@
  */
 
 import type { GitObjects, ObjectId } from "@statewalker/vcs-core";
+import { ObjectInfoError } from "@statewalker/vcs-transport";
 import { parseGitBool } from "@statewalker/vcs-utils";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { RemoteConfigStore } from "../../remote-config/index.js";
 import { quotePath } from "../../results/quote-path.js";
 import { PlumbingCommand, PlumbingError } from "../plumbing-command.js";
+import {
+  RemoteObjectInfoCommand,
+  type RemoteObjectInfoResult,
+  RemoteObjectInfoUnsupportedError,
+} from "../remote-object-info-command.js";
 import { applyMailmapToHeader } from "../rev-filter/index.js";
 import type { RevisionResolver } from "../revision-resolver.js";
 import {
@@ -59,9 +65,13 @@ interface ObjectInfo {
  * Replace refs apply as in git (`OBJECT_INFO_LOOKUP_REPLACE`): the name printed is the one
  * asked, the type, size and content the replacement's; `--batch-all-objects` reads none.
  *
+ * `--batch-command`'s `remote-object-info <remote> <id>...` (2.56) asks the remote's v2
+ * `object-info` through {@link setRemoteObjectInfo}'s command: only the atoms the server
+ * answered expand (`%(objectname)` always), and an object it lacks prints `<id> missing`.
+ *
  * Not implemented: `--textconv`, `--filters`, `--path`, `--follow-symlinks`, `--filter`
- * (2.5x), `--batch-command`'s `remote-object-info` (2.5x), and the `%(objectsize:disk)` and
- * `%(deltabase)` atoms (refused: the stores report neither). `--unordered` lists objects in
+ * (2.5x), and the `%(objectsize:disk)` and `%(deltabase)` atoms (refused: the stores report
+ * neither; git's `remote-object-info` would print them empty). `--unordered` lists objects in
  * the store's listing order, not pack order. The promisor-remote warning of
  * `--batch-all-objects` is not printed.
  */
@@ -146,6 +156,18 @@ export class CatFileCommand extends PlumbingCommand {
     this.unordered = unordered;
     return this;
   }
+
+  /**
+   * The `remote-object-info` command a `--batch-command` line runs (default: one over the
+   * default transports; `Git.catFile()` gives the facade's): its credentials and transports.
+   */
+  setRemoteObjectInfo(factory: () => RemoteObjectInfoCommand): this {
+    this.checkCallable();
+    this.remoteObjectInfoFactory = factory;
+    return this;
+  }
+
+  private remoteObjectInfoFactory?: () => RemoteObjectInfoCommand;
 
   /** `--use-mailmap`: idents of commits and tags mapped through the mailmap. */
   setUseMailmap(use: boolean): this {
@@ -396,7 +418,11 @@ export class CatFileCommand extends PlumbingCommand {
   /** batch_objects */
   private async runBatch(): Promise<number> {
     const compatibility = this.compatibility;
-    const format = parseBatchFormat(this.format ?? DEFAULT_BATCH_FORMAT, compatibility);
+    // --batch-command defers %(objectsize:disk)/%(deltabase) to the first local object: a
+    // remote-object-info line prints them empty, as git
+    const format = parseBatchFormat(this.format ?? DEFAULT_BATCH_FORMAT, compatibility, {
+      deferUnsupported: this.batch === "command",
+    });
     const plain = this.format === undefined || this.format === DEFAULT_BATCH_FORMAT;
     const state: BatchState = {
       format,
@@ -469,7 +495,8 @@ export class CatFileCommand extends PlumbingCommand {
         return;
       }
       if (name === "remote-object-info") {
-        throw new PlumbingError("fatal: cat-file: remote-object-info is not supported");
+        await this.remoteObjectInfo(state, arg);
+        return;
       }
       await this.batchOne({ ...state, contents: name === "contents" }, resolver, arg, undefined);
     };
@@ -500,6 +527,77 @@ export class CatFileCommand extends PlumbingCommand {
       else queue.push(found);
     }
     if (buffer && queue.length > 0) await flush();
+  }
+
+  /**
+   * parse_cmd_remote_object_info: `<remote> <id>...` split as git's `split_cmdline` (quotes
+   * and backslashes), the ids checked before the remote is asked, then one line per id in
+   * order: `<id> missing` for an object the server lacks, else the format with only the
+   * atoms the server answered (the default format prints the type and size it got).
+   */
+  private async remoteObjectInfo(state: BatchState, line: string): Promise<void> {
+    if (line.length >= MAX_REMOTE_OBJ_INFO_LINE) {
+      throw new PlumbingError("fatal: remote-object-info command too long");
+    }
+    const argv = splitCmdline(line);
+    if (typeof argv === "string") {
+      throw new PlumbingError(`fatal: remote-object-info: failed to parse command line: ${argv}`);
+    }
+    if (argv.length - 1 > MAX_ALLOWED_OBJ_LIMIT) {
+      throw new PlumbingError(
+        `fatal: remote-object-info supports at most ${MAX_ALLOWED_OBJ_LIMIT} objects`,
+      );
+    }
+    // get_remote_info: get_oid_hex reads the first hexsz digits (any case) and nothing after
+    const hexLength = this.objectFormat.hexLength;
+    const ids: string[] = [];
+    for (const arg of argv.slice(1)) {
+      const head = arg.slice(0, hexLength);
+      if (head.length === hexLength && /^[0-9a-fA-F]+$/.test(head)) {
+        ids.push(head.toLowerCase());
+        continue;
+      }
+      if (arg.length < hexLength && arg.length >= 4 && /^[0-9a-fA-F]+$/.test(arg)) {
+        throw new PlumbingError(
+          `fatal: remote-object-info does not support short oids, ${hexLength} characters required`,
+        );
+      }
+      throw new PlumbingError(`fatal: not a valid object name '${arg}'`);
+    }
+    if (ids.length === 0) throw new PlumbingError("fatal: remote-object-info requires objects");
+    const command = (
+      this.remoteObjectInfoFactory?.() ?? new RemoteObjectInfoCommand(this.workingCopy)
+    )
+      .setRemote(argv[0] as string)
+      .setSize(state.plain || state.format.needsSize)
+      .setType(state.plain || state.format.needsType);
+    for (const id of ids) command.addObjectId(id);
+    let answer: RemoteObjectInfoResult;
+    try {
+      answer = await command.call();
+    } catch (error) {
+      if (error instanceof ObjectInfoError || error instanceof RemoteObjectInfoUnsupportedError) {
+        throw new PlumbingError(`fatal: ${error.message}`);
+      }
+      throw error;
+    }
+    const remote = { size: answer.size, type: answer.type };
+    for (const object of answer.objects) {
+      if (object.missing) {
+        await this.write(`${object.id} missing${state.delim}`);
+        continue;
+      }
+      const data: BatchObjectData = {
+        id: object.id,
+        ...(object.type !== undefined ? { type: object.type } : {}),
+        ...(object.size !== undefined ? { size: object.size } : {}),
+      };
+      await this.write(
+        state.plain
+          ? `${data.id} ${data.type ?? ""} ${data.size ?? 0}${state.delim}`
+          : `${expandBatchFormat(state.format, data, remote)}${state.delim}`,
+      );
+    }
   }
 
   /** batch_one_object */
@@ -583,6 +681,45 @@ interface BatchState {
   contents: boolean;
   /** Replace refs apply (not under `--batch-all-objects`) */
   replace: boolean;
+}
+
+/** cat-file.c's MAX_ALLOWED_OBJ_LIMIT: ids one remote-object-info line may ask about. */
+const MAX_ALLOWED_OBJ_LIMIT = 10000;
+
+/** cat-file.c's MAX_REMOTE_OBJ_INFO_LINE: a URL of 8 KiB and the ids (GIT_MAX_HEXSZ + 1 each). */
+const MAX_REMOTE_OBJ_INFO_LINE = 8 * 1024 + MAX_ALLOWED_OBJ_LIMIT * (64 + 1);
+
+/**
+ * alias.c's split_cmdline: words split on whitespace, quotes removed, a backslash escaping
+ * the next character outside single quotes; split_cmdline_strerror's text on an error.
+ */
+function splitCmdline(line: string): string[] | string {
+  // one word to begin with; every whitespace run ends one and starts the next (a trailing
+  // run leaves an empty last word, as git's)
+  const args: string[] = [];
+  let current = "";
+  let quoted = "";
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i] as string;
+    if (!quoted && /[ \t\n\r]/.test(c)) {
+      args.push(current);
+      current = "";
+      while (i + 1 < line.length && /[ \t\n\r]/.test(line[i + 1] as string)) i++;
+    } else if (!quoted && (c === "'" || c === '"')) {
+      quoted = c;
+    } else if (c === quoted) {
+      quoted = "";
+    } else {
+      if (c === "\\" && quoted !== "'") {
+        i++;
+        if (i >= line.length) return "cmdline ends with \\";
+      }
+      current += line[i];
+    }
+  }
+  if (quoted) return "unclosed quote";
+  args.push(current);
+  return args;
 }
 
 function modeLetter(mode: CatFileMode): string {

@@ -130,6 +130,13 @@ export function serverV2Capabilities(
   }
   // serve.c's order: ... object-info, bundle-uri
   if (options.bundleUri && !list.includes("bundle-uri")) list.push("bundle-uri");
+  // serve.c's last capability: `promisor-remote=<pr-info>` (promisor.advertise)
+  if (
+    options.promisorRemote !== undefined &&
+    !list.some((c) => c === "promisor-remote" || c.startsWith("promisor-remote="))
+  ) {
+    list.push(`promisor-remote=${options.promisorRemote}`);
+  }
   return list;
 }
 
@@ -145,6 +152,8 @@ export interface ServerV2CapabilityOptions {
   sessionId?: string;
   /** `bundle-uri` (git's `uploadpack.advertiseBundleURIs`), after `object-info` */
   bundleUri?: boolean;
+  /** `promisor-remote=<pr-info>` (git's `promisor.advertise`: `promisorRemoteAdvertisement`) */
+  promisorRemote?: string;
 }
 
 /**

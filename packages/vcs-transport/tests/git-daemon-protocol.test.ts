@@ -84,6 +84,7 @@ describe("git-daemon's request line", () => {
       path: "/r.git",
       host: "example.com",
       port: "9418",
+      extendedArgs: true,
       gitProtocol: "version=2:x=y",
     });
     expect(parseGitDaemonRequest(enc.encode("git-receive-pack /a b\n"))).toEqual({
@@ -110,9 +111,11 @@ describe("git-daemon's request line", () => {
     expect(parseGitDaemonRequest(enc.encode("git-upload-pack /r\0HOST=h\0"))).toMatchObject({
       host: "h",
     });
+    // an empty host= still counts as extended arguments (`--interpolated-path` applies)
     expect(parseGitDaemonRequest(enc.encode("git-upload-pack /r\0host=\0"))).toEqual({
       command: "git-upload-pack",
       path: "/r",
+      extendedArgs: true,
     });
   });
 
@@ -144,7 +147,12 @@ describe("git-daemon's request line", () => {
       const { request, input } = await readGitDaemonRequest(
         chunks(all.subarray(0, cut), all.subarray(cut)),
       );
-      expect(request).toEqual({ command: "git-upload-pack", path: "/r", host: "h" });
+      expect(request).toEqual({
+        command: "git-upload-pack",
+        path: "/r",
+        host: "h",
+        extendedArgs: true,
+      });
       let rest = "";
       for await (const c of input) rest += dec.decode(c);
       expect(rest).toBe("0000rest");
@@ -185,6 +193,7 @@ describe("git-daemon's request line", () => {
       path: "~u/r.git",
       host: "h",
       port: "9419",
+      extendedArgs: true,
       gitProtocol: "version=2",
     });
     // --upload-pack names the program in the line, as git_connect_git writes it
@@ -746,11 +755,47 @@ describe("createBasePathResolver: git-daemon's path rules", () => {
     expect(await resolve("/b/")).toBe("/srv/b");
     expect(await resolve("/c")).toBe("/srv/c.git");
     expect(await resolve("/d")).toBe("/srv/d.git/.git");
-    expect(await resolve("/hidden")).toBeUndefined();
+    // found but not exported: git-daemon's "repository not exported"
+    await expect(resolve("/hidden")).rejects.toThrow("repository not exported");
     expect(await resolverOf(files, { exportAll: true })("/hidden")).toBe("/srv/hidden.git");
     expect(await resolve("/nope")).toBeUndefined();
     // an implicit session's relative path, read below the base too
     expect(await resolve("b")).toBe("/srv/b");
+  });
+
+  it("maps a host= request through --interpolated-path, never out of the base", async () => {
+    const files = await storage(["/srv/h1/r.git", "/srv/r.git", "/other/r.git"]);
+    const withHost = (template: string, host?: string) => {
+      const resolve = createBasePathResolver({
+        files,
+        basePath: "/srv",
+        interpolatedPath: template,
+        openRepository: async (gitDir) => opened(gitDir),
+      });
+      return async (path: string) =>
+        (
+          (await resolve(path, {
+            ...request(path),
+            extendedArgs: true,
+            ...(host !== undefined ? { host } : {}),
+          })) as { gitDir?: string; path?: string } | undefined
+        )?.gitDir;
+    };
+    expect(await withHost("/srv/%H%D", "h1")("/r")).toBe("/srv/h1/r.git");
+    // a template leading outside the base, or a host climbing out of it, finds nothing
+    expect(await withHost("/other%D", "h1")("/r")).toBeUndefined();
+    expect(await withHost("/srv/%H/../..%D", "h1")("/other/r")).toBeUndefined();
+    // a relative path is refused while interpolating
+    expect(await withHost("/srv%D", "h1")("r")).toBeUndefined();
+    // no host= at all: the base path
+    const plain = createBasePathResolver({
+      files,
+      basePath: "/srv",
+      interpolatedPath: "/srv/%H%D",
+      openRepository: async (gitDir) => opened(gitDir),
+    });
+    const served = (await plain("/r", request("/r"))) as { gitDir?: string; path?: string };
+    expect(served).toMatchObject({ gitDir: "/srv/r.git", path: "/srv/r.git" });
   });
 
   it("refuses aliases, ~user without userPath, and paths leaving the base", async () => {

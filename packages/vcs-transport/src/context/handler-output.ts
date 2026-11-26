@@ -20,6 +20,13 @@ export class HandlerOutput {
   clientSessionId?: string;
 
   /**
+   * Server side (v2): the promisor remotes the client accepted (its `promisor-remote=` line,
+   * serve.c's mark_promisor_remotes_as_accepted); upload-pack then leaves out the promisor
+   * objects it lacks (pack-objects `--missing=allow-promisor`)
+   */
+  acceptedPromisorRemotes?: string[];
+
+  /**
    * receive-pack: the reason `authorize` refused the whole push, when the run ended there
    * (`receivePack.authorizeFailure: "fatal"`; HTTP answers 403).
    */

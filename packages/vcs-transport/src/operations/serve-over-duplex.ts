@@ -10,6 +10,7 @@ import type { Duplex } from "../api/duplex.js";
 import type { ServeResult } from "../api/fetch-result.js";
 import type { RepositoryFacade } from "../api/repository-facade.js";
 import { HandlerOutput } from "../context/handler-output.js";
+import { namespacedRefStore } from "../context/namespaced-ref-store.js";
 import type { ProcessConfiguration, UploadPackRequestPolicy } from "../context/process-config.js";
 import type { ProcessContext, RefStore } from "../context/process-context.js";
 import { ProtocolState } from "../context/protocol-state.js";
@@ -36,6 +37,7 @@ import {
   serverPushTransitions,
 } from "../fsm/push/server-push-fsm.js";
 import { encodePacketLine } from "../protocol/pkt-line-codec.js";
+import { gitNamespacePrefix } from "../protocol/ref-namespace.js";
 import { processSessionId, validSessionId } from "../protocol/session-id.js";
 import type { ServiceType } from "../protocol/types.js";
 import { withIdleTimeout, withWriteTimeout } from "../utils/idle-timeout.js";
@@ -147,6 +149,14 @@ export interface ServeOverDuplexOptions {
    * reachable request policies, and HEAD naming a hidden branch is still advertised.
    */
   hideRefs?: string[];
+  /**
+   * The ref namespace to serve (git's `GIT_NAMESPACE` / `git --namespace`, gitnamespaces(7)):
+   * the client sees and writes only `refs/namespaces/<ns>/...` (nested for `a/b`), named
+   * without that prefix, and `HEAD` is `refs/namespaces/<ns>/HEAD` (`namespacedRefStore`).
+   * Non-`^` hidden ref patterns match the stripped names, `^` ones the full names. A value
+   * git refuses (`bad git namespace path`) fails the request before anything is written.
+   */
+  namespace?: string;
   /** Hidden ref patterns of upload-pack, after `hideRefs` (git's `uploadpack.hideRefs`) */
   uploadPackHideRefs?: string[];
   /** Hidden ref patterns of receive-pack, after `hideRefs` (git's `receive.hideRefs`) */
@@ -217,6 +227,12 @@ export interface ServeOverDuplexOptions {
   /** The session id {@link advertiseSID} advertises (default: one per process, `processSessionId()`) */
   sessionId?: string;
   /**
+   * Protocol v2: the `promisor-remote` capability's value (git's `promisor.advertise`,
+   * `promisorRemoteAdvertisement`); the remotes the client accepts come back in
+   * `ServeResult.acceptedPromisorRemotes`
+   */
+  promisorRemoteInfo?: string;
+  /**
    * upload-pack: git's `uploadpack.packObjectsHook`, run by the host (see `PackObjectsHook`):
    * the pack comes from its stdout. git reads the setting only from protected configuration,
    * so a served repository's config never sets it (`serverSettingsFromConfig` does not read it)
@@ -280,7 +296,20 @@ export interface ServeOverDuplexOptions {
  * ```
  */
 export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<ServeResult> {
-  const { duplex, repository, refStore, service = "git-upload-pack" } = options;
+  const { duplex, repository, service = "git-upload-pack" } = options;
+  // GIT_NAMESPACE: the namespace's view of the refs (git dies on a bad value, at once)
+  let namespace: string;
+  try {
+    namespace = gitNamespacePrefix(options.namespace);
+  } catch (error) {
+    return { success: false, error: `fatal: ${(error as Error).message}` };
+  }
+  const refStore = namespace ? namespacedRefStore(options.refStore, namespace) : options.refStore;
+  // receive-pack's head_name is the repository's own HEAD, whatever the namespace
+  const namespaceHead =
+    namespace && options.currentBranch === undefined
+      ? await options.refStore.getSymrefTarget?.("HEAD")
+      : undefined;
 
   // v2 is fetch-only: run it only when explicitly requested AND the service is
   // upload-pack. receive-pack/push always falls through to the v1 push FSM.
@@ -337,8 +366,13 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
     ...(options.advertiseSID
       ? { sessionId: validSessionId(options.sessionId) ?? processSessionId() }
       : {}),
+    ...(options.promisorRemoteInfo !== undefined && useV2 && service === "git-upload-pack"
+      ? { promisorRemote: options.promisorRemoteInfo }
+      : {}),
     advertiseObjectInfo: options.advertiseObjectInfo,
     ...(options.uploadPackFilter ? { uploadPackFilter: options.uploadPackFilter } : {}),
+    ...(namespace ? { namespace } : {}),
+    ...(namespaceHead !== undefined ? { namespaceHead } : {}),
     hiddenRefs: [
       ...(options.hideRefs ?? []),
       ...((service === "git-receive-pack"
@@ -411,10 +445,14 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
       await (write ?? ((data: Uint8Array) => duplex.write(data)))(encodePacketLine("version 1\n"));
     }
     const success = await fsm.run(ctx);
-    const clientSid =
-      ctx.output.clientSessionId !== undefined
+    const clientSid = {
+      ...(ctx.output.clientSessionId !== undefined
         ? { clientSessionId: ctx.output.clientSessionId }
-        : {};
+        : {}),
+      ...(ctx.output.acceptedPromisorRemotes !== undefined
+        ? { acceptedPromisorRemotes: ctx.output.acceptedPromisorRemotes }
+        : {}),
+    };
     for (const task of afterReport) setTimeout(() => void task(), 0);
 
     if (!success || ctx.output.error) {

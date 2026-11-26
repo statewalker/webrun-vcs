@@ -244,7 +244,11 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
 
         let first = true;
         // the refs under refs/ but the hidden ones (git's receive.hideRefs): never HEAD
-        const refsArray = receivePackRefs(refs, getConfig(ctx).hiddenRefs);
+        const refsArray = receivePackRefs(
+          refs,
+          getConfig(ctx).hiddenRefs,
+          getConfig(ctx).namespace,
+        );
         // write_head_info: then the alternates' refs as `.have`, each object id once and none
         // an advertised ref names (the first line carries the capabilities, whichever it is)
         const seen = new Set(refsArray.map(([, oid]) => oid));
@@ -666,7 +670,7 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         const known = new Set(state.refs.values());
         // git's check_connected walks `--not --exclude-hidden=receive --all`: HEAD too, which
         // receive-pack does not advertise (a detached HEAD's history counts as present)
-        if (!isRefHidden("HEAD", getConfig(ctx).hiddenRefs)) {
+        if (!isRefHidden("HEAD", getConfig(ctx).hiddenRefs, getConfig(ctx).namespace)) {
           const head = await getRefStore(ctx).get("HEAD");
           if (head) known.add(head);
         }
@@ -1296,10 +1300,12 @@ function internalError(ctx: ProcessContext, error: unknown): string {
 
 /** Refuses the commands that would change a hidden ref, with git's texts. */
 function rejectHiddenUpdates(ctx: ProcessContext, commands: PushCommand[]): void {
-  const hidden = getConfig(ctx).hiddenRefs;
+  const { hiddenRefs: hidden, namespace } = getConfig(ctx);
   if (!hidden?.length) return;
   for (const cmd of commands) {
-    if (cmd.result !== "NOT_ATTEMPTED" || !isRefHidden(cmd.refName, hidden)) continue;
+    if (cmd.result !== "NOT_ATTEMPTED" || !isRefHidden(cmd.refName, hidden, namespace)) {
+      continue;
+    }
     reject(
       cmd,
       cmd.type === "DELETE" ? "deny deleting a hidden ref" : "deny updating a hidden ref",
@@ -1601,7 +1607,12 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
       : repository.isBare
         ? await repository.isBare()
         : true);
-  const head = config.currentBranch ?? (await refStore.getSymrefTarget?.("HEAD"));
+  // the repository's own HEAD, not a served namespace's (receive-pack's head_name)
+  const head =
+    config.currentBranch ??
+    (config.namespace !== undefined
+      ? config.namespaceHead
+      : await refStore.getSymrefTarget?.("HEAD"));
   const denyCurrentBranch = denyActionOf(config.denyCurrentBranch);
   const denyDeleteCurrent = denyActionOf(rp.denyDeleteCurrent);
   // find_shared_symref over the worktrees: the branches a non-bare worktree's HEAD uses
@@ -1672,7 +1683,8 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
         cmd.message = "deletion prohibited";
         return;
       }
-      if (checkedOut.has(name) || head === name) {
+      // a worktree's branch by the name sent, HEAD's by the namespaced name (git's update())
+      if (checkedOut.has(name) || head === (config.namespace ?? "") + name) {
         if (denyDeleteCurrent === "warn") await sendWarning(ctx, "deleting the current branch");
         else if (denyDeleteCurrent !== "ignore") {
           if (denyDeleteCurrent === "unconfigured") {

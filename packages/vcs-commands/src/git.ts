@@ -49,6 +49,8 @@ import {
   DiffPairsCommand,
   DiffTreeCommand,
   EditBranchDescriptionCommand,
+  FastExportCommand,
+  FastImportCommand,
   FetchCommand,
   FetchMultipleCommand,
   FmtMergeMsgCommand,
@@ -95,6 +97,7 @@ import {
   RemoteArchiveCommand,
   RemoteGetUrlCommand,
   RemoteListCommand,
+  RemoteObjectInfoCommand,
   RemotePruneCommand,
   RemoteRemoveCommand,
   RemoteRenameCommand,
@@ -905,6 +908,33 @@ export class Git implements Disposable {
   }
 
   /**
+   * Create a FastExportCommand writing history as a fast-import stream (`git fast-export`).
+   *
+   * @example
+   * ```typescript
+   * const { stdout } = await git.fastExport().addArgument("--all").callOutput();
+   * ```
+   */
+  fastExport(): FastExportCommand {
+    this.checkClosed();
+    return new FastExportCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a FastImportCommand writing objects and refs from a fast-import stream
+   * (`git fast-import`).
+   *
+   * @example
+   * ```typescript
+   * const { exitCode } = await git.fastImport().setInput(stream).callOutput();
+   * ```
+   */
+  fastImport(): FastImportCommand {
+    this.checkClosed();
+    return new FastImportCommand(this._workingCopy);
+  }
+
+  /**
    * Create an UnpackObjectsCommand exploding a pack into loose objects (`git unpack-objects`,
    * `-n`, `--strict`).
    *
@@ -1249,7 +1279,23 @@ export class Git implements Disposable {
    */
   catFile(): CatFileCommand {
     this.checkClosed();
-    return new CatFileCommand(this._workingCopy);
+    // `--batch-command`'s remote-object-info asks remotes through this facade's transports
+    return new CatFileCommand(this._workingCopy).setRemoteObjectInfo(() => this.remoteObjectInfo());
+  }
+
+  /**
+   * Create a RemoteObjectInfoCommand: the size and type of objects a remote holds, asked
+   * with protocol v2's `object-info` without fetching them (git 2.56's
+   * `transport_fetch_object_info`).
+   *
+   * @example
+   * ```typescript
+   * const { objects } = await git.remoteObjectInfo().setRemote("origin").addObjectId(id).call();
+   * ```
+   */
+  remoteObjectInfo(): RemoteObjectInfoCommand {
+    this.checkClosed();
+    return this.withTransports(new RemoteObjectInfoCommand(this._workingCopy));
   }
 
   /**
