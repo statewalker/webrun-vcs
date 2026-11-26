@@ -1,5 +1,34 @@
 # @statewalker/vcs-commands
 
+## 0.11.0
+
+### Minor Changes
+
+- 9ad5c69: `extensions.compatObjectFormat`: `cat-file --batch`, `--batch-check` and `--batch-command`, single-object `cat-file`, `ls-tree` and `rev-parse --output-object-format` take abbreviated and full ids of the compatibility format (git's `GET_OID_HASH_ANY`, `ResolveOptions.hashAny`: the loose object map's ids disambiguated with the stored objects). `commit -S` and `tag -s` (and every command signing a commit) sign the compatibility view too and write both signatures, as git master's `commit_tree_extended` and `do_sign`: new optional `Commit.compatSignature` / `AnnotatedTag.compatSignature`, and `CompatObjects.compatIdsWithPrefix` / `convertToCompat`.
+- a0c4c58: fsmonitor: `core.fsmonitor=true` asks git's builtin daemon over a `MessagePort` the host opens (`GitHostEnvironment.openIpcPort`, `IpcPortRequest`; `queryFsmonitorDaemon` speaks simple-ipc's query), and `update-index --fsmonitor-valid` sets a gitlink's bit as git does. vcs-utils-node adds the Node socket adapter: `socketMessagePort`, `connectSocketPort` and `listenSocketPorts` turn a TCP or Unix-domain socket into one end of a `MessageChannel` (webrun-rpc's stream tier, with backpressure and an explicit half-close); the Node host environment opens IPC endpoints with it.
+- aac8a7d: fsmonitor: every command that reads the index asks the monitor as git's `tweak_fsmonitor` does (`GitCommand.readCurrentIndex`), so any index it writes carries the `FSMN` extension and a failed answer drops the valid bits; `reset --hard` and `checkout -f` neither stat nor rewrite an entry the monitor holds unchanged when the target keeps it (unpack-trees' `oneway_merge`; `fsmonitorKeptEntries`, `restoreKeptEntries`); a sparse index keeps `FSMN` with its positions over the collapsed entries, on read and write (`FsmonitorState.markSparseDirectoriesInvalid`).
+- bdb1463: fsmonitor: `UpdateIndexCommand.setFsmonitor` / `setFsmonitorValid` (`git update-index --[no-]fsmonitor`, `--[no-]fsmonitor-valid`, with git's warnings and its bare-repository refusal), `update-index --refresh` asks the monitor and skips and marks fsmonitor-valid entries, and diff-files, `git diff` and diff-index take entries the monitor reported nothing for as unchanged without an lstat. `FsmonitorState.writtenWhileDisabled` keeps an `FSMN` that `update-index --fsmonitor` added with `core.fsmonitor` off.
+- 0236bda: A submodule using git master's `extensions.objectStorage = files://<dir>` no longer fails its superproject's status and diff: the submodule is reported with a `warning: cannot look into submodule` line (`SubmoduleDirt.unreadable`), its commit change still read from refs. Clone reports such a source's format instead of "does not exist". New `setObjectStorageFormat` on `CloneCommand`, `SubmoduleAddCommand` and `SubmoduleUpdateCommand` (t7427's `--object-storage-format`); `UnsupportedRepositoryFormatError.notSupportedHere` tells our limitations from git's refusals. Fixes statewalker/webrun-vcs#441.
+- c716cad: `git repo info`: `RepoInfoCommand.setSetupDirectory(hostPath)` takes the directory git's setup went to (`setupGitDirectory`'s `cwd` as a host path). The `path.*.relative` keys are relative to it plus the prefix, and a relative `$GIT_INDEX_FILE` is read there, so a git started outside the worktree (explicit `$GIT_DIR`/`$GIT_WORK_TREE`) or with a bare `$GIT_DIR` gets git's paths.
+
+### Patch Changes
+
+- 7b5ef59: `Staging.indexLocation()` (optional; `GitStaging`, `FileStagingStore`): the index file a staging reads and writes, git's `repo_get_index_file`. `git repo info` reports a relative `$GIT_INDEX_FILE` as the file the working copy opened (read from where git's setup went), and finds `path.superprojectworkingtree.*` as submodule.c's `get_superproject_working_tree` does: a gitlink at the worktree's path in the index of the repository above it, so embedded submodules and a superproject's linked-worktree submodules are found and a dropped gitlink is not (statewalker/webrun-vcs#444, statewalker/webrun-vcs#445).
+- Updated dependencies
+- Updated dependencies [9ad5c69]
+- Updated dependencies [a0c4c58]
+- Updated dependencies [aac8a7d]
+- Updated dependencies [bdb1463]
+- Updated dependencies [869ff58]
+- Updated dependencies [0236bda]
+- Updated dependencies [c92f979]
+- Updated dependencies [7b5ef59]
+  - @statewalker/vcs-store-mem@0.11.0
+  - @statewalker/vcs-core@0.11.0
+  - @statewalker/vcs-store-files@0.11.0
+  - @statewalker/vcs-working-tree@0.11.0
+  - @statewalker/vcs-transport@0.11.0
+
 ## 0.10.0
 
 ### Minor Changes

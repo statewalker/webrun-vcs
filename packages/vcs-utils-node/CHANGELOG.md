@@ -1,5 +1,12 @@
 # @statewalker/vcs-utils-node
 
+## 0.11.0
+
+### Minor Changes
+
+- a0c4c58: fsmonitor: `core.fsmonitor=true` asks git's builtin daemon over a `MessagePort` the host opens (`GitHostEnvironment.openIpcPort`, `IpcPortRequest`; `queryFsmonitorDaemon` speaks simple-ipc's query), and `update-index --fsmonitor-valid` sets a gitlink's bit as git does. vcs-utils-node adds the Node socket adapter: `socketMessagePort`, `connectSocketPort` and `listenSocketPorts` turn a TCP or Unix-domain socket into one end of a `MessageChannel` (webrun-rpc's stream tier, with backpressure and an explicit half-close); the Node host environment opens IPC endpoints with it.
+- 869ff58: git:// over MessagePorts: `createGitDaemonConnector`'s `openSocket`, `createSshConnector`'s `exec` and `GitDaemon.serve` accept a `MessagePort` as well as a `Duplex` (`ByteStream`, `isDuplex`, `duplexOfStream`), so a Node socket through vcs-utils-node's adapter (`connectSocketPort`, `listenSocketPorts`), a `MessageChannel`, a worker or a WebSocket bridge carry the same session. `messagePortDuplex` takes `drainTimeout` (`DEFAULT_PORT_DRAIN_TIMEOUT`) for a serving side's close, which lets the far end take the whole answer before the client's input is abandoned. `listenSocketPorts` gives `onPort` the client's address (`SocketPeer`), and a socket the adapter half-closed is flushed before it is destroyed.
+
 ## 0.10.0
 
 ### Minor Changes

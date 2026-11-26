@@ -1,5 +1,24 @@
 # @statewalker/vcs-store-files
 
+## 0.11.0
+
+### Minor Changes
+
+- 9ad5c69: `extensions.compatObjectFormat`: `cat-file --batch`, `--batch-check` and `--batch-command`, single-object `cat-file`, `ls-tree` and `rev-parse --output-object-format` take abbreviated and full ids of the compatibility format (git's `GET_OID_HASH_ANY`, `ResolveOptions.hashAny`: the loose object map's ids disambiguated with the stored objects). `commit -S` and `tag -s` (and every command signing a commit) sign the compatibility view too and write both signatures, as git master's `commit_tree_extended` and `do_sign`: new optional `Commit.compatSignature` / `AnnotatedTag.compatSignature`, and `CompatObjects.compatIdsWithPrefix` / `convertToCompat`.
+- 0236bda: A submodule using git master's `extensions.objectStorage = files://<dir>` no longer fails its superproject's status and diff: the submodule is reported with a `warning: cannot look into submodule` line (`SubmoduleDirt.unreadable`), its commit change still read from refs. Clone reports such a source's format instead of "does not exist". New `setObjectStorageFormat` on `CloneCommand`, `SubmoduleAddCommand` and `SubmoduleUpdateCommand` (t7427's `--object-storage-format`); `UnsupportedRepositoryFormatError.notSupportedHere` tells our limitations from git's refusals. Fixes statewalker/webrun-vcs#441.
+- 7b5ef59: `Staging.indexLocation()` (optional; `GitStaging`, `FileStagingStore`): the index file a staging reads and writes, git's `repo_get_index_file`. `git repo info` reports a relative `$GIT_INDEX_FILE` as the file the working copy opened (read from where git's setup went), and finds `path.superprojectworkingtree.*` as submodule.c's `get_superproject_working_tree` does: a gitlink at the worktree's path in the index of the repository above it, so embedded submodules and a superproject's linked-worktree submodules are found and a dropped gitlink is not (statewalker/webrun-vcs#444, statewalker/webrun-vcs#445).
+
+### Patch Changes
+
+- c92f979: A submodule or nested repository whose refs live in a reftable (`extensions.refStorage = reftable`) no longer reads as having no commit checked out: `FileWorktree.gitlinkHeadState` / `readGitlinkHead` resolve its HEAD through its reftable stacks (the linked worktree's own stack for per-worktree names), as git's `resolve_gitlink_ref` opens the submodule's ref store, instead of following the `.git/HEAD` stub. `add`, `submodule add`, status, diff and `submodule status` of such a submodule now match native git.
+- Updated dependencies [9ad5c69]
+- Updated dependencies [a0c4c58]
+- Updated dependencies [aac8a7d]
+- Updated dependencies [bdb1463]
+- Updated dependencies [7b5ef59]
+  - @statewalker/vcs-core@0.11.0
+  - @statewalker/vcs-working-tree@0.11.0
+
 ## 0.10.0
 
 ### Minor Changes

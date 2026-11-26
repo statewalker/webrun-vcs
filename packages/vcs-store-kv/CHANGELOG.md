@@ -1,5 +1,24 @@
 # @statewalker/vcs-store-kv
 
+## 0.11.0
+
+### Minor Changes
+
+- Release of the changes since the last published version:
+  
+  - @statewalker/vcs-core crosses a breaking line
+  - @statewalker/vcs-working-tree crosses a breaking line
+
+### Patch Changes
+
+- Updated dependencies [9ad5c69]
+- Updated dependencies [a0c4c58]
+- Updated dependencies [aac8a7d]
+- Updated dependencies [bdb1463]
+- Updated dependencies [7b5ef59]
+  - @statewalker/vcs-core@0.11.0
+  - @statewalker/vcs-working-tree@0.11.0
+
 ## 0.10.0
 
 ### Minor Changes
