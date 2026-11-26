@@ -34,7 +34,8 @@
  * `--full-name`/`grep.fullName`, quoted as `core.quotePath` says (not with `-z`). Binary files
  * (a NUL in their first 8000 bytes, or the `diff` attribute's driver) report `Binary file x
  * matches`; `--textconv` runs `diff.<driver>.textconv` through the runner the host installs
- * (`installTextconvRunner`). `-p`/`-W` use the driver's funcname pattern. Configuration:
+ * (`installTextconvRunner`), a blob of a tree or the index through the driver's notes cache
+ * (`diff.<driver>.cachetextconv`, as git's fill_textconv). `-p`/`-W` use the driver's funcname pattern. Configuration:
  * `grep.lineNumber`, `grep.column`, `grep.fullName`, `grep.patternType`,
  * `grep.extendedRegexp`, `grep.threads`, `color.grep`, `color.grep.<slot>`.
  *
@@ -62,12 +63,13 @@ import { RevisionError } from "../../errors/index.js";
 import { GitCommand } from "../../git-command.js";
 import { quotePath } from "../../results/quote-path.js";
 import { parseGitColor } from "../config-value-types.js";
-import { type TextconvRunner, textconvRunnerOf } from "../diff-textconv.js";
+import { type TextconvRequest, textconvRunnerOf } from "../diff-textconv.js";
 import { configValue } from "../merge-config.js";
 import { MATCHED_FNMATCH, matchPathspec, type PathspecItem, parsePathspec } from "../pathspec.js";
 import type { GrepPatternType } from "../rev-filter/index.js";
 import { type ArgumentFiles, verifyFilename, verifyNonFilename } from "../revision-filenames.js";
 import type { RevisionResolver } from "../revision-resolver.js";
+import { TextconvCaches } from "../textconv-cache.js";
 import {
   DEFAULT_GREP_COLORS,
   type GrepBinaryMode,
@@ -148,7 +150,11 @@ interface GrepContext {
   treeEntries?(id: ObjectId): Promise<readonly { name: string; mode: number; id: ObjectId }[]>;
   resolver?(): RevisionResolver;
   argumentFiles?(prefix: string): ArgumentFiles;
-  textconv?: TextconvRunner;
+  /**
+   * Runs a textconv (diff.c's fill_textconv): through the driver's cache when it has one and
+   * `id` is the converted blob's (a tree's or the index's; never a worktree file's)
+   */
+  textconv?(request: TextconvRequest, id: ObjectId | undefined): Promise<Uint8Array>;
   inOneOperation<T>(fn: () => Promise<T>): Promise<T>;
 }
 
@@ -564,6 +570,7 @@ class GrepRun {
     withIndex: boolean,
     read: () => Promise<Uint8Array | undefined>,
     textconvInput: (content: Uint8Array) => Promise<Uint8Array>,
+    id?: ObjectId,
   ): Promise<boolean> {
     const o = this.o;
     const driver = await this.driver(path, withIndex);
@@ -571,13 +578,16 @@ class GrepRun {
     let textconv = false;
     if (o.textconv && driver?.textconv && this.ctx.textconv && content !== undefined) {
       const tc = driver.textconv;
-      content = await this.ctx.textconv({
-        driver: tc.name,
-        command: tc.command,
-        path: path ?? "",
-        content: await textconvInput(content),
-        cache: tc.cache,
-      });
+      content = await this.ctx.textconv(
+        {
+          driver: tc.name,
+          command: tc.command,
+          path: path ?? "",
+          content: await textconvInput(content),
+          cache: tc.cache,
+        },
+        id,
+      );
       textconv = true;
     }
     return this.engine.grepSource({
@@ -618,10 +628,16 @@ class GrepRun {
     mode = FileMode.REGULAR_FILE as number,
   ): Promise<boolean> {
     const read = () => this.ctx.readBlob?.(id) ?? Promise.resolve(undefined);
-    return this.grepOne(name, path, true, read, async (content) =>
-      collectChunks(
-        await smudgeContent(this.ctx.worktree?.contentFilter, path ?? "", content, mode),
-      ),
+    return this.grepOne(
+      name,
+      path,
+      true,
+      read,
+      async (content) =>
+        collectChunks(
+          await smudgeContent(this.ctx.worktree?.contentFilter, path ?? "", content, mode),
+        ),
+      id,
     );
   }
 
@@ -1010,6 +1026,8 @@ export class GrepCommand extends GitCommand<GrepResult> implements GrepSetters {
     const wc = this.workingCopy;
     const worktree = this.worktreeAccess;
     const get = (key: string) => configValue(wc, key);
+    const runner = textconvRunnerOf(wc);
+    const caches = new TextconvCaches(() => this.notesContext());
     const ctx: GrepContext = {
       worktree,
       config: get,
@@ -1032,7 +1050,12 @@ export class GrepCommand extends GitCommand<GrepResult> implements GrepSetters {
         (await this.treeEntries(id)).map((e) => ({ name: e.name, mode: e.mode, id: e.id })),
       resolver: () => this.revisionResolver(),
       argumentFiles: (prefix) => this.argumentFiles(prefix),
-      textconv: textconvRunnerOf(wc),
+      ...(runner
+        ? {
+            textconv: (request: TextconvRequest, id: ObjectId | undefined) =>
+              caches.run(runner, request, id),
+          }
+        : {}),
       inOneOperation: (fn) => this.inOneOperation(fn),
     };
     return new GrepRun(ctx, this.options).run();
