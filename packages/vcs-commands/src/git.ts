@@ -110,6 +110,7 @@ import {
   RepackCommand,
   ReplaceCommand,
   ReplayCommand,
+  RequestPullCommand,
   RerereCommand,
   ResetCommand,
   RestoreCommand,
@@ -1945,6 +1946,20 @@ export class Git implements Disposable {
   lsRemote(): LsRemoteCommand {
     this.checkClosed();
     return this.withTransports(new LsRemoteCommand(this._workingCopy));
+  }
+
+  /**
+   * Create a RequestPullCommand (`git request-pull`): the text asking to pull a published
+   * branch or tag, with its shortlog and diffstat.
+   *
+   * @example
+   * ```typescript
+   * const { stdout } = await git.requestPull().setStart("v1.0").setUrl("origin").setEnd("main").call();
+   * ```
+   */
+  requestPull(): RequestPullCommand {
+    this.checkClosed();
+    return this.withTransports(new RequestPullCommand(this._workingCopy));
   }
 
   /**
