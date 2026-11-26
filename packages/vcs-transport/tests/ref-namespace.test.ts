@@ -131,7 +131,7 @@ describe("namespacedRefStore", () => {
     );
     expect(await outside.get("HEAD")).toBeUndefined();
     expect(await outside.getSymrefTarget?.("HEAD")).toBeUndefined();
-    expect((await outside.listAll()).map(([n]) => n)).not.toContain("HEAD");
+    expect([...(await outside.listAll())].map(([n]) => n)).not.toContain("HEAD");
   });
 
   it("writes under the prefix, never through a symbolic ref leaving it", async () => {
