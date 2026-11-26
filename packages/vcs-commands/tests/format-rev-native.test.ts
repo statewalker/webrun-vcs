@@ -5,7 +5,7 @@
  * `$GIT3`, each skipped when it has no `format-rev` (2.43).
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -232,6 +232,15 @@ function describeFormatRev(native: NativeGit) {
         );
         shell.tick();
         shell.ok(dir, "commit", "-q", "--allow-empty", "-m", "only a subject");
+        // format-rev's fresh rev_info reads no log.* settings and its builtin formats map no
+        // idents, whatever the configuration and .mailmap say
+        shell.ok(dir, "config", "log.date", "relative");
+        shell.ok(dir, "config", "log.mailmap", "true");
+        shell.ok(dir, "config", "log.abbrevCommit", "true");
+        writeFileSync(
+          join(dir, ".mailmap"),
+          `Mapped Name <mapped@example.com> <${shell.ok(dir, "log", "-1", "--format=%ae").trim()}>\n`,
+        );
         const revs = "HEAD\nHEAD~1\nHEAD~2\nHEAD~2^2\n";
         const list = shell.ok(dir, "rev-list", "HEAD");
         const previous = repo;

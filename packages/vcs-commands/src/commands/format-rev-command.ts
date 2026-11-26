@@ -217,12 +217,15 @@ export class FormatRevCommand extends PlumbingCommand {
     try {
       if (pretty.builtin !== undefined) {
         // pretty_print_commit with format-rev's context: fmt_output_email_subject of a
-        // rev_info without a subject prefix, encode_email_headers off
+        // rev_info without a subject prefix, encode_email_headers off, no mailmap, and the
+        // default date mode of a fresh rev_info (`log.date` is never read)
         return decodeGitPath(
           await log.callBytes({
             pretty: pretty.builtin,
             prettyOnly: true,
             notes: false,
+            mailmap: false,
+            date: "default",
             mail: { subject: () => "Subject: ", encodeHeaders: false },
           }),
         );
