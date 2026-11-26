@@ -16,6 +16,9 @@ export function createCompatObjects(map: LooseObjectMap, objects: GitObjects): C
     compat: map.compat,
     toCompat: (id) => map.toCompat(id),
     toStorage: (compatId) => map.toStorage(compatId),
+    compatIdsWithPrefix: (prefix) => map.compatIdsWithPrefix(prefix),
+    convertToCompat: (type, content) =>
+      convertObjectContent(type, content, map.storage, map.compat, (i) => map.toCompat(i)),
     async readAsCompat(compatId) {
       const id = await map.toStorage(compatId);
       if (id === undefined) return undefined;

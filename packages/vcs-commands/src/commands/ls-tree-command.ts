@@ -263,7 +263,9 @@ export class LsTreeCommand extends PlumbingCommand {
     const resolver = this.revisionResolver();
     let id: string | undefined;
     try {
-      id = await resolver.resolve(this.treeish);
+      // GET_OID_HASH_ANY: a tree named by an id of the compatibility format is listed with
+      // that format's ids
+      id = await resolver.resolve(this.treeish, { hashAny: true });
     } catch (e) {
       if (!(e instanceof RefNotFoundError)) throw e;
     }
@@ -370,6 +372,18 @@ export class LsTreeCommand extends PlumbingCommand {
 
   /** parse_tree_indirect: a commit's tree, a tag's object peeled, a tree itself. */
   private async peelToTree(id: string): Promise<string | undefined> {
+    const compat = this.compatObjects;
+    if (compat && id.length !== this.objectFormat.hexLength) {
+      // git parses an object named by a compatibility id with the storage format's parsers:
+      // a tree reads (its entries decoded at the id's width), a commit's `tree` line is too
+      // short for them (`bogus commit object`), a blob is hashed with the storage format's
+      // hash (`hash mismatch`), a tag fails quietly
+      const type = (await compat.readAsCompat(id).catch(() => undefined))?.type;
+      if (type === "tree") return id;
+      if (type === "commit") this.warn(`error: bogus commit object ${id}`);
+      if (type === "blob") this.warn(`error: hash mismatch ${id}`);
+      return undefined;
+    }
     const peeled = await this.revisionResolver().peelTags(id);
     if (peeled.type === "tree") return peeled.id;
     if (peeled.type === "commit") {
@@ -435,6 +449,12 @@ export class LsTreeCommand extends PlumbingCommand {
 
   private async abbreviated(id: string): Promise<string> {
     if (this.abbrev === 0) return id;
+    if (id.length !== this.objectFormat.hexLength) {
+      // an id of the compatibility format: the minimum asked (default 7), not measured
+      // against the repository's ids
+      const min = this.abbrev < 0 ? 7 : Math.max(4, this.abbrev);
+      return id.slice(0, Math.min(min, id.length));
+    }
     const hex = this.objectFormat.hexLength;
     const min =
       this.abbrev < 0 ? undefined : this.abbrev < 4 ? 4 : this.abbrev > hex ? hex : this.abbrev;
@@ -444,6 +464,10 @@ export class LsTreeCommand extends PlumbingCommand {
 
   /** The blob's size, undefined when it cannot be read. */
   private async blobSize(id: string): Promise<number | undefined> {
+    const compat = this.compatObjects;
+    if (compat && id.length !== this.objectFormat.hexLength) {
+      return (await compat.readAsCompat(id).catch(() => undefined))?.content.length;
+    }
     const objects = this._workingCopy.history?.objects;
     try {
       if (objects) {

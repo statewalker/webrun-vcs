@@ -14,10 +14,18 @@
  *   in both (`unable to map tree ... in commit object`) before any ref moves.
  */
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
+import { createNodeGitHostEnvironment, createNodeSigner } from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Git } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
@@ -287,4 +295,367 @@ describe.skipIf(!git3)("extensions.compatObjectFormat (git master)", () => {
     expect(git(mine, ["rev-parse", "--verify", "-q", "up"]).status).not.toBe(0);
     expect(git(mine, ["fsck"]).status).toBe(0);
   });
+
+  /** native git with `input` on stdin, stdout as latin1 bytes */
+  const gitIn = (cwd: string, args: string[], input: string) => {
+    const r = spawnSync(git3 as string, args, { cwd, env: env(), input, encoding: "latin1" });
+    return { status: r.status ?? -1, out: r.stdout, err: r.stderr };
+  };
+  const latin1 = (bytes: Uint8Array) => Buffer.from(bytes).toString("latin1");
+
+  it("cat-file --batch* take compatibility ids, full and abbreviated (cat-file.c batch_one_object, GET_OID_HASH_ANY)", async () => {
+    const dir = compatRepo();
+    buildNative(dir);
+    const g = await ours(dir);
+    const ids: string[] = [];
+    for (const name of NAMES)
+      ids.push(ok(dir, ["rev-parse", "--output-object-format=sha1", name]).trim());
+    const input = [
+      ...ids,
+      ...ids.map((id) => id.slice(0, 8)),
+      ...ids.map((id) => id.toUpperCase().slice(0, 12)),
+      ...NAMES,
+      // an abbreviation that misses flushes git's loose cache, and the map's compatibility
+      // ids with it: the lines after it find none
+      "1234567890123456789012345678901234567890",
+      `${ids[0]}:a`,
+      `${ids[1]} with rest`,
+      "",
+    ].join("\n");
+    const cases: Array<[string[], (c: ReturnType<Git["catFile"]>) => ReturnType<Git["catFile"]>]> =
+      [
+        [["cat-file", "--batch-check"], (c) => c.setBatch("info")],
+        [["cat-file", "--batch"], (c) => c.setBatch("contents")],
+        [
+          ["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize) %(rest)"],
+          (c) => c.setBatch("info", "%(objectname) %(objecttype) %(objectsize) %(rest)"),
+        ],
+        [
+          ["cat-file", "--batch", "--use-mailmap"],
+          (c) => c.setBatch("contents").setUseMailmap(true),
+        ],
+      ];
+    writeFileSync(join(dir, ".mailmap"), "M <m@example.com> <a@example.com>\n");
+    for (const [args, configure] of cases) {
+      const native = gitIn(dir, args, input);
+      expect(native.status, `${args.join(" ")}: ${native.err}`).toBe(0);
+      const r = await configure(g.catFile()).setStdin(input).callOutput();
+      expect({ status: r.exitCode, out: latin1(r.stdout), err: r.stderr }, args.join(" ")).toEqual(
+        native,
+      );
+    }
+    // --batch-command: info and contents of compatibility ids
+    const commands = `info ${ids[0]}\ncontents ${ids[2]?.slice(0, 9)}\ninfo ${ids[4]}\ncontents ${ids[3]}\n`;
+    const native = gitIn(dir, ["cat-file", "--batch-command"], commands);
+    expect(native.status, native.err).toBe(0);
+    const r = await g.catFile().setBatch("command").setStdin(commands).callOutput();
+    expect({ status: r.exitCode, out: latin1(r.stdout), err: r.stderr }).toEqual(native);
+    // single-object modes take abbreviated compatibility ids too, and refuse unmapped ones
+    for (const name of [
+      ids[0]?.slice(0, 7),
+      ids[3]?.slice(0, 10),
+      "1234567890123456789012345678901234567890",
+    ]) {
+      for (const [flag, mode] of [
+        ["-t", "type"],
+        ["-s", "size"],
+        ["-p", "pretty"],
+        ["-e", "exists"],
+      ] as const) {
+        const n = git(dir, ["cat-file", flag, name as string]);
+        const o = await g
+          .catFile()
+          .setMode(mode)
+          .setObject(name as string)
+          .callOutput();
+        expect(
+          { status: o.exitCode, out: new TextDecoder().decode(o.stdout) },
+          `${flag} ${name}`,
+        ).toEqual({
+          status: n.status,
+          out: n.out,
+        });
+        if (n.status !== 0) expect(o.stderr.trim()).toBe(n.err.trim());
+      }
+    }
+  });
+
+  it("ls-tree lists a tree named by its compatibility id with compatibility ids (builtin/ls-tree.c, GET_OID_HASH_ANY)", async () => {
+    const dir = compatRepo();
+    buildNative(dir);
+    const g = await ours(dir);
+    const id = (name: string) => ok(dir, ["rev-parse", "--output-object-format=sha1", name]).trim();
+    const tree = id("HEAD^{tree}");
+    const variants: string[][] = [
+      [],
+      ["-r"],
+      ["-r", "-t"],
+      ["-l"],
+      ["-r", "-l"],
+      ["--name-only"],
+      ["--object-only", "-r"],
+      ["--abbrev"],
+      ["--format=%(objectmode) %(objecttype) %(objectname) %(objectsize:padded) %(path)", "-r"],
+      ["-d"],
+    ];
+    const run = async (args: string[], name: string) => {
+      const c = g.lsTree().setTreeish(name);
+      for (const a of args) {
+        if (a === "-r") c.setRecursive(true);
+        else if (a === "-t") c.setShowTrees(true);
+        else if (a === "-d") c.setTreesOnly(true);
+        else if (a === "-l") c.setLong();
+        else if (a === "--name-only") c.setNameOnly();
+        else if (a === "--object-only") c.setObjectOnly();
+        else if (a === "--abbrev") c.setAbbrev();
+        else if (a.startsWith("--format=")) c.setFormat(a.slice("--format=".length));
+      }
+      const r = await c.callOutput();
+      return { status: r.exitCode, out: latin1(r.stdout), err: r.stderr };
+    };
+    for (const name of [tree, tree.slice(0, 9), id("HEAD:d")]) {
+      for (const args of variants) {
+        const native = git(dir, ["ls-tree", ...args, name]);
+        expect(native.status, `${args.join(" ")} ${name}: ${native.err}`).toBe(0);
+        expect(await run(args, name), `${args.join(" ")} ${name}`).toEqual(native);
+      }
+    }
+    // git parses a commit or tag named by a compatibility id with the storage parsers: no tree
+    for (const name of [
+      id("HEAD"),
+      id("v1"),
+      id("HEAD:a"),
+      "1234567890123456789012345678901234567890",
+    ]) {
+      const native = git(dir, ["ls-tree", name]);
+      expect(native.status, name).toBe(128);
+      const r = await run([], name);
+      expect({ status: r.status, out: r.out, err: r.err.trim() }, name).toEqual({
+        status: 128,
+        out: native.out,
+        err: native.err.trim(),
+      });
+    }
+  });
+
+  it("rev-parse --output-object-format takes abbreviated ids of either format (get_short_oid without an algorithm)", async () => {
+    const dir = compatRepo();
+    buildNative(dir);
+    const g = await ours(dir);
+    for (const name of NAMES) {
+      const sha1 = ok(dir, ["rev-parse", "--output-object-format=sha1", name]).trim();
+      const sha256 = ok(dir, ["rev-parse", name]).trim();
+      for (const short of [sha1.slice(0, 7), sha1.slice(0, 11).toUpperCase(), sha256.slice(0, 9)]) {
+        for (const format of ["sha1", "sha256"]) {
+          const native = ok(dir, ["rev-parse", `--output-object-format=${format}`, short]).trim();
+          const r = await g
+            .revParse()
+            .addArgument(`--output-object-format=${format}`)
+            .addArgument(short)
+            .call();
+          expect(r.lines, `${format} ${short}`).toEqual([native]);
+        }
+      }
+    }
+  });
+
+  it("an abbreviation shared by a storage id and a compatibility id is ambiguous across both", async () => {
+    const dir = compatRepo();
+    // blobs until a 4-digit prefix of a SHA-256 id is one of a SHA-1 id
+    const paths: string[] = [];
+    for (let i = 1; i <= 400; i++) {
+      writeFileSync(join(dir, `f${i}`), `blob ${i}\n`);
+      paths.push(`f${i}`);
+    }
+    gitIn(dir, ["hash-object", "-w", "--stdin-paths"], `${paths.join("\n")}\n`);
+    const lines = mapLines(dir).map((l) => l.split(" ") as [string, string]);
+    const storage = new Set(lines.map(([a]) => a.slice(0, 4)));
+    const shared = lines.map(([, b]) => b.slice(0, 4)).find((p) => storage.has(p));
+    expect(shared).toBeDefined();
+    const prefix = shared as string;
+    const g = await ours(dir);
+    const native = gitIn(dir, ["cat-file", "--batch-check"], `${prefix}\n`);
+    const r = await g.catFile().setBatch("info").setStdin(`${prefix}\n`).callOutput();
+    expect({ status: r.exitCode, out: latin1(r.stdout), err: r.stderr }).toEqual(native);
+    expect(native.out).toBe(`${prefix} ambiguous\n`);
+    for (const format of ["sha1", "sha256"]) {
+      const n = git(dir, ["rev-parse", `--output-object-format=${format}`, prefix]);
+      expect(n.status).toBe(128);
+      const error = await g
+        .revParse()
+        .addArgument(`--output-object-format=${format}`)
+        .addArgument(prefix)
+        .call()
+        .then(
+          () => undefined,
+          (e: Error) => e.message,
+        );
+      // git's candidate list, then its unknown-revision death
+      expect(error).toContain(n.err.split("fatal:")[0]?.trim());
+    }
+  });
+
+  /**
+   * A `gpg.program` whose signature is a hash of what it is given: a signature over the wrong
+   * buffer shows as another signature (and another object id)
+   */
+  const hashingGpg = () => {
+    const path = join(root, "hashing-gpg");
+    writeFileSync(
+      path,
+      [
+        "#!/bin/sh",
+        "h=$(sha256sum | cut -c1-48)",
+        'echo "[GNUPG:] SIG_CREATED D 22 10 00 1 2" >&2',
+        "printf -- '-----BEGIN PGP SIGNATURE-----\\n\\n%s\\n-----END PGP SIGNATURE-----\\n' \"$h\"",
+        "",
+      ].join("\n"),
+    );
+    chmodSync(path, 0o755);
+    return path;
+  };
+
+  for (const [storage, compat] of [
+    ["sha256", "sha1"],
+    ["sha1", "sha256"],
+  ] as const) {
+    it(`commit -S and tag -s sign both formats' views (${storage} with ${compat}; commit.c commit_tree_extended, builtin/tag.c do_sign)`, async () => {
+      const program = hashingGpg();
+      const twins = ["n", "o"].map((name) => {
+        const dir = fresh(name);
+        mkdirSync(dir);
+        ok(dir, ["init", "-q", "-b", "main", `--object-format=${storage}`]);
+        ok(dir, ["config", "core.repositoryformatversion", "1"]);
+        ok(dir, ["config", "extensions.compatObjectFormat", compat]);
+        ok(dir, ["config", "gpg.program", program]);
+        mkdirSync(join(dir, "d"));
+        writeFileSync(join(dir, "a"), "hello\n");
+        writeFileSync(join(dir, "d/b"), "x\n");
+        return dir;
+      });
+      const [native, mine] = twins as [string, string];
+      ok(native, ["add", "."]);
+      ok(native, ["commit", "-q", "-S", "-m", "one"]);
+      ok(native, ["tag", "-s", "-m", "release", "v1"]);
+      writeFileSync(join(native, "a"), "again\n");
+      ok(native, ["commit", "-q", "-S", "-am", "two"]);
+      const g = await openOurs(
+        mine,
+        createNodeGitHostEnvironment({
+          env: env(),
+          effectiveUid: null,
+          signer: createNodeSigner({ env: env() }),
+        }),
+      );
+      await g.add().addFilepattern(".").call();
+      await g.commit().setMessage("one\n").setSign(true).call();
+      await g.tag().setName("v1").setMessage("release\n").setSigned(true).call();
+      writeFileSync(join(mine, "a"), "again\n");
+      await g.add().addFilepattern("a").call();
+      await g.commit().setMessage("two\n").setSign(true).call();
+      // the same objects in both formats, so the same ids and map lines
+      for (const name of ["HEAD", "HEAD~1", "v1"]) {
+        for (const format of [storage, compat]) {
+          expect(
+            ok(mine, ["rev-parse", `--output-object-format=${format}`, name]),
+            `${format} ${name}`,
+          ).toBe(ok(native, ["rev-parse", `--output-object-format=${format}`, name]));
+        }
+        const compatId = ok(native, ["rev-parse", `--output-object-format=${compat}`, name]).trim();
+        expect(ok(mine, ["cat-file", "-p", compatId])).toBe(
+          ok(native, ["cat-file", "-p", compatId]),
+        );
+      }
+      expect(mapLines(mine)).toEqual(mapLines(native));
+      // each view carries both signatures, and they differ: each signs its own view
+      const head = ok(mine, ["cat-file", "-p", "HEAD"]);
+      const sigs = [
+        ...head.matchAll(/^(gpgsig(?:-sha256)?) -----BEGIN PGP SIGNATURE-----\n \n (\w+)$/gm),
+      ];
+      expect(sigs.map((m) => m[1])).toEqual(["gpgsig", "gpgsig-sha256"]);
+      expect(sigs[0]?.[2]).not.toBe(sigs[1]?.[2]);
+      expect(git(mine, ["fsck", "--strict"])).toMatchObject({ status: 0, err: "" });
+    });
+  }
+
+  /**
+   * `am -S`: ours signs the storage commit and its conversion, both through the signer. git
+   * master signs the storage commit alike, but its compatibility buffer is written after
+   * `fmt_ident`'s static buffer was reused for the committer: the author line it signs reads
+   * `<committer name> <committer email>` without a date, so its SHA-1 signature covers a
+   * buffer that is not the commit's SHA-1 view. Ours deliberately does not copy that (a
+   * signature over the wrong buffer): the storage signature and everything else agree.
+   */
+  for (const encoding of [undefined, "ISO-8859-1"]) {
+    it(`am -S signs both views (i18n.commitEncoding ${encoding ?? "unset"})`, async () => {
+      const program = hashingGpg();
+      const source = fresh("src");
+      mkdirSync(source);
+      ok(source, ["init", "-q", "-b", "main", "--object-format=sha256"]);
+      writeFileSync(join(source, "a"), "hello\n");
+      ok(source, ["add", "a"]);
+      ok(source, ["commit", "-q", "-m", "base"]);
+      writeFileSync(join(source, "a"), "hello again\n");
+      ok(source, ["commit", "-q", "-am", "change"]);
+      const patch = ok(source, ["format-patch", "--stdout", "-1"]);
+      const twins = ["n", "o"].map((name) => {
+        const dir = compatRepo(name);
+        ok(dir, ["config", "gpg.program", program]);
+        if (encoding) ok(dir, ["config", "i18n.commitEncoding", encoding]);
+        writeFileSync(join(dir, "a"), "hello\n");
+        ok(dir, ["add", "a"]);
+        ok(dir, ["commit", "-q", "-m", "base"]);
+        return dir;
+      });
+      const [native, mine] = twins as [string, string];
+      const applied = gitIn(native, ["am", "-q", "-S"], patch);
+      expect(applied.status, applied.err).toBe(0);
+      const g = await openOurs(
+        mine,
+        createNodeGitHostEnvironment({
+          env: env(),
+          effectiveUid: null,
+          signer: createNodeSigner({ env: env() }),
+        }),
+      );
+      const result = await g.am().addMbox(new TextEncoder().encode(patch)).setSign(true).call();
+      expect(result.exitCode, String(result.errors)).toBe(0);
+      /** a commit's headers: each signature apart, the rest with the message */
+      const split = (raw: string) => {
+        const sig: Record<string, string> = {};
+        const rest: string[] = [];
+        let current: string | undefined;
+        for (const line of raw.split("\n")) {
+          const m = /^(gpgsig(?:-sha256)?) (.*)$/.exec(line);
+          if (m) {
+            current = m[1] as string;
+            sig[current] = `${m[2]}\n`;
+          } else if (current && line.startsWith(" ")) sig[current] += `${line.slice(1)}\n`;
+          else {
+            current = undefined;
+            rest.push(line);
+          }
+        }
+        return { sig, rest: rest.join("\n") };
+      };
+      const hashOf = (text: string) =>
+        spawnSync("sha256sum", { input: text, encoding: "utf8" }).stdout.slice(0, 48);
+      const ourHead = split(ok(mine, ["cat-file", "commit", "HEAD"]));
+      const nativeHead = split(ok(native, ["cat-file", "commit", "HEAD"]));
+      // the storage commit and its signature as git's
+      expect(ourHead.rest).toBe(nativeHead.rest);
+      expect(ourHead.sig["gpgsig-sha256"]).toBe(nativeHead.sig["gpgsig-sha256"]);
+      expect(Object.keys(ourHead.sig)).toEqual(["gpgsig", "gpgsig-sha256"]);
+      // ours: the SHA-1 signature covers the commit's SHA-1 view without its signatures
+      const sha1 = ok(mine, ["rev-parse", "--output-object-format=sha1", "HEAD"]).trim();
+      const view = split(ok(mine, ["cat-file", "commit", sha1])).rest;
+      expect(ourHead.sig.gpgsig).toContain(`\n${hashOf(view)}\n`);
+      // git master's covers an author line without its date (see above)
+      expect(nativeHead.sig.gpgsig).not.toContain(`\n${hashOf(view)}\n`);
+      expect(nativeHead.sig.gpgsig).toContain(
+        `\n${hashOf(view.replace(/^author .*$/m, "author C <c@example.com>"))}\n`,
+      );
+      expect(git(mine, ["fsck", "--strict"])).toMatchObject({ status: 0, err: "" });
+    });
+  }
 });

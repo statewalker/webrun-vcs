@@ -37,7 +37,7 @@ export function serializeTagEntry(entry: TagEntry): string {
     case "gpgsig": {
       // GPG signature with continuation lines
       const sigLines = entry.value.split("\n");
-      const lines = [`gpgsig ${sigLines[0]}\n`];
+      const lines = [`${entry.header ?? "gpgsig"} ${sigLines[0]}\n`];
       for (let i = 1; i < sigLines.length; i++) {
         lines.push(` ${sigLines[i]}\n`);
       }
@@ -204,6 +204,10 @@ export function* tagToEntries(tag: AnnotatedTag): Generator<TagEntry> {
   if (tag.gpgSignature) {
     yield { type: "gpgsig", value: tag.gpgSignature };
   }
+  if (tag.compatSignature) {
+    const { header, value } = tag.compatSignature;
+    yield { type: "gpgsig", value, header };
+  }
 
   yield { type: "message", value: tag.message };
 }
@@ -223,6 +227,7 @@ export async function entriesToTag(
   let tagger: AnnotatedTag["tagger"] | undefined;
   let encoding: string | undefined;
   let gpgSignature: string | undefined;
+  let compatSignature: AnnotatedTag["compatSignature"];
   let message = "";
 
   for await (const entry of entries) {
@@ -243,7 +248,8 @@ export async function entriesToTag(
         encoding = entry.value;
         break;
       case "gpgsig":
-        gpgSignature = entry.value;
+        if (entry.header) compatSignature = { header: entry.header, value: entry.value };
+        else gpgSignature = entry.value;
         break;
       case "message":
         message = entry.value;
@@ -279,6 +285,7 @@ export async function entriesToTag(
   if (gpgSignature) {
     tag.gpgSignature = gpgSignature;
   }
+  if (compatSignature) tag.compatSignature = compatSignature;
 
   return tag;
 }
