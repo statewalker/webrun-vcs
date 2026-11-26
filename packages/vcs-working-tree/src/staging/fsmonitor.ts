@@ -68,6 +68,11 @@ export class FsmonitorState {
   hasRun = false;
   /** git's `untracked->use_fsmonitor`: the untracked cache's valid directories are trusted */
   useForUntracked = false;
+  /**
+   * Added by `update-index --fsmonitor` with `core.fsmonitor` off: written all the same (git
+   * writes any `fsmonitor_last_update`), removed by the next read with the monitor off
+   */
+  writtenWhileDisabled = false;
 
   constructor(
     /** git's `fsmonitor_last_update` */
@@ -125,6 +130,7 @@ export class FsmonitorState {
     state.changed = this.changed;
     state.hasRun = this.hasRun;
     state.useForUntracked = this.useForUntracked;
+    state.writtenWhileDisabled = this.writtenWhileDisabled;
     return state;
   }
 }
