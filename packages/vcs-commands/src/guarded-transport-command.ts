@@ -163,6 +163,7 @@ export abstract class GuardedTransportCommand<T> extends TransportCommand<T> {
       child.setTransports(this.rawTransports());
       child.setAuthPolicy((url) => this.policy()(url));
     } else child.setTransports(this.getTransports());
+    for (const [url, bytes] of this.bundles) child.addBundle(url, bytes);
     if (this.timeout) child.setTimeout(this.timeout);
     if (this.gzipRequests !== undefined) child.setGzipRequests(this.gzipRequests);
     if (this.credentialHelper) child.setCredentialHelper(this.credentialHelper);

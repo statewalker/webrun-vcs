@@ -143,6 +143,15 @@ export interface FetchClientOptions {
    * (`fsckObjects`) keeps its pack whatever its size, as git's index-pack takes those.
    */
   unpackLimit?: number;
+  /**
+   * The remote is a bundle (transport.c's `fetch_refs_from_bundle`, bundle.c's `unbundle`):
+   * its pack goes through index-pack, so it is kept whatever its size. A filtered bundle's
+   * (`filter`, its header's `@filter=`) is a promisor pack whose `.promisor` reads
+   * `from-bundle` (`index-pack --promisor=from-bundle`); its absent objects pass the checks
+   * only when `promised` (the repository has a promisor remote: check_connected's partial
+   * clone case), else the check fails as git's rev-list does.
+   */
+  bundle?: { filter?: string; promised?: boolean };
   /** Shallow fetch: at most this many commits from each fetched tip (`--depth`) */
   depth?: number;
   /** `--deepen-relative`: `depth` counts from the current shallow boundary */
@@ -519,7 +528,10 @@ export async function fetchFromConnection(
   // the filter the server takes (fetch-pack drops one it does not, with a warning): its
   // objects are promised, so the checks below cannot walk them
   const filter = options.filter && serverSupportsFilter(connection) ? options.filter : undefined;
-  const strictLinks = !filter && (!!options.fsckObjects || options.cloning === true);
+  // a filtered bundle's pack: a promisor pack of its own kind (`--promisor=from-bundle`)
+  const bundleFilter = options.bundle?.filter;
+  const strictLinks =
+    !filter && !bundleFilter && (!!options.fsckObjects || options.cloning === true);
   /**
    * The refs a filtered round asked for (fetch-pack's `sought`), the lines of its pack's
    * `.promisor` file: `<id> <name>`, in the order the server listed them
@@ -592,7 +604,7 @@ export async function fetchFromConnection(
     const receivedLinks =
       received && links ? new ReceivedLinks(grafts, formatOf(repository).rawLength) : undefined;
     // a promisor pack's outgoing links (index-pack --promisor's repack_local_links)
-    const outgoing = filter ? new Set<string>() : undefined;
+    const outgoing = filter || bundleFilter ? new Set<string>() : undefined;
     if (options.negotiationAlgorithm === "skipping" && !parsedCommits) {
       parsedCommits = await parsedBeforeNegotiation(repository, remoteRefs, localTips, {
         refetch: !!options.refetch,
@@ -620,7 +632,7 @@ export async function fetchFromConnection(
         repository.importPack(pack, {
           // a filtered or checked pack goes through index-pack (`--promisor`, `--strict`):
           // kept, never unpacked; otherwise fetch.unpackLimit decides (0: always unpacked)
-          ...(options.keepPack || filter || options.fsckObjects
+          ...(options.keepPack || filter || options.fsckObjects || options.bundle
             ? { keepPack: true }
             : options.unpackLimit !== undefined
               ? {
@@ -716,6 +728,9 @@ export async function fetchFromConnection(
       const content = kept ? promisorSought.map((r) => `${r.oid} ${r.name}\n`).join("") : "";
       await repository.markPromisorPack?.(imported.packId, content);
       // git 2.48+: the local objects the pack links to go into a promisor pack of their own
+      if (outgoing && outgoing.size > 0) await repository.repackLocalLinks?.(outgoing);
+    } else if (bundleFilter && imported.packId !== undefined) {
+      await repository.markPromisorPack?.(imported.packId, "from-bundle\n");
       if (outgoing && outgoing.size > 0) await repository.repackLocalLinks?.(outgoing);
     }
     packFetched = true;
@@ -996,8 +1011,12 @@ export async function fetchFromConnection(
       tips.push(p.oid);
     }
     let lines: string[] | undefined;
-    const promised = filter ? filterPromises(filter) : undefined;
-    if (filter && !promised) {
+    // a filtered bundle's absent objects are promised only in a repository with a promisor
+    // remote (check_connected's --exclude-promisor-objects); elsewhere rev-list walks them
+    const checkedFilter =
+      filter ?? (bundleFilter && options.bundle?.promised ? bundleFilter : undefined);
+    const promised = checkedFilter ? filterPromises(checkedFilter) : undefined;
+    if (checkedFilter && !promised) {
       // a filter that may leave out commits or tags: their history cannot be walked; the
       // tips must have come
       for (const tip of tips) {
