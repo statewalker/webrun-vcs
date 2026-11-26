@@ -377,6 +377,44 @@ describeGit("ref namespaces against native git (t5509)", () => {
     expect(runs.native[1]).toMatch(/^0 refs\/heads\/two\n/);
   });
 
+  // not from t5509: a namespace's client asking, by id, for a commit only another namespace
+  // reaches, under uploadpack.allowTipSHA1InWant + allowReachableSHA1InWant (v0): git counts
+  // only the namespace's own tips
+  it("a want reachable only from another namespace is not ours (v0 reachable tips)", async () => {
+    const dir = pushedPushee();
+    const other = join(root, `other-${counter++}`);
+    git(root, "init", "-q", "-b", "main", other);
+    writeFileSync(join(other, "secret"), "x\n");
+    git(other, "add", "secret");
+    git(other, "commit", "-q", "-m", "secret");
+    const secret = git(other, "rev-parse", "HEAD").trim();
+    git(other, "push", "-q", dir, "main:refs/namespaces/b/refs/heads/main");
+    for (const key of ["allowTipSHA1InWant", "allowReachableSHA1InWant"]) {
+      git(dir, "config", `uploadpack.${key}`, "true");
+    }
+    const pair = twin(dir);
+    const runs = await bothSides(pair, async (served, side) => {
+      const out: string[] = [];
+      for (const want of [commit0, secret]) {
+        const client = join(root, `client-${counter++}`);
+        git(root, "init", "-q", "-b", "main", client);
+        const r = await gitAsync(root, client, [
+          ...EXT,
+          "-c",
+          "protocol.version=0",
+          "fetch",
+          "-q",
+          urlOf(served, "namespace", side),
+          want,
+        ]);
+        out.push(`${r.status === 0} ${/not our ref/.test(r.stderr)}`);
+      }
+      return out;
+    });
+    expect(runs.ours).toEqual(runs.native);
+    expect(runs.native).toEqual(["true false", "false true"]);
+  });
+
   it('t5509-fetch-push-namespaces.sh: "denyCurrentBranch and unborn branch with ref namespace"', async () => {
     const unborn = join(root, `unborn-${counter++}`);
     git(root, "init", "-q", "-b", "main", unborn);

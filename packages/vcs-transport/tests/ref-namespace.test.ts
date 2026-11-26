@@ -134,6 +134,25 @@ describe("namespacedRefStore", () => {
     expect([...(await outside.listAll())].map(([n]) => n)).not.toContain("HEAD");
   });
 
+  it("never asks the store for a name with `..` (deepen-not, want-ref)", async () => {
+    const { store } = mapStore(entries);
+    const asked: string[] = [];
+    const spy: RefStore = {
+      ...store,
+      async get(name) {
+        asked.push(name);
+        return store.get(name);
+      },
+    };
+    const view = namespacedRefStore(spy, NS);
+    for (const name of ["refs/../../../../refs/heads/secret", "refs/heads/../secret", "refs//x"]) {
+      expect(await view.get(name)).toBeUndefined();
+      expect(await view.getSymrefTarget?.(name)).toBeUndefined();
+      await expect(view.update(name, A)).rejects.toThrow(/outside the namespace/);
+    }
+    expect(asked).toEqual([]);
+  });
+
   it("writes under the prefix, never through a symbolic ref leaving it", async () => {
     const { store, writes } = mapStore(entries);
     const view = namespacedRefStore(store, NS);

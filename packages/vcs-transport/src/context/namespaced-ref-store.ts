@@ -2,7 +2,7 @@
  * A served repository's refs as one ref namespace sees them (git's `GIT_NAMESPACE`).
  */
 
-import type { BatchResult, RefCommand } from "@statewalker/vcs-core";
+import { type BatchResult, isValidRefName, type RefCommand } from "@statewalker/vcs-core";
 import { stripNamespace } from "../protocol/ref-namespace.js";
 import type { RefStore } from "./process-context.js";
 
@@ -19,7 +19,7 @@ const MAX_SYMREF_DEPTH = 5;
  * Nothing outside the namespace is reachable through it, which is stricter than git: a
  * symbolic ref of the namespace whose chain leaves it reads as absent and is never written
  * through (git follows it, advertising or updating the ref outside), names other than `HEAD`
- * and `refs/...` are absent, and every tip (`isRefTip`) is one of the namespace's.
+ * and well-formed `refs/...` (no `..`) are absent, and every tip (`isRefTip`) is one of the namespace's.
  *
  * @example
  * ```ts
@@ -29,7 +29,10 @@ const MAX_SYMREF_DEPTH = 5;
  * ```
  */
 export function namespacedRefStore(store: RefStore, prefix: string): RefStore {
-  const readable = (name: string) => name === "HEAD" || name.startsWith("refs/");
+  // a well-formed name only: `refs/../../x` would reach outside the prefix in a store that
+  // joins paths (git's refs_read_ref reads only names check_refname_format accepts)
+  const readable = (name: string) =>
+    name === "HEAD" || (name.startsWith("refs/") && isValidRefName(name));
 
   /**
    * The full name a namespaced name ends at, through its symbolic refs: undefined when the
@@ -70,7 +73,7 @@ export function namespacedRefStore(store: RefStore, prefix: string): RefStore {
 
   /** Refuses a write to a name the namespace does not own (through a symref leaving it). */
   async function writable(name: string): Promise<boolean> {
-    return name.startsWith("refs/") && (await insideTarget(name)) !== undefined;
+    return name !== "HEAD" && readable(name) && (await insideTarget(name)) !== undefined;
   }
 
   const namespaced: RefStore = {
