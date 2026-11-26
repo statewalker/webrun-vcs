@@ -45,6 +45,8 @@ export interface PatchBackendOptions {
   mode: PatchMode;
   /** The revision the diff compares with (`diff-index <rev>`); the empty tree for none */
   revision?: string;
+  /** The `trees` diff's second tree-ish (`diff-tree -r <revision> <newRevision>`) */
+  newRevision?: string;
   /** The pathspec elements */
   paths?: string[];
   /** `-U<n>` / `diff.context` (add-patch passes it on) */
@@ -85,6 +87,7 @@ export function createPatchBackend(options: PatchBackendOptions): PatchBackend {
     if (mode.diff !== "files") {
       diff.setOldTree(options.revision ?? EMPTY_TREE_ID);
       if (mode.diff === "index-cached") diff.setCached(true);
+      if (mode.diff === "trees") diff.setNewTree(options.newRevision ?? EMPTY_TREE_ID);
     }
     if (pathspec.length > 0) diff.setPathspec(pathspec);
     return diff;
@@ -93,7 +96,7 @@ export function createPatchBackend(options: PatchBackendOptions): PatchBackend {
   return {
     async diff() {
       const diff = diffCommand(paths);
-      if (temporary) {
+      if (temporary && mode.diff !== "trees") {
         // `GIT_INDEX_FILE` at the temporary index: only its paths are in the diff. An entry
         // without carried stat data is compared by content; one carrying the repository
         // index's flags (2.5x) is taken as its flags say (skip-worktree, assume-unchanged)

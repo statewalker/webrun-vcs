@@ -132,6 +132,12 @@ export interface ExportPackOptions {
   /** Write deltas on a base in the pack as OFS deltas (the client's `ofs-delta`; default true) */
   ofsDelta?: boolean;
   /**
+   * Asked for each listed object before the pack is written (all of them before its first
+   * byte): true leaves it out (git's `pack-objects --uri-protocol`, an object offloaded to a
+   * packfile URI). A facade without it sends everything (and so offloads nothing)
+   */
+  leaveOut?: (id: string) => boolean;
+  /**
    * pack-objects' `--missing=allow-promisor` (upload-pack's, once the client accepted a
    * promisor remote of the `promisor-remote` capability): promisor objects the repository
    * lacks are left out instead of failing the pack (nor fetched)

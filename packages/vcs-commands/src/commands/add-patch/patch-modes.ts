@@ -23,7 +23,9 @@ export type PatchModeName =
   /** `restore -p --source=HEAD` */
   | "worktree_head"
   /** `restore -p --source=<tree-ish>` */
-  | "worktree_nothead";
+  | "worktree_nothead"
+  /** `git history split`: a commit's changes staged into a temporary index of its parent */
+  | "index";
 
 /** The diff a mode shows (add-patch.c's `diff_cmd`). */
 export type PatchDiffKind =
@@ -32,7 +34,9 @@ export type PatchDiffKind =
   /** `diff-index <rev>`: the revision against the worktree */
   | "index"
   /** `diff-index --cached <rev>`: the revision against the index */
-  | "index-cached";
+  | "index-cached"
+  /** `diff-tree -r <tree> <commit>`: two trees (`run_add_p_index`) */
+  | "trees";
 
 /** How `git apply` is run (`--cached`, `-R`). */
 export interface PatchApplyArgs {
@@ -214,6 +218,26 @@ export const PATCH_MODES: Readonly<Record<PatchModeName, PatchMode>> = {
     promptMode: prompts("Apply", " to worktree", "Apply this hunk"),
     editHunkHint: hint("applying"),
     helpPatchText: help("apply", " to worktree", ""),
+  },
+  // run_add_p_index's mode: its prompts have a single `%s`, which takes the earlier
+  // decision; the extra choices (`,j,J,g,/,s`) git computes are never printed
+  index: {
+    name: "index",
+    diff: "trees",
+    diffReverse: false,
+    applyArgs: CACHED,
+    applyCheckArgs: CACHED,
+    isReverse: false,
+    indexOnly: true,
+    applyForCheckout: false,
+    promptMode: [
+      "Stage mode change [y,n,q,a,d%s,?]? ",
+      "Stage deletion [y,n,q,a,d%s,?]? ",
+      "Stage addition [y,n,q,a,d%s,?]? ",
+      "Stage this hunk [y,n,q,a,d%s,?]? ",
+    ],
+    editHunkHint: hint("staging"),
+    helpPatchText: help("stage", "", ""),
   },
 };
 
