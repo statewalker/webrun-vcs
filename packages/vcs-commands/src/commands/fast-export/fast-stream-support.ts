@@ -4,6 +4,7 @@
  */
 
 import type { GitObjects, ObjectId } from "@statewalker/vcs-core";
+import { type FilesApi, tryReadFile } from "@statewalker/vcs-utils/files";
 
 /**
  * How signed tags and commits are handled (gpg-interface.c's `parse_sign_mode`): `warn` is
@@ -114,4 +115,68 @@ export function signatureStartOf(message: string, compatibility: "2.43" | "2.56"
     len = eol < 0 ? message.length : eol + 1;
   }
   return match;
+}
+
+/**
+ * Marks files over a FilesApi: paths relative to `cwd` (git's current directory, default the
+ * FilesApi's root), `relative-marks` ones below `<gitDir>/info/fast-import/`.
+ *
+ * @example
+ * ```typescript
+ * git.fastImport().setMarksFiles(marksFilesOf(files, { gitDir: ".git" })).setExportMarks("marks");
+ * ```
+ */
+export function marksFilesOf(
+  files: FilesApi,
+  options: { cwd?: string; gitDir?: string } = {},
+): FastMarksFiles {
+  const join = (dir: string | undefined, path: string) =>
+    path.startsWith("/") || !dir ? path : `${dir.replace(/\/+$/, "")}/${path}`;
+  const resolve = (path: string, relative?: boolean) =>
+    relative ? join(`${options.gitDir ?? ".git"}/info/fast-import`, path) : join(options.cwd, path);
+  return {
+    read: async (path, opts) => {
+      const full = resolve(path, opts?.relative);
+      // a missing file must read as absent (an in-memory FilesApi reads it as empty)
+      if ((await files.stats(full))?.kind !== "file") return undefined;
+      return tryReadFile(files, full);
+    },
+    write: async (path, bytes, opts) => {
+      await files.write(resolve(path, opts?.relative), [bytes]);
+    },
+  };
+}
+
+/** A ByteSink writing into a Web Stream (the writer is released when the run ends). */
+export function writableSink(stream: WritableStream<Uint8Array>): {
+  sink: (chunk: Uint8Array) => Promise<void>;
+  release: () => void;
+} {
+  const writer = stream.getWriter();
+  return {
+    sink: async (chunk) => {
+      await writer.write(chunk);
+    },
+    release: () => writer.releaseLock(),
+  };
+}
+
+/** A Web Stream's bytes, whole. */
+export async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    length += value.length;
+  }
+  const out = new Uint8Array(length);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.length;
+  }
+  return out;
 }

@@ -8,12 +8,17 @@
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
+import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-
-import type { FastExportCommand, FastImportCommand, FastMarksFiles } from "../src/index.js";
+import {
+  type FastExportCommand,
+  type FastImportCommand,
+  type FastMarksFiles,
+  marksFilesOf,
+} from "../src/index.js";
 import { gitOk, openOurs, put } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 
@@ -51,17 +56,7 @@ function gitIn(cwd: string, args: string[], input?: Uint8Array | string) {
 
 /** Marks files relative to `dir`, as git opens them from its current directory. */
 function marksFiles(dir: string): FastMarksFiles {
-  return {
-    read: async (path) => {
-      const full = join(dir, path);
-      return existsSync(full) ? new Uint8Array(readFileSync(full)) : undefined;
-    },
-    write: async (path, bytes) => {
-      const full = join(dir, path);
-      mkdirSync(dirname(full), { recursive: true });
-      writeFileSync(full, bytes);
-    },
-  };
+  return marksFilesOf(createNodeFilesApi({ rootDir: dir }));
 }
 
 /** `git fast-export <args>` mapped onto the command (the options t9350 uses). */
@@ -337,6 +332,34 @@ describeGit("git fast-export against native git", () => {
       .setCompatibility(compatibility)
       .callOutput();
     expect(r.exitCode).toBe(0);
+    const refs = (d: string) =>
+      gitIn(d, ["for-each-ref", "--format=%(refname) %(objectname)"]).stdout;
+    expect(refs(target)).toBe(refs(repo));
+  });
+
+  it('t9350-fast-export.sh: "fast-export | fast-import" (Web Streams)', async () => {
+    const git = await openOurs(repo);
+    const pipe = new TransformStream<Uint8Array, Uint8Array>();
+    const target = emptyRepo("streams");
+    const ours = await openOurs(target);
+    const exporting = git
+      .fastExport()
+      .addArgument("--all")
+      .setCompatibility(compatibility)
+      .setOutput(pipe.writable)
+      .call()
+      .then(async (r) => {
+        await pipe.writable.close();
+        return r;
+      });
+    const importing = ours
+      .fastImport()
+      .setInput(pipe.readable)
+      .setCompatibility(compatibility)
+      .call();
+    const [exported, imported] = await Promise.all([exporting, importing]);
+    expect(exported.exitCode).toBe(0);
+    expect(imported.exitCode).toBe(0);
     const refs = (d: string) =>
       gitIn(d, ["for-each-ref", "--format=%(refname) %(objectname)"]).stdout;
     expect(refs(target)).toBe(refs(repo));

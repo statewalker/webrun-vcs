@@ -22,9 +22,11 @@ import {
   isSignMode,
   latin1,
   latin1Bytes,
+  readAll,
   readObjectBytes,
   type SignMode,
   signatureStartOf,
+  writableSink,
 } from "./fast-stream-support.js";
 
 /** `--date-format=<fmt>` */
@@ -134,11 +136,34 @@ export class FastImportCommand extends PlumbingCommand {
   private failure = false;
   private importMarksDone = false;
 
-  /** The stream (git reads it from stdin). */
-  setInput(input: string | Uint8Array): this {
+  private inputStream?: ReadableStream<Uint8Array>;
+  private outputStream?: WritableStream<Uint8Array>;
+
+  /** The stream (git reads it from stdin): bytes, text (UTF-8), or a Web Stream. */
+  setInput(input: string | Uint8Array | ReadableStream<Uint8Array>): this {
     this.checkCallable();
-    this.input = typeof input === "string" ? latin1Bytes(utf8Binary(input)) : input;
+    if (input instanceof ReadableStream) this.inputStream = input;
+    else this.input = typeof input === "string" ? latin1Bytes(utf8Binary(input)) : input;
     return this;
+  }
+
+  /** Where the stream goes, as a Web Stream (in place of `setStdout`); not closed here. */
+  setOutput(stream: WritableStream<Uint8Array>): this {
+    this.checkCallable();
+    this.outputStream = stream;
+    return this;
+  }
+
+  override async call() {
+    if (this.inputStream) this.input = await readAll(this.inputStream);
+    if (!this.outputStream) return super.call();
+    const { sink, release } = writableSink(this.outputStream);
+    this.setStdout(sink);
+    try {
+      return await super.call();
+    } finally {
+      release();
+    }
   }
 
   /** `--force`: branches may be rewound. */

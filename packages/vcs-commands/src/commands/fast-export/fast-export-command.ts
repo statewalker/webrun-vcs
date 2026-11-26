@@ -32,6 +32,7 @@ import {
   type SignMode,
   signatureFormatOf,
   signatureStartOf,
+  writableSink,
 } from "./fast-stream-support.js";
 
 /** `--tag-of-filtered-object=<mode>` */
@@ -181,6 +182,26 @@ export class FastExportCommand extends PlumbingCommand {
   private readonly shown = new Set<ObjectId>();
   private progressCounter = 0;
   private quotePathFully = true;
+
+  private outputStream?: WritableStream<Uint8Array>;
+
+  /** Where the stream goes, as a Web Stream (in place of `setStdout`); not closed here. */
+  setOutput(stream: WritableStream<Uint8Array>): this {
+    this.checkCallable();
+    this.outputStream = stream;
+    return this;
+  }
+
+  override async call() {
+    if (!this.outputStream) return super.call();
+    const { sink, release } = writableSink(this.outputStream);
+    this.setStdout(sink);
+    try {
+      return await super.call();
+    } finally {
+      release();
+    }
+  }
 
   /** A revision argument (`main`, `^v1`, `a..b`, `--all`, ...), as `git rev-list` reads it. */
   addArgument(arg: string): this {
