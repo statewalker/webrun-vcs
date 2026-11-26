@@ -230,6 +230,8 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
 
         state.commandServed = true;
         ctx.state.currentCommand = command;
+        // a fetch's sideband-all ends with it: the next command answers as it would alone
+        state.fetchRequest = undefined;
         if (command === "ls-refs") return "LS_REFS";
         if (command === "fetch") return "FETCH";
         if (command === "bundle-uri") return "BUNDLE_URI";
@@ -413,6 +415,14 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
             req.includeTags = true;
           } else if (line === "ofs-delta") {
             req.ofsDeltas = true;
+          } else if (line === "sideband-all") {
+            // only with uploadpack.allowSidebandAll (process_args): else git dies on an
+            // unexpected line, with no ERR packet
+            if (!ctx.config.allowSidebandAll) {
+              ctx.output.error = `unexpected line: '${line}'`;
+              return "ERROR";
+            }
+            req.sidebandAll = true;
           }
         }
 
@@ -595,12 +605,12 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
     "SEND_ACKS_ONLY",
     async (ctx) => {
       try {
-        await ctx.transport.writeLine("acknowledgments");
+        await writeFetchLine(ctx, "acknowledgments");
 
         const acks = ctx.state.acks ?? [];
-        if (acks.length === 0) await ctx.transport.writeLine("NAK");
+        if (acks.length === 0) await writeFetchLine(ctx, "NAK");
         for (const oid of acks) {
-          await ctx.transport.writeLine(`ACK ${oid}`);
+          await writeFetchLine(ctx, `ACK ${oid}`);
         }
 
         await ctx.transport.writeFlush();
@@ -625,13 +635,13 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
     "SEND_ACKNOWLEDGMENTS",
     async (ctx) => {
       try {
-        await ctx.transport.writeLine("acknowledgments");
+        await writeFetchLine(ctx, "acknowledgments");
 
         for (const oid of ctx.state.acks ?? []) {
-          await ctx.transport.writeLine(`ACK ${oid}`);
+          await writeFetchLine(ctx, `ACK ${oid}`);
         }
 
-        await ctx.transport.writeLine("ready");
+        await writeFetchLine(ctx, "ready");
         await ctx.transport.writeDelimiter();
         return "ACKS_DONE";
       } catch (e) {
@@ -703,13 +713,13 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
         ctx.state.serverShallow = new Set(update.shallow);
         ctx.state.serverUnshallow = new Set(update.unshallow);
 
-        await ctx.transport.writeLine("shallow-info");
+        await writeFetchLine(ctx, "shallow-info");
 
         for (const oid of update.shallow) {
-          await ctx.transport.writeLine(`shallow ${oid}`);
+          await writeFetchLine(ctx, `shallow ${oid}`);
         }
         for (const oid of update.unshallow) {
-          await ctx.transport.writeLine(`unshallow ${oid}`);
+          await writeFetchLine(ctx, `unshallow ${oid}`);
         }
 
         await ctx.transport.writeDelimiter();
@@ -733,10 +743,10 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           return "NO_WANTED_REFS";
         }
 
-        await ctx.transport.writeLine("wanted-refs");
+        await writeFetchLine(ctx, "wanted-refs");
 
         for (const [refName, oid] of ctx.state.wantedRefs ?? new Map()) {
-          await ctx.transport.writeLine(`${oid} ${refName}`);
+          await writeFetchLine(ctx, `${oid} ${refName}`);
         }
 
         await ctx.transport.writeDelimiter();
@@ -756,7 +766,7 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
         const state = ctx.state as ServerV2State;
         const req = state.fetchRequest;
 
-        await ctx.transport.writeLine("packfile");
+        await writeFetchLine(ctx, "packfile");
 
         // Export pack, cut at the shallow boundary: the new shallow commits and the client's
         // own; the parents of unshallowed commits are tips of their own
@@ -919,8 +929,13 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
     async (ctx) => {
       try {
         const errorMsg = ctx.output.error ?? "Unknown error";
-        // git's packet_writer_error, then it dies: no newline, no flush
-        await writeRaw(ctx, `ERR ${errorMsg}`);
+        // git's packet_writer_error, then it dies: no newline, no flush; on band 3 (without
+        // `ERR `) once the fetch asked for sideband-all
+        if ((ctx.state as ServerV2State).fetchRequest?.sidebandAll) {
+          await ctx.transport.writeSideband(3, textEncoder.encode(errorMsg));
+        } else {
+          await writeRaw(ctx, `ERR ${errorMsg}`);
+        }
         ctx.output.errorReported = true;
         return "ERROR_SENT";
       } catch (e) {
@@ -988,6 +1003,17 @@ async function readArgument(ctx: ProcessContext): Promise<PktLineResult> {
   return ctx.transport.readPktLine();
 }
 
+/**
+ * A line of the fetch response, as git's `packet_writer_write` writes `<line>\n`: on side band 1
+ * once the request asked for `sideband-all` (delimiters and flushes stay as they are).
+ */
+function writeFetchLine(ctx: ProcessContext, line: string): Promise<void> {
+  if ((ctx.state as ServerV2State).fetchRequest?.sidebandAll) {
+    return ctx.transport.writeSideband(1, textEncoder.encode(`${line}\n`));
+  }
+  return ctx.transport.writeLine(line);
+}
+
 /** A pkt-line written as git's `packet_writer_write` does: the text, no newline added. */
 function writeRaw(ctx: ProcessContext, text: string): Promise<void> {
   return ctx.transport.writePktLine(textEncoder.encode(text));
@@ -1001,6 +1027,7 @@ function advertisedCapabilities(ctx: ProcessContext): string[] {
     ctx.config.uploadPackFilter,
     {
       ...(ctx.config.allowRefInWant ? { allowRefInWant: true } : {}),
+      ...(ctx.config.allowSidebandAll ? { allowSidebandAll: true } : {}),
       ...(ctx.config.sessionId !== undefined ? { sessionId: ctx.config.sessionId } : {}),
       ...(ctx.config.bundleUris !== undefined ? { bundleUri: true } : {}),
     },

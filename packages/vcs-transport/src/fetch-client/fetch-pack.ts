@@ -446,6 +446,10 @@ async function fetchPackV2(
   if (!request.onProgress) head.push(encodePacketLine("no-progress"));
   if (request.includeTag) head.push(encodePacketLine("include-tag"));
   head.push(encodePacketLine("ofs-delta"));
+  // git's do_fetch_pack_v2: every packet of the answer on side band 1 when the server takes it
+  // (uploadpack.allowSidebandAll), its progress on band 2 and its errors on band 3
+  const sidebandAll = fetchFeatures(connection).has("sideband-all");
+  if (sidebandAll) head.push(encodePacketLine("sideband-all"));
   for (const line of shallowLines(request, shallow)) head.push(encodePacketLine(line));
   if (request.filter) head.push(encodePacketLine(`filter ${request.filter}`));
   // add_wants: `want-ref <name>` for the refs asked for by name when the server takes them,
@@ -489,6 +493,8 @@ async function fetchPackV2(
     ];
     stats.rounds++;
     const pkts = await connection.request(body);
+    const onProgress = request.onProgress;
+    if (sidebandAll) pkts.demultiplex({ onProgress: onProgress && ((m) => onProgress(m.trim())) });
     let section = await pkts.readLine();
     if (section === undefined) throw new TransportError("Empty fetch response");
     if (section === "acknowledgments") {
@@ -562,6 +568,8 @@ async function fetchPackV2(
       }
       section = await pkts.readLine();
     }
+    // the packfile section's packets are side-band packets of their own (get_pack's demuxer)
+    pkts.demultiplex(false);
     await request.onShallowUpdate?.(shallowUpdate);
     const received = await receivePack(pkts, request, shallowUpdate, stats);
     return wantedRefs ? { ...received, wantedRefs } : received;
