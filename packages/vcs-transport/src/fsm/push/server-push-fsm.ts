@@ -1390,7 +1390,7 @@ function receivedPushCertificate(
     const settings = receivePackConfig(ctx).pushCertificates;
     const repository = getRepository(ctx);
     const encoder = new TextEncoder();
-    const id = await repository.storeBlob?.(encoder.encode(certificate)).catch(() => undefined);
+    const id = await repository.writeBlob?.(encoder.encode(certificate)).catch(() => undefined);
     const end = signedTextEnd(certificate);
     const payload = certificate.slice(0, end);
     // check_signature: a signature of no known format (none) dies; the verifier throws it
