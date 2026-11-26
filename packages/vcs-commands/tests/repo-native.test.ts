@@ -19,6 +19,7 @@ import {
   nativeGits,
   type Outcome,
   openOursAt,
+  openOursFromEnvironment,
   outcomeOf,
 } from "./repo-native-support.js";
 
@@ -295,6 +296,169 @@ function describeRepo(native: NativeGit) {
         expect(ours).toEqual(nativeOut);
         const all = shell.run(join(sup, "sub"), ["repo", "info", "--all"]);
         expect(await oursInfo(shell, join(sup, "sub"), ["--all"], "2.57")).toEqual(all);
+      });
+
+      /** `git repo info <keys>` run in `cwd` with `env`, ours opened from the same variables. */
+      async function infoFromEnvironment(
+        cwd: string,
+        env: Record<string, string>,
+        keys: string[],
+      ): Promise<Outcome> {
+        const nativeOut = shell.run(cwd, ["repo", "info", ...keys], { env });
+        const { git, prefix } = await openOursFromEnvironment(shell.home, cwd, env);
+        const ours = await outcomeOf(() =>
+          git
+            .repoInfo()
+            .setCompatibility(compatibility as RepoCompatibility)
+            .setCurrentDirectory(prefix.replace(/\/$/, ""))
+            .addKeys(...keys)
+            .callOutput(),
+        );
+        expect(ours).toEqual(nativeOut);
+        return nativeOut;
+      }
+
+      const commondirKeys = ["path.commondir.absolute", "path.commondir.relative"];
+      const gitdirKeys = ["path.gitdir.absolute", "path.gitdir.relative"];
+
+      it("t1900-repo-info.sh: 'absolute: commondir with GIT_COMMON_DIR and GIT_DIR'", async ({
+        skip: s,
+      }) => {
+        if (skip() || compatibility === "2.54") s();
+        // t1900-repo-info.sh: "relative: commondir with GIT_COMMON_DIR and GIT_DIR"
+        const dir = init();
+        mkdirSync(join(dir, "sub"));
+        const common = join(dir, "custom-common");
+        shell.ok(shell.home, "init", "-q", "--bare", common);
+        const env = { GIT_COMMON_DIR: common, GIT_DIR: "../.git" };
+        const out = await infoFromEnvironment(join(dir, "sub"), env, commondirKeys);
+        expect(out.stdout).toContain(`path.commondir.absolute=${common}\n`);
+        await infoFromEnvironment(join(dir, "sub"), env, gitdirKeys);
+      });
+
+      it("t1900-repo-info.sh: 'absolute: commondir with only GIT_DIR'", async ({ skip: s }) => {
+        if (skip() || compatibility === "2.54") s();
+        // t1900-repo-info.sh: "relative: commondir with only GIT_DIR"
+        const dir = init();
+        mkdirSync(join(dir, "sub"));
+        const env = { GIT_DIR: "../.git" };
+        await infoFromEnvironment(join(dir, "sub"), env, commondirKeys);
+        // t1900-repo-info.sh: "absolute: gitdir with explicit GIT_DIR"
+        const out = await infoFromEnvironment(join(dir, "sub"), env, gitdirKeys);
+        expect(out.stdout).toContain("path.gitdir.relative=../.git\n");
+        // t1900-repo-info.sh: "relative: gitdir with explicit GIT_DIR"
+        await infoFromEnvironment(join(dir, "sub"), { GIT_DIR: join(dir, ".git") }, gitdirKeys);
+      });
+
+      it("t1900-repo-info.sh: 'absolute: index with GIT_INDEX_FILE override'", async ({
+        skip: s,
+      }) => {
+        if (compatibility !== "2.57") s();
+        // t1900-repo-info.sh: "relative: index with GIT_INDEX_FILE override"
+        const dir = init();
+        mkdirSync(join(dir, "sub"));
+        const keys = ["path.index.absolute", "path.index.relative"];
+        await infoFromEnvironment(
+          join(dir, "sub"),
+          { GIT_INDEX_FILE: join(dir, "custom-index-file") },
+          keys,
+        );
+        await infoFromEnvironment(join(dir, "sub"), { GIT_INDEX_FILE: "custom-index" }, keys);
+        await infoFromEnvironment(
+          join(dir, "sub"),
+          { GIT_DIR: "../.git", GIT_INDEX_FILE: "idx" },
+          keys,
+        );
+        // outside the worktree git's setup stays where it started: the index is read there
+        // (absolute key only: `setCurrentDirectory` names no directory outside the worktree)
+        const out = join(shell.home, `out${counter++}`);
+        mkdirSync(out);
+        await infoFromEnvironment(
+          out,
+          { GIT_DIR: join(dir, ".git"), GIT_WORK_TREE: dir, GIT_INDEX_FILE: "idx" },
+          ["path.index.absolute"],
+        );
+      });
+
+      /** `repo info`'s superproject keys in `dir`, native and ours. */
+      async function superproject(dir: string): Promise<Outcome> {
+        const keys = [
+          "path.superprojectworkingtree.absolute",
+          "path.superprojectworkingtree.relative",
+        ];
+        const nativeOut = shell.run(dir, ["repo", "info", ...keys]);
+        expect(await oursInfo(shell, dir, keys, "2.57")).toEqual(nativeOut);
+        return nativeOut;
+      }
+
+      it("path.superprojectworkingtree of an embedded submodule, nested ones and a dropped gitlink", async ({
+        skip: s,
+      }) => {
+        if (compatibility !== "2.57") s();
+        const sup = init();
+        shell.commit(sup, "base");
+        // an embedded `.git` directory: `git submodule add ./inner inner` over a repository
+        const inner = join(sup, "inner");
+        shell.ok(shell.home, "init", "-q", inner);
+        shell.commit(inner, "inner");
+        shell.ok(
+          sup,
+          "-c",
+          "protocol.file.allow=always",
+          "submodule",
+          "add",
+          "-q",
+          "./inner",
+          "inner",
+        );
+        let out = await superproject(inner);
+        expect(out.stdout).toContain(`path.superprojectworkingtree.absolute=${sup}\n`);
+        // a submodule below a directory: the superproject is two levels up
+        mkdirSync(join(sup, "libs"));
+        const deep = join(sup, "libs", "deep");
+        shell.ok(shell.home, "init", "-q", deep);
+        shell.commit(deep, "deep");
+        shell.ok(
+          sup,
+          "-c",
+          "protocol.file.allow=always",
+          "submodule",
+          "add",
+          "-q",
+          "./libs/deep",
+          "libs/deep",
+        );
+        out = await superproject(deep);
+        expect(out.stdout).toContain(`path.superprojectworkingtree.relative=../../\n`);
+        // a submodule of the superproject's linked worktree (`.git/worktrees/<id>/modules/`)
+        shell.ok(sup, "commit", "-q", "-m", "submodules");
+        const linked = join(shell.home, `wt${counter++}`);
+        shell.ok(sup, "worktree", "add", "-q", linked);
+        shell.ok(
+          linked,
+          "-c",
+          "protocol.file.allow=always",
+          "submodule",
+          "update",
+          "-q",
+          "--init",
+          "inner",
+        );
+        out = await superproject(join(linked, "inner"));
+        expect(out.stdout).toContain(`path.superprojectworkingtree.absolute=${linked}\n`);
+        // a repository the parent does not track: no superproject
+        const loose = join(sup, "loose");
+        shell.ok(shell.home, "init", "-q", loose);
+        out = await superproject(loose);
+        expect(out.stdout).toContain("path.superprojectworkingtree.absolute=\n");
+        // a submodule under .git/modules whose gitlink left the superproject's index
+        const sub = init();
+        shell.commit(sub, "initial");
+        shell.ok(sup, "-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "mod");
+        await superproject(join(sup, "mod"));
+        shell.ok(sup, "rm", "-q", "--cached", "mod");
+        out = await superproject(join(sup, "mod"));
+        expect(out.stdout).toContain("path.superprojectworkingtree.absolute=\n");
       });
     });
 
