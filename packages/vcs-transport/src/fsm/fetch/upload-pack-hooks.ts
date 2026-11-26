@@ -199,7 +199,9 @@ export async function includeTagCandidates(
 ): Promise<string[]> {
   const ids = new Set<string>();
   for (const [name, oid] of await refStore.listAll()) {
-    if (name.startsWith("refs/tags/") && !isRefHidden(name, config.hiddenRefs)) ids.add(oid);
+    if (name.startsWith("refs/tags/") && !isRefHidden(name, config.hiddenRefs, config.namespace)) {
+      ids.add(oid);
+    }
   }
   return [...ids];
 }

@@ -9,6 +9,7 @@ export * from "./hidden-refs.js";
 export * from "./object-format.js";
 export * from "./pkt-line-codec.js";
 export * from "./push-cert.js";
+export * from "./ref-namespace.js";
 export * from "./report-status.js";
 export * from "./session-id.js";
 export * from "./sideband.js";

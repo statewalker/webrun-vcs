@@ -255,7 +255,7 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
         // upload-pack's symref=HEAD:<branch> (as the smart-HTTP advertisement has it): a
         // client cloning in v0 learns the remote HEAD's branch from it
         // hidden refs are neither advertised nor "ours" under the ADVERTISED policy
-        const refsArray = visibleRefs(refs, config.hiddenRefs);
+        const refsArray = visibleRefs(refs, config.hiddenRefs, config.namespace);
         // (only a HEAD that resolves: an unborn one is not advertised, nor its symref)
         const headTarget = refsArray.some(([name]) => name === "HEAD")
           ? await refStore.getSymrefTarget?.("HEAD")

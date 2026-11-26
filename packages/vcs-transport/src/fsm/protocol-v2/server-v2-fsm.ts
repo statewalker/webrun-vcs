@@ -273,7 +273,11 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
         }
 
         // Get refs: hidden ones are not listed (git's ls-refs with hideRefs)
-        const allRefs = visibleRefs(await ctx.refStore.listAll(), ctx.config.hiddenRefs);
+        const allRefs = visibleRefs(
+          await ctx.refStore.listAll(),
+          ctx.config.hiddenRefs,
+          ctx.config.namespace,
+        );
         const matches = (name: string) =>
           refPrefixes.length === 0 || refPrefixes.some((p) => name.startsWith(p));
 
@@ -455,7 +459,7 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           // (`refs//hidden/x`, `refs/./hidden/x`) is an unknown ref, never read
           const oid =
             !isValidRefName(refName, { allowOneLevel: true }) ||
-            isRefHidden(refName, ctx.config.hiddenRefs)
+            isRefHidden(refName, ctx.config.hiddenRefs, ctx.config.namespace)
               ? undefined
               : await ctx.refStore.get(refName);
           if (!oid) {
@@ -507,7 +511,9 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           const tipSet = new Set(
             policy === "TIP"
               ? tips
-              : visibleRefs(allRefs, ctx.config.hiddenRefs).map(([, oid]) => oid),
+              : visibleRefs(allRefs, ctx.config.hiddenRefs, ctx.config.namespace).map(
+                  ([, oid]) => oid,
+                ),
           );
           refused = req.wants.find((oid) => !tipSet.has(oid));
         } else {
