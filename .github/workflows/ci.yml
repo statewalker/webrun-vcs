@@ -88,6 +88,13 @@ jobs:
         if: steps.needs.outputs.test == 'true'
         run: pnpm --filter "@statewalker/vcs-commands..." run build
 
+      # THROWAWAY (#437): how many test files and tests the whole suite registers under this git.
+      - name: Count the whole suite
+        if: steps.needs.outputs.test == 'true' && matrix.shard == 1
+        run: |
+          pnpm --filter @statewalker/vcs-commands exec vitest list --json="$RUNNER_TEMP/list.json" > /dev/null || true
+          node -e 'const l=require(process.argv[1]);console.log(`whole suite: ${new Set(l.map(t=>t.file)).size} files with tests, ${l.length} tests`)' "$RUNNER_TEMP/list.json"
+
       - name: Test (shard ${{ matrix.shard }}/4)
         if: steps.needs.outputs.test == 'true'
         run: pnpm --filter @statewalker/vcs-commands exec vitest run --shard=${{ matrix.shard }}/$SHARDS
