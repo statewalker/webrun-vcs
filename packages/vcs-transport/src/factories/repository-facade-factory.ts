@@ -264,6 +264,8 @@ function createRepositoryFacadeFromHistory(
     // Object existence - check across all stores
     // ─────────────────────────────────────────────────────────────────
 
+    writeBlob: (content: Uint8Array) => history.blobs.store([content]),
+
     async has(oid: string): Promise<boolean> {
       if (await commits.has(oid)) return true;
       if (await history.trees.has(oid)) return true;
