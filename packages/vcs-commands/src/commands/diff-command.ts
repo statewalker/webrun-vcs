@@ -3913,6 +3913,9 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           result.worktreeEntry?.isDirectory
         ) {
           const found = await readSubmoduleDirt(worktree, entry.path, ignore !== "none");
+          for (const line of found.unreadable ?? []) {
+            if (!this.configWarnings.includes(line)) this.configWarnings.push(line);
+          }
           if (found.modified) dirt.modified = true;
           if (ignore === "none" && found.untracked) dirt.untracked = true;
           dirty = !!dirt.modified || !!dirt.untracked;
