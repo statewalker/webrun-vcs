@@ -17,6 +17,7 @@ import {
   setConfigMultivarText,
 } from "@statewalker/vcs-store-files";
 import {
+  bundleUriLines,
   createRepositoryFacade,
   createTransportRefStore,
   FetchCheckError,
@@ -28,6 +29,7 @@ import {
   refPrefixes,
   ShallowRemoteRejectedError,
   type FetchOptions as TransportFetchOptions,
+  type UploadPackConnection,
 } from "@statewalker/vcs-transport";
 import { parseGitBool } from "@statewalker/vcs-utils";
 import { parseGitInt } from "@statewalker/vcs-utils/encoding";
@@ -46,7 +48,13 @@ import { RemoteConfigStore } from "../remote-config/index.js";
 import type { CloneResult } from "../results/clone-result.js";
 import type { FetchResult, TrackingRefUpdate } from "../results/fetch-result.js";
 import { TransportCommand } from "../transport-command.js";
-import { BundlePrerequisitesError } from "./bundle/index.js";
+import {
+  BundleList,
+  BundlePrerequisitesError,
+  fetchBundleList,
+  fetchBundleUri,
+  parseBundleListLine,
+} from "./bundle/index.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { defaultInitialBranch } from "./default-branch.js";
 import { TagOption, toTagMode, toTrackingRefUpdate } from "./fetch-command.js";
@@ -205,6 +213,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
   private serverOptions: string[] = [];
   /** The git version reproduced; default the hooks' */
   private compatibility?: "2.43" | "2.56";
+  private bundleUri?: string;
   private cloneAllBranches = true;
   private mirror = false;
   private singleBranch?: boolean;
@@ -275,6 +284,23 @@ export class CloneCommand extends TransportCommand<CloneResult> {
    */
   getBranch(): string | undefined {
     return this.branch;
+  }
+
+  /**
+   * `git clone --bundle-uri=<uri>`: before fetching from the remote, the bundle (or bundle
+   * list) at `uri` is downloaded and applied, its refs written under `refs/bundles/`
+   * (bundle-uri.c's `fetch_bundle_uri`), so the fetch asks only for what the bundles lack.
+   * `uri` is an `http(s)://` URL, a `file://` URL or a path (relative to the worktree top).
+   * A failure only warns (`CloneResult.messages`). A list using the `creationToken`
+   * heuristic is remembered as `fetch.bundleURI` (later fetches download its new bundles),
+   * with `fetch.bundleCreationToken`. Without it, `transfer.bundleURI=true` asks a protocol
+   * v2 server for its bundle list (the `bundle-uri` command). Refused with a shallow clone,
+   * as git.
+   */
+  setBundleUri(uri: string): this {
+    this.checkCallable();
+    this.bundleUri = uri;
+    return this;
   }
 
   /**
@@ -857,6 +883,19 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       });
     }
 
+    if (
+      this.bundleUri !== undefined &&
+      (this.depth !== undefined ||
+        this.shallowSince !== undefined ||
+        this.shallowExcludes.length > 0)
+    ) {
+      throw new GitApiError(
+        compatibility === "2.43"
+          ? "fatal: --bundle-uri is incompatible with --depth, --shallow-since, and --shallow-exclude"
+          : "fatal: options '--bundle-uri' and '--depth/--shallow-since/--shallow-exclude' cannot be used together",
+      );
+    }
+
     // clone.c: the source is a path or a URL before anything else (get_repo_path): an
     // existing repository path becomes absolute (remote.<name>.url, the reflog), a name with
     // a colon is a URL, anything else is "does not exist", never rewritten. The URL connected
@@ -1208,7 +1247,16 @@ export class CloneCommand extends TransportCommand<CloneResult> {
             "fatal: server options require protocol version 2 or later",
         );
       }
-      return fetchFromConnection(connection, fetchOptions);
+      // the bundles come after the ref listing and before anything is fetched (or a local
+      // clone's objects copied)
+      const copy = fetchOptions.beforeFetch;
+      return fetchFromConnection(connection, {
+        ...fetchOptions,
+        beforeFetch: async (remoteRefs, refMap) => {
+          await this.cloneBundles(connection, sourceUrl, compatibility, messages);
+          return copy?.(remoteRefs, refMap);
+        },
+      });
     }).catch((error: unknown) => {
       if (error instanceof ShallowRemoteRejectedError) {
         throw new TransportError(`fatal: ${error.message}`);
@@ -1438,6 +1486,68 @@ export class CloneCommand extends TransportCommand<CloneResult> {
    * --no-fetch] [--filter=<spec>] [--[no-]single-branch]` in the new repository: what it
    * printed and its exit status.
    */
+  /**
+   * clone.c's bundle step: `--bundle-uri` (`fetch_bundle_uri`, `fetch.bundleURI` stored for a
+   * `creationToken` list), else, under `transfer.bundleURI`, the server's list
+   * (`transport_get_remote_bundle_uri`, `fetch_bundle_list`); warnings into `messages`.
+   */
+  private async cloneBundles(
+    connection: UploadPackConnection,
+    remoteUrl: string,
+    compatibility: "2.43" | "2.56",
+    messages: string[],
+  ): Promise<void> {
+    const store = RemoteConfigStore.from(this.workingCopy);
+    const message = (line: string) => messages.push(`${line}\n`);
+    const worktree = repositoryPlaceOf(this.workingCopy);
+    const host = this.bundleUriHost({
+      remoteUrl,
+      compatibility,
+      message,
+      setConfigValue: (key, value) => this.writeConfigValue(key, value, "add"),
+      // odb_mkstemp's `<objects>/bundles/tmp_uri_XXXXXX`, as git's errors name the list
+      tempFileName: () =>
+        absolutePathOf(
+          worktree,
+          `${this.bare ? "" : ".git/"}objects/bundles/tmp_uri_${randomSuffix()}`,
+        ),
+    });
+    if (this.bundleUri !== undefined) {
+      const fetched = await fetchBundleUri(host, this.bundleUri);
+      if (!fetched.ok) {
+        message(`warning: failed to fetch objects from bundle URI '${this.bundleUri}'`);
+      } else if (fetched.hasHeuristic) {
+        await this.writeConfigValue("fetch.bundleuri", this.bundleUri, "add");
+      }
+      return;
+    }
+    // transport_get_remote_bundle_uri: only under transfer.bundleURI, only from a v2 server
+    // advertising `bundle-uri`
+    const enabled = store.value("transfer.bundleURI");
+    if (enabled === undefined || parseGitBool(enabled) !== true) return;
+    if (connection.version !== 2 || !connection.capabilities.has("bundle-uri")) return;
+    const list = new BundleList(remoteUrl);
+    const lines = await bundleUriLines(connection);
+    // get_remote_bundle_uri: the first bad line is reported (its number counted from 2), the
+    // rest read but not parsed
+    let failed = false;
+    lines.forEach((line, index) => {
+      if (failed) return;
+      const parseMessages: string[] = [];
+      const error = parseBundleListLine(list, line, parseMessages);
+      for (const m of parseMessages) message(m);
+      if (error === undefined) return;
+      if (error) message(error);
+      message(`error: error on bundle-uri response line ${index + 2}: ${line}`);
+      failed = true;
+    });
+    if (failed) message("error: could not retrieve server-advertised bundle-uri list");
+    if (list.size === 0) return;
+    if (!(await fetchBundleList(host, list))) {
+      message("warning: failed to fetch advertised bundles");
+    }
+  }
+
   private async updateSubmodules(): Promise<SubmoduleCommandResult> {
     const store = RemoteConfigStore.from(this.workingCopy);
     const configured = store.value("clone.filterSubmodules");
@@ -1960,6 +2070,14 @@ function withConfiguredRefspecs(
  * after the directory clone runs in (the worktree top, as the host sees it when the storage
  * has a root directory), without resolving `..` (git writes `/top/../src`).
  */
+/** mkstemp's six random characters. */
+function randomSuffix(): string {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  let out = "";
+  for (let i = 0; i < 6; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+}
+
 function absolutePathOf(
   worktree: Pick<Worktree, "getRoot" | "getFiles"> | undefined,
   path: string,
