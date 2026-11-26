@@ -1040,6 +1040,17 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       // fetch.unpackLimit / transfer.unpackLimit: keep the pack or unpack it
       ...(unpackLimit !== undefined ? { unpackLimit } : {}),
       ...(filter ? { filter } : {}),
+      // a bundle: its pack kept, a filtered one's a `from-bundle` promisor pack
+      ...(remote.kind === "bundle"
+        ? {
+            bundle: {
+              ...(remote.remote.bundle.header.filter !== undefined
+                ? { filter: remote.remote.bundle.header.filter }
+                : {}),
+              promised: promisorRemotes(store).length > 0,
+            },
+          }
+        : {}),
       ...(this.refetch ? { refetch: true } : {}),
       ...(negotiationAlgorithm !== "consecutive" ? { negotiationAlgorithm } : {}),
       ...(negotiationTips ? { negotiationTips } : {}),

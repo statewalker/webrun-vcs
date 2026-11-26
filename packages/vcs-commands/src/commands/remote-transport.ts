@@ -272,7 +272,19 @@ export async function openBundleRemote(
     ?.readLocalFile?.(path)
     .catch(() => undefined);
   if (!bytes) return undefined;
-  const opened = openBundle(bytes, path);
+  return bundleRemoteOf(workingCopy, bytes, path);
+}
+
+/**
+ * A bundle's bytes as a remote of `workingCopy` (the repository fetching): undefined when
+ * they do not read as a bundle. `name` is how git reports it (its path as given).
+ */
+export function bundleRemoteOf(
+  workingCopy: WorkingCopy,
+  bytes: Uint8Array,
+  name: string,
+): BundleRemote | undefined {
+  const opened = openBundle(bytes, name);
   if (!opened.ok) return undefined;
   const history = workingCopy.history;
   return {

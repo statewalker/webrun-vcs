@@ -12,6 +12,8 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -20,6 +22,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
+import { FetchCheckError } from "@statewalker/vcs-transport";
 import {
   createNodeFilesApi,
   createNodeGitHostEnvironment,
@@ -92,17 +95,41 @@ function bundle(name: string, args: string[], options: string[] = []): string {
 }
 
 const showRef = (dir: string) => run(dir, ["show-ref"]).stdout;
+/** The pack directory's files by kind (`pack`, `idx`, `promisor`, ...) and the loose objects. */
+function storage(gitDir: string) {
+  const packDir = join(gitDir, "objects", "pack");
+  const kinds = readdirSync(packDir)
+    .map((name) => name.slice(name.lastIndexOf(".") + 1))
+    .sort();
+  const promisors = readdirSync(packDir)
+    .filter((name) => name.endsWith(".promisor"))
+    .map((name) => readFileSync(join(packDir, name), "utf8"))
+    .sort();
+  const loose = readdirSync(join(gitDir, "objects")).filter((d) => /^[0-9a-f]{2}$/.test(d));
+  return { kinds, promisors, loose: loose.length };
+}
+
 const objects = (dir: string) =>
   gitOk(dir, ["cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)"]);
 
 /** Our fetch's printout (git's stderr) and status, or its death. */
-async function ourFetch(git: Git, remote: string, refspecs: string[], quiet = false) {
+async function ourFetch(
+  git: Git,
+  remote: string,
+  refspecs: string[],
+  quiet = false,
+  bytes?: Uint8Array,
+) {
   try {
     const command = git.fetch().setRemote(remote).setCompatibility(compatibility);
+    if (bytes) command.addBundle(remote, bytes);
     if (refspecs.length > 0) command.setRefSpecs(...refspecs);
     const result = await command.call();
     return { status: 0, stderr: fetchOutputText(result, quiet) };
   } catch (error) {
+    if (error instanceof FetchCheckError) {
+      return { status: error.exitCode ?? 1, stderr: `${error.lines.join("\n")}\n` };
+    }
     if (!(error instanceof GitApiError)) throw error;
     return { status: error.exitCode, stderr: `${error.message}\n` };
   }
@@ -322,5 +349,174 @@ git checkout -q main; m tags/v2 "Merge commit O"; c "Commit P" main.txt`,
     const mine = join(home, "link-ours.git");
     await ourClone(home, mine, (c) => c.setURI(join(home, "link")).setMirror(true), { bare: true });
     expect(showRef(mine)).toBe(showRef(native));
+  });
+  it("a fetch keeps the bundle's pack whatever its size (unbundle runs index-pack)", async () => {
+    const all = bundle("all-main.bdl", ["main"]);
+    // release's tip alone: its parent (v2) is in main's history, so three new objects, which
+    // a fetch over the wire would unpack (below fetch.unpackLimit); a bundle's pack is kept
+    const tip = bundle("tip-only.bdl", ["-1", "release"]);
+    const native = join(home, "keep-native");
+    const mine = join(home, "keep-ours");
+    gitOk(home, ["init", "-q", native]);
+    gitOk(home, ["init", "-q", mine]);
+    for (const [file, spec] of [
+      [all, "refs/heads/main:refs/heads/main"],
+      [tip, "refs/heads/release:refs/heads/release"],
+    ] as const) {
+      const expected = run(native, ["fetch", file, spec]);
+      const result = await ourFetch(await openWorktree(mine), file, [spec]);
+      expect(result).toEqual({ status: expected.status, stderr: expected.stderr });
+      expect(storage(join(mine, ".git"))).toEqual(storage(join(native, ".git")));
+      expect(showRef(mine)).toBe(showRef(native));
+      expect(objects(mine)).toBe(objects(native));
+    }
+    expect(storage(join(mine, ".git")).kinds.filter((k) => k === "pack")).toHaveLength(2);
+  });
+
+  it("fetching a filtered bundle writes a from-bundle promisor pack (t6020-bundle-misc filtered bundles)", async () => {
+    const filtered = bundle("filtered.bdl", ["--all", "--filter=blob:none"]);
+    // without a promisor remote: the pack is kept as a promisor pack, the check fails
+    const native = join(home, "filtered-native");
+    const mine = join(home, "filtered-ours");
+    gitOk(home, ["init", "-q", native]);
+    gitOk(home, ["init", "-q", mine]);
+    const expected = run(native, ["fetch", filtered, "refs/*:refs/*"]);
+    expect(expected.status).toBe(1);
+    const result = await ourFetch(await openWorktree(mine), filtered, ["refs/*:refs/*"]);
+    expect(result.status).toBe(expected.status);
+    const errors = (text: string) => text.split("\n").filter((l) => /^(error|fatal): /.test(l));
+    expect(errors(result.stderr).map((l) => l.replace(/'[0-9a-f]{40}'/, "<id>"))).toEqual(
+      errors(expected.stderr).map((l) => l.replace(/'[0-9a-f]{40}'/, "<id>")),
+    );
+    expect(storage(join(mine, ".git"))).toEqual(storage(join(native, ".git")));
+    expect(showRef(mine)).toBe(showRef(native));
+    // with a promisor remote (a partial clone): the fetch succeeds, the blobs promised
+    const incremental = bundle("incremental-filtered.bdl", [
+      "^main",
+      "release",
+      "--filter=blob:none",
+    ]);
+    const pn = join(home, "promisor-native");
+    const po = join(home, "promisor-ours");
+    for (const dir of [pn, po]) {
+      gitOk(home, ["init", "-q", dir]);
+      gitOk(dir, ["fetch", "-q", bundle("all-main.bdl", ["main"]), "main:main"]);
+      gitOk(dir, ["config", "remote.origin.url", repo]);
+      gitOk(dir, ["config", "remote.origin.promisor", "true"]);
+      gitOk(dir, ["config", "remote.origin.partialclonefilter", "blob:none"]);
+    }
+    const ok = run(pn, ["fetch", incremental, "refs/heads/release:refs/heads/release"]);
+    const ours = await ourFetch(await openWorktree(po), incremental, [
+      "refs/heads/release:refs/heads/release",
+    ]);
+    expect(ours).toEqual({ status: ok.status, stderr: ok.stderr });
+    expect(ok.status).toBe(0);
+    expect(showRef(po)).toBe(showRef(pn));
+    expect(objects(po)).toBe(objects(pn));
+    // git 2.48+'s index-pack --promisor also packs the local objects the bundle's pack links
+    // to into a promisor pack of their own (repack_local_links, an empty `.promisor`); ours
+    // always does, 2.43 does not
+    if (compatibility === "2.43") {
+      const bundlePromisors = (dir: string) =>
+        storage(join(dir, ".git")).promisors.filter((c) => c !== "");
+      expect(bundlePromisors(po)).toEqual(bundlePromisors(pn));
+    } else {
+      expect(storage(join(po, ".git"))).toEqual(storage(join(pn, ".git")));
+    }
+    expect(storage(join(po, ".git")).promisors).toContain("from-bundle\n");
+    expect(run(po, ["fsck", "--no-dangling"]).status).toBe(0);
+  });
+
+  it("a bundle given as bytes (addBundle) is fetched, cloned and listed as the file is", async () => {
+    const bytes = new Uint8Array(readFileSync(b1));
+    const url = "memory/b1.bundle"; // nothing on disk names it
+    const listed = await (await openWorktree(repo))
+      .lsRemote()
+      .addBundle(url, bytes)
+      .setRemote(url)
+      .call();
+    expect(listed.refs.map((r) => `${r.objectId}\t${r.name}`)).toEqual(
+      run(repo, ["ls-remote", b1])
+        .stdout.split("\n")
+        .filter((l) => l && !l.endsWith("\tHEAD")),
+    );
+    const native = join(home, "bytes-native.git");
+    gitOk(home, ["clone", "-q", "--mirror", b1, native]);
+    const mine = join(home, "bytes-ours.git");
+    await ourClone(home, mine, (c) => c.setURI(url).addBundle(url, bytes).setMirror(true), {
+      bare: true,
+    });
+    expect(showRef(mine)).toBe(showRef(native));
+    expect(run(mine, ["config", "remote.origin.url"]).stdout).toBe(`${url}\n`);
+    // later bundles as bytes too, prerequisites checked against the repository
+    const b2Bytes = new Uint8Array(readFileSync(b2));
+    const expected = run(native, ["fetch", b2, "+refs/*:refs/*"]);
+    const result = await ourFetch(await openBare(mine), b2, ["+refs/*:refs/*"], false, b2Bytes);
+    expect(result).toEqual({ status: expected.status, stderr: expected.stderr });
+    expect(showRef(mine)).toBe(showRef(native));
+    expect(objects(mine)).toBe(objects(native));
+    const lacking = join(home, "bytes-lacking");
+    const lackingNative = join(home, "bytes-lacking-native");
+    gitOk(home, ["init", "-q", lacking]);
+    gitOk(home, ["init", "-q", lackingNative]);
+    const refused = run(lackingNative, ["fetch", b2, "refs/*:refs/*"]);
+    const ourRefusal = await ourFetch(
+      await openWorktree(lacking),
+      b2,
+      ["refs/*:refs/*"],
+      false,
+      b2Bytes,
+    );
+    expect(ourRefusal).toEqual({ status: refused.status, stderr: refused.stderr });
+    // pull hands the bundle to its fetch
+    const pn = join(home, "bytes-pull-native");
+    const po = join(home, "bytes-pull-ours");
+    for (const dir of [pn, po]) gitOk(home, ["init", "-q", "-b", "main", dir]);
+    const pulled = run(pn, ["pull", "-q", b1, "topic/1"]);
+    expect(pulled.status).toBe(0);
+    const mineBefore = await openWorktree(po);
+    await mineBefore.pull().addBundle("b1", bytes).setRemote("b1").setRefSpecs("topic/1").call();
+    expect(run(po, ["rev-parse", "HEAD"]).stdout).toBe(run(pn, ["rev-parse", "HEAD"]).stdout);
+    expect(run(po, ["status", "--porcelain"]).stdout).toBe("");
+  });
+
+  it("BundleWriterTest: our bundles of a single ref, of HEAD and incremental ones, fetched by native git and ours", async () => {
+    const ours = await openWorktree(repo);
+    const write = async (name: string, args: string[]) => {
+      const command = ours.bundleCreate().setCompatibility(compatibility);
+      for (const a of args) command.addArgument(a);
+      const { bundle: bytes } = await command.call();
+      if (!bytes) throw new Error(`no bundle for ${args.join(" ")}`);
+      const file = join(home, name);
+      writeFileSync(file, bytes);
+      return { file, bytes };
+    };
+    // testWriteSingleRef, testWriteHEAD, testIncrementalBundle
+    const single = await write("w-single.bdl", ["topic/1"]);
+    const head = await write("w-head.bdl", ["HEAD"]);
+    const incremental = await write("w-incremental.bdl", ["topic/1..topic/2"]);
+    const native = join(home, "writer-native");
+    const mine = join(home, "writer-ours");
+    gitOk(home, ["init", "-q", native]);
+    gitOk(home, ["init", "-q", mine]);
+    for (const { file, bytes } of [incremental, single, head, incremental]) {
+      const expected = run(native, [
+        "fetch",
+        file,
+        "refs/*:refs/remotes/b/*",
+        "HEAD:refs/remotes/b/HEAD",
+      ]);
+      const result = await ourFetch(
+        await openWorktree(mine),
+        file,
+        ["refs/*:refs/remotes/b/*", "HEAD:refs/remotes/b/HEAD"],
+        false,
+        bytes,
+      );
+      expect(result).toEqual({ status: expected.status, stderr: expected.stderr });
+      expect(showRef(mine)).toBe(showRef(native));
+      expect(objects(mine)).toBe(objects(native));
+    }
+    expect(run(mine, ["fsck", "--strict", "--no-dangling"]).status).toBe(0);
   });
 });
