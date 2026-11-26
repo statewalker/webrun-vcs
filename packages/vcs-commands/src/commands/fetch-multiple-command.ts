@@ -265,7 +265,10 @@ export class FetchMultipleCommand extends GuardedTransportCommand<FetchMultipleR
       ...(parallel ? ["--end-of-options"] : []),
     ];
     let stdout = "";
-    let stderr = "";
+    // cmd_fetch downloads fetch.bundleURI's bundles once; its children are run with
+    // `-c fetch.bundleURI=` so they download nothing
+    let stderr = (await this.fetchConfiguredBundles()).map((l) => `${l}\n`).join("");
+    this.bundleUriOverride = "";
     let failed = false;
     const fetches: FetchMultipleEntry[] = [];
     // git's parallel runner prints every `Fetching` line as it starts a child; ours starts

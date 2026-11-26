@@ -156,6 +156,12 @@ export interface HttpServerOptions {
   allowRefInWant?: boolean;
   /** Protocol v2: `fetch=... sideband-all` (git's `uploadpack.allowSidebandAll`) */
   allowSidebandAll?: boolean;
+  /**
+   * Protocol v2: git's `uploadpack.advertiseBundleURIs`: `bundle-uri` advertised and answered
+   * with these lines, the served repository's `bundle.*` settings as `<key>=<value>` in config
+   * order (`bundle_uri_command`). Undefined: not advertised, and the command refused
+   */
+  bundleUris?: readonly string[];
   /** git's `transfer.advertiseSID`: `session-id=<sessionId>` advertised by both services */
   advertiseSID?: boolean;
   /** The id {@link advertiseSID} advertises (default `processSessionId()`) */
@@ -759,6 +765,7 @@ function v2CapabilityOptions(options: HttpServerOptions): ServerV2CapabilityOpti
     ...(options.allowRefInWant ? { allowRefInWant: true } : {}),
     ...(options.allowSidebandAll ? { allowSidebandAll: true } : {}),
     ...(sid !== undefined ? { sessionId: sid } : {}),
+    ...(options.bundleUris !== undefined ? { bundleUri: true } : {}),
   };
 }
 
@@ -886,6 +893,7 @@ export async function handleUploadPackV2(
     requestPolicy: options.requestPolicy ?? "ANY",
     ...(options.allowRefInWant ? { allowRefInWant: true } : {}),
     ...(options.allowSidebandAll ? { allowSidebandAll: true } : {}),
+    ...(options.bundleUris !== undefined ? { bundleUris: options.bundleUris } : {}),
     ...(advertisedSessionId(options) !== undefined
       ? { sessionId: advertisedSessionId(options) }
       : {}),
@@ -1434,6 +1442,8 @@ export interface HttpHandlerOptions {
   allowRefInWant?: boolean;
   /** v2 `sideband-all` (see {@link HttpServerOptions.allowSidebandAll}) */
   allowSidebandAll?: boolean;
+  /** v2 `bundle-uri` (see {@link HttpServerOptions.bundleUris}) */
+  bundleUris?: readonly string[];
   /** `session-id` advertised (see {@link HttpServerOptions.advertiseSID}) */
   advertiseSID?: boolean;
   /** The id {@link advertiseSID} advertises (see {@link HttpServerOptions.sessionId}) */
@@ -1489,6 +1499,7 @@ export function createHttpHandler(
     advertiseObjectInfo,
     allowRefInWant,
     allowSidebandAll,
+    bundleUris,
     advertiseSID,
     sessionId,
     packObjectsHook,
@@ -1519,6 +1530,7 @@ export function createHttpHandler(
       advertiseObjectInfo,
       ...(allowRefInWant ? { allowRefInWant } : {}),
       ...(allowSidebandAll ? { allowSidebandAll } : {}),
+      ...(bundleUris !== undefined ? { bundleUris } : {}),
       ...(advertiseSID ? { advertiseSID } : {}),
       ...(sessionId !== undefined ? { sessionId } : {}),
       ...(packObjectsHook ? { packObjectsHook } : {}),

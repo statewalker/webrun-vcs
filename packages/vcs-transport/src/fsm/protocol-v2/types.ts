@@ -121,9 +121,12 @@ export function serverV2Capabilities(
     list.splice(objectInfo >= 0 ? objectInfo : list.length, 0, `session-id=${options.sessionId}`);
   }
   const named = list.some((c) => c === "object-info" || c.startsWith("object-info="));
-  if (!advertiseObjectInfo || named) return list;
-  const attributes = objectInfoAttributes(repository);
-  if (attributes.length > 0) list.push(`object-info=${attributes.join(" ")}`);
+  if (advertiseObjectInfo && !named) {
+    const attributes = objectInfoAttributes(repository);
+    if (attributes.length > 0) list.push(`object-info=${attributes.join(" ")}`);
+  }
+  // serve.c's order: ... object-info, bundle-uri
+  if (options.bundleUri && !list.includes("bundle-uri")) list.push("bundle-uri");
   return list;
 }
 
@@ -135,6 +138,8 @@ export interface ServerV2CapabilityOptions {
   allowSidebandAll?: boolean;
   /** `session-id=<id>` (git's `transfer.advertiseSID`) */
   sessionId?: string;
+  /** `bundle-uri` (git's `uploadpack.advertiseBundleURIs`), after `object-info` */
+  bundleUri?: boolean;
 }
 
 /**

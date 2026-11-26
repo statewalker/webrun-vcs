@@ -5,7 +5,10 @@
 
 export * from "./bundle-create-command.js";
 export * from "./bundle-format.js";
+export * from "./bundle-list.js";
 export * from "./bundle-read-commands.js";
 export * from "./bundle-support.js";
 export * from "./bundle-transport.js";
+export * from "./bundle-uri.js";
+export * from "./bundle-uri-host.js";
 export * from "./bundle-verify.js";

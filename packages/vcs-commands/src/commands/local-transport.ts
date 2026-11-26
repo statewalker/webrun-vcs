@@ -189,6 +189,8 @@ export async function withLocalUploadPack<T>(
       ...(settings.allowRefInWant ? { allowRefInWant: true } : {}),
       // uploadpack.allowSidebandAll
       ...(settings.allowSidebandAll ? { allowSidebandAll: true } : {}),
+      // uploadpack.advertiseBundleURIs and bundle.*
+      ...(settings.bundleUris !== undefined ? { bundleUris: settings.bundleUris } : {}),
       ...(settings.advertiseSID ? { advertiseSID: true } : {}),
       ...(head && "target" in head ? { currentBranch: head.target } : {}),
     }))().finally(() => server.close?.());

@@ -253,6 +253,12 @@ export class ProcessConfiguration {
    * git's `uploadpack.allowSidebandAll` (default false: the argument is an unexpected line)
    */
   allowSidebandAll?: boolean;
+  /**
+   * Protocol v2: git's `uploadpack.advertiseBundleURIs`: `bundle-uri` advertised and answered
+   * with these lines, the served repository's `bundle.*` settings as `<key>=<value>` in config
+   * order (`bundle_uri_command`). Undefined: not advertised, and the command refused
+   */
+  bundleUris?: readonly string[];
 
   /**
    * Server side: the session id advertised as `session-id=<id>` (git's `transfer.advertiseSID`
