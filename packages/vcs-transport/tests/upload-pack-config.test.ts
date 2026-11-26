@@ -97,6 +97,34 @@ describe("upload-pack config", () => {
     expect(serverV2Capabilities().some((c) => c.includes("ref-in-want"))).toBe(false);
   });
 
+  it("reads uploadpack.allowSidebandAll and advertises sideband-all after ref-in-want", () => {
+    expect(
+      explicitServerSettingsFromConfig(config([["uploadpack.allowSidebandAll", "true"]]))
+        .allowSidebandAll,
+    ).toBe(true);
+    expect(
+      explicitServerSettingsFromConfig(
+        config([
+          ["uploadpack.allowSidebandAll", "true"],
+          ["uploadpack.allowSidebandAll", "false"],
+        ]),
+      ).allowSidebandAll,
+    ).toBe(false);
+    expect(explicitServerSettingsFromConfig(config([]))).not.toHaveProperty("allowSidebandAll");
+    const fetch = (options: { allowRefInWant?: boolean; allowSidebandAll?: boolean }) =>
+      serverV2Capabilities(undefined, false, undefined, { allowFilter: true }, options).find((c) =>
+        c.startsWith("fetch="),
+      );
+    // upload_pack_advertise's order
+    expect(fetch({ allowRefInWant: true, allowSidebandAll: true })).toBe(
+      "fetch=shallow wait-for-done filter ref-in-want sideband-all",
+    );
+    expect(fetch({ allowSidebandAll: true })).toBe(
+      "fetch=shallow wait-for-done filter sideband-all",
+    );
+    expect(fetch({})).toBe("fetch=shallow wait-for-done filter");
+  });
+
   it("builds pack-objects' arguments and input as create_pack_file", () => {
     expect(packObjectsHookArgs({ ofsDelta: true, includeTag: true })).toEqual([
       "git",
