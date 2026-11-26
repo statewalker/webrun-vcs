@@ -1066,6 +1066,38 @@ export class HookSession {
   }
 
   /**
+   * A program git runs through the shell with variables of its own (diff.c's
+   * `run_external_diff`: `use_shell`, the worktree's top as its directory, its stdout git's):
+   * its exit code and output as bytes; undefined without a runner or a layout, an exit code
+   * of 127 when the runner fails to start it.
+   */
+  async runProgram(
+    name: string,
+    command: string,
+    args: readonly string[],
+    env: Record<string, string>,
+  ): Promise<{ exitCode: number; stdout: Uint8Array; stderr: Uint8Array } | undefined> {
+    const runner = this.runner;
+    if (!runner) return undefined;
+    const layout = await this.host.layout();
+    if (!layout) return undefined;
+    const { invocation } = this.invocationOf(
+      layout,
+      name,
+      { kind: "configured", name, command },
+      { args: [...args], keepStdout: true, env },
+    );
+    let outcome: HookOutcome | undefined;
+    try {
+      outcome = await runner.run(invocation);
+    } catch {
+      outcome = undefined;
+    }
+    if (!outcome) return { exitCode: 127, stdout: new Uint8Array(0), stderr: new Uint8Array(0) };
+    return { exitCode: outcome.exitCode, stdout: outcome.stdout, stderr: outcome.stderr };
+  }
+
+  /**
    * A file a git option names as the repository's FilesApi reaches it: a relative path from
    * the directory git runs in (the worktree top). Undefined without a layout, or for a path
    * outside the FilesApi.

@@ -87,6 +87,27 @@ export interface GitHostEnvironment {
       string
     >
   >;
+  /**
+   * The variables of git's diff and merge machinery: `GIT_EXTERNAL_DIFF` and
+   * `GIT_EXTERNAL_DIFF_TRUST_EXIT_CODE` (diff.c's `external_diff`, over `diff.external` and
+   * `diff.trustExitCode`), `GIT_DIFF_OPTS` (`-u<n>` / `--unified=<n>`, the context of every
+   * builtin patch), `GIT_MERGE_VERBOSITY` (merge-ort's `verbosity`, over `merge.verbosity`:
+   * 0 silences `git merge`'s messages); absent ones unset
+   */
+  diffVariables?: Partial<
+    Record<
+      | "GIT_EXTERNAL_DIFF"
+      | "GIT_EXTERNAL_DIFF_TRUST_EXIT_CODE"
+      | "GIT_DIFF_OPTS"
+      | "GIT_MERGE_VERBOSITY",
+      string
+    >
+  >;
+  /**
+   * The host directory git creates temporary files in (`$TMPDIR`, else `/tmp`): an external
+   * diff's sides (`git-blob-XXXXXX/<name>`) are written there through {@link hostFilesOf}
+   */
+  tempDirectory?: string;
   /** The build's `DEFAULT_EDITOR` (default `vi`; Debian's git: `editor`) */
   defaultEditor?: string;
   /** The build's `DEFAULT_PAGER` (default `less`; Debian's git: `pager`) */

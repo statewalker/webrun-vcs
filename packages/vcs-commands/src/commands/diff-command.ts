@@ -68,9 +68,11 @@ import {
   type DiffDriver,
   type DiffFilePair,
   type DiffOutputOptions,
+  type DiffSideSpec,
   type DiffstatFile,
   type DiffstatOptions,
   diffDriverOf,
+  externalDiffMetainfo,
   formatNameOnly,
   formatNameStatus,
   formatNumstat,
@@ -97,6 +99,12 @@ import {
   readDiffColorSettings,
   whitespaceRuleError,
 } from "./diff-color-config.js";
+import {
+  ExternalDiffDiedError,
+  type ExternalDiffProgram,
+  ExternalDiffTempFiles,
+  externalDiffProgramOf,
+} from "./diff-external.js";
 import { type TextconvRequest, type TextconvRunner, textconvRunnerOf } from "./diff-textconv.js";
 import {
   DO_MATCH_DIRECTORY,
@@ -284,6 +292,15 @@ export interface DiffTextOptions
    * `installTextconvRunner`, without one no textconv applies
    */
   textconv?: boolean;
+  /**
+   * `--ext-diff` / `--no-ext-diff`: run external diff programs (`GIT_EXTERNAL_DIFF`,
+   * `diff.external`, `diff.<driver>.command`) instead of the builtin patch. Default false;
+   * `Git.diff()` (porcelain `git diff`) turns it on, as git, while `git log`/`show` and the
+   * plumbing diffs need it asked. The programs run through the host's `hookRunner`, their
+   * sides written in its `tempDirectory` through `hostFilesOf`; without those the builtin
+   * patch is shown. See `diff-external.ts`.
+   */
+  extDiff?: boolean;
   /**
    * `-R`: the two sides swapped (an addition shows as a deletion, the new side first), their
    * prefixes with them (`diff --git b/f a/f`). Combined diffs of conflicted paths are not swapped.
@@ -638,6 +655,9 @@ function submoduleIgnoreValue(
 
 const S_IFMT = 0o170000;
 const GITLINK = 0o160000;
+const SYMLINK = 0o120000;
+/** A mode as git's `%06o` prints it */
+const octal6 = (mode: number) => mode.toString(8).padStart(6, "0");
 const encoder = new TextEncoder();
 
 /** The chunks as one array. */
@@ -801,6 +821,10 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   private changesFound = false;
   /** git's `check_failed`: `--check` found an error in the last call */
   private checkFailed = false;
+  /** git's `diff_path_counter`: the external diff calls made so far */
+  private externalCounter = 0;
+  /** What external diff programs wrote on stderr in the last call */
+  private externalStderr: Uint8Array[] = [];
   /** The revisions given resolved (ranges, `--merge-base`) */
   private sidesResolved = false;
   /** The compiled pickaxe (`-S`, `-G`, `--find-object`), once the options are checked */
@@ -987,6 +1011,18 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
    */
   get warnings(): readonly string[] {
     return this.configWarnings;
+  }
+
+  /** What the external diff programs of the last call wrote on stderr (git passes it through) */
+  get programStderr(): Uint8Array {
+    const total = this.externalStderr.reduce((n, c) => n + c.length, 0);
+    const out = new Uint8Array(total);
+    let at = 0;
+    for (const chunk of this.externalStderr) {
+      out.set(chunk, at);
+      at += chunk.length;
+    }
+    return out;
   }
 
   /**
@@ -1380,7 +1416,13 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         PREFETCH_FORMATS.has(format) || this.pickaxeReads,
       );
       const sink = new ByteSink();
-      await this.writeFormats(sink, [format], collected);
+      try {
+        await this.writeFormats(sink, [format], collected);
+      } catch (error) {
+        // what git wrote on stdout before an external diff made it die
+        if (error instanceof ExternalDiffDiedError) error.output = sink.bytes();
+        throw error;
+      }
       return sink.bytes();
     });
   }
@@ -1411,14 +1453,14 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     this.changesFound = false;
     const options = this.outputOptions();
     Object.assign(options, this.prefixes());
+    this.resetExternal();
     for (const entry of entries) {
       if (entry.unmerged) {
         this.changesFound = true;
         break;
       }
-      const scratch = new ByteSink();
-      await writePairPatch(scratch, diffEntryToPair(entry, this.blobs), options);
-      if (scratch.length > 0) {
+      const pair = this.withTextconvInputs(diffEntryToPair(entry, this.blobs), entry);
+      if (await this.patchOf(new ByteSink(), pair, options, entries.length, true)) {
         this.changesFound = true;
         break;
       }
@@ -1587,6 +1629,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     // diffcore_std's has_changes; with diff_from_contents, what the outputs show (below)
     const fromContents = this.fromContents;
     this.changesFound = !fromContents && entries.length > 0;
+    this.resetExternal();
     const options = this.outputOptions();
     Object.assign(options, this.prefixes());
     if (this.textOptions.reverse) {
@@ -1745,9 +1788,10 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
             options.abbrevLengths = await this.idAbbreviator().lengths(ids, options.abbrev);
           }
           // diff_flush_patch_all_file_pairs: moved lines are looked for over every pair
+          // (diff_setup_done: not with an external diff program)
           const moved = this.colorSettings;
           const out =
-            moved?.colors && moved.colorMoved !== "no"
+            moved?.colors && moved.colorMoved !== "no" && !this.externalProgram()
               ? new MovedLineBuffer(moved.colorMoved, moved.colorMovedWs)
               : sink;
           for (const pair of this.withHeaderOnlyPairs(pairs, full, headers)) {
@@ -1756,9 +1800,29 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
               if (this.includesConflictHeaders(headers)) {
                 writeHeaderOnlyPatch(out, pair, headers?.get(pair) ?? [], options);
               }
-            } else if (unmerged.has(pair)) {
-              out.text(`* Unmerged path ${pair.new?.path ?? pair.old?.path}\n`);
-            } else await writePairPatch(out, pair, options);
+            } else {
+              const isUnmerged = unmerged.has(pair);
+              const external = await this.externalDiffFor(pair, options, isUnmerged);
+              if (external) {
+                // run_external_diff's found_changes, by the program's exit code
+                if (
+                  await this.runExternalDiff(
+                    out,
+                    external,
+                    pair,
+                    options,
+                    pairs.length,
+                    false,
+                    isUnmerged,
+                  )
+                ) {
+                  this.changesFound = true;
+                }
+                continue;
+              }
+              if (isUnmerged) out.text(`* Unmerged path ${pair.new?.path ?? pair.old?.path}\n`);
+              else await writePairPatch(out, pair, options);
+            }
             // builtin_diff's found_changes: the pair showed something
             if (out.length > before) this.changesFound = true;
           }
@@ -2156,11 +2220,198 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         shown.push(pair);
         continue;
       }
-      const scratch = new ByteSink();
-      await writePairPatch(scratch, pair, options);
-      if (scratch.length > 0) shown.push(pair);
+      if (await this.patchOf(new ByteSink(), pair, options, pairs.length, true)) shown.push(pair);
     }
     return shown;
+  }
+
+  /** The host environment the working copy's configuration was opened with */
+  private get hostEnvironment(): GitHostEnvironment | undefined {
+    return (this.workingCopy.config as { environment?: GitHostEnvironment })?.environment;
+  }
+
+  /** diff_setup_done: the external diff calls of a new output start from 1 */
+  private resetExternal(): void {
+    this.externalCounter = 0;
+    this.externalStderr = [];
+  }
+
+  /**
+   * diff.c's `external_diff()` where external diffs are allowed (`--ext-diff`, porcelain
+   * `git diff`): `GIT_EXTERNAL_DIFF`, else `diff.external` of the UI configuration
+   */
+  private externalProgram(): ExternalDiffProgram | undefined {
+    if (!this.textOptions.extDiff) return undefined;
+    const config = this.config;
+    return externalDiffProgramOf(
+      this.hostEnvironment,
+      this.textOptions.uiConfig === false ? undefined : (key) => config.value(key),
+    );
+  }
+
+  /**
+   * The program run_diff_cmd runs for a pair, if any: the pair's `diff.<driver>.command`
+   * (attributes of its first path), else {@link externalProgram}; none without a runner to
+   * run it or a place to write its files. `split`: a change between a file and a symbolic
+   * link that only a driver's program takes (run_diff splits it in two when no
+   * `GIT_EXTERNAL_DIFF`/`diff.external` is set).
+   */
+  private async externalDiffFor(
+    pair: DiffFilePair,
+    options: DiffOutputOptions,
+    unmerged: boolean,
+  ): Promise<(ExternalDiffProgram & { split: boolean }) | undefined> {
+    if (!this.textOptions.extDiff) return undefined;
+    const environment = this.hostEnvironment;
+    if (!environment?.hookRunner || !environment.hostFilesOf) return undefined;
+    const { old: one, new: two } = pair;
+    if ((one && (one.mode & S_IFMT) === 0o040000) || (two && (two.mode & S_IFMT) === 0o040000)) {
+      return undefined;
+    }
+    const global = this.externalProgram();
+    const split =
+      !global && !unmerged && !!one && !!two && (one.mode & S_IFMT) !== (two.mode & S_IFMT);
+    const side = one ?? two;
+    const attrPath = side?.attrPath ?? side?.path;
+    const driver = attrPath ? await options.driver?.(attrPath) : undefined;
+    if (driver?.externalCommand !== undefined) {
+      return {
+        command: driver.externalCommand,
+        trustExitCode: driver.trustExitCode ?? false,
+        split,
+      };
+    }
+    return global && { ...global, split: false };
+  }
+
+  /**
+   * A pair's patch, through its external program or the builtin one: whether it shows a
+   * change (git's `found_changes`). `quiet`: nothing is written (diff_flush_patch_quietly).
+   */
+  private async patchOf(
+    out: ByteSink,
+    pair: DiffFilePair,
+    options: DiffOutputOptions,
+    total: number,
+    quiet: boolean,
+  ): Promise<boolean> {
+    const external = await this.externalDiffFor(pair, options, false);
+    if (external) return this.runExternalDiff(out, external, pair, options, total, quiet);
+    const before = out.length;
+    await writePairPatch(out, pair, options);
+    return out.length > before;
+  }
+
+  /**
+   * diff.c's run_external_diff for a pair (both halves of a split one): the program's stdout
+   * into `out` (nothing when `quiet`), its stderr kept; whether the pair counts as changed.
+   * Without `trustExitCode` a quiet check does not run the program and counts a change.
+   *
+   * @throws ExternalDiffDiedError on an exit code git does not accept
+   */
+  private async runExternalDiff(
+    out: ByteSink,
+    program: ExternalDiffProgram & { split: boolean },
+    pair: DiffFilePair,
+    options: DiffOutputOptions,
+    total: number,
+    quiet: boolean,
+    unmerged = false,
+  ): Promise<boolean> {
+    if (!program.trustExitCode && quiet) return true;
+    const { old: one, new: two } = pair;
+    const name = one?.path ?? two?.path ?? "";
+    // a split pair: the old side against nothing, then nothing against the new side
+    const calls: Array<[DiffSideSpec | undefined, DiffSideSpec | undefined]> = program.split
+      ? [
+          [one, undefined],
+          [undefined, two],
+        ]
+      : [[one, two]];
+    let found = false;
+    for (const [a, b] of calls) {
+      const temps = new ExternalDiffTempFiles(this.hostEnvironment ?? {});
+      try {
+        const args = [name];
+        // an unmerged path: its name alone
+        if (!unmerged) {
+          args.push(...(await this.externalSide(a, temps)), ...(await this.externalSide(b, temps)));
+          const otherPath = two?.path ?? name;
+          if (!program.split && otherPath !== name) {
+            args.push(otherPath);
+            const xfrm = externalDiffMetainfo(pair, options);
+            if (xfrm !== undefined) args.push(xfrm);
+          }
+        }
+        const env = {
+          GIT_DIFF_PATH_COUNTER: String(++this.externalCounter),
+          GIT_DIFF_PATH_TOTAL: String(total),
+        };
+        const ran = await this.hooks.runProgram("external-diff", program.command, args, env);
+        if (!ran) throw new ExternalDiffDiedError(name);
+        if (!quiet && ran.stdout.length > 0) out.push(ran.stdout);
+        if (ran.stderr.length > 0) this.externalStderr.push(ran.stderr);
+        if (ran.exitCode === 0) {
+          if (!program.trustExitCode) found = true;
+        } else if (program.trustExitCode && ran.exitCode === 1) found = true;
+        else throw new ExternalDiffDiedError(name);
+      } finally {
+        await temps.removeAll();
+      }
+    }
+    return found;
+  }
+
+  /**
+   * prepare_temp_file: the three arguments naming one side. An absent side is `/dev/null . .`;
+   * the worktree's file is passed by its path from the top (the null id when the comparison
+   * did not hash it, a symbolic link's target in a temporary file); a stored side whose
+   * index entry the worktree's file still matches is passed as that file
+   * (`reuse_worktree_file`, only when the diff reads the index); any other side is a
+   * temporary file of its content as checkout writes it.
+   */
+  private async externalSide(
+    side: DiffSideSpec | undefined,
+    temps: ExternalDiffTempFiles,
+  ): Promise<string[]> {
+    if (!side) return ["/dev/null", ".", "."];
+    const nullId = this.objectFormat.nullId;
+    const path = side.attrPath ?? side.path;
+    const mode = octal6(side.mode);
+    const gitlink = (side.mode & S_IFMT) === GITLINK;
+    const fromWorktree = side.idValid === false;
+    const worktree = this.worktreeIfAny;
+    if (!gitlink && worktree && (fromWorktree || (await this.reusesWorktreeFile(path, side)))) {
+      const current = await worktree.getEntry(path);
+      if (!current || current.isDirectory) return ["/dev/null", ".", "."];
+      if ((current.mode & S_IFMT) !== SYMLINK) return [path, fromWorktree ? nullId : side.id, mode];
+      const target = await collectChunks(worktree.readContent(path));
+      return [
+        await temps.write(path, target),
+        fromWorktree ? nullId : side.id,
+        fromWorktree ? octal6(SYMLINK) : mode,
+      ];
+    }
+    const content = gitlink ? await side.read() : await (side.readTextconvInput ?? side.read)();
+    return [await temps.write(path, content), side.id, mode];
+  }
+
+  /** reuse_worktree_file: the index's entry of `path` holds the side and its file matches it */
+  private async reusesWorktreeFile(path: string, side: DiffSideSpec): Promise<boolean> {
+    // a diff of two trees reads no index (`istate->cache` empty)
+    if (this.newTree !== undefined || !this.worktreeIfAny) return false;
+    const entry = await this.staging.getEntry(path);
+    if (!entry || entry.stage !== 0 || entry.objectId !== side.id) return false;
+    if ((entry.mode & S_IFMT) !== 0o100000) return false;
+    if (entry.assumeValid || entry.skipWorktree) return false;
+    const worktree = this.worktreeIfAny;
+    const current = await worktree.getEntry(path);
+    if (!current) return false;
+    // ie_match_stat: the stat data, and the content of a racily clean entry
+    const trust = worktreeModeTrust(this.workingCopy, worktree);
+    const indexTime = this.staging.getUpdateTime();
+    const compared = await compareWithWorktree(worktree, entry, { trust, indexTime }, current);
+    return compared.kind === undefined;
   }
 
   private get config(): RemoteConfigStore {
@@ -2326,6 +2577,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       ignoreConfigNoPrefix: _ignoreConfigNoPrefix,
       orderFile: _orderFile,
       textconv: _textconv,
+      extDiff: _extDiff,
       abbrev: _abbrev,
       diffFilter: _diffFilter,
       relative: _relative,
@@ -2362,6 +2614,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       : {};
     const ignoreRegex = this.ignoreRegex();
     const abbrev = abbrevOption(this.textOptions.abbrev);
+    const diffOpts = this.hostEnvironment?.diffVariables?.GIT_DIFF_OPTS;
     return {
       context: intValue(get("diff.context")) ?? 3,
       interHunkContext: intValue(get("diff.interHunkContext")) ?? 0,
@@ -2386,6 +2639,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         ? { defaultWordRegex: get("diff.wordRegex") as string }
         : {}),
       whitespaceRule,
+      ...(diffOpts !== undefined ? { diffOpts } : {}),
     };
   }
 

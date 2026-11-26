@@ -1806,7 +1806,8 @@ export class Git implements Disposable {
    */
   diff(): DiffCommand {
     this.checkClosed();
-    return new DiffCommand(this._workingCopy);
+    // porcelain `git diff` allows external diff programs (`--no-ext-diff` turns them off)
+    return new DiffCommand(this._workingCopy).setOptions({ extDiff: true });
   }
 
   // ============ Patch Operations ============

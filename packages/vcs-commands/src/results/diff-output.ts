@@ -133,6 +133,13 @@ export interface DiffDriver {
   /** `diff.<name>.cachetextconv`: outputs kept in `refs/notes/textconv/<name>` */
   cacheTextconv?: boolean;
   /**
+   * `diff.<name>.command`: the external diff program of the paths with this driver, run
+   * instead of the builtin patch where external diffs are allowed (`--ext-diff`, `git diff`)
+   */
+  externalCommand?: string;
+  /** `diff.<name>.trustExitCode` (git 2.46+): the program's exit code 0 means "no change" */
+  trustExitCode?: boolean;
+  /**
    * Turns a side's content into the text the patch compares (git's `fill_textconv`): set
    * when textconv is allowed and the host can run `textconvCommand`. A side converted this
    * way is never binary.
@@ -158,6 +165,8 @@ export interface DiffOutputOptions
   indentHeuristic?: boolean;
   /** Length of abbreviated object ids in `index` lines (default 7) */
   abbrev?: number;
+  /** `$GIT_DIFF_OPTS`: `-u<n>` or `--unified=<n>` sets every patch's context (see {@link diffOptsContext}) */
+  diffOpts?: string;
   /**
    * diff.c's `additional_path_headers` (`--remerge-diff`'s `remerge CONFLICT` lines): the
    * headers shown after a pair's rename lines, by the pair's first name
@@ -263,12 +272,15 @@ export function diffDriverOf(
   );
   const textconvCommand = config?.(`diff.${name}.textconv`);
   const cacheTextconv = boolValue(config?.(`diff.${name}.cachetextconv`));
+  const externalCommand = config?.(`diff.${name}.command`);
+  const trustExitCode = boolValue(config?.(`diff.${name}.trustexitcode`));
   if (
     binary === undefined &&
     !algorithm &&
     !findFunction &&
     !wordRegex &&
-    textconvCommand === undefined
+    textconvCommand === undefined &&
+    externalCommand === undefined
   ) {
     return undefined;
   }
@@ -280,7 +292,43 @@ export function diffDriverOf(
     ...(wordRegex ? { wordRegex } : {}),
     ...(textconvCommand !== undefined ? { textconvCommand } : {}),
     ...(cacheTextconv !== undefined ? { cacheTextconv } : {}),
+    ...(externalCommand !== undefined ? { externalCommand } : {}),
+    ...(trustExitCode !== undefined ? { trustExitCode } : {}),
   };
+}
+
+/**
+ * The context `GIT_DIFF_OPTS` gives every builtin patch (diff.c's builtin_diff: `--unified=<n>`
+ * or `-u<n>`, read as `strtoul`, so `-u` alone is 0), over `-U`; undefined for any other value
+ */
+export function diffOptsContext(diffOpts: string | undefined): number | undefined {
+  if (diffOpts === undefined) return undefined;
+  const rest = diffOpts.startsWith("--unified=")
+    ? diffOpts.slice("--unified=".length)
+    : diffOpts.startsWith("-u")
+      ? diffOpts.slice(2)
+      : undefined;
+  if (rest === undefined) return undefined;
+  const digits = /^\s*\+?(\d*)/.exec(rest)?.[1] ?? "";
+  return digits === "" ? 0 : Number.parseInt(digits, 10);
+}
+
+/**
+ * The extended header lines of a pair as git hands them to an external diff program
+ * (fill_metainfo without colors, its `xfrm_msg`): the similarity and rename or copy lines,
+ * the `index` line; undefined when there are none
+ */
+export function externalDiffMetainfo(
+  pair: DiffFilePair,
+  options: DiffOutputOptions,
+): string | undefined {
+  const name = pair.old?.path ?? pair.new?.path ?? "";
+  const otherPath = pair.new?.path ?? name;
+  const other = otherPath !== name ? otherPath : undefined;
+  const one = new LoadedSide(pair.old, undefined, pair.new?.id);
+  const two = new LoadedSide(pair.new, undefined, pair.old?.id);
+  const { text } = metainfo(pair, one, two, name, other, { ...options, colors: undefined });
+  return text === "" ? undefined : text;
 }
 
 /** A git boolean (`git_config_bool`), undefined when unset or not one. */
@@ -663,9 +711,10 @@ async function builtinDiff(
     : await two.read();
   // `git log -L`: the context widened to the widest range, the hunks then cut to the ranges
   const lineRanges = pair.lineRanges;
-  const context = lineRanges
-    ? Math.max(options.context ?? 3, lineRangesSpan(lineRanges))
-    : options.context;
+  // GIT_DIFF_OPTS wins over every other context (builtin_diff sets xecfg.ctxlen last)
+  const context =
+    diffOptsContext(options.diffOpts) ??
+    (lineRanges ? Math.max(options.context ?? 3, lineRangesSpan(lineRanges)) : options.context);
   let result = unifiedDiffHunks(textOne, textTwo, {
     ...options,
     ...(context !== undefined ? { context } : {}),
