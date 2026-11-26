@@ -168,7 +168,7 @@ export async function openOursFromEnvironment(
   home: string,
   cwd: string,
   env: Record<string, string> = {},
-): Promise<{ git: Git; prefix: string }> {
+): Promise<{ git: Git; prefix: string; cwd: string }> {
   const files = createNodeFilesApi({ rootDir: "/" });
   const environment = createNodeGitHostEnvironment({ env: { ...nativeGitEnv(home), ...env } });
   const { admin, setup } = await openRepositoryFromEnvironment({
@@ -180,7 +180,8 @@ export async function openOursFromEnvironment(
     setup.workTree === undefined
       ? Git.fromWorktreeAdmin(admin)
       : Git.fromWorkingCopy(admin as WorkingCopy);
-  return { git, prefix: setup.prefix ?? "" };
+  // the FilesApi is rooted at `/`: its paths are host paths without the leading slash
+  return { git, prefix: setup.prefix ?? "", cwd: `/${setup.cwd.replace(/^\/+/, "")}` };
 }
 
 /** A plumbing run as an outcome (stdout as latin1). */
