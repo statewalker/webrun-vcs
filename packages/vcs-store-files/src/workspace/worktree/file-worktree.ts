@@ -1309,11 +1309,15 @@ export class FileWorktree implements Worktree {
     const repo = await this.nestedGitDir(path);
     if (repo.state !== "repository") return { state: repo.state };
     const { gitDir, commonDir } = repo;
-    // the nested repository's own ref storage, as resolve_gitlink_ref opens its ref store; a
-    // format we cannot read keeps the files reading (loose refs and packed-refs)
+    // the nested repository's own ref storage, as resolve_gitlink_ref opens its ref store
     const format = await readRepositoryFormat(this.files, commonDir).catch(() => undefined);
     if (format?.refStorage === "reftable") {
       return this.reftableHeadState(gitDir, commonDir, format.objectFormat);
+    }
+    // a format we refuse (git may still read it): a reftable repository's HEAD file is a stub,
+    // so its HEAD cannot be read here; any other keeps the files reading below
+    if (format === undefined && (await this.refStorageOf(commonDir)) === "reftable") {
+      return { state: "unknown" };
     }
     let head = await this.readRefFile(joinPath(gitDir, "HEAD"));
     for (let depth = 0; typeof head === "string" && head.startsWith("ref:"); depth++) {
@@ -1338,6 +1342,22 @@ export class FileWorktree implements Worktree {
       return { state: "none" };
     }
     return { state: "commit", head: head.toLowerCase() };
+  }
+
+  /** `extensions.refStorage` of the repository at `commonDir`, read without any format check. */
+  private async refStorageOf(commonDir: string): Promise<string | undefined> {
+    try {
+      const config = await createWorkingCopyConfig(
+        configFilesApiOf(this.files, { readOnly: "only extensions.refStorage is read" }),
+        commonDir,
+        undefined,
+        { includes: false },
+      );
+      const value = config.get("extensions.refstorage");
+      return typeof value === "string" ? value.toLowerCase() : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /**

@@ -186,4 +186,46 @@ describeReftable("reftable submodules (#459)", () => {
       ok(t.native, "config", "-f", ".gitmodules", "--list"),
     );
   });
+  // `worktree add --relative-paths` is 2.48+: the twins are copies, so absolute gitdir
+  // paths would point the copies back at the fixture
+  const relativeWorktrees = gitAtLeast(
+    native ? execFileSync(native.bin, ["--version"]).toString() : "",
+    2,
+    48,
+  );
+  it.skipIf(!relativeWorktrees)(
+    "a linked worktree of a reftable repository reads HEAD from its own stack",
+    async () => {
+      const t = twins((dir) => {
+        // `sub` is replaced by a linked worktree of `main-repo` (reftable), on a branch one
+        // commit ahead of the main worktree's HEAD
+        ok(dir, "init", "-q", "--ref-format=reftable", "-b", "main", "main-repo");
+        writeFileSync(join(dir, "main-repo", "m"), "m\n");
+        ok(join(dir, "main-repo"), "add", "m");
+        ok(join(dir, "main-repo"), "commit", "-q", "-m", "m1");
+        rmSync(join(dir, "sub"), { recursive: true, force: true });
+        ok(
+          join(dir, "main-repo"),
+          "worktree",
+          "add",
+          "-q",
+          "--relative-paths",
+          "-b",
+          "wt",
+          "../sub",
+        );
+        writeFileSync(join(dir, "sub", "w"), "w\n");
+        ok(join(dir, "sub"), "add", "w");
+        ok(join(dir, "sub"), "commit", "-q", "-m", "w1");
+      });
+      const wtHead = ok(join(t.native, "sub"), "rev-parse", "HEAD");
+      expect(wtHead).not.toBe(ok(join(t.native, "main-repo"), "rev-parse", "HEAD"));
+      ok(t.native, "add", "sub");
+      await (await openOurs(t.ours)).add().addFilepattern("sub").call();
+      expect(ok(t.ours, "ls-files", "-s", "sub")).toBe(ok(t.native, "ls-files", "-s", "sub"));
+      expect(ok(t.ours, "ls-files", "-s", "sub")).toContain(wtHead.trim());
+      const { text } = await (await openOurs(t.ours)).status().callText({ format: "short" });
+      expect(text).toBe(ok(t.native, "status", "--short"));
+    },
+  );
 });
