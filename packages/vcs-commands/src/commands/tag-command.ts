@@ -35,7 +35,7 @@ import {
   type RefSortKey,
   signatureStart,
 } from "./ref-filter/index.js";
-import { SigningFailedError, signPayload } from "./signing.js";
+import { SigningFailedError, signPayload, signTagCompat } from "./signing.js";
 import {
   amendWithTrailers,
   type TrailerCommandRunner,
@@ -504,13 +504,18 @@ export class TagCommand extends GitCommand<Ref> {
       // build_tag_object signs before writing (do_sign): the signature appended to the tag
       // object, so to its message
       if (sign) {
-        const signature = await this.signTag(
-          await collectTagBytes(tag),
-          tagger,
-          compatibility,
-          warnings,
-        );
-        if (signature) tag.message = `${message}${new TextDecoder().decode(signature)}`;
+        const payload = await collectTagBytes(tag);
+        const signature = await this.signTag(payload, tagger, compatibility, warnings);
+        if (signature) {
+          tag.message = `${message}${new TextDecoder().decode(signature)}`;
+          // with a compatibility object format do_sign signs the converted tag too and puts
+          // that signature in the header (so in both objects: the conversion moves each
+          // signature to where its own format keeps it)
+          const compatSignature = await this.signTag(payload, tagger, compatibility, warnings, {
+            compat: true,
+          });
+          if (compatSignature) tag.compatSignature = compatSignature;
+        }
       }
       tagObjectId = await this.tagsStore.storeTag(tag);
     } else {
@@ -640,7 +645,21 @@ export class TagCommand extends GitCommand<Ref> {
     tagger: PersonIdent,
     compatibility: "2.43" | "2.56",
     warnings: string[],
-  ): Promise<Uint8Array | undefined> {
+  ): Promise<Uint8Array | undefined>;
+  private async signTag(
+    payload: Uint8Array,
+    tagger: PersonIdent,
+    compatibility: "2.43" | "2.56",
+    warnings: string[],
+    options: { compat: true },
+  ): Promise<AnnotatedTag["compatSignature"]>;
+  private async signTag(
+    payload: Uint8Array,
+    tagger: PersonIdent,
+    compatibility: "2.43" | "2.56",
+    warnings: string[],
+    options?: { compat: true },
+  ): Promise<Uint8Array | AnnotatedTag["compatSignature"]> {
     const gitDir = (await this.hooks.hostGitDir({ real: false }).catch(() => undefined))?.replace(
       /\/+$/,
       "",
@@ -654,11 +673,14 @@ export class TagCommand extends GitCommand<Ref> {
           : `${gitDir}/TAG_EDITMSG`;
     const cwd = await this.hooks.hostWorkingDirectory().catch(() => undefined);
     try {
-      return await signPayload(this.workingCopy, this.signingKey ?? "", payload, {
+      const signOptions = {
         committer: tagger,
         ...(cwd !== undefined ? { cwd } : {}),
         tail: ["error: unable to sign the tag", `The tag message has been left in ${path}`],
-      });
+      };
+      const key = this.signingKey ?? "";
+      if (options?.compat) return await signTagCompat(this.workingCopy, key, payload, signOptions);
+      return await signPayload(this.workingCopy, key, payload, signOptions);
     } catch (e) {
       if (!(e instanceof SigningFailedError)) throw e;
       // git 2.43's do_sign fails only on a negative return, and its sign_buffer_ssh returns

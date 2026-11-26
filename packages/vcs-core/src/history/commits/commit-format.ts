@@ -65,7 +65,7 @@ export async function* encodeCommitEntries(
       case "gpgsig": {
         // GPG signature with continuation lines
         const sigLines = entry.value.split("\n");
-        yield line(`${signatureHeader} ${sigLines[0]}`);
+        yield line(`${entry.header ?? signatureHeader} ${sigLines[0]}`);
         for (let i = 1; i < sigLines.length; i++) {
           yield line(` ${sigLines[i]}`);
         }
@@ -310,8 +310,14 @@ export function* commitToEntries(commit: Commit): Generator<CommitEntry> {
     yield { type: "encoding", value: commit.encoding };
   }
 
+  // add_header_signature in git's algorithm order: `gpgsig` (SHA-1) before `gpgsig-sha256`
+  const compat = commit.compatSignature;
+  if (compat?.header === "gpgsig") yield { type: "gpgsig", value: compat.value, header: "gpgsig" };
   if (commit.gpgSignature) {
     yield { type: "gpgsig", value: commit.gpgSignature };
+  }
+  if (compat?.header === "gpgsig-sha256") {
+    yield { type: "gpgsig", value: compat.value, header: "gpgsig-sha256" };
   }
 
   yield { type: "message", value: commit.message };
@@ -338,6 +344,7 @@ class CommitBuilder {
   private committer: Commit["committer"] | undefined;
   private encoding: string | undefined;
   private gpgSignature: string | undefined;
+  private compatSignature: Commit["compatSignature"];
   private message = "";
 
   add(entry: CommitEntry): void {
@@ -358,7 +365,8 @@ class CommitBuilder {
         this.encoding = entry.value;
         break;
       case "gpgsig":
-        this.gpgSignature = entry.value;
+        if (entry.header) this.compatSignature = { header: entry.header, value: entry.value };
+        else this.gpgSignature = entry.value;
         break;
       case "message":
         this.message = entry.value;
@@ -393,6 +401,7 @@ class CommitBuilder {
     if (gpgSignature) {
       commit.gpgSignature = gpgSignature;
     }
+    if (this.compatSignature) commit.compatSignature = this.compatSignature;
 
     return commit;
   }

@@ -39,6 +39,14 @@ export interface Commit {
   encoding?: string;
   /** GPG signature (optional) */
   gpgSignature?: string;
+  /**
+   * In a repository with a compatibility object format (`extensions.compatObjectFormat`):
+   * the signature over the commit as that format sees it, written under that format's header
+   * beside `gpgSignature`, as git's `commit_tree_extended` writes both (`gpgsig`, the SHA-1
+   * view's, before `gpgsig-sha256`, the SHA-256 view's). Only written: a loaded commit never
+   * has it (its other header is not read back into the model).
+   */
+  compatSignature?: { header: "gpgsig" | "gpgsig-sha256"; value: string };
 }
 
 /**
