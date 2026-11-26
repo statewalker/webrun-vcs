@@ -102,13 +102,29 @@ export interface FetchPackRequest {
    * Ignored by a server without `ref-in-want`
    */
   wantRefs?: ReadonlyArray<{ name: string; oid: string }>;
+  /**
+   * The protocols the client takes packfile URIs over (git's `fetch.uriProtocols`): sent as
+   * `packfile-uris <list>` to a server advertising `fetch=... packfile-uris`, keeping only
+   * `http` and `https` (fetch-pack's send_fetch_request). The URIs the server answers come
+   * back as {@link FetchPackResult.packfileUris}: the caller downloads them
+   */
+  uriProtocols?: readonly string[];
   /** Stores the pack as it arrives (never buffered whole) */
-  importPack(pack: AsyncIterable<Uint8Array>): Promise<PackImportResult>;
+  importPack(pack: AsyncIterable<Uint8Array>, info?: PackInfo): Promise<PackImportResult>;
   /**
    * Called with the server's shallow update before the pack is imported (it may refuse it by
    * throwing: a repository that cannot record shallow commits).
    */
   onShallowUpdate?(update: ServerShallowUpdate): Promise<void> | void;
+}
+
+/** What {@link FetchPackRequest.importPack} is told about the pack it stores. */
+export interface PackInfo {
+  /**
+   * The server named packfile URIs: the objects are split across packs, so this one is
+   * indexed and kept whatever its size (fetch-pack's get_pack with `index_pack_args`)
+   */
+  packfileUris?: boolean;
 }
 
 /** The server's `shallow`/`unshallow` lines. */
@@ -140,6 +156,18 @@ export interface FetchPackResult {
    * id the server sent for it, which may differ from the one listed before (it moved)
    */
   wantedRefs?: Map<string, string>;
+  /**
+   * The server's `packfile-uris` section (v2): packs the server left out of its answer, each
+   * to be downloaded from `uri` and checked to be the pack named `hash` (its trailer)
+   */
+  packfileUris?: PackfileUri[];
+}
+
+/** A `<hash> <uri>` line of a v2 `packfile-uris` section. */
+export interface PackfileUri {
+  /** The checksum the pack's trailer must hold (hex) */
+  hash: string;
+  uri: string;
 }
 
 /**
@@ -452,6 +480,11 @@ async function fetchPackV2(
   if (sidebandAll) head.push(encodePacketLine("sideband-all"));
   for (const line of shallowLines(request, shallow)) head.push(encodePacketLine(line));
   if (request.filter) head.push(encodePacketLine(`filter ${request.filter}`));
+  // fetch.uriProtocols: only http and https are asked for
+  if (fetchFeatures(connection).has("packfile-uris")) {
+    const protocols = (request.uriProtocols ?? []).filter((p) => p === "http" || p === "https");
+    if (protocols.length > 0) head.push(encodePacketLine(`packfile-uris ${protocols.join(",")}`));
+  }
   // add_wants: `want-ref <name>` for the refs asked for by name when the server takes them,
   // `want <id>` for the rest
   const byName = fetchFeatures(connection).has("ref-in-want") ? (request.wantRefs ?? []) : [];
@@ -466,6 +499,7 @@ async function fetchPackV2(
     head.push(encodePacketLine(`want-ref ${name}`));
   }
   let wantedRefs: Map<string, string> | undefined;
+  let packfileUris: PackfileUri[] | undefined;
 
   const stats: NegotiationStats = { rounds: 0, haves: 0 };
   const commons: string[] = [];
@@ -563,6 +597,16 @@ async function fetchPackV2(
           }
           wantedRefs.set(name, line.slice(0, space));
         }
+      } else if (section === "packfile-uris") {
+        // receive_packfile_uris: `<hash> <uri>`
+        const hexLength = formatOf(request).hexLength;
+        packfileUris = [];
+        for (const line of lines) {
+          if (line.length < hexLength || line[hexLength] !== " ") {
+            throw new TransportError(`fatal: expected '<hash> <uri>', got: ${line}`);
+          }
+          packfileUris.push({ hash: line.slice(0, hexLength), uri: line.slice(hexLength + 1) });
+        }
       } else {
         throw new TransportError(`Unexpected section ${section}`);
       }
@@ -571,8 +615,14 @@ async function fetchPackV2(
     // the packfile section's packets are side-band packets of their own (get_pack's demuxer)
     pkts.demultiplex(false);
     await request.onShallowUpdate?.(shallowUpdate);
-    const received = await receivePack(pkts, request, shallowUpdate, stats);
-    return wantedRefs ? { ...received, wantedRefs } : received;
+    const received = await receivePack(pkts, request, shallowUpdate, stats, {
+      ...(packfileUris?.length ? { packfileUris: true } : {}),
+    });
+    return {
+      ...received,
+      ...(wantedRefs ? { wantedRefs } : {}),
+      ...(packfileUris?.length ? { packfileUris } : {}),
+    };
   }
 }
 
@@ -765,6 +815,7 @@ async function receivePack(
   request: FetchPackRequest,
   shallowUpdate: ServerShallowUpdate,
   stats: NegotiationStats,
+  info: PackInfo = {},
 ): Promise<FetchPackResult> {
   const onProgress = request.onProgress;
   const counted = { bytes: 0, objects: 0 };
@@ -774,7 +825,7 @@ async function receivePack(
   );
   let imported: PackImportResult | undefined;
   try {
-    imported = await request.importPack(pack);
+    imported = await request.importPack(pack, info);
     for await (const _ of pack) {
       // the rest of the pack section, after what the import read
     }

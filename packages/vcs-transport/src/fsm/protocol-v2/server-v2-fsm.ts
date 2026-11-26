@@ -37,6 +37,7 @@ import {
 } from "../fetch/index.js";
 import { checkUploadPackFilter } from "../fetch/upload-pack-filter.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
+import { type BlobPackfileUri, offloadedByUri, parseBlobPackfileUris } from "./packfile-uris.js";
 import {
   createEmptyFetchRequest,
   type FetchV2Request,
@@ -77,6 +78,7 @@ export const serverV2Transitions: FsmTransition[] = [
 
   // Validate fetch wants
   ["VALIDATE_FETCH_WANTS", "VALID", "PROCESS_HAVES"],
+  ["VALIDATE_FETCH_WANTS", "NO_WANTS", "READ_COMMAND"],
   ["VALIDATE_FETCH_WANTS", "INVALID_WANT", "SEND_ERROR"],
   ["VALIDATE_FETCH_WANTS", "ERROR", ""],
 
@@ -448,8 +450,22 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
               return "ERROR";
             }
             req.sidebandAll = true;
+          } else if (line.startsWith("packfile-uris ")) {
+            // only with an uploadpack.blobPackfileUri value (process_args): else an unexpected
+            // line; a second one is an ERR
+            if (!ctx.config.blobPackfileUris?.length) {
+              ctx.output.error = `unexpected line: '${line}'`;
+              return "ERROR";
+            }
+            if (req.packfileUriProtocols?.length) {
+              ctx.output.error = "multiple packfile-uris lines forbidden";
+              return "INVALID_REQUEST";
+            }
+            req.packfileUriProtocols = line.slice("packfile-uris ".length).split(",");
           }
         }
+        // packfile URIs need sideband-all: without it the protocols are forgotten
+        if (!req.sidebandAll) req.packfileUriProtocols = undefined;
 
         return "FETCH_PARSED";
       } catch (e) {
@@ -558,6 +574,10 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           ctx.output.error = denied;
           return "INVALID_WANT";
         }
+
+        // upload_pack_v2: a request without wants (and without wait-for-done) wants nothing:
+        // no answer at all
+        if (ctx.state.wants.size === 0 && !req.waitForDone) return "NO_WANTS";
 
         return "VALID";
       } catch (e) {
@@ -793,7 +813,10 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
         const state = ctx.state as ServerV2State;
         const req = state.fetchRequest;
 
-        await writeFetchLine(ctx, "packfile");
+        // packfile-uris <protocols>: pack-objects --uri-protocol lists the pack first, and the
+        // `packfile` line follows its URIs (relay_pack_data)
+        const uriProtocols = req?.packfileUriProtocols ?? [];
+        if (uriProtocols.length === 0) await writeFetchLine(ctx, "packfile");
 
         // Export pack, cut at the shallow boundary: the new shallow commits and the client's
         // own; the parents of unshallowed commits are tips of their own
@@ -805,41 +828,109 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
         const packShallow =
           shallow?.packShallow ?? (req?.shallow.length ? new Set(req.shallow) : undefined);
         const hook = ctx.config.uploadPack?.packObjectsHook;
-        const packStream = hook
-          ? // uploadpack.packObjectsHook: the host's command builds the pack (create_pack_file)
-            packFromHook(
-              hook,
-              {
-                shallow: (packShallow?.size ?? 0) > 0,
+        // uploadpack.blobPackfileUri: read by pack-objects for every pack it writes
+        const offloaded: BlobPackfileUri[] = [];
+        let exclusions: Map<string, BlobPackfileUri> | undefined;
+        let configDeath: unknown;
+        if (!hook && ctx.config.blobPackfileUris?.length) {
+          try {
+            exclusions = parseBlobPackfileUris(
+              ctx.config.blobPackfileUris,
+              formatOf(ctx.repository).hexLength,
+            );
+          } catch (error) {
+            configDeath = error;
+          }
+        }
+        const leaveOut =
+          exclusions && uriProtocols.length > 0
+            ? (id: string) => {
+                const entry = exclusions.get(id);
+                if (!entry || !offloadedByUri(entry, uriProtocols)) return false;
+                offloaded.push(entry);
+                return true;
+              }
+            : undefined;
+        let packStream: AsyncIterable<Uint8Array> = configDeath
+          ? failingStream(configDeath)
+          : hook
+            ? // uploadpack.packObjectsHook: the host's command builds the pack (create_pack_file)
+              packFromHook(
+                hook,
+                {
+                  shallow: (packShallow?.size ?? 0) > 0,
+                  thin,
+                  progress: !(req?.noProgress ?? false),
+                  ofsDelta: req?.ofsDeltas ?? false,
+                  includeTag: req?.includeTags ?? false,
+                  ...(req?.filter ? { filter: req.filter } : {}),
+                },
+                packObjectsHookInput({
+                  shallow: packShallow ?? [],
+                  wants: ctx.state.wants,
+                  haves: common,
+                  extraEdges: shallow?.extraWants ?? [],
+                }),
+                (chunk) => void ctx.transport.writeSideband(2, chunk).catch(() => {}),
+              )
+            : ctx.repository.exportPack(wants, common, {
                 thin,
-                progress: !(req?.noProgress ?? false),
                 ofsDelta: req?.ofsDeltas ?? false,
-                includeTag: req?.includeTags ?? false,
-                ...(req?.filter ? { filter: req.filter } : {}),
-              },
-              packObjectsHookInput({
-                shallow: packShallow ?? [],
-                wants: ctx.state.wants,
-                haves: common,
-                extraEdges: shallow?.extraWants ?? [],
-              }),
-              (chunk) => void ctx.transport.writeSideband(2, chunk).catch(() => {}),
-            )
-          : ctx.repository.exportPack(wants, common, {
-              thin,
-              ofsDelta: req?.ofsDeltas ?? false,
-              includeTag: req?.includeTags,
-              // git's pack-objects --include-tag: the visible annotated tags of packed objects
-              includeTags: req?.includeTags
-                ? await includeTagCandidates(ctx.config, ctx.refStore)
-                : undefined,
-              filterSpec: req?.filter ?? undefined,
-              shallow: packShallow,
-              // upload-pack's missing_allow_promisor: a client accepted a promisor remote
-              ...((ctx.output.acceptedPromisorRemotes?.length ?? 0) > 0
-                ? { missingAllowPromisor: true }
-                : {}),
-            });
+                includeTag: req?.includeTags,
+                // git's pack-objects --include-tag: the visible annotated tags of packed objects
+                includeTags: req?.includeTags
+                  ? await includeTagCandidates(ctx.config, ctx.refStore)
+                  : undefined,
+                filterSpec: req?.filter ?? undefined,
+                shallow: packShallow,
+                ...(leaveOut ? { leaveOut } : {}),
+                // upload-pack's missing_allow_promisor: a client accepted a promisor remote
+                ...((ctx.output.acceptedPromisorRemotes?.length ?? 0) > 0
+                  ? { missingAllowPromisor: true }
+                  : {}),
+              });
+
+        if (uriProtocols.length > 0) {
+          // the objects are listed before the pack's first byte: its URIs go first, then the
+          // `packfile` line; a pack-objects that dies first writes neither
+          const it = packStream[Symbol.asyncIterator]();
+          let first: IteratorResult<Uint8Array> | undefined;
+          let failure: unknown;
+          // upload-pack's keep-alive while pack-objects lists: an empty band-1 packet (`0005\1`)
+          const keepAliveMs = ctx.config.keepAliveMs ?? 0;
+          const timer =
+            keepAliveMs > 0
+              ? setInterval(() => {
+                  void ctx.transport.writeSideband(1, new Uint8Array(0)).catch(() => {});
+                }, keepAliveMs)
+              : undefined;
+          try {
+            first = await it.next();
+          } catch (error) {
+            failure = error ?? new Error("pack-objects failed");
+          } finally {
+            if (timer !== undefined) clearInterval(timer);
+          }
+          if (failure === undefined) {
+            if (offloaded.length > 0) {
+              await writeFetchLine(ctx, "packfile-uris");
+              for (const entry of offloaded) {
+                await writeFetchLine(ctx, `${entry.packHash} ${entry.uri}`);
+              }
+              await ctx.transport.writeDelimiter();
+            }
+            await writeFetchLine(ctx, "packfile");
+          }
+          packStream = (async function* () {
+            if (failure !== undefined) throw failure;
+            if (first && !first.done) yield first.value;
+            while (true) {
+              const next = await it.next();
+              if (next.done) return;
+              yield next.value;
+            }
+          })();
+        }
 
         // The packfile section is side-band multiplexed (seeded as side-band-64k by the
         // server): keep-alives until the first byte, an error on band 3 after it
@@ -1025,6 +1116,13 @@ const KNOWN_OBJECT_FORMATS = new Set(["sha1", "sha256"]);
 const textEncoder = new TextEncoder();
 
 /** The next argument line of the current command (a flush READ_COMMAND already read counts). */
+/** A pack stream that fails at once (pack-objects dying before it writes anything). */
+function failingStream(error: unknown): AsyncIterable<Uint8Array> {
+  return {
+    [Symbol.asyncIterator]: () => ({ next: () => Promise.reject(error) }),
+  };
+}
+
 async function readArgument(ctx: ProcessContext): Promise<PktLineResult> {
   const state = ctx.state as ServerV2State;
   if (state.argumentsEnded) {
@@ -1059,6 +1157,7 @@ function advertisedCapabilities(ctx: ProcessContext): string[] {
     {
       ...(ctx.config.allowRefInWant ? { allowRefInWant: true } : {}),
       ...(ctx.config.allowSidebandAll ? { allowSidebandAll: true } : {}),
+      ...(ctx.config.blobPackfileUris?.length ? { packfileUris: true } : {}),
       ...(ctx.config.sessionId !== undefined ? { sessionId: ctx.config.sessionId } : {}),
       ...(ctx.config.bundleUris !== undefined ? { bundleUri: true } : {}),
       ...(ctx.config.promisorRemote !== undefined

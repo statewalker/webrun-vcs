@@ -264,6 +264,7 @@ function createRepositoryFacadeFromHistory(
         shallow: options?.shallow,
         ...(useBitmaps === false ? { useBitmaps } : {}),
         ofsDelta: options?.ofsDelta,
+        ...(options?.leaveOut ? { leaveOut: options.leaveOut } : {}),
         includeTags: options?.includeTag
           ? (options.includeTags ?? (await tagRefIds(refs)))
           : undefined,
