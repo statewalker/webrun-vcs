@@ -2,8 +2,10 @@ name: git 3.0 oracle
 
 # Native twins of git 3.0 behaviour: a git built from master with WITH_BREAKING_CHANGES=YesPlease
 # (Documentation/BreakingChanges.adoc), exported as $GIT3, against ours with
-# GitHostEnvironment.breakingChanges. Runs the `*-git3-native` test files, which skip without
-# $GIT3 in the main CI. The build is cached under git master's commit; a new commit rebuilds it.
+# GitHostEnvironment.breakingChanges. Runs every test file that uses $GIT3 or $GIT_TEST_TOOL,
+# directly or through a support module (scripts/git3-twins.mjs: `*-git3-native` files and
+# mixed ones such as repo-native), whose git master halves skip without $GIT3 in the main CI.
+# The build is cached under git master's commit; a new commit rebuilds it.
 # It also installs git's test-tool as $GIT_TEST_TOOL for `sha1dc-native` (t0013-sha1dc.sh).
 on:
   schedule:
@@ -12,9 +14,9 @@ on:
   pull_request:
     paths:
       - "packages/*/src/**"
-      - "packages/vcs-commands/tests/*git3*"
-      - "packages/vcs-commands/tests/native-git3.ts"
-      - "packages/vcs-commands/tests/sha1dc-native.test.ts"
+      - "packages/vcs-commands/tests/**"
+      - "scripts/git3-twins.mjs"
+      - "scripts/git3-twins.test.mjs"
       - "pnpm-lock.yaml"
       - ".github/workflows/git3-oracle.yml"
 
@@ -88,6 +90,15 @@ jobs:
       - name: Build
         run: pnpm --filter "@statewalker/vcs-commands^..." run build
 
+      - name: Tests of scripts/git3-twins.mjs
+        run: node --test scripts/git3-twins.test.mjs
+
       - name: git 3.0 twins
         working-directory: packages/vcs-commands
-        run: npx vitest run git3-native sha1dc-native
+        # Selected by content, not by name (scripts/git3-twins.mjs); verbose, so the log shows
+        # which twins ran and which skipped.
+        run: |
+          set -o pipefail
+          node ../../scripts/git3-twins.mjs . > "$RUNNER_TEMP/git3-twins.txt"
+          cat "$RUNNER_TEMP/git3-twins.txt"
+          xargs npx vitest run --reporter=verbose < "$RUNNER_TEMP/git3-twins.txt"
