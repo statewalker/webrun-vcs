@@ -1,0 +1,6 @@
+---
+"@statewalker/vcs-commands": minor
+"@statewalker/vcs-transport": minor
+---
+
+Bundle URIs (statewalker/statewalker-root#379). `clone().setBundleUri(uri)` is `git clone --bundle-uri`: the bundle, or bundle list, at an `http(s)://` URL, a `file://` URL or a path is downloaded and unbundled before the fetch, its refs written under `refs/bundles/` (git 2.43: branches only; 2.5x: every ref), so the fetch asks only for what the bundles lack. Lists follow git's rules: `all` and `any` modes, nested lists up to depth 4, relative URIs, and the `creationToken` heuristic (newest first until one applies, `fetch.bundleCreationToken` recorded and `fetch.bundleURI` stored by the clone). Without `--bundle-uri`, `transfer.bundleURI=true` asks a protocol v2 server for its list (`bundleUriLines`); `fetch` downloads `fetch.bundleURI` first (`setBundleUri` overrides it, `""` turns it off; `fetch --all`/`--multiple` does it once). Failures only warn, in git's words. Servers (local transport, git://, smart HTTP) advertise `bundle-uri` under `uploadpack.advertiseBundleURIs` and answer with the repository's `bundle.*` settings (`ServerConfigSettings.bundleUris`, `ServeOverDuplexOptions.bundleUris`). The list parser and walker are exported (`BundleList`, `parseBundleListLine`, `parseBundleListConfig`, `fetchBundleUri`, `fetchBundleList`).
