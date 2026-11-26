@@ -107,6 +107,8 @@ interface RepoFacts {
   index?: string;
   workTree?: string;
   superproject?: string;
+  /** git's current directory after its setup (host path), when the caller gave it */
+  setupDirectory?: string;
   /** git's `repo->prefix`: the current directory below the worktree top, with a `/` */
   prefix: string;
 }
@@ -115,8 +117,9 @@ type InfoField = (facts: RepoFacts) => string;
 
 const relativeTo = (facts: RepoFacts, path: string | undefined): string => {
   if (path === undefined) return "";
-  // git runs from the worktree top (the git directory when bare); the prefix is below it
-  const base = facts.workTree ?? facts.gitDir ?? "";
+  // git runs from where its setup went: the worktree top (the git directory when a bare one
+  // is discovered), else where it started; the prefix is below it
+  const base = facts.setupDirectory ?? facts.workTree ?? facts.gitDir ?? "";
   const cwd = facts.prefix ? `${base}/${facts.prefix}` : base;
   return gitRelativePath(path, cwd);
 };
@@ -170,11 +173,13 @@ function hostPathOf(files: FilesApi, path: string): string | undefined {
  * the host's `realPath`; without a root directory the path keys are empty. The git directory
  * and worktree are the working copy's: open it where git's setup puts them
  * (`openRepositoryFromEnvironment` for `$GIT_DIR`/`$GIT_WORK_TREE`) and pass its `prefix` to
- * {@link setCurrentDirectory}; `$GIT_COMMON_DIR` and `$GIT_INDEX_FILE` are read from the host
- * environment (a relative index is the file the working copy opened: git's setup reads it from
- * the worktree top, or from where it started outside the worktree). Relative keys are
- * computed from {@link setCurrentDirectory}, so a git started outside the worktree is not
- * expressed.
+ * {@link setCurrentDirectory}, and the setup's current directory (`setup.cwd`, as a host path)
+ * to {@link setSetupDirectory}; `$GIT_COMMON_DIR` and `$GIT_INDEX_FILE` are read from the host
+ * environment. Relative keys are relative to the setup directory plus the prefix, and a relative
+ * `$GIT_INDEX_FILE` is read in the setup directory (the worktree top, else where git started:
+ * outside the worktree, or with a bare `$GIT_DIR`). Without a setup directory git is taken to
+ * have gone to the worktree top (the git directory when bare), and a relative index is the
+ * file the working copy's staging opened.
  * `path.superprojectworkingtree.*` is submodule.c's `get_superproject_working_tree`: the
  * repository of the worktree's parent directory (reached through `hostFilesOf`, else the
  * FilesApi) must hold a gitlink at the worktree's path in its index.
@@ -186,6 +191,7 @@ export class RepoInfoCommand extends PlumbingCommand {
   private keys: string[] = [];
   private compatibility: RepoCompatibility = "2.57";
   private currentDirectory = "";
+  private setupDirectory: string | undefined;
 
   /** `--format=<format>` (`lines`, `nul`; `table` is refused when printing values) */
   setFormat(format: string): this {
@@ -233,6 +239,16 @@ export class RepoInfoCommand extends PlumbingCommand {
   setCurrentDirectory(path: string): this {
     this.checkCallable();
     this.currentDirectory = path.replace(/^\/+|\/+$/g, "");
+    return this;
+  }
+
+  /**
+   * The directory git's setup went to, as a host path (`setupGitDirectory`'s `cwd` joined to
+   * the FilesApi's root): the worktree top when git started inside it, else where it started.
+   */
+  setSetupDirectory(hostPath: string | undefined): this {
+    this.checkCallable();
+    this.setupDirectory = hostPath === undefined ? undefined : hostPath.replace(/(.)\/+$/, "$1");
     return this;
   }
 
@@ -296,6 +312,7 @@ export class RepoInfoCommand extends PlumbingCommand {
       objectFormat: this.objectFormat.name,
       refStorage,
       prefix: this.currentDirectory ? `${this.currentDirectory}/` : "",
+      setupDirectory: await real(this.setupDirectory),
     };
     if (!layout) return facts;
     const files = layout.files;
@@ -315,10 +332,13 @@ export class RepoInfoCommand extends PlumbingCommand {
         ? await real(named.startsWith("/") ? named : `${facts.gitDir}/${named}`)
         : facts.gitDir;
     // repo_get_index_file: `$GIT_INDEX_FILE` (an absolute one as given; a relative one is the
-    // file the working copy opened, which git's setup read from the directory it went to:
-    // the worktree top, else where it started), else `<git dir>/index`
+    // file in the directory git's setup went to: the worktree top, else where it started; the
+    // file the working copy opened when the caller did not say), else `<git dir>/index`
     const indexFile = environment?.indexFile;
-    const location = indexFile && !indexFile.startsWith("/") ? this.indexLocation() : undefined;
+    const location =
+      indexFile && !indexFile.startsWith("/") && facts.setupDirectory === undefined
+        ? this.indexLocation()
+        : undefined;
     facts.index =
       indexFile === undefined
         ? facts.gitDir
@@ -326,11 +346,13 @@ export class RepoInfoCommand extends PlumbingCommand {
           : undefined
         : indexFile.startsWith("/")
           ? indexFile
-          : await real(
-              location
-                ? hostPathOf(location.files, location.path)
-                : `${hostPathOf(files, layout.bare ? layout.gitDir : layout.top) ?? ""}/${indexFile}`,
-            );
+          : facts.setupDirectory !== undefined
+            ? `${facts.setupDirectory.replace(/\/$/, "")}/${indexFile}`
+            : await real(
+                location
+                  ? hostPathOf(location.files, location.path)
+                  : `${hostPathOf(files, layout.bare ? layout.gitDir : layout.top) ?? ""}/${indexFile}`,
+              );
     if (!layout.bare) {
       facts.workTree = await real(hostPathOf(files, layout.top));
       facts.superproject = await this.superprojectOf(files, layout.top, facts.workTree);
