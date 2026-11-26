@@ -160,23 +160,3 @@ export function writableSink(stream: WritableStream<Uint8Array>): {
     release: () => writer.releaseLock(),
   };
 }
-
-/** A Web Stream's bytes, whole. */
-export async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
-  const reader = stream.getReader();
-  const chunks: Uint8Array[] = [];
-  let length = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    length += value.length;
-  }
-  const out = new Uint8Array(length);
-  let at = 0;
-  for (const c of chunks) {
-    out.set(c, at);
-    at += c.length;
-  }
-  return out;
-}

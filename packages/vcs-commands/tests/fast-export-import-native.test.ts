@@ -365,6 +365,40 @@ describeGit("git fast-export against native git", () => {
     expect(refs(target)).toBe(refs(repo));
   });
 
+  it('t9300-fast-import.sh: "R: print blob mid-commit" (a frontend waiting for the answer on an open stream)', async () => {
+    const target = emptyRepo("interactive");
+    const ours = await openOurs(target);
+    const input = new TransformStream<Uint8Array, Uint8Array>();
+    const output = new TransformStream<Uint8Array, Uint8Array>();
+    const enc = new TextEncoder();
+    const writer = input.writable.getWriter();
+    const reader = output.readable.getReader();
+    let received = "";
+    const drained = (async () => {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        received += new TextDecoder().decode(value);
+      }
+    })();
+    const run = ours.fastImport().setInput(input.readable).setOutput(output.writable).call();
+    // a frontend that waits for each answer before it writes on
+    await writer.write(enc.encode("blob\nmark :1\ndata 3\nhi\n\ncat-blob :1\n"));
+    while (!/^[0-9a-f]{40} blob 3\nhi\n\n$/.test(received)) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    await writer.write(
+      enc.encode(
+        `commit refs/heads/main\n${"committer C O Mitter <committer@example.com> 1112912473 -0700"}\ndata 2\nx\nM 644 :1 hi\n\n`,
+      ),
+    );
+    await writer.close();
+    expect((await run).exitCode).toBe(0);
+    await output.writable.close();
+    await drained;
+    expect(gitIn(target, ["cat-file", "-p", "main:hi"]).stdout).toBe("hi\n");
+  });
+
   it('t9350-fast-export.sh: "cope with tagger-less tags"', async () => {
     const head = gitOk(root, repo, "rev-parse", "HEAD").trim();
     const id = gitIn(

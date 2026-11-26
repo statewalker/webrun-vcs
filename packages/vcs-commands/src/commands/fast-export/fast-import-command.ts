@@ -22,7 +22,6 @@ import {
   isSignMode,
   latin1,
   latin1Bytes,
-  readAll,
   readObjectBytes,
   type SignMode,
   signatureStartOf,
@@ -154,15 +153,45 @@ export class FastImportCommand extends PlumbingCommand {
     return this;
   }
 
+  /** The input stream's reader while it is read as the commands need it (git's stdin) */
+  private reader?: ReadableStreamDefaultReader<Uint8Array>;
+
+  /** Pulls the next chunk of a streamed input; false at its end (or for bytes given whole). */
+  private async pull(): Promise<boolean> {
+    if (!this.reader) return false;
+    const { done, value } = await this.reader.read();
+    if (done) {
+      this.reader.releaseLock();
+      this.reader = undefined;
+      return false;
+    }
+    const rest = this.input.subarray(this.pos);
+    const joined = new Uint8Array(rest.length + value.length);
+    joined.set(rest, 0);
+    joined.set(value, rest.length);
+    this.input = joined;
+    this.pos = 0;
+    return true;
+  }
+
   override async call() {
-    if (this.inputStream) this.input = await readAll(this.inputStream);
-    if (!this.outputStream) return super.call();
-    const { sink, release } = writableSink(this.outputStream);
-    this.setStdout(sink);
+    if (this.inputStream) {
+      this.reader = this.inputStream.getReader();
+      this.input = new Uint8Array(0);
+    }
     try {
-      return await super.call();
+      if (!this.outputStream) return await super.call();
+      const { sink, release } = writableSink(this.outputStream);
+      this.setStdout(sink);
+      try {
+        return await super.call();
+      } finally {
+        release();
+      }
     } finally {
-      release();
+      // git stops reading at `done` or a death: the rest of the stream stays the caller's
+      this.reader?.releaseLock();
+      this.reader = undefined;
     }
   }
 
@@ -269,13 +298,13 @@ export class FastImportCommand extends PlumbingCommand {
         else if (cmd.startsWith("cat-blob ")) await this.parseCatBlob(cmd.slice(9));
         else if (cmd.startsWith("get-mark ")) await this.parseGetMark(cmd.slice(9));
         else if (cmd === "checkpoint") {
-          this.skipOptionalLf();
+          await this.skipOptionalLf();
           await this.checkpoint();
         } else if (cmd === "done") break;
         else if (cmd === "alias") await this.parseAlias();
         else if (cmd.startsWith("progress ")) {
           await this.write(latin1Bytes(`${cmd}\n`));
-          this.skipOptionalLf();
+          await this.skipOptionalLf();
         } else if (cmd.startsWith("feature ")) this.parseFeature(cmd.slice(8));
         else if (cmd.startsWith("option git ")) this.parseOption(cmd.slice(11));
         else if (cmd.startsWith("option ")) {
@@ -299,7 +328,10 @@ export class FastImportCommand extends PlumbingCommand {
   // ---------------------------------------------------------------- stream reading
 
   /** strbuf_getline_lf: the next line without its newline; undefined at the end. */
-  private readLine(): string | undefined {
+  private async readLine(): Promise<string | undefined> {
+    while (this.input.indexOf(10, this.pos) < 0 && (await this.pull())) {
+      // a line arrives in pieces
+    }
     if (this.pos >= this.input.length) return undefined;
     let end = this.input.indexOf(10, this.pos);
     if (end < 0) end = this.input.length;
@@ -318,7 +350,7 @@ export class FastImportCommand extends PlumbingCommand {
     for (;;) {
       if (this.unread) this.unread = false;
       else {
-        const line = this.readLine();
+        const line = await this.readLine();
         if (line === undefined) {
           this.eof = true;
           this.line = "";
@@ -334,12 +366,14 @@ export class FastImportCommand extends PlumbingCommand {
     }
   }
 
-  private skipOptionalLf(): void {
+  /** git's fgetc/ungetc: waits for the next byte, consumed only when it is a newline. */
+  private async skipOptionalLf(): Promise<void> {
+    if (this.pos >= this.input.length) await this.pull();
     if (this.input[this.pos] === 10) this.pos++;
   }
 
   /** parse_data: the bytes of a `data` command, as a binary string. */
-  private parseData(): string {
+  private async parseData(): Promise<string> {
     const cmd = this.line;
     if (!cmd.startsWith("data ")) this.die(`expected 'data n' command, found: ${cmd}`);
     let data = cmd.slice(5);
@@ -348,7 +382,7 @@ export class FastImportCommand extends PlumbingCommand {
       data = data.slice(2);
       const parts: string[] = [];
       for (;;) {
-        const line = this.readLine();
+        const line = await this.readLine();
         if (line === undefined) this.die(`EOF in data (terminator '${data}' not found)`);
         if (line === data) break;
         parts.push(`${line}\n`);
@@ -356,6 +390,9 @@ export class FastImportCommand extends PlumbingCommand {
       out = parts.join("");
     } else {
       const length = Number(/^\s*\+?(\d*)/.exec(data)?.[1] || "0");
+      while (this.input.length - this.pos < length && (await this.pull())) {
+        // the data arrives in pieces
+      }
       const available = this.input.length - this.pos;
       if (available < length) {
         this.pos = this.input.length;
@@ -364,7 +401,7 @@ export class FastImportCommand extends PlumbingCommand {
       out = latin1(this.input.subarray(this.pos, this.pos + length));
       this.pos += length;
     }
-    this.skipOptionalLf();
+    await this.skipOptionalLf();
     return out;
   }
 
@@ -588,7 +625,7 @@ export class FastImportCommand extends PlumbingCommand {
     await this.readNextCommand();
     await this.parseMark();
     await this.parseOriginalIdentifier();
-    const data = this.parseData();
+    const data = await this.parseData();
     await this.storeObject("blob", data, this.nextMark);
   }
 
@@ -920,7 +957,7 @@ export class FastImportCommand extends PlumbingCommand {
       while (await this.readNextCommand()) {
         if (this.line.startsWith("cat-blob ")) await this.parseCatBlob(this.line.slice(9));
         else {
-          const data = this.parseData();
+          const data = await this.parseData();
           id = await this.storeObject("blob", data, 0);
           break;
         }
@@ -1052,7 +1089,7 @@ export class FastImportCommand extends PlumbingCommand {
     }
     if (format === "unknown") this.warn("warning: 'unknown' signature format in gpgsig");
     await this.readNextCommand();
-    return { hash, data: this.parseData() };
+    return { hash, data: await this.parseData() };
   }
 
   private async parseNewCommit(arg: string): Promise<void> {
@@ -1086,7 +1123,7 @@ export class FastImportCommand extends PlumbingCommand {
             this.warn("warning: stripping a commit signature");
           }
           await this.readNextCommand();
-          this.parseData();
+          await this.parseData();
           break;
         default: {
           if (this.signedCommits === "warn-verbatim" || this.signedCommits === "warn") {
@@ -1108,7 +1145,7 @@ export class FastImportCommand extends PlumbingCommand {
       encoding = this.line.slice(9);
       await this.readNextCommand();
     }
-    const msg = this.parseData();
+    const msg = await this.parseData();
     await this.readNextCommand();
     if (this.line.startsWith("from ")) await this.parseObjectish(b, this.line.slice(5));
     const merges = await this.parseMerge();
@@ -1192,7 +1229,7 @@ export class FastImportCommand extends PlumbingCommand {
       tagger = this.parseIdent(this.line.slice(7));
       await this.readNextCommand();
     }
-    let msg = this.parseData();
+    let msg = await this.parseData();
     let data = `object ${id}\ntype ${type}\ntag ${arg}\n`;
     if (tagger !== undefined) data += `tagger ${tagger}\n`;
     if (this.compatibility !== "2.43") {
@@ -1323,7 +1360,7 @@ export class FastImportCommand extends PlumbingCommand {
   }
 
   private async parseAlias(): Promise<void> {
-    this.skipOptionalLf();
+    await this.skipOptionalLf();
     await this.readNextCommand();
     await this.parseMark();
     const mark = this.nextMark;
