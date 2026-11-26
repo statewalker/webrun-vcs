@@ -188,6 +188,17 @@ export interface GitHostEnvironment {
    */
   defaultRefFormat?: string;
   /**
+   * `$GIT_DEFAULT_OBJECT_STORAGE_FORMAT` as given (git master): the object storage of a new
+   * repository (`files`, or `files://<objects directory>`), before
+   * `init.defaultObjectStorageFormat` (setup.c `repository_format_configure`)
+   */
+  defaultObjectStorageFormat?: string;
+  /**
+   * `$GIT_OBJECT_STORAGE_FORMAT` as given (git master): overrides an existing repository's
+   * `extensions.objectStorage` and wins over the defaults of a new one
+   */
+  objectStorageFormat?: string;
+  /**
    * `$GIT_TEST_REFTABLE_AUTOCOMPACTION` as a boolean: false turns off the reftable stack's
    * compaction after each write (git's test knob; default true)
    */

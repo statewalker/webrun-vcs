@@ -54,6 +54,7 @@ import {
 import { Git } from "../git.js";
 import type { InitResult } from "../results/init-result.js";
 import {
+  checkDefaultObjectStorage,
   defaultInitialBranch,
   defaultRefFormat,
   InvalidInitialBranchError,
@@ -486,6 +487,8 @@ export class InitCommand {
         ? await defaultRefFormat(this.environment, this.refFormat)
         : undefined;
       if (refFormat) warnings.push(...refFormat.warnings);
+      // the object storage (git master's `extensions.objectStorage`): plain `files` only
+      warnings.push(...(await checkDefaultObjectStorage(this.environment, fresh)));
 
       // core.sharedRepository: --shared, else the configuration (the repository's own when it
       // exists); what init creates gets git's modes (adjust_shared_perm)
@@ -519,6 +522,17 @@ export class InitCommand {
       const refStorage = fresh ? (refFormat?.format ?? "files") : undefined;
       if (fresh && objectFormat.name !== "sha1") set("extensions.objectformat", objectFormat.name);
       if (refStorage === "reftable") set("extensions.refstorage", "reftable");
+      if (!fresh) {
+        // initialize_repository_version: a reinitialized plain `files` storage loses its
+        // `extensions.objectStorage` (any other was refused above)
+        const result = setConfigMultivarText(
+          text,
+          configPath,
+          "extensions.objectstorage",
+          undefined,
+        );
+        if (result.text !== undefined) text = result.text;
+      }
       const v1 =
         (fresh && (objectFormat.name !== "sha1" || refStorage === "reftable")) ||
         (!fresh && /^\s*\[\s*extensions\s*\]/im.test(text ?? ""));

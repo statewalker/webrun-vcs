@@ -261,8 +261,34 @@ describe("repository format values as git parses them (review fixes)", () => {
       v(1, "\tpartialClone\n"),
       /missing value for/,
     ],
+    [
+      "objectStorage = garbage (git master knows only files)",
+      v(1, "\tobjectStorage = garbage\n"),
+      /invalid value for 'extensions.objectstorage': 'garbage'/,
+    ],
+    [
+      "objectStorage = files://objs (objects outside objects/)",
+      v(1, "\tobjectStorage = files://objs\n"),
+      /not supported by webrun-vcs:\n\textensions.objectStorage = files:\/\/objs/,
+    ],
+    ["a bare objectStorage key", v(1, "\tobjectStorage\n"), /missing value for/],
+    [
+      "objectStorage = files in version 0 (a version-1 extension)",
+      v(0, "\tobjectStorage = files\n"),
+      /v1-only extension found:\n\tobjectstorage$/,
+    ],
   ])("refuses: %s", async (_name, config, message) => {
     const files = await repoWithConfig(config);
     await expect(createGitFilesBackend({ files })).rejects.toThrow(message);
   });
+});
+
+describe("extensions.objectStorage (git master)", () => {
+  it.each([["files"], ["files://"]])(
+    "opens objectStorage = %s as a plain repository",
+    async (value) => {
+      const files = await repoWithConfig(v(1, `\tobjectStorage = ${value}\n`));
+      await expect(createGitFilesBackend({ files })).resolves.toBeDefined();
+    },
+  );
 });
