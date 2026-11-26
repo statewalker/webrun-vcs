@@ -342,6 +342,58 @@ describeGit("filter.<driver>.required against native git (t0021)", () => {
       commandLine: { "filter.req.clean": "" },
     });
   });
+
+  /** The host's own uppercasing driver (running no command, as git-lfs's). */
+  const UPPER: FilterDriverRegistry = {
+    req: {
+      clean: async (content) =>
+        new TextEncoder().encode(new TextDecoder().decode(content).toUpperCase()),
+    },
+  };
+  const OFF = { hostFilters: UPPER, commandLine: { "filter.req.clean": "" } };
+
+  /**
+   * `test.q` staged in both twins with its mtime set by `touch -d <date>`, before the add, so
+   * whether its entry is racily clean does not depend on the second the twins run in.
+   */
+  async function stagedAt(date: string): Promise<{ native: string; ours: string }> {
+    const tw = setup(
+      { "filter.req.clean": "tr a-z A-Z", "filter.req.required": "true" },
+      "*.q filter=req",
+      `echo test >test.q\ntouch -d '${date}' test.q`,
+    );
+    await compareAdd(tw, "test.q", { hostFilters: UPPER });
+    return tw;
+  }
+
+  it("a stat-clean file is not cleaned again: add_to_index's ie_match_stat (webrun-vcs#378)", async () => {
+    const tw = await stagedAt("2 minutes ago");
+    await compareAdd(tw, "test.q", OFF);
+    // add_files_to_cache (`add -u`, `add -A`) and `commit -a` pass it over too
+    const sameIndex = () =>
+      expect(git(tw.ours, ["ls-files", "-s"]).stdout).toBe(
+        git(tw.native, ["ls-files", "-s"]).stdout,
+      );
+    for (const flag of ["-u", "-A"]) {
+      expect(git(tw.native, ["add", flag], envOf(OFF.commandLine)).status).toBe(0);
+      const add = (await open(tw.ours, OFF)).add();
+      await (flag === "-u" ? add.setUpdate(true) : add.setAll(true).addFilepattern(".")).call();
+      sameIndex();
+    }
+    const commit = ["commit", "-q", "-a", "-m", "one"];
+    expect(git(tw.native, commit, envOf(OFF.commandLine)).status).toBe(0);
+    await (await open(tw.ours, OFF)).commit().setAll(true).setMessage("one\n").call();
+    sameIndex();
+    expect(git(tw.ours, ["rev-parse", "HEAD^{tree}"]).stdout).toBe(
+      git(tw.native, ["rev-parse", "HEAD^{tree}"]).stdout,
+    );
+  });
+
+  it("a racily clean file is cleaned again, so the turned-off required driver dies", async () => {
+    // an mtime after the index's: racily clean in both, whatever the clock
+    const tw = await stagedAt("1 hour");
+    await compareAdd(tw, "test.q", OFF);
+  });
 });
 
 const HELPER = `#!/bin/sh
