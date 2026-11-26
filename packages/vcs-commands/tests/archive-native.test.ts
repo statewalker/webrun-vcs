@@ -60,6 +60,7 @@ async function twins(
   };
   const n = nativeArchive(home, dir, args, run);
   const o = await oursArchive(home, dir, args, run);
+  expectNotDatedNow(n);
   const view = (r: ArchiveOutcome, bytes: boolean) => ({
     status: r.status,
     err: r.err,
@@ -73,6 +74,28 @@ async function twins(
   expect(view(o, false)).toEqual(view(n, false));
   expect(view(o, true)).toEqual(view(n, true));
   return n;
+}
+
+/**
+ * Fixture commits are dated 2005, so an archive dated within the hour comes from the clock:
+ * native git and ours each read their own (a tree's archive without `--mtime`), and twins
+ * straddling a second boundary differ (statewalker/webrun-vcs#369). Such twins pin `--mtime`.
+ */
+function expectNotDatedNow(r: ArchiveOutcome): void {
+  if (r.status !== 0) return;
+  let time: number | undefined;
+  if (isTar(r.out)) {
+    time = Number.parseInt(r.out.subarray(136, 147).toString("latin1"), 8);
+  } else if (r.out.length >= 30 && r.out.readUInt32LE(0) === 0x04034b50) {
+    const t = r.out.readUInt16LE(10);
+    const d = r.out.readUInt16LE(12);
+    time =
+      Date.UTC((d >> 9) + 1980, ((d >> 5) & 15) - 1, d & 31, t >> 11, (t >> 5) & 63, (t & 31) * 2) /
+      1000;
+  }
+  if (time !== undefined && Math.abs(time - Date.now() / 1000) < 3600) {
+    throw new Error("archive dated now: the twins race the clock, pin it with --mtime");
+  }
 }
 
 const isTar = (out: Buffer) =>
@@ -787,7 +810,7 @@ describeGit("git archive edge cases, native", () => {
     for (const tree of [dotGit, nested, ntfs]) {
       const n = await twins(repo, [tree]);
       expect([128, 255]).toContain(n.status);
-      await twins(repo, ["--worktree-attributes", tree]);
+      await twins(repo, ["--worktree-attributes", "--mtime=2002-02-02T02:02:02-0200", tree]);
     }
     // names the tree decoder refuses: git archives `..` under --worktree-attributes, ours
     // refuses it as verify_path does (an entry that escapes on extraction)
