@@ -120,6 +120,7 @@ import {
   RmCommand,
   SetUpstreamBranchCommand,
   ShortlogCommand,
+  ShowBranchCommand,
   ShowCommand,
   ShowCurrentBranchCommand,
   ShowIndexCommand,
@@ -1431,6 +1432,21 @@ export class Git implements Disposable {
   stripspace(): StripspaceCommand {
     this.checkClosed();
     return new StripspaceCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a ShowBranchCommand (`git show-branch`): the commit-ancestry table of branches,
+   * `--list`, `--more`, `--independent`, `--merge-base`, `--topics`, `--reflog`; git's argv,
+   * its output and exit status.
+   *
+   * @example
+   * ```typescript
+   * const { stdout } = await git.showBranch().setArguments(["main", "topic"]).call();
+   * ```
+   */
+  showBranch(): ShowBranchCommand {
+    this.checkClosed();
+    return new ShowBranchCommand(this._workingCopy);
   }
 
   /**
