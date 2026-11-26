@@ -174,6 +174,7 @@ export class DefaultSerializationApi implements SerializationApi {
       ...(excludeObjects.length > 0 ? { excludeObjects } : {}),
       onBoundary: options.thinPack && !bitmap ? (b) => boundary.push(b) : undefined,
     })) {
+      if (options.leaveOut?.(o.id)) continue;
       listed.push(o);
     }
     yield* writePack(this.objects, listed, {

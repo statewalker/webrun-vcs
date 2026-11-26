@@ -136,6 +136,11 @@ export interface ExportOptions extends PackOptions {
    * `TreeDepthError` (see `ListObjectsOptions.maxTreeDepth`)
    */
   maxTreeDepth?: number;
+  /**
+   * Asked for each listed object, all before the pack's first byte: true leaves it out of the
+   * pack (git's `pack-objects --uri-protocol`: an object a packfile URI delivers instead)
+   */
+  leaveOut?: (id: ObjectId) => boolean;
 }
 
 /**
