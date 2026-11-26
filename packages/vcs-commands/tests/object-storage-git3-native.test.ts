@@ -4,7 +4,9 @@
  * master oracle (`$GIT3`, skipped without it: no release has the extension yet, 2.43 and
  * 2.56 refuse it as an unknown extension). The one format is `files`; a plain `files`
  * repository opens as any other, while `files://<directory>` (objects outside `objects/`) is
- * refused before anything is read or written. Scenarios from t7427 (git master).
+ * refused before anything is read or written. The scenarios are t7427's (git master) formats
+ * run through init and open; its `submodule add`/`clone --recurse-submodules` options are not
+ * ported (no title is cited).
  */
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
@@ -74,7 +76,7 @@ describe.skipIf(!git3)("extensions.objectStorage (git master)", () => {
   });
   afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-  it('t7427-submodule-object-storage-format.sh: "add submodules with explicit files storage format"', async () => {
+  it("a plain files storage opens as any repository; files:// reads as files", async () => {
     // a plain `files` storage is the repository as always: both read the same history
     const dir = repoWith("files");
     expect(git(dir, ["rev-parse", "--show-object-storage-format"]).out).toBe("files\n");
@@ -89,7 +91,7 @@ describe.skipIf(!git3)("extensions.objectStorage (git master)", () => {
     await expect(openOurs(empty)).resolves.toBeDefined();
   });
 
-  it('t7427-submodule-object-storage-format.sh: "add existing repository with different object storage format"', async () => {
+  it("files://objs (git init --object-storage-format) is refused unchanged", async () => {
     // `git init --object-storage-format=files://objs`: objects in `.git/objs`, which native
     // git reads; we refuse it before reading or writing anything
     const dir = fresh("objs");
@@ -104,7 +106,7 @@ describe.skipIf(!git3)("extensions.objectStorage (git master)", () => {
     expect(readFileSync(join(dir, ".git/config"), "utf8")).toBe(before);
   });
 
-  it('t7427-submodule-object-storage-format.sh: "add submodules with garbage object storage format"', async () => {
+  it("an unknown format in the config or in $GIT_OBJECT_STORAGE_FORMAT", async () => {
     // an unknown format in the repository's config: git's error line
     const dir = repoWith("garbage");
     const native = git(dir, ["status"]);
@@ -149,7 +151,7 @@ describe.skipIf(!git3)("extensions.objectStorage (git master)", () => {
     ).resolves.toBeDefined();
   });
 
-  it('t7427-submodule-object-storage-format.sh: "add submodules with object storage payload is rejected"', async () => {
+  it("init: the variables and init.defaultObjectStorageFormat", async () => {
     // init's defaults: an unknown name in either variable dies with git's line
     for (const variable of ["GIT_OBJECT_STORAGE_FORMAT", "GIT_DEFAULT_OBJECT_STORAGE_FORMAT"]) {
       const nativeDir = fresh("init-native");
@@ -204,5 +206,18 @@ describe.skipIf(!git3)("extensions.objectStorage (git master)", () => {
       }
     })();
     expect(ours).toEqual({ status: native.status, lines: lines(native.err) });
+  });
+
+  it("reinit drops a plain extensions.objectStorage, as initialize_repository_version", async () => {
+    const nativeDir = repoWith("files");
+    const oursDir = repoWith("files");
+    expect(git(nativeDir, ["init", "-q"]).status).toBe(0);
+    await Git.init()
+      .setFilesApi(createNodeFilesApi({ rootDir: oursDir }))
+      .setEnvironment(createNodeGitHostEnvironment({ env: env() }))
+      .call();
+    expect(readFileSync(join(oursDir, ".git/config"), "utf8")).toBe(
+      readFileSync(join(nativeDir, ".git/config"), "utf8"),
+    );
   });
 });

@@ -522,6 +522,17 @@ export class InitCommand {
       const refStorage = fresh ? (refFormat?.format ?? "files") : undefined;
       if (fresh && objectFormat.name !== "sha1") set("extensions.objectformat", objectFormat.name);
       if (refStorage === "reftable") set("extensions.refstorage", "reftable");
+      if (!fresh) {
+        // initialize_repository_version: a reinitialized plain `files` storage loses its
+        // `extensions.objectStorage` (any other was refused above)
+        const result = setConfigMultivarText(
+          text,
+          configPath,
+          "extensions.objectstorage",
+          undefined,
+        );
+        if (result.text !== undefined) text = result.text;
+      }
       const v1 =
         (fresh && (objectFormat.name !== "sha1" || refStorage === "reftable")) ||
         (!fresh && /^\s*\[\s*extensions\s*\]/im.test(text ?? ""));
