@@ -727,3 +727,143 @@ describeGit("merge.<driver>.driver and .recursive against native git (t6406)", (
     await compareMerge(tw, "recursive-a", ["custom"]);
   });
 });
+
+describeGit("merge.<driver> sections without a command against native git (webrun-vcs#380)", () => {
+  /** `git <args>` natively and `run` in ours: exit status, fatal/error lines, the state after. */
+  async function compare(
+    tw: { native: string; ours: string },
+    args: string[],
+    run: (repo: Git) => Promise<{ status: number; errors: string[] }>,
+  ): Promise<void> {
+    const native = git(tw.native, args);
+    const repo = await open(tw.ours);
+    let outcome: { status: number; errors: string[] };
+    try {
+      outcome = await run(repo);
+    } catch (error) {
+      outcome = { status: 128, errors: [fatalLine(error)] };
+    }
+    expect(outcome).toEqual({
+      status: native.status,
+      errors: native.stderr.split("\n").filter((l) => /^(fatal|error): /.test(l)),
+    });
+    expect(snapshot(root, tw.ours)).toEqual(snapshot(root, tw.native));
+  }
+
+  const merge = (branch: string) => async (repo: Git) => {
+    const result = await repo.merge().include(branch).call();
+    const conflicted = (result.conflicts?.length ?? 0) > 0 || result.status === "conflicting";
+    return { status: conflicted ? 1 : 0, errors: [] };
+  };
+
+  it("a merge attribute naming a driver with only merge.<name>.name dies (ll_ext_merge)", async () => {
+    const tw = twins(
+      [
+        T6406_SETUP,
+        "echo 'text merge=foo' >.gitattributes",
+        "git config merge.foo.name 'a driver without a command'",
+      ].join("\n"),
+    );
+    await compare(tw, ["merge", "main"], merge("main"));
+  });
+
+  it("merge.text.* makes text a user driver: merge=text then dies", async () => {
+    const tw = twins(
+      [
+        T6406_SETUP,
+        "echo 'text merge=text' >.gitattributes",
+        "git config merge.text.recursive binary",
+      ].join("\n"),
+    );
+    await compare(tw, ["merge", "main"], merge("main"));
+  });
+
+  it("merge.text.recursive does not change the builtin text driver of an unset attribute", async () => {
+    const tw = twins(
+      [T6406_SETUP, CRISS_CROSS, "git config merge.text.recursive binary"].join("\n"),
+    );
+    await compare(tw, ["merge", "recursive-a"], merge("recursive-a"));
+  });
+
+  it("a recursive driver without a command dies in the inner merge", async () => {
+    const tw = twins(
+      [
+        T6406_SETUP,
+        CRISS_CROSS,
+        "git config merge.custom.recursive lacking",
+        "git config merge.custom.driver 'cat %B >%A'",
+        "git config merge.lacking.name 'no command'",
+        "echo '* merge=custom' >.gitattributes",
+      ].join("\n"),
+    );
+    const native = git(tw.native, ["merge", "recursive-a"]);
+    const repo = await open(tw.ours, { merges: ["custom"] });
+    let outcome: { status: number; errors: string[] };
+    try {
+      outcome = await merge("recursive-a")(repo);
+    } catch (error) {
+      outcome = { status: 128, errors: [fatalLine(error)] };
+    }
+    expect(outcome).toEqual({
+      status: native.status,
+      errors: native.stderr.split("\n").filter((l) => /^(fatal|error): /.test(l)),
+    });
+    expect(snapshot(root, tw.ours)).toEqual(snapshot(root, tw.native));
+  });
+
+  it("cherry-pick dies the same way", async () => {
+    const tw = twins(
+      [
+        T6406_SETUP,
+        "echo 'text merge=foo' >.gitattributes",
+        "git config merge.foo.name 'a driver without a command'",
+      ].join("\n"),
+    );
+    await compare(tw, ["cherry-pick", "main"], async (repo) => {
+      const result = await repo.cherryPick().include("main").call();
+      return { status: String(result.status) === "OK" ? 0 : 1, errors: [] };
+    });
+  });
+
+  it("checkout -m dies the same way", async () => {
+    const tw = twins(
+      [
+        T6406_SETUP,
+        "git merge main >/dev/null 2>&1 || true",
+        "echo 'text merge=foo' >.gitattributes",
+        "git config merge.foo.name 'a driver without a command'",
+      ].join("\n"),
+    );
+    await compare(tw, ["checkout", "-m", "--", "text"], async (repo) => {
+      const result = await repo.checkout().setMerge(true).addPath("text").call();
+      return { status: result.exitCode ?? 0, errors: [] };
+    });
+  });
+
+  for (const argv of [
+    ["--write-tree", "main", "side"],
+    ["main^", "main", "side"],
+  ]) {
+    it(`merge-tree ${argv.join(" ")} dies the same way`, async () => {
+      const tw = twins(
+        [
+          T6406_SETUP,
+          "echo 'text merge=foo' >.gitattributes",
+          "git config merge.foo.name 'a driver without a command'",
+        ].join("\n"),
+      );
+      const native = git(tw.native, ["merge-tree", ...argv]);
+      const repo = await open(tw.ours);
+      const command = repo.mergeTree();
+      if (argv[0] === "main^") command.setTrivialMerge("main^", "main", "side");
+      else command.setBranches("main", "side");
+      const out = await command.callOutput();
+      expect({
+        status: out.exitCode,
+        stdout: Buffer.from(out.stdout).toString("utf8"),
+        stderr: out.stderr,
+      }).toEqual({ status: native.status, stdout: native.stdout, stderr: native.stderr });
+      expect(snapshot(root, tw.ours)).toEqual(snapshot(root, tw.native));
+    });
+  }
+});
