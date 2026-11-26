@@ -115,6 +115,12 @@ export interface InstallPackOptions {
    * objects" (a pack file), or a caller's (`--progress-title`).
    */
   progressTitle?: string;
+  /**
+   * The base name's prefix (default `pack`): the files are `<namePrefix>-<id>.pack`/`.idx`, as
+   * `git pack-objects <dir>/<namePrefix>` names them (the maintenance loose-objects task's
+   * `loose-<id>.pack`). A name with a path separator is refused.
+   */
+  namePrefix?: string;
 }
 
 /** See `InstallPackOptions.onContent` (and `UnpackObjectsOptions.onContent`). */
@@ -1317,6 +1323,8 @@ export async function installPack(
   source: AsyncIterable<Uint8Array>,
   options: InstallPackOptions = {},
 ): Promise<InstalledPack> {
+  if (options.namePrefix !== undefined && !/^[A-Za-z0-9._-]+$/.test(options.namePrefix))
+    throw new Error(`invalid pack name prefix: ${options.namePrefix}`);
   const maxObjectSize = options.maxObjectSize ?? 2 ** 30;
   const format = options.objectFormat ?? SHA1_OBJECT_FORMAT;
   const baseCacheBytes = options.baseCacheBytes ?? 32 * 2 ** 20;
@@ -1447,7 +1455,7 @@ export async function installPack(
     const types: Record<ObjectTypeString, number> = { commit: 0, tree: 0, blob: 0, tag: 0 };
     for (let i = 0; i < t.n; i++) types[TYPE_NAMES[t.type[i] as number] as ObjectTypeString]++;
     const result: InstalledPack = { packId, count: t.n, appended: appendedCount, types };
-    const name = `${dir}/pack-${packId}`;
+    const name = `${dir}/${options.namePrefix ?? "pack"}-${packId}`;
     const mtimesOf = options.mtimes;
     const mtimesBytes = mtimesOf
       ? encodePackMtimes(

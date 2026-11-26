@@ -71,6 +71,7 @@ import {
   LsFilesCommand,
   LsRemoteCommand,
   LsTreeCommand,
+  MaintenanceRunCommand,
   MergeBaseCommand,
   MergeCommand,
   MergeTreeCommand,
@@ -1063,6 +1064,21 @@ export class Git implements Disposable {
   repack(): RepackCommand {
     this.checkClosed();
     return new RepackCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a MaintenanceRunCommand (`git maintenance run [--auto] [--task=<task>]
+   * [--schedule=<frequency>]`), the facade's transports used by the prefetch task.
+   *
+   * @example
+   * ```typescript
+   * await git.maintenanceRun().addTask("commit-graph").addTask("loose-objects").call();
+   * await git.maintenanceRun().setAuto(true).call();
+   * ```
+   */
+  maintenanceRun(): MaintenanceRunCommand {
+    this.checkClosed();
+    return this.withTransports(new MaintenanceRunCommand(this._workingCopy));
   }
 
   /**

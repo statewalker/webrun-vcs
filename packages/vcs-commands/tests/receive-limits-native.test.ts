@@ -9,7 +9,7 @@
 import { cpSync, existsSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-
+import { nativeIs25x } from "./hooks-native-support.js";
 import {
   commitFiles,
   describeGit,
@@ -251,6 +251,38 @@ describeGit("receive-pack's limits and policies, as native git", () => {
       }, 60_000);
     }
   });
+
+  // git 2.5x's receive-pack runs `maintenance run --auto --quiet`: without maintenance.strategy
+  // the geometric strategy, whose tasks each ask their own condition (here none holds: the two
+  // packs already form a geometric progression), where 2.43's `gc --auto` would repack them
+  // (statewalker/webrun-vcs#383)
+  (nativeIs25x ? it : it.skip)(
+    "receive.autogc with the default maintenance strategy: the target ends up as native git's",
+    async () => {
+      const src = source(120, 40);
+      const t = twins(src, [
+        ["maintenance.auto", "true"],
+        ["maintenance.autoDetach", "false"],
+        ["gc.autoDetach", "false"],
+        ["gc.auto", "6700"],
+        // gc --auto would repack two packs into one; the geometric strategy does not ask it
+        ["gc.autoPackLimit", "1"],
+      ]);
+      await pushAll(t, "HEAD:refs/heads/main");
+      for (const name of ["n", "d", "o"] as const) commitFiles(join(t[name], "src"), 120, 40, 1);
+      const { native, served, ours: mine } = await pushAll(t, "HEAD:refs/heads/main");
+      const theirs = nativeOutcome(native);
+      expect(theirs.ok).toBe(true);
+      expect(nativeOutcome(served)).toEqual(theirs);
+      expect(mine.result && ourOutcome(mine.result)).toEqual(theirs);
+      const midx = (dir: string) => existsSync(join(dir, "objects", "pack", "multi-pack-index"));
+      const state = { ...stateOf(join(t.n, "dst")), midx: midx(join(t.n, "dst")) };
+      expect(state.packs).toBe(2);
+      expect({ ...stateOf(join(t.d, "dst")), midx: midx(join(t.d, "dst")) }).toEqual(state);
+      expect({ ...stateOf(join(t.o, "dst")), midx: midx(join(t.o, "dst")) }).toEqual(state);
+    },
+    60_000,
+  );
 
   it('t5400-send-pack.sh: "receive-pack runs auto-gc in remote repo"', async () => {
     const k = `g${Date.now()}`;
