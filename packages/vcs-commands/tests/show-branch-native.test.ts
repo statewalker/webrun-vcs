@@ -210,6 +210,23 @@ describeGit("git show-branch, native twins", () => {
     }
   });
 
+  it("-g HEAD after a checkout, and an ambiguous name", async () => {
+    const dir = repository("head-reflog");
+    for (let i = 0; i < 8; i++) shell.commit(dir, "--no-tag", `c${i}`);
+    shell.ok(dir, "branch", "side", "HEAD~5");
+    shell.ok(dir, "checkout", "-q", "side");
+    for (let i = 0; i < 3; i++) shell.commit(dir, "--no-tag", `s${i}`);
+    shell.ok(dir, "checkout", "-q", "main");
+    shell.tick();
+    shell.ok(dir, "merge", "-q", "--no-ff", "-m", "merge side", "side");
+    shell.commit(dir, "--no-tag", "after");
+    // the headers read main's reflog, the commits HEAD's own (HEAD@{n})
+    await check(dir, ["-g", "HEAD"], testTick());
+    shell.ok(dir, "tag", "main", "side");
+    const ambiguous = await check(dir, ["main", "main"]);
+    expect(ambiguous.stderr).toContain("is ambiguous");
+  });
+
   it("globs, --all with remotes, and more refs than git handles", async () => {
     const dir = join(root, `globs-${counter++}`);
     shell.ok(root, "clone", "-q", t3202, dir);

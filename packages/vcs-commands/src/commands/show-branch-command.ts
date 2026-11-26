@@ -414,6 +414,18 @@ export class ShowBranchCommand extends GitCommand<PlumbingTextOutput> {
     };
 
     const numRev = refNames.length;
+    // git looks every name up again (repo_get_oid, lookup_commit_reference): `HEAD@{n}`
+    // reads HEAD's own reflog, and an ambiguous name warns once more
+    for (let i = 0; i < numRev; i++) {
+      const name = refNames[i] as string;
+      const id = await getOid(name);
+      if (id === undefined) throw new Death(`fatal: '${name}' is not a valid ref.`, 128);
+      const peeled = await resolver.peelTags(id).catch(() => undefined);
+      if (peeled?.type !== "commit") {
+        throw new Death(`fatal: cannot find commit ${name} (${id})`, 128);
+      }
+      refCommits[i] = peeled.id;
+    }
     const rev: Node[] = [];
     const seen: Node[] = [];
     /** mark_seen: commit_list_insert, so the list is newest-inserted first */
