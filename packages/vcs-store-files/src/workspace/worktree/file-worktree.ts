@@ -254,7 +254,7 @@ export class FileWorktree implements Worktree {
       return await this.batchScoped(fn, options);
     } finally {
       this.operationDepth--;
-      if (this.operationDepth === 0) this.tellModified();
+      if (this.operationDepth === 0) this.flushModified();
     }
   }
 
@@ -284,10 +284,10 @@ export class FileWorktree implements Worktree {
     const { modified, deleted } = this.pendingChanges;
     (removed ? modified : deleted).delete(path);
     (removed ? deleted : modified).add(path);
-    if (this.operationDepth === 0) this.tellModified();
+    if (this.operationDepth === 0) this.flushModified();
   }
 
-  private tellModified(): void {
+  flushModified(): void {
     const pending = this.pendingChanges;
     this.pendingChanges = undefined;
     if (!pending || (pending.modified.size === 0 && pending.deleted.size === 0)) return;

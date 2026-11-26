@@ -32,7 +32,7 @@ import type { RepositoryEvent } from "@statewalker/vcs-working-tree";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { Git } from "../src/index.js";
-import { type HookTwin, hookTwins, nativeIn } from "./hooks-native-support.js";
+import { type HookTwin, hookTwins, nativeIn, nativeIs25x } from "./hooks-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, putFile } from "./status-native-support.js";
 
@@ -129,8 +129,16 @@ function refsState(dir: string): string {
   ].join("\n");
 }
 
-/** Consecutive repeats merged: git's nested and ours' split writes count as one run. */
-const runs = (kinds: string[]) => kinds.filter((k, i) => i === 0 || kinds[i - 1] !== k);
+/** Runs of consecutive equal kinds, with their lengths. */
+function counted(kinds: string[]): Array<[string, number]> {
+  const out: Array<[string, number]> = [];
+  for (const k of kinds) {
+    const last = out[out.length - 1];
+    if (last && last[0] === k) last[1]++;
+    else out.push([k, 1]);
+  }
+  return out;
+}
 
 interface Observed {
   events: RepositoryEvent[];
@@ -180,12 +188,28 @@ async function expectEvents(
 
   const label = args.join(" ");
   expect(state(mine.dir), label).toBe(state(theirs.dir));
-  // refs and index writes in native git's order
+  // worktree, index and refs writes in native git's order (git writes an operation's files
+  // first), each run no longer than native git's: once per write
   const kinds = seen.events
-    .map((e) => e.type)
-    .filter((t) => t === "refs-changed" || t === "index-changed")
-    .map((t) => (t === "refs-changed" ? "refs" : "index"));
-  expect(runs(kinds), label).toEqual(runs(nativeWrites));
+    .filter((e) => e.type !== "config-changed")
+    .map((e) =>
+      e.type === "refs-changed" ? "refs" : e.type === "index-changed" ? "index" : "worktree",
+    );
+  const expected = [
+    ...(nativeWorktree.modified.length + nativeWorktree.deleted.length > 0 ? ["worktree"] : []),
+    ...nativeWrites,
+  ];
+  const ours = counted(kinds);
+  const theirsRuns = counted(expected);
+  expect(
+    ours.map(([k]) => k),
+    label,
+  ).toEqual(theirsRuns.map(([k]) => k));
+  ours.forEach(([kind, n], i) => {
+    // git 2.43 updates HEAD outside a transaction: one ref write more than its hook tells
+    const allowed = theirsRuns[i][1] + (kind === "refs" && !nativeIs25x ? 1 : 0);
+    expect(n, `${label}: ${kind} events of run ${i}`).toBeLessThanOrEqual(allowed);
+  });
   // the config once per write of the file
   const configEvents = seen.events.filter((e) => e.type === "config-changed").length;
   expect(configEvents, label).toBe(configChanged ? 1 : 0);

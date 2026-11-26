@@ -351,6 +351,8 @@ export interface Worktree {
   addModifiedListener?(
     listener: (modified: readonly string[], deleted: readonly string[]) => void,
   ): () => void;
+  /** Tells the modified listeners now what a batch in progress changed so far. */
+  flushModified?(): void;
   /**
    * Removes the directory at `path` only if it holds nothing at all (git's `rmdir`): no
    * file, link, directory, `.git`, FIFO or ignored file. Returns whether it was removed.

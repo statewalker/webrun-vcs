@@ -30,8 +30,9 @@ export interface ConfigChangedEvent {
 }
 
 /**
- * Files of the worktree were written or removed: one event per worktree operation (a
- * worktree batch, or a single write outside one). Paths are worktree-relative.
+ * Files of the worktree were written or removed: told when the worktree operation ends (a
+ * worktree batch, or a single write outside one), or before the index or refs event that
+ * follows them. Paths are worktree-relative.
  */
 export interface WorkingTreeModifiedEvent {
   readonly type: "working-tree-modified";

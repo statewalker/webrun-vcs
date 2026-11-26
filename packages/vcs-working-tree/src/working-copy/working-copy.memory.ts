@@ -79,6 +79,7 @@ export class MemoryWorkingCopy implements WorkingCopy {
   readonly worktrees?: LinkedWorktrees;
   /** Told after each write of the refs, the index, the configuration and the worktree */
   readonly listeners = new RepositoryListeners();
+  private readonly disconnectListeners: () => void;
 
   constructor(options: MemoryWorkingCopyOptions) {
     this.history = options.history;
@@ -89,7 +90,7 @@ export class MemoryWorkingCopy implements WorkingCopy {
     if (options.worktrees) this.worktrees = options.worktrees;
     // git's clean / smudge (attributes, core.autocrlf, ...) on the worktree's content
     installContentFilter(this, options);
-    connectRepositoryListeners(this, this.listeners);
+    this.disconnectListeners = connectRepositoryListeners(this, this.listeners);
   }
 
   /**
@@ -235,7 +236,7 @@ export class MemoryWorkingCopy implements WorkingCopy {
    * No-op for memory implementation.
    */
   async close(): Promise<void> {
-    // No resources to release
+    this.disconnectListeners();
   }
 
   // ============ Test Helpers ============

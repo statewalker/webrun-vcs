@@ -13,7 +13,7 @@ const WRITES: Record<string, (result: unknown) => boolean> = {
 const OBSERVERS = Symbol("refWriteObservers");
 
 interface Observed {
-  [OBSERVERS]?: { listeners: Set<() => void>; depth: number };
+  [OBSERVERS]?: { listeners: Set<() => void>; depth: number; changed: boolean };
 }
 
 /**
@@ -21,14 +21,14 @@ interface Observed {
  * `setSymbolic`, `remove`, `removeAll`, an accepted `batch`, a successful
  * `compareAndSwap`): a write made of other writes of the same store (a `set` running a
  * `batch`) is told once, when the outer one returns (writes running concurrently on one store are told
- * once, when the last returns). Every holder of the store is
+ * once, when the last returns, if any of them changed refs). Every holder of the store is
  * observed, whatever reaches it. Returns what removes the listener.
  */
 export function observeRefWrites(refs: Refs, listener: () => void): () => void {
   const target = refs as unknown as Observed & Record<string, unknown>;
   let observers = target[OBSERVERS];
   if (!observers) {
-    const state = { listeners: new Set<() => void>(), depth: 0 };
+    const state = { listeners: new Set<() => void>(), depth: 0, changed: false };
     observers = state;
     Object.defineProperty(target, OBSERVERS, { value: state });
     for (const [name, changed] of Object.entries(WRITES)) {
@@ -39,15 +39,19 @@ export function observeRefWrites(refs: Refs, listener: () => void): () => void {
         let result: unknown;
         try {
           result = await (original as (...a: unknown[]) => Promise<unknown>).apply(this, args);
+          if (changed(result)) state.changed = true;
         } finally {
           state.depth--;
-        }
-        if (state.depth === 0 && changed(result)) {
-          for (const told of [...state.listeners]) {
-            try {
-              told();
-            } catch {
-              // a listener's failure never fails the write
+          // told once every write in flight has returned, if any of them changed refs (an
+          // inner write that committed counts even when the outer one then fails)
+          if (state.depth === 0 && state.changed) {
+            state.changed = false;
+            for (const told of [...state.listeners]) {
+              try {
+                told();
+              } catch {
+                // a listener's failure never fails the write
+              }
             }
           }
         }

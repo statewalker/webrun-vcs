@@ -50,4 +50,16 @@ describe("observeRefWrites", () => {
     await refs.remove("refs/heads/main");
     expect(other).toBe(1);
   });
+
+  it("tells a change of concurrent writes once, even when the last one fails", async () => {
+    const refs = createMemoryRefs();
+    let told = 0;
+    observeRefWrites(refs, () => told++);
+    const [, cas] = await Promise.all([
+      refs.set("refs/heads/a", ID_A),
+      refs.compareAndSwap("refs/heads/b", ID_B, ID_A),
+    ]);
+    expect(cas.success).toBe(false);
+    expect(told).toBe(1);
+  });
 });
