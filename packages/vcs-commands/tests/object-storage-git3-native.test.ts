@@ -4,12 +4,13 @@
  * master oracle (`$GIT3`, skipped without it: no release has the extension yet, 2.43 and
  * 2.56 refuse it as an unknown extension). The one format is `files`; a plain `files`
  * repository opens as any other, while `files://<directory>` (objects outside `objects/`) is
- * refused before anything is read or written. The scenarios are t7427's (git master) formats
- * run through init and open; its `submodule add`/`clone --recurse-submodules` options are not
- * ported (no title is cited).
+ * refused before anything is read or written, and only that repository is: a superproject
+ * whose submodule uses one still has its status and diff (statewalker/webrun-vcs#441), and a
+ * clone of one says why it is refused. The scenarios are t7427's (git master): its formats
+ * run through init and open, and its `submodule add`/`update` and `clone` options.
  */
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGitFilesBackend } from "@statewalker/vcs-store-files";
@@ -19,6 +20,7 @@ import {
 } from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Git } from "../src/index.js";
+import { ourClone, ourCloneFails } from "./clone-options-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { git3Binary, nativeGit3Env } from "./native-git3.js";
 
@@ -219,5 +221,217 @@ describe.skipIf(!git3)("extensions.objectStorage (git master)", () => {
     expect(readFileSync(join(oursDir, ".git/config"), "utf8")).toBe(
       readFileSync(join(nativeDir, ".git/config"), "utf8"),
     );
+  });
+  /** A file:// submodule clone needs `protocol.file.allow=always` (t7427's setup). */
+  const ALLOW_FILE = {
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "protocol.file.allow",
+    GIT_CONFIG_VALUE_0: "always",
+  };
+  /** What our command died with: its first line (git's `fatal:`). */
+  const deathOf = async (run: () => Promise<unknown>) => {
+    try {
+      await run();
+    } catch (e) {
+      return String((e as Error).message).split("\n")[0];
+    }
+    throw new Error("succeeded");
+  };
+  /** An empty superproject `<dir>/upstream` and a repository `<dir>/submodule` with a commit. */
+  const upstreamAndSubmodule = () => {
+    const dir = fresh("t7427");
+    mkdirSync(dir);
+    expect(git(dir, ["init", "-q", "submodule"]).status).toBe(0);
+    expect(git(join(dir, "submodule"), ["commit", "-q", "--allow-empty", "-m", "s"]).status).toBe(
+      0,
+    );
+    expect(git(dir, ["init", "-q", "upstream"]).status).toBe(0);
+    return dir;
+  };
+
+  it('t7427-submodule-object-storage-format.sh: "add existing repository with different object storage format"', async () => {
+    // a superproject whose submodule keeps its objects in `.git/objs`: native git master
+    // reads both; we read the superproject and report the submodule as far as its refs go
+    const dir = fresh("parent");
+    mkdirSync(dir);
+    expect(git(dir, ["init", "-q"]).status).toBe(0);
+    expect(git(dir, ["commit", "-q", "--allow-empty", "-m", "parent"]).status).toBe(0);
+    expect(
+      git(dir, ["init", "-q", "--object-storage-format=files://objs", "submodule"]).status,
+    ).toBe(0);
+    const sub = join(dir, "submodule");
+    expect(git(sub, ["commit", "-q", "--allow-empty", "-m", "submodule"]).status).toBe(0);
+    expect(git(dir, ["submodule", "add", "./submodule"]).status).toBe(0);
+    expect(git(sub, ["rev-parse", "--show-object-storage-format"]).out).toBe("files://objs\n");
+    // a new commit in the submodule: the superproject sees it through the submodule's refs
+    expect(git(sub, ["commit", "-q", "--allow-empty", "-m", "two"]).status).toBe(0);
+    const ours = await openOurs(dir);
+    const status = await ours.status().call();
+    expect(status.files.map((f) => `${f.index}${f.worktree} ${f.path}`)).toEqual(
+      lines(git(dir, ["status", "--porcelain"]).out),
+    );
+    // its own changes are unknown to us (its objects are elsewhere): a warning says so
+    expect(status.warnings).toEqual([
+      "warning: cannot look into submodule 'submodule': repository format not supported by webrun-vcs:\n\textensions.objectStorage = files://objs",
+    ]);
+    const diff = ours.diff();
+    expect(await diff.callText()).toBe(git(dir, ["diff"]).out);
+    expect(diff.warnings.length).toBe(1);
+    // the superproject's own history reads as always
+    const ids: string[] = [];
+    for await (const c of await ours.log().call()) ids.push(c.id);
+    expect(ids).toEqual([git(dir, ["rev-parse", "HEAD"]).out.trim()]);
+  });
+
+  it("a local clone of a files://objs repository is refused with its format", async () => {
+    // native git master falls back to a non-local clone; we cannot read the source's
+    // objects and say so (never "does not exist"), writing nothing
+    const dir = fresh("clone-src");
+    mkdirSync(dir);
+    expect(git(dir, ["init", "-q", "--object-storage-format=files://objs", "src"]).status).toBe(0);
+    expect(git(join(dir, "src"), ["commit", "-q", "--allow-empty", "-m", "one"]).status).toBe(0);
+    const native = git(dir, ["clone", "-q", "src", "native"]);
+    expect(native.status).toBe(0);
+    expect(lines(native.err)).toEqual([
+      "warning: falling back to non-local clone because of non-default object storage format",
+    ]);
+    for (const local of [true, false]) {
+      const target = join(dir, `ours-${local}`);
+      const death = await ourCloneFails(dir, target, (c) =>
+        c.setURI(join(dir, "src")).setLocal(local),
+      );
+      expect(death.message).toBe(
+        "fatal: repository format not supported by webrun-vcs:\n\textensions.objectStorage = files://objs",
+      );
+      expect(existsSync(join(target, ".git/refs/remotes"))).toBe(false);
+    }
+  });
+
+  it('t7427-submodule-object-storage-format.sh: "add submodules with garbage object storage format", "add submodules with object storage payload is rejected"', async () => {
+    for (const format of ["garbage", "files://objs"]) {
+      const dir = upstreamAndSubmodule();
+      const up = join(dir, "upstream");
+      const native = git(
+        up,
+        ["submodule", "add", `--object-storage-format=${format}`, `file://${dir}/submodule`],
+        ALLOW_FILE,
+      );
+      expect(native.status).toBe(128);
+      expect(lines(native.err)).toEqual([`fatal: unknown object storage format '${format}'`]);
+      const ours = await openOurs(up);
+      expect(
+        await deathOf(() =>
+          ours
+            .submoduleAdd()
+            .setObjectStorageFormat(format)
+            .setURI(`file://${dir}/submodule`)
+            .call(),
+        ),
+      ).toBe(lines(native.err)[0]);
+      // and the same for submodule update
+      expect(
+        await deathOf(() =>
+          ours.submoduleUpdate().setInit(true).setObjectStorageFormat(format).call(),
+        ),
+      ).toBe(`fatal: unknown object storage format '${format}'`);
+      expect(
+        lines(git(up, ["submodule", "update", "--init", `--object-storage-format=${format}`]).err),
+      ).toEqual([`fatal: unknown object storage format '${format}'`]);
+    }
+  });
+
+  it('t7427-submodule-object-storage-format.sh: "clone submodules with explicit object storage format"', async () => {
+    const dir = upstreamAndSubmodule();
+    const up = join(dir, "upstream");
+    expect(git(up, ["submodule", "add", `file://${dir}/submodule`], ALLOW_FILE).status).toBe(0);
+    expect(git(up, ["commit", "-q", "-m", "upstream submodule"]).status).toBe(0);
+    expect(
+      git(dir, ["clone", "-q", "--no-recurse-submodules", `file://${up}`, "native"]).status,
+    ).toBe(0);
+    expect(
+      git(dir, ["clone", "-q", "--no-recurse-submodules", `file://${up}`, "ours"]).status,
+    ).toBe(0);
+    const native = git(
+      join(dir, "native"),
+      ["submodule", "update", "--init", "--object-storage-format=files"],
+      ALLOW_FILE,
+    );
+    expect(native.status).toBe(0);
+    const ours = await openOurs(
+      dir,
+      createNodeGitHostEnvironment({ env: env(ALLOW_FILE) }),
+      undefined,
+      "ours",
+    );
+    const result = await ours
+      .submoduleUpdate()
+      .setInit(true)
+      .setObjectStorageFormat("files")
+      .call();
+    expect(result.stderr.split("/ours/").join("/<T>/")).toBe(
+      native.err.split("/native/").join("/<T>/"),
+    );
+    expect(result.exitCode).toBe(0);
+    for (const side of ["native", "ours"]) {
+      const sub = join(dir, side, "submodule");
+      expect(git(sub, ["rev-parse", "--show-object-storage-format"]).out).toBe("files\n");
+      expect(existsSync(join(dir, side, ".git/modules/submodule/objects/pack"))).toBe(true);
+      expect(git(sub, ["rev-parse", "HEAD"]).out).toBe(
+        git(join(dir, "submodule"), ["rev-parse", "HEAD"]).out,
+      );
+    }
+  });
+
+  it('t7427-submodule-object-storage-format.sh: "recursive clone propagates object storage format"', async () => {
+    // with `files` (the payload of t7427's clone is refused: see the next case)
+    const dir = upstreamAndSubmodule();
+    const up = join(dir, "upstream");
+    expect(git(up, ["submodule", "add", `file://${dir}/submodule`], ALLOW_FILE).status).toBe(0);
+    expect(git(up, ["commit", "-q", "-am", "add submodule"]).status).toBe(0);
+    const args = ["clone", "-q", "--object-storage-format=files", "--recurse-submodules"];
+    expect(git(dir, [...args, "upstream", "native"], ALLOW_FILE).status).toBe(0);
+    const result = await ourClone(
+      dir,
+      join(dir, "ours"),
+      (c) => c.setURI(up).setObjectStorageFormat("files").setRecurseSubmodules(true),
+      { extraEnv: ALLOW_FILE },
+    );
+    expect(result.submodules?.exitCode ?? 0).toBe(0);
+    for (const side of ["native", "ours"]) {
+      for (const repo of [join(dir, side), join(dir, side, "submodule")]) {
+        expect(git(repo, ["rev-parse", "--show-object-storage-format"]).out).toBe("files\n");
+      }
+      expect(existsSync(join(dir, side, ".git/modules/submodule/objects/pack"))).toBe(true);
+      expect(readFileSync(join(dir, side, ".git/config"), "utf8")).not.toContain("objectstorage");
+    }
+  });
+
+  it("clone --object-storage-format: an unknown format dies, a payload is refused", async () => {
+    const dir = upstreamAndSubmodule();
+    const sub = join(dir, "submodule");
+    const native = git(dir, ["clone", "-q", "--object-storage-format=garbage", sub, "native"]);
+    expect(native.status).toBe(128);
+    expect(lines(native.err)).toEqual(["fatal: unknown object storage format 'garbage'"]);
+    expect(
+      (
+        await ourCloneFails(dir, join(dir, "ours"), (c) =>
+          c.setURI(sub).setObjectStorageFormat("garbage"),
+        )
+      ).message,
+    ).toBe(lines(native.err)[0]);
+    // a payload: native git master clones into `.git/objs`; we refuse before fetching
+    expect(
+      git(dir, ["clone", "-q", "--object-storage-format=files://objs", sub, "n2"]).status,
+    ).toBe(0);
+    expect(git(join(dir, "n2"), ["rev-parse", "--show-object-storage-format"]).out).toBe(
+      "files://objs\n",
+    );
+    const refused = await ourCloneFails(dir, join(dir, "o2"), (c) =>
+      c.setURI(sub).setObjectStorageFormat("files://objs"),
+    );
+    expect(refused.message).toBe(
+      "fatal: object storage format not supported by webrun-vcs: 'files://objs'",
+    );
+    expect(existsSync(join(dir, "o2/.git/refs/remotes"))).toBe(false);
   });
 });

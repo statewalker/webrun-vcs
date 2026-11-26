@@ -226,6 +226,25 @@ export class UnsupportedObjectStorageError extends Error {
   }
 }
 
+/**
+ * The death of an `--object-storage-format` option git master does not know: clone takes a
+ * URI (`files`, `files://<dir>`: `object_storage_format_by_uri`), `submodule add`/`update` a
+ * name (`files` alone: `object_storage_format_by_name`, so `files://objs` is unknown there).
+ * Undefined when git takes the value.
+ *
+ * @example
+ * ```typescript
+ * unknownObjectStorageFormat("files://objs", "name"); // "fatal: unknown object storage format 'files://objs'"
+ * ```
+ */
+export function unknownObjectStorageFormat(
+  value: string,
+  kind: "uri" | "name",
+): string | undefined {
+  const known = kind === "name" ? value === "files" : objectStorageFormatByUri(value) !== undefined;
+  return known ? undefined : `fatal: unknown object storage format '${value}'`;
+}
+
 /** A reinitialization naming another object storage payload: git dies (exit 128). */
 export class ReinitializeObjectStorageError extends Error {
   override name = "ReinitializeObjectStorageError";

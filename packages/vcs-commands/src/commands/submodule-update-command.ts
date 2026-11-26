@@ -5,6 +5,7 @@
  * `compute_rev_name`), over the submodule model of `submodule-model.ts`, the clone, fetch,
  * checkout, merge and rebase commands.
  */
+
 import type { ObjectId } from "@statewalker/vcs-core";
 import {
   type Credentials,
@@ -14,12 +15,12 @@ import {
 } from "@statewalker/vcs-transport";
 import type { PosixFilesApi } from "@statewalker/vcs-utils/files";
 import { type WorkingCopy, wildmatch } from "@statewalker/vcs-working-tree";
-
 import { GitApiError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { CheckoutCommand, CheckoutStatus } from "./checkout-command.js";
 import { createIdAbbreviator } from "./core-config.js";
+import { unknownObjectStorageFormat } from "./default-branch.js";
 import { DiffCommand } from "./diff-command.js";
 import { FetchCommand } from "./fetch-command.js";
 import { createDescriber } from "./git-describe.js";
@@ -244,6 +245,7 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
   private requireInit = false;
   /** `--filter=<spec>` of the clones */
   private filter?: string;
+  private objectStorageFormat?: string;
   /** `--[no-]single-branch` of the clones */
   private singleBranch?: boolean;
   private transports?: GitTransportRegistry;
@@ -328,6 +330,17 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
   setRecommendShallow(recommend: boolean): this {
     this.checkCallable();
     this.recommendShallow = recommend;
+    return this;
+  }
+
+  /**
+   * `--object-storage-format=<name>` (git master): the object storage of the submodules
+   * cloned. Only `files` is a name git knows (the repository as always); anything else,
+   * `files://<dir>` included, dies `unknown object storage format '<v>'` before any work.
+   */
+  setObjectStorageFormat(format: string): this {
+    this.checkCallable();
+    this.objectStorageFormat = format;
     return this;
   }
 
@@ -485,6 +498,10 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
 
   async call(): Promise<SubmoduleCommandResult> {
     this.start();
+    if (this.objectStorageFormat !== undefined) {
+      const unknown = unknownObjectStorageFormat(this.objectStorageFormat, "name");
+      if (unknown) this.die(unknown);
+    }
     if (this.requireInit) this.init = true;
     const list = await this.moduleList(this.paths);
     if (!list) return this.finish();

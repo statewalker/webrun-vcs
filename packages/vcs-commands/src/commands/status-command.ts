@@ -218,6 +218,22 @@ async function concat(chunks: AsyncIterable<Uint8Array> | Iterable<Uint8Array>) 
 export interface SubmoduleDirt {
   modified?: boolean;
   untracked?: boolean;
+  /**
+   * The repository could not be looked into because git opens it and we do not (an
+   * `extensions.objectStorage` payload): its warning lines. Its own changes are then unknown
+   * (no `modified`/`untracked`); a commit other than the index's still shows, read from refs.
+   */
+  unreadable?: string[];
+}
+
+/**
+ * The warning lines for a submodule we cannot look into (git opens it, we do not), or
+ * undefined for any other failure, which stays fatal as git's child status dies on it.
+ */
+export function submoduleNotSupportedWarning(path: string, error: unknown): string[] | undefined {
+  if (!(error instanceof Error) || error.name !== "UnsupportedRepositoryFormatError") return;
+  if (!(error as { notSupportedHere?: boolean }).notSupportedHere) return;
+  return [`warning: cannot look into submodule '${path}': ${error.message}`];
 }
 
 /**
@@ -227,14 +243,23 @@ export interface SubmoduleDirt {
  * untracked content; any other change, a nested submodule's included, is modified content.
  * Nothing for a submodule that is not populated (or that the worktree cannot open). A
  * configuration the inner status cannot read fails with its messages and git's
- * `'git status --porcelain=2' failed in submodule <path>`.
+ * `'git status --porcelain=2' failed in submodule <path>`. A repository git opens and we do
+ * not (an `extensions.objectStorage` payload, statewalker/webrun-vcs#441) is no failure of
+ * the superproject: its state is `unreadable`, with a warning.
  */
 export async function readSubmoduleDirt(
   worktree: Worktree,
   path: string,
   ignoreUntracked: boolean,
 ): Promise<SubmoduleDirt> {
-  const inner: WorkingCopy | undefined = await worktree.openGitlink?.(path);
+  let inner: WorkingCopy | undefined;
+  try {
+    inner = await worktree.openGitlink?.(path);
+  } catch (error) {
+    const unreadable = submoduleNotSupportedWarning(path, error);
+    if (unreadable) return { unreadable };
+    throw error;
+  }
   if (!inner) return {};
   // `git status --porcelain=2` there, with `-uno` when untracked content is ignored
   const command = new StatusCommand(inner).setRenames(false);
@@ -878,6 +903,8 @@ export class StatusCommand extends GitCommand<Status> {
     const indexTime = this.staging.getUpdateTime();
     const gitlinks = new Set<string>();
     const refresh: IndexStatUpdate[] = [];
+    // submodules we cannot look into (a repository git opens and we do not)
+    const submoduleWarnings: string[] = [];
     const unmerged = new Map<string, [StatusSide?, StatusSide?, StatusSide?]>();
     // the `.gitignore` files whose entry is up to date (git's ce_uptodate after its refresh):
     // the untracked cache takes their ids from the index
@@ -1005,6 +1032,7 @@ export class StatusCommand extends GitCommand<Status> {
             // a populated submodule's own index and worktree (git's is_submodule_modified)
             if (flags && !flags.dirty && result.worktreeEntry?.isDirectory) {
               dirt = await readSubmoduleDirt(worktree, entry.path, flags.untracked);
+              if (dirt.unreadable) submoduleWarnings.push(...dirt.unreadable);
             }
             if (result.kind === "deleted") {
               y = "D";
@@ -1065,6 +1093,7 @@ export class StatusCommand extends GitCommand<Status> {
 
     const renamed = new Map<string, string>();
     const warnings: string[] = (fsm?.warnings ?? []).map((w) => `warning: ${w}`);
+    warnings.push(...submoduleWarnings);
     const renameMode = this.renameMode();
     if (renameMode) await this.pairRenames(files, renamed, worktree, warnings, renameMode);
 

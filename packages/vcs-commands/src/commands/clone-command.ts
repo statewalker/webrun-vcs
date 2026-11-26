@@ -13,6 +13,7 @@ import {
   GitWorkingCopyConfig,
   HostPaths,
   hostRootOf,
+  objectStorageFormatByUri,
   parseConfigKey,
   setConfigMultivarText,
 } from "@statewalker/vcs-store-files";
@@ -56,7 +57,11 @@ import {
   parseBundleListLine,
 } from "./bundle/index.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
-import { defaultInitialBranch } from "./default-branch.js";
+import {
+  defaultInitialBranch,
+  UnsupportedObjectStorageError,
+  unknownObjectStorageFormat,
+} from "./default-branch.js";
 import { TagOption, toTagMode, toTrackingRefUpdate } from "./fetch-command.js";
 import { fetchFsckOf } from "./fsck/index.js";
 import { runPostCheckoutHook } from "./git-hooks.js";
@@ -106,6 +111,7 @@ const CLONE_SETTINGS = [
   "dissociate",
   "references",
   "recurseSubmodules",
+  "objectStorageFormat",
   "shallowSubmodules",
   "alsoFilterSubmodules",
   "remoteSubmodules",
@@ -232,6 +238,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
   private references: { path: string; required: boolean }[] = [];
   /** `--recurse-submodules[=<pathspec>]` values, in the order given */
   private recurseSubmodules: string[] = [];
+  private objectStorageFormat?: string;
   private shallowSubmodules = false;
   /** `--[no-]also-filter-submodules`; unset: `clone.filterSubmodules` */
   private alsoFilterSubmodules?: boolean;
@@ -743,6 +750,19 @@ export class CloneCommand extends TransportCommand<CloneResult> {
    * `protocol.file.allow=always`. Credentials and headers reach a submodule's URL only as
    * `SubmoduleUpdateCommand.setCredentials` allows (the clone's own origin).
    */
+  /**
+   * `--object-storage-format=<format>`: the clone's object storage (git master). `files` is
+   * the repository as always and is passed on to the submodules a recursive clone makes; a
+   * name git does not know dies as git (`unknown object storage format '<v>'`), and
+   * `files://<directory>`, objects outside `objects/`, which we do not read, is refused
+   * before anything is fetched (`UnsupportedObjectStorageError`).
+   */
+  setObjectStorageFormat(format: string): this {
+    this.checkCallable();
+    this.objectStorageFormat = format;
+    return this;
+  }
+
   setRecurseSubmodules(recurse: boolean | string[]): this {
     this.checkCallable();
     this.recurseSubmodules = recurse === true ? ["."] : recurse === false ? [] : [...recurse];
@@ -842,6 +862,14 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     if (!this.uri) {
       throw new InvalidRemoteError("", "URI must be specified for clone");
     }
+    // cmd_clone: the object storage format is checked with the options, before anything
+    if (this.objectStorageFormat !== undefined) {
+      const unknown = unknownObjectStorageFormat(this.objectStorageFormat, "uri");
+      if (unknown) throw new GitApiError(unknown);
+      if (objectStorageFormatByUri(this.objectStorageFormat)?.payload !== undefined) {
+        throw new UnsupportedObjectStorageError(this.objectStorageFormat);
+      }
+    }
     // cmd_clone: what --recurse-submodules adds to the -c values (option_config)
     const submoduleConfig: string[] = [];
     if (this.recurseSubmodules.length > 0) {
@@ -908,10 +936,19 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     const uri = this.uri;
     // a bare repository's working copy opens it from its git directory
     const worktree = repositoryPlaceOf(this.workingCopy);
+    // a repository whose format we cannot open (an `extensions.objectStorage` payload, which
+    // git master clones non-locally) is refused with that format, never "does not exist"
+    let formatRefusal: Error | undefined;
     const isRepositoryPath = await worktree
       ?.openRepository?.(uri, { checkOwnership: false, commandLineConfig: false })
       .then((opened) => opened !== undefined)
-      .catch(() => false);
+      .catch((error: unknown) => {
+        if (error instanceof Error && error.name === "UnsupportedRepositoryFormatError") {
+          formatRefusal = error;
+        }
+        return false;
+      });
+    if (formatRefusal) throw new TransportError(`fatal: ${formatRefusal.message}`);
     // get_repo_path: then a regular file, `<path>.bundle` first (a bundle: the transport reads
     // it there, remote.<name>.url keeps the path as given)
     let bundleFile: string | undefined;
@@ -1568,6 +1605,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     if (this.shallowSubmodules) update.setDepth(1);
     if (this.remoteSubmodules) update.setRemote(true).setNoFetch(true);
     if (filterSubmodules && this.filterSpec !== undefined) update.setFilter(this.filterSpec);
+    // object_storage_format_to_name: the name alone (`files`), never a payload
+    if (this.objectStorageFormat !== undefined) update.setObjectStorageFormat("files");
     // option_single_branch, settled before (a deepening clone is a single-branch one, a
     // --revision clone none): always passed on, as --single-branch or --no-single-branch
     update.setSingleBranch(
