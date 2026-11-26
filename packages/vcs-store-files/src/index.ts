@@ -20,6 +20,8 @@ export * from "./gc.js";
 export * from "./gc-strategy.js";
 // git multi-pack-index write / verify / expire / repack
 export * from "./multi-pack-index.js";
+// Opening the repository git's setup arrives at ($GIT_DIR, $GIT_INDEX_FILE, ...)
+export * from "./open-repository-from-environment.js";
 // Pack file management (file-dependent)
 export * from "./pack/index.js";
 // Quarantine for received packs (receive-pack)

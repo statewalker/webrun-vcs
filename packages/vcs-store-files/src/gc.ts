@@ -28,6 +28,7 @@ import { sweepQuarantines } from "./quarantine/files-quarantine.js";
 import { listReachableObjects, rebaseFileRoots } from "./reachable-objects.js";
 import { expireReflogs, gcExpiresReflogs, parseExpiryDate } from "./reflog-expire.js";
 import { createFilesRefOps } from "./refs/index.js";
+import { assertObjectsAtGitDir } from "./relocated-objects.js";
 import {
   DEFAULT_PRUNE_EXPIRE_MS,
   type PackSnapshot,
@@ -334,6 +335,14 @@ export interface StorageCount {
  */
 export async function gc(options: GcOptions): Promise<GcResult> {
   const { history, files, gitDir = ".git", dryRun = false } = options;
+  assertObjectsAtGitDir(
+    gitDir,
+    "gc",
+    options.objects,
+    options.packs,
+    history.objects,
+    history.packs,
+  );
   if (!(options.objects ?? history.objects))
     throw new Error("gc needs the object kernel: pass objects or a files backend history");
   // the walks read no absent object of a partial clone (git's fetch_if_missing = 0): they
