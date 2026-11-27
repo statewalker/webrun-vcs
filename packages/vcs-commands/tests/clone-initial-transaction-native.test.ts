@@ -15,7 +15,6 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -32,6 +31,7 @@ import { nativeIs25x } from "./hooks-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -94,7 +94,7 @@ describeGit("clone's initial ref transaction, as native git", () => {
     writeFileSync(join(template, "hooks/reference-transaction"), HOOK);
     chmodSync(join(template, "hooks/reference-transaction"), 0o755);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   async function twin(
     name: string,

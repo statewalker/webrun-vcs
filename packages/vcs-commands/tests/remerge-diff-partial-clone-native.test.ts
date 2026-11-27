@@ -8,7 +8,7 @@
  * compared, and every id a fetch asks for must exist on the server.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
@@ -21,6 +21,7 @@ import { openOurs } from "./merge-native-helpers.js";
 import { gitAsync } from "./native-connect-support.js";
 import { nativeGitAvailable, nativeGitHttpBackend } from "./native-git-http-backend.js";
 import { testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 /** Whether the native git on PATH can fetch over HTTP (the 2.56.1 build has no curl) */
 const nativeHasCurl = (() => {
@@ -72,9 +73,9 @@ test_write_lines 1 2 vier 4 5 6 7 8 9 x >numbers; git add numbers; test_tick; gi
 `;
 
 const roots: string[] = [];
-afterAll(() => {
-  for (const r of roots) rmSync(r, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const r of roots) await removeTempDir(r);
+}, CLEANUP_TIMEOUT);
 
 /** The ids `want` lines of upload-pack requests ask for */
 function wantsOf(body: Buffer): string[] {

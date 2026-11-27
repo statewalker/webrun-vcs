@@ -30,6 +30,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { Git, ResetMode } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -127,7 +128,7 @@ describeGit("attribute source (GIT_ATTR_SOURCE, attr.tree) against native git", 
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "attr-source-native-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("a checkout smudges with the source's attributes (attr.tree, then $GIT_ATTR_SOURCE)", async () => {
     const t = twins("checkout");

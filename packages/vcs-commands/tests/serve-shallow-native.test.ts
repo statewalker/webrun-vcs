@@ -13,7 +13,7 @@
  * loopback port; our client clones from native `git daemon` and `git http-backend`, and from
  * a local path (our upload-pack in process); each result is compared with native git's.
  */
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -34,6 +34,7 @@ import { openOurs } from "./merge-native-helpers.js";
 import { daemonOpener, gitAsync } from "./native-connect-support.js";
 import { nativeGitAvailable, nativeGitHttpBackend } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -139,8 +140,8 @@ describeGit("serving a shallow repository, as native git", () => {
   afterAll(async () => {
     await nativeHttp?.close();
     await ourHttp?.close();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   const variants: Array<{ name: string; args: string[] }> = [
     { name: "plain", args: [] },

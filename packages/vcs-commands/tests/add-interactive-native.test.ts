@@ -7,7 +7,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
+import { chmodSync, mkdtempSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -16,6 +16,7 @@ import type { PatchRequest } from "../src/commands/add-patch/index.js";
 import { gitOk, openOurs, put, snapshot } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 import { gitAtLeast } from "./native-git-working-copy.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -124,7 +125,7 @@ describeGit("add -i as native git", () => {
     root = mkdtempSync(join(tmpdir(), "add-interactive-native-"));
     compat = gitAtLeast(gitOk(root, root, "--version"), 2, 50) ? "2.56" : "2.43";
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("lists the status, the menu, help and errors, and quits", async () => {
     const { requests } = await compare(twins(mixed), [

@@ -17,6 +17,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { gitOk, openOurs, put, snapshot } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -175,7 +176,7 @@ describeGit("git read-tree against native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "read-tree-native-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const optionErrors: string[][] = [
     ["-m", "--reset", "c1"],

@@ -19,6 +19,7 @@ import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 import { gitAtLeast } from "./native-git-working-copy.js";
 import { nativeGit3Env } from "./native-git3.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 /** A native git that makes reftable repositories, and its environment. */
 function reftableGit(): { bin: string; env: (home: string) => Record<string, string> } | undefined {
@@ -96,9 +97,9 @@ describeReftable("reftable submodules (#459)", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "reftable-submodule-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("the nested repository's HEAD file is reftable's stub", () => {
     const t = twins();

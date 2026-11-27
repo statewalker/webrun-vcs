@@ -9,12 +9,13 @@
  * Every git call runs with fixed author and committer identities in its environment.
  */
 import { execFile } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { push } from "@statewalker/vcs-transport";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../../../temp-dir-support.js";
 import {
   createInitializedTestRepository,
   createRepositoryFacade,
@@ -53,9 +54,9 @@ const tmp = () => {
   dirs.push(d);
   return d;
 };
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 
 /** `n` commits rewriting a few text files, so the packs carry deltas. */
 async function commitVersions(ctx: TestRepositoryContext, from: number, n: number) {

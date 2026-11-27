@@ -14,7 +14,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -34,6 +34,7 @@ import {
   snapshot,
 } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -346,9 +347,9 @@ describeGit("rebase --committer-date-is-author-date, --ignore-date, --trailer", 
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "rebase-dates-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   describe("t3436-rebase-more-options", () => {
     /** The script's setup: GIT_AUTHOR_DATE fixed, the committer dated by the tick */

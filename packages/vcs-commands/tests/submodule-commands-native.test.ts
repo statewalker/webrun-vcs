@@ -18,7 +18,6 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
-  rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,6 +32,7 @@ import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitAtLeast } from "./native-git-working-copy.js";
 import { testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -179,7 +179,7 @@ describeGit("git submodule init (t7400, SubmoduleInitTest)", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "submodule-cmds-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("registers the URLs, resolved against the remote or the worktree, and -q", async () => {
     const t = twins(`${BASIC}
@@ -280,7 +280,7 @@ describeGit("git submodule deinit (t7400, SubmoduleDeinitTest)", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "submodule-cmds-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("refuses local changes without -f, clears with -f, again, and --all", async () => {
     const t = twins(`${BASIC}
@@ -322,7 +322,7 @@ describeGit("submodule git directories and paths git refuses", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "submodule-cmds-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** `hippo` (populated) and `hippo/hooks` at `hooks`, whose git dir would be inside hippo's. */
   const HIPPO = `
@@ -447,7 +447,7 @@ describeGit("git submodule sync (t7403, SubmoduleSyncTest)", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "submodule-cmds-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const NESTED = `
 git init -q -b main inner; (cd inner; echo i>i; git add i; git commit -qm i)
@@ -504,7 +504,7 @@ describeGit("git submodule set-url and set-branch (t7420, t7419)", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "submodule-cmds-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("set-url rewrites .gitmodules and syncs (t7420)", async () => {
     const t = twins(`${BASIC}
@@ -569,7 +569,7 @@ describeGit("git submodule foreach (t7407)", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "submodule-cmds-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const NESTED = `
 git init -q -b main inner; (cd inner; echo i>i; git add i; git commit -qm i)

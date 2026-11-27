@@ -8,7 +8,7 @@
  * Native git reads each input; ours must print the same lines. Run with the system git (2.43)
  * and with 2.56.1 first on `PATH`.
  */
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -16,6 +16,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { git, native, type Outcome, outcomeOf, writeFiles } from "./plumbing-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -108,7 +109,7 @@ describeGit("git patch-id against native git", () => {
     g("commit", "-q", "-m", "binary");
     g("checkout", "-q", "main");
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const top = (rev: string, ...extra: string[]) =>
     git(root, repo, ["log", "-p", "-1", rev, "-O", "bar-then-foo", "--full-index", ...extra, "--"]);

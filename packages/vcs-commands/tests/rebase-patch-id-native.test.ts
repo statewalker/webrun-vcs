@@ -25,6 +25,7 @@ import {
   text,
 } from "./merge-native-scenarios.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -73,9 +74,9 @@ describeGit("rebase drops commits already upstream, as native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "rebase-patchid-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   const change = { f: text({ 2: "S" }), g: "new\n" };
 

@@ -9,7 +9,7 @@
  * files.
  */
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -45,6 +45,7 @@ import {
 } from "./merge-native-helpers.js";
 import { buildHistory, type History, text } from "./merge-native-scenarios.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -110,9 +111,9 @@ describeGit("merge, pick, rebase and stash keep untracked work as git does", () 
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "merge-dataloss-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("merge --abort refuses to replace a directory holding an untracked file", async () => {
     const { native, ours } = twins({
@@ -610,9 +611,9 @@ describeGit("autostash and directory replacement never strand or lose work", () 
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "merge-dataloss-wt-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("a merge or rebase with autostash refuses where the checkout keeps no state files", async () => {
     const { ours } = twins({ ...conflictA, base: { ...conflictA.base, "b.txt": "b\n" } }, (dir) =>
@@ -677,9 +678,9 @@ describeGit("a refused merge over a symbolic link among the leading directories"
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "merge-dataloss-link-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   // d/f assume-unchanged, d then replaced by a link: save_state's `stash create` passes the
   // entry over (refresh_index marks it up to date), the merge is refused and git's reset

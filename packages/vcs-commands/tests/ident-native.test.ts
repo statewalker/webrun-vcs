@@ -8,7 +8,7 @@
  * other shows. Our commands are given no identity: they resolve it as git does.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
@@ -31,6 +31,7 @@ import {
   resolveCommitterIdent,
 } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -135,9 +136,9 @@ describeGit("commit identities, native twins", () => {
     home = join(root, "home");
     mkdirSync(home);
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("commit: the author and the committer from the variables; amend keeps the author", async () => {
     const t = twins();
@@ -552,9 +553,9 @@ describeGit("identities as git resolves them: guesses, empty values, refusals", 
     home = join(root, "home");
     mkdirSync(home);
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** No identity in the environment, no dates: what the configuration gives. */
   const NONE: Env = {

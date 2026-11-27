@@ -7,7 +7,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -27,6 +27,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { formatBlamePorcelain, Git } from "../src/index.js";
 import { buildLongHistory, type LongHistory } from "./blame-long-history.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -115,9 +116,9 @@ describeGit("blame reads and diffs each version once", () => {
       versionLines += text.split("\n").length - 1;
     }
   }, 60_000);
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("loads each commit and version at most once and interns each line at most once", async () => {
     const counts: Counts = {};
@@ -298,9 +299,9 @@ describeGit("blame -C -C -C over parents with many files", () => {
     execFileSync("git", ["fast-import", "--quiet"], { cwd: dir, env, input: chunks.join("") });
     tip = execFileSync("git", ["rev-parse", "main"], { cwd: dir, env }).toString().trim();
   }, 120_000);
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("interns only the files sharing lines with the blamed ones, whatever the caches keep", async () => {
     const native = execFileSync(

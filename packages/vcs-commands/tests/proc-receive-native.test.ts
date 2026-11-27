@@ -13,7 +13,7 @@
  * Each compares the client's lines, the hook logs (every receive hook's arguments, stdin and
  * variables; what proc-receive read: the version line, commands, push options) and the refs.
  */
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createBasePathResolver, createServedFetchHandler } from "@statewalker/vcs-transport";
@@ -43,6 +43,7 @@ import {
 } from "./native-git-http-backend.js";
 import { installProcReceive, writeProcReceiveTool } from "./proc-receive-native-support.js";
 import { gitOut, gitRun, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -669,7 +670,7 @@ describeGit("proc-receive: a native client pushing to our served receive-pack", 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "proc-receive-served-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   for (const s of SCENARIOS) {
     for (const porcelain of [false, true]) {
@@ -713,7 +714,7 @@ describeGit("proc-receive: a local push, native and ours", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "proc-receive-local-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   for (const s of SCENARIOS) {
     it(s.label, async () => {
@@ -765,7 +766,7 @@ describeGit("proc-receive: our client pushing to native receive-pack", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "proc-receive-client-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   for (const s of SCENARIOS) {
     it(s.label, async () => {
@@ -848,7 +849,7 @@ describeGit("proc-receive: receive.procReceiveRefs without a value", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "proc-receive-nonbool-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("receive-pack dies reading its config (config_error_nonbool), before the advertisement", async () => {
     const dir = join(root, "r");

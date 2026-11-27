@@ -6,7 +6,7 @@
  * in one copy of a repository with logging hooks and ours (with the Node hook runner) in the
  * other, and compares the logs, stderr, exit status and HEAD.
  */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -25,6 +25,7 @@ import {
 } from "./hooks-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -78,7 +79,7 @@ describeGit("am hooks: as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-am-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("applypatch-msg, pre-applypatch and post-applypatch per patch", async () => {
     const dir = join(root, "r");

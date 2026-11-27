@@ -25,6 +25,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type CheckoutResult, CheckoutStage, type Git, ResetMode } from "../src/index.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, openRepo, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -278,7 +279,7 @@ describeGit("checkout, restore and reset with pathspecs, as native git", () => {
     template = join(root, "template");
     base(template);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("git checkout [<tree-ish>] [--[no-]overlay] -- <pathspec>", async () => {
     const seen = new Set<string>();
@@ -597,7 +598,7 @@ describeGit("checkout and restore of unmerged paths, as native git", () => {
     // (exits 1 for the unmerged paths)
     gitRun(root, dir, ["update-index", "-q", "--refresh"]);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const resolved = (dir: string) => {
     putFile(dir, "m.txt", "resolved\n");
@@ -767,7 +768,7 @@ describeGit("checkout, restore and reset in a sparse checkout, as native git", (
     putFile(dir, "in/b.txt", "b-wt\n");
     git(dir, ["update-index", "-q", "--refresh"]);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("skip-worktree entries are passed over unless --ignore-skip-worktree-bits", async () => {
     const specs: string[][] = [
@@ -868,7 +869,7 @@ describeGit("path checkouts and resets: the index git writes, removals, merges, 
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "checkout-paths-fixes-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const fixture = (name: string, build: (dir: string) => void) => {
     const dir = join(root, name);

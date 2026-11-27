@@ -19,7 +19,6 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
-  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -44,6 +43,7 @@ import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitAtLeast } from "./native-git-working-copy.js";
 import { testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -305,7 +305,7 @@ describeGit("git submodule absorbgitdirs (t7412)", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "submodule-absorb-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t7412-submodule-absorbgitdirs.sh: "absorb the git dir"', async () => {
     const t = twins(SETUP);

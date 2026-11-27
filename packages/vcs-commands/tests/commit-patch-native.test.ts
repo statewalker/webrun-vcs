@@ -6,7 +6,7 @@
  * are compared. Inputs from git's t/t7514-commit-patch.sh.
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -26,6 +26,7 @@ import {
 } from "./interactive-extras-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitAtLeast } from "./native-git-working-copy.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -113,7 +114,7 @@ describeGit("commit -p as native git", () => {
     root = mkdtempSync(join(tmpdir(), "commit-patch-native-"));
     compat = gitAtLeast(gitOk(root, root, ["--version"]), 2, 50) ? "2.56" : "2.43";
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t7514-commit-patch.sh: “edit hunk "commit -p -m message"”', async () => {
     await compare(twins(t7514), {

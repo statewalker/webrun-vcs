@@ -7,15 +7,7 @@
  * git:// server serving a copy of the repository with `settings.namespace`. git decides what
  * the client sees (ls-remote, clone, fetch) and what lands in the served repository.
  */
-import {
-  cpSync,
-  mkdirSync,
-  mkdtempSync,
-  readdirSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import {
@@ -37,6 +29,7 @@ import { openOurs } from "./merge-native-helpers.js";
 import { gitAsync, startTcpServer } from "./native-connect-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -178,8 +171,8 @@ describeGit("ref namespaces against native git (t5509)", () => {
   afterAll(async () => {
     await closeServer?.();
     await http?.close();
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it('t5509-fetch-push-namespaces.sh: "pushing into a repository using a ref namespace"', async () => {
     const empty = join(root, `empty-${counter++}`);

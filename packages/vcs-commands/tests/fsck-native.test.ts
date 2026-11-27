@@ -48,6 +48,7 @@ import { type FsckCommand, Git } from "../src/index.js";
 import { gitOk, openOurs, put } from "./merge-native-helpers.js";
 import { createMockWorktree } from "./mock-worktree-store.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -65,7 +66,7 @@ describeGit("fsck against native git", () => {
     const version = /(\d+)\.(\d+)/.exec(native(probe, ["--version"]).stdout);
     if (version && (Number(version[1]) > 2 || Number(version[2]) >= 45)) compatibility = "2.56";
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   function native(cwd: string, args: string[], input?: Uint8Array) {
     const r = spawnSync("git", args, { cwd, env: nativeGitEnv(root), input });

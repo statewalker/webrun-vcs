@@ -48,6 +48,7 @@ import { nativeIs25x } from "./hooks-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 import { openBare } from "./plumbing-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -365,7 +366,7 @@ describeGit("fsmonitor against native git (t7519-status-fsmonitor.sh)", () => {
     put(".gitignore", ".gitignore\nexpect*\nactual*\nmarker*\n");
     dateBack();
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   for (const uc of [false, true]) {
     it(`t7519-status-fsmonitor.sh: "compare status with and without fsmonitor" (untrackedCache=${uc})`, async () => {

@@ -22,6 +22,7 @@ import type { Git } from "../src/index.js";
 import { ourClone } from "./clone-options-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -165,9 +166,9 @@ describeGit("git clone --recurse-submodules (native twins)", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "clone-recurse-"));
   });
-  afterAll(() => {
-    if (!process.env.KEEP_TWINS) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (!process.env.KEEP_TWINS) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   const t5614 =
     (args: string[], configure: (c: Clone) => Clone, setup = "") =>

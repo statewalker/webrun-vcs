@@ -14,11 +14,12 @@ import {
   execFileSync,
   spawn,
 } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 
 /** A clean git environment: no user or system config, a fixed identity (CI has none). */
 const env = {
@@ -45,9 +46,9 @@ const gitAsync = (cwd: string, args: string[]) =>
   });
 
 const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 
 /** A repository with two commits; returns its directory, HEAD and the first commit's tree. */
 function newRepo() {

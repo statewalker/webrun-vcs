@@ -5,7 +5,7 @@
  * (stdout, stderr and exit status; usage errors by their first line).
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -14,6 +14,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type Outcome, Shell } from "./describe-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -91,9 +92,9 @@ describeGit("git show-branch, native twins", () => {
       .trim()
       .split("\n");
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it('t3202-show-branch.sh: "show-branch with more than 8 branches"', async () => {
     const out = await check(t3202, sorted);

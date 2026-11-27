@@ -57,6 +57,7 @@ import { openOurs } from "./merge-native-helpers.js";
 import { gitAsync } from "./native-connect-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -263,7 +264,7 @@ describeGit("git's native protocol over the duplex adapters", () => {
     git(join(srv, "hid.git"), "config", "uploadpack.hideRefs", "refs/hidden");
     host = await ours(emptyRepo());
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   for (const adapter of ADAPTERS) {
     describe(adapter.name, () => {
@@ -574,7 +575,7 @@ describeGit("git's native protocol over the duplex adapters", () => {
       const commit = git(join(srv, big), "commit-tree", "-m", "big", tree).trim();
       git(join(srv, big), "update-ref", "refs/heads/main", commit);
     });
-    afterAll(() => rmSync(join(srv, big), { recursive: true, force: true }));
+    afterAll(() => removeTempDir(join(srv, big)), CLEANUP_TIMEOUT);
 
     const metered: Array<{
       name: string;

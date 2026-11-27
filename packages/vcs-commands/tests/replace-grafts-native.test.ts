@@ -7,15 +7,7 @@
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
-import {
-  cpSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  utimesSync,
-  writeFileSync,
-} from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
@@ -28,6 +20,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Git, type LogResult } from "../src/index.js";
 import { git, gitOk, normalizeState, openOurs, put, snapshot } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -96,7 +89,7 @@ describeGit("replace refs and grafts in history walks, native twins", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "replace-grafts-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("grafts: log, rev-list, parents and merge bases follow the grafted parents", async () => {
     const { dir, ids } = repo();
@@ -185,7 +178,7 @@ describeGit("replace refs and grafts in porcelain commands, native twins", () =>
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "replace-grafts-porcelain-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const twins = (dir: string) => {
     const nd = join(root, `n${n}`);
@@ -420,7 +413,7 @@ describeGit("replace ref names, grafts file and their messages, native twins", (
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "replace-grafts-messages-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** git 2.43 words the grafts advice differently: its hint lines are compared from 2.5x on */
   const modern = /git version 2\.(5\d|[6-9]\d)/.test(g(process.cwd(), "--version"));

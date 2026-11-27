@@ -12,7 +12,7 @@
  * deciding the result).
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
@@ -24,6 +24,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { Git, type LogOutputOptions } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -187,9 +188,9 @@ describeGit("log/rev-list revisions and order against native git", () => {
     home = join(root, "home");
     mkdirSync(home);
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   describe("t6018-rev-list-glob", () => {
     let repo = "";

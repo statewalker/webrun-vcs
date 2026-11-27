@@ -12,6 +12,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { describeTwin, nameRevTwin, type Outcome, Shell } from "./describe-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -49,9 +50,9 @@ describeGit("git name-rev, native twins", () => {
     root = mkdtempSync(join(tmpdir(), "name-rev-native-"));
     shell = new Shell(root);
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   describe("JGit NameRevCommandTest", () => {
     it("NameRevCommandTest.simple", async () => {
@@ -355,9 +356,9 @@ describeGit("git name-rev and describe in a shallow clone, native twins", () => 
     shell.ok(root, "clone", "-q", "--no-local", "--depth=2", src, dir);
     shell.ok(dir, "fetch", "-q", "--tags", "--depth=2");
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("name-rev --all lists no parent the shallow boundary cuts off", async () => {
     const sorted = (s: string) => s.split("\n").sort().join("\n");

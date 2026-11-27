@@ -40,6 +40,7 @@ import {
   noMaintenance,
 } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -413,8 +414,8 @@ describeGit("receive-pack checks pushed objects (receive.fsckObjects), as native
     await nativeHttp?.close();
     await ourHttp?.close();
     await ourDaemon?.close();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   for (const scenario of SCENARIOS) {
     describe(scenario.title, () => {

@@ -20,6 +20,7 @@ import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { createFetchHandler } from "../../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 import {
   cleanupDir,
   createTransportRepo,
@@ -173,8 +174,8 @@ describeGit("Interop · real git client ← our smart-HTTP server", { timeout: T
   afterAll(async () => {
     await server?.close();
     await repo?.close();
-    cleanupDir(root);
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** Requests logged from `start` on. */
   function requestsSince(start: number) {

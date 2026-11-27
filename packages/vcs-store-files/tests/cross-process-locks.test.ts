@@ -5,13 +5,14 @@
  * sees a lock we hold.
  */
 import { type ChildProcessWithoutNullStreams, execFileSync, spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const env = {
   ...process.env,
@@ -26,9 +27,9 @@ const git = (cwd: string, args: string[]) =>
   execFileSync("git", args, { cwd, env, encoding: "utf8", stdio: "pipe" });
 
 const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 function gitRepo(): string {
   const dir = mkdtempSync(join(tmpdir(), "cross-process-locks-"));
   dirs.push(dir);

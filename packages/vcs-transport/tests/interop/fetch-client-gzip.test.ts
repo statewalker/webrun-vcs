@@ -11,9 +11,9 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createFetchHandler, fetch, GZIP_REQUEST_MIN_BYTES } from "../../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 import { gitHttpBackend } from "./git-http-backend.js";
 import {
-  cleanupDir,
   commitInRepo,
   createTransportRepo,
   gitAvailable,
@@ -113,8 +113,8 @@ describeGit("fetch client: git http-backend takes the gzipped bodies", () => {
   let root: string | undefined;
   afterEach(async () => {
     for (const r of repos.splice(0)) await r.close();
-    if (root) cleanupDir(root);
-  });
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("a negotiation with many haves against native git", async () => {
     const { client, handler, c1 } = await setup(repos);

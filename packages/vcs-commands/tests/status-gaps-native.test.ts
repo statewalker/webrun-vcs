@@ -35,6 +35,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { formatStatusPorcelain, Git, type StatusCommand } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -145,7 +146,7 @@ describeGit("status renames against native git (status.renames)", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "status-renames-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
   const at = (name: string, setup: (d: string) => void) => {
     const d = join(root, name);
     repo(d);
@@ -353,7 +354,7 @@ describeGit("dirty submodule content in status against native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "status-submodule-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
   const at = (name: string, setup: (d: string) => void) => {
     const d = join(root, name);
     superproject(d, join(root, "up"));
@@ -564,7 +565,7 @@ describeGit("clean -X against native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "clean-x-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** native `git clean` with `args` in one build, ours in its twin; would-remove lists and trees. */
   async function twin(
@@ -689,7 +690,7 @@ describeGit("clean -d and absolute gitfile targets (native git)", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "clean-absolute-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   async function bothClean(setup: (dir: string) => void) {
     const nativeDir = join(root, "native");
@@ -753,7 +754,7 @@ describeGit("clean keeps repositories it cannot check; ignored directories as gi
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "clean-review-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   type Flags = { d?: boolean; x?: boolean; X?: boolean };
   /** native `git clean -f` with `flags` in one build, ours in the other build of `setup`. */
@@ -858,7 +859,7 @@ describeGit("status review cases against native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "status-review2-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("a deinitialised submodule's directory is never entered for untracked files", async () => {
     const d = join(root, "r");
@@ -911,7 +912,7 @@ describeGit("clean removes inside non-repository .git directories as git (review
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "clean-fake-git-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   type Flags = { d?: boolean; x?: boolean; X?: boolean; ff?: boolean };
   const argsOf = (flags: Flags) => {
@@ -1161,7 +1162,7 @@ describeGit(
     beforeEach(() => {
       root = mkdtempSync(join(tmpdir(), "status-ita-head-"));
     });
-    afterEach(() => rmSync(root, { recursive: true, force: true }));
+    afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
     const at = (name: string, setup: (d: string) => void) => {
       const d = join(root, name);
       repo(d);
@@ -1220,7 +1221,7 @@ describeGit("status renames with unmerged paths against native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "status-unmerged-renames-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** A conflicted merge: `base`, then `ours` on main and `theirs` on a branch. */
   const conflicted = (

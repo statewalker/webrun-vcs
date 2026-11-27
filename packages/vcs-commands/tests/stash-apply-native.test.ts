@@ -42,6 +42,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { findInTheWay } from "../src/commands/worktree-overwrite-checks.js";
 import { Git } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -146,7 +147,7 @@ describeGit("stash apply against native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "stash-native-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("stages the files the stash adds, keeps unrelated edits (without --index)", async () => {
     const dir = join(root, "r");
@@ -258,7 +259,7 @@ describeGit("ignore rules are read fresh, as native git reads them", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "ignore-native-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("a .gitignore changed since an earlier read no longer makes a file expendable", async () => {
     const dir = join(root, "r");
@@ -361,7 +362,7 @@ describeGit("stash apply conflicts as native git leaves them", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "stash-conflicts-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("modify/delete: the stash deletes what HEAD modified, ours stays (UD)", async () => {
     const dir = join(root, "r");
@@ -582,7 +583,7 @@ describeGit("ignore rules read per operation", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "ignore-fresh-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** The stashed file dd, an untracked dd/precious.log, the instance's rules read first. */
   async function staleSetup(dir: string, stash: boolean) {
@@ -754,7 +755,7 @@ describeGit("stash apply file/directory conflicts: unique move-aside names", () 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "stash-moveaside-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** The stash adds p/x; the index has the file p. */
   function oursFileSetup(dir: string) {
@@ -887,7 +888,7 @@ describeGit("stash apply modify/delete with a file/directory collision", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "stash-mddir-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** p committed; the stash modifies it; then p is deleted and p/x added (staged). */
   function setup(dir: string, ignore = false) {
@@ -967,7 +968,7 @@ describeGit("stash apply rename conflicts as git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "stash-renames-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const files = ["a.txt", "c.txt", "d.txt", "c.txt/inner", "c.txt~Updated upstream"];
 
@@ -1047,7 +1048,7 @@ describe("findInTheWay never lets a file replace a tracked directory", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "in-the-way-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("refuses a write at a tracked directory unless its files are removed", async () => {
     const dir = join(root, "r");
@@ -1083,7 +1084,7 @@ describeGit("stash apply follow-ups: gitlinks moved aside, kept edits, wording",
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "stash-followups-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** The stash adds d/x; the index then has a gitlink at d (a nested repository, or none). */
   function gitlinkSetup(dir: string, nested: boolean) {
@@ -1175,7 +1176,7 @@ describeGit("stash apply never pairs empty files as renames (merge-ort)", () => 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "stash-empty-rename-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("an empty file moved upstream and modified in the stash: DU at the old path, as git", async () => {
     const dir = join(root, "r");
@@ -1198,7 +1199,7 @@ describeGit("stash apply --index keeps the cache-tree describing the index it le
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "stash-cache-tree-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** The TREE extension of `dir`'s index as hex, and what verifyCacheTree finds wrong. */
   async function cacheTreeOf(dir: string) {
@@ -1259,7 +1260,7 @@ describeGit("stash apply replacing a directory by a file keeps no clashing entry
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "stash-df-unstage-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   for (const [label, build] of [
     [

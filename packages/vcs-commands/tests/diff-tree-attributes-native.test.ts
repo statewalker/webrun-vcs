@@ -5,13 +5,14 @@
  * diffs against the index (`--cached`) or the worktree read it from the index.
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, unlinkSync } from "node:fs";
+import { mkdtempSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { openOurs, put } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -49,9 +50,9 @@ describeGit("diff drivers' attributes without the index for a diff of trees", ()
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "diff-tree-attrs-"));
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("reads the worktree's attributes alone for two trees, the index's for --cached", async () => {
     const dir = join(root, "repo");

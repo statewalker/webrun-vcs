@@ -9,7 +9,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createDefaultTransports } from "@statewalker/vcs-transport";
@@ -21,6 +21,7 @@ import { openOurs } from "./merge-native-helpers.js";
 import { childDuplex, daemonArgs } from "./native-connect-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -136,9 +137,9 @@ describeGit("fetch negotiators and negotiation tips (native twins)", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "negotiators-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it(`t5552-skipping-fetch-negotiator.sh: "commits with no parents are sent regardless of skip distance"`, async () => {
     const dir = scenario("server", "client");

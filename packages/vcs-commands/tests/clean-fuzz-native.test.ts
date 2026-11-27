@@ -41,6 +41,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { Git } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -651,7 +652,7 @@ describeGit("clean differential fuzz against native git", () => {
     mkdirSync(home);
     mkdirSync(tmpl);
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it(`never removes what git keeps (${ONLY !== undefined ? `seed ${ONLY}` : `seeds ${START}..${START + COUNT - 1}`})`, async () => {
     const seeds = ONLY !== undefined ? [ONLY] : Array.from({ length: COUNT }, (_, i) => START + i);
@@ -842,7 +843,7 @@ describeGit("clean: minimal repros of the differential fuzz (native twins)", () 
     mkdirSync(home);
     mkdirSync(tmpl);
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   for (const [name, repro] of Object.entries(REPROS)) {
     for (const flag of repro.flags) {
@@ -887,7 +888,7 @@ describeGit("ignore rules as git check-ignore (nested negations, directory-only 
     mkdirSync(home);
     mkdirSync(tmpl);
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const layouts: Record<string, Record<string, string>> = {
     "!*/ under *.o": { ".gitignore": "*.o\n", "w/.gitignore": "!*/\n" },
@@ -1105,7 +1106,7 @@ describeGit("clean: review repros A-E (native twins)", () => {
     mkdirSync(home);
     mkdirSync(tmpl);
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   for (const [name, repro] of Object.entries(REPROS2)) {
     for (const [flag, paths] of repro.runs) {
@@ -1171,7 +1172,7 @@ describeGit("ignore rules as git check-ignore (review repros A-C)", () => {
     mkdirSync(home);
     mkdirSync(tmpl);
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const layouts: Record<string, { ignores: Record<string, string>; files: string[] }> = {
     "A: repeated names": {
@@ -1236,7 +1237,7 @@ describeGit("clean -- :(prefix:N) counts bytes, as git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "clean-prefix-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const SPECS = [
     ":(prefix:3)Ä/*",
@@ -1286,7 +1287,7 @@ describeGit("clean -- pathspecs match bytes, as git (cut characters, raw names)"
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "clean-bytes-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const b = (...parts: Array<string | number[] | Buffer>) =>
     Buffer.concat(parts.map((p) => (typeof p === "string" ? Buffer.from(p) : Buffer.from(p))));

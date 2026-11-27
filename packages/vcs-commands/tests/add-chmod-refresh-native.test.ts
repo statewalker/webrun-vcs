@@ -25,6 +25,7 @@ import { AddFailedError } from "../src/errors/index.js";
 import type { Git } from "../src/index.js";
 import { git, gitOk, normalizeState, openOurs, put, snapshot } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 /** The git version whose messages ours reproduces: the one on PATH. */
@@ -134,7 +135,7 @@ describeGit("git add --chmod against native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "add-chmod-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("+x on a tracked file changes the index mode only", async () => {
     const { native, ours } = twins(base);
@@ -200,7 +201,7 @@ describeGit("git add --refresh against native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "add-refresh-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("stores the fresh stat of files that still hold their content, adds nothing", async () => {
     const { native, ours } = twins((dir) => {
@@ -263,7 +264,7 @@ describeGit("git add of paths outside the sparse checkout against native git", (
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "add-sparse-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** k/a in the sparse checkout; s/b and s/c skip-worktree. */
   const sparse = (dir: string) => {
@@ -330,7 +331,7 @@ describeGit("skip-worktree entries present in the worktree against native git", 
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "add-sparse-present-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** k/a in the cone; s/b, s/c and s/t/d skip-worktree (their files removed). */
   const sparse = (dir: string) => {
@@ -485,7 +486,7 @@ describeGit("sparse-checkout patterns as git reads them, against native git", ()
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "add-sparse-patterns-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** k/a committed, a cone sparse checkout of k, then `patterns` as the file. */
   const sparseWith =

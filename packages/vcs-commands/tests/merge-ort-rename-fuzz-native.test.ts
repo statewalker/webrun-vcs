@@ -25,6 +25,7 @@ import { flatTree, storeFlatTreeOver } from "../src/commands/merge-support.js";
 import { ortMergeCounters, ortResultEntries } from "../src/commands/ort-merge.js";
 import { mergeStoredTrees, storedBase } from "../src/commands/ort-recursive.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -497,10 +498,10 @@ describeGit("merge-ort renames fuzz against git merge-tree", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "ort-rename-fuzz-"));
   });
-  afterAll(() => {
+  afterAll(async () => {
     if (process.env.ORT_RENAME_FUZZ_KEEP) console.log("kept", root);
-    else rmSync(root, { recursive: true, force: true });
-  });
+    else await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("rename conflicts with directory renames merge as native merge-tree merges them", async () => {
     const plans = new Map(seeds.map((seed) => [String(seed), randomPlan(seed)]));

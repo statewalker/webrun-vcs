@@ -11,7 +11,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -21,6 +21,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Git, ReplayCommand, ReplayCompatibility } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 function nativeMinor(): number {
   const r = spawnSync("git", ["--version"]);
@@ -280,9 +281,9 @@ git clone -q --bare . bare
 `,
     );
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it('t3650-replay-basics.sh: "argument to --advance must be a reference"', async () => {
     const oid = git(base, ["rev-parse", "main"]).stdout.trim();

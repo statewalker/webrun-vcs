@@ -31,6 +31,7 @@ import {
   REFLOG_EXPIRY_DEFAULTS,
 } from "./gc-native-twins-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -81,7 +82,7 @@ describeGit("gc beside native git (t6500-gc, t5304-prune, t6501-freshen-objects)
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "gc-concurrency-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** A history, a deleted branch, an old unreachable loose blob `revived` later. */
   function scenario(name: string) {

@@ -5,7 +5,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -20,6 +20,7 @@ import {
   serializeTree,
   type TreeEntry,
 } from "../../../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../../temp-dir-support.js";
 
 const BLOB = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
 const TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -100,7 +101,7 @@ describeGit("tree ids in any input order match git mktree", () => {
     root = mkdtempSync(join(tmpdir(), "tree-order-"));
     execFileSync("git", ["init", "-q", root], { env });
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   function mktree(entries: TreeEntry[]): string {
     const input = entries

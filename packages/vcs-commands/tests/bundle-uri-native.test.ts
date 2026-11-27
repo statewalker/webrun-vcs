@@ -14,7 +14,6 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
 import { createServer, type Server } from "node:http";
@@ -48,6 +47,7 @@ import { openOurs } from "./merge-native-helpers.js";
 import { gitAsync, startTcpServer } from "./native-connect-support.js";
 import { nativeGitAvailable, nativeGitHttpBackend } from "./native-git-http-backend.js";
 import { testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -240,9 +240,9 @@ git bundle create -q ALL.bundle --all
     );
   });
 
-  afterAll(() => {
-    rmSync(home, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(home);
+  }, CLEANUP_TIMEOUT);
 
   it('t5558-clone-bundle-uri.sh: "fail to clone from non-existent file"', async () => {
     const t = await cloneTwins(from, join(home, "does-not-exist"));

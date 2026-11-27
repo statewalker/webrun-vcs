@@ -20,11 +20,12 @@ import {
 } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import { createGitFilesBackend, FileGcStrategy, gc, repack } from "../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 
 const home = mkdtempSync(join(tmpdir(), "gc-roots-home-"));
 dirs.push(home);

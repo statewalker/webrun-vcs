@@ -37,6 +37,7 @@ import {
 } from "../src/index.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, openRepo, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -336,7 +337,7 @@ describeGit("error exit codes: as native git", () => {
     template = join(root, "template");
     base(template);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   for (const row of ROWS) {
     it(row.name, async () => {

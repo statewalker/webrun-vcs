@@ -8,7 +8,7 @@
  * users only by default, `http.uploadpack`, `http.getanyfile`) refuse as it refuses; hidden
  * refs and refusals reach the client as native git reports them.
  */
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -42,6 +42,7 @@ import {
   noMaintenance,
 } from "./native-git-http-backend.js";
 import { gitOut, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -213,7 +214,7 @@ describeGit("served smart HTTP: receive hooks as git http-backend runs them", ()
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "http-served-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("pre-receive, update, post-receive, post-update and reference-transaction", async () => {
     const dir = join(root, "r");
@@ -271,7 +272,7 @@ describeGit("served smart HTTP: http-backend's service rules", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "http-served-rules-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("receive-pack: refused to anonymous users unless http.receivepack, served with REMOTE_USER", async () => {
     const dir = join(root, "r");
@@ -349,7 +350,7 @@ describeGit("local push: the quarantine path given to pre-receive (as native git
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "quarantine-local-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("a pre-receive running native git reads the quarantined objects of a local push", async () => {
     const dir = join(root, "r");
@@ -385,7 +386,7 @@ describeGit("served smart HTTP: the client's variables, decoded paths, missing d
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "http-served-client-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("REMOTE_USER reaches every receive hook; the committer is the user where none is set", async () => {
     const dir = join(root, "r");
@@ -478,7 +479,7 @@ describeGit("served smart HTTP: configured receive hooks (as git http-backend ru
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "http-served-config-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const logCommand = (name: string, code = 0) =>
     `f() { { printf '== cfg-${name}'; printf ' [%s]' "$@"; printf ' GIT_DIR=%s pwd=%s\\n' "$GIT_DIR" "$(pwd)"; input=$(cat); if [ -n "$input" ]; then printf 'stdin:\\n%s\\n' "$input"; fi; } >> "$HOOK_LOG"; echo hook cfg-${name} out; return ${code}; }; f`;
@@ -509,7 +510,7 @@ describeGit("served smart HTTP: a broken hook configuration (as git http-backend
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "http-served-broken-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("hook.x.event without a command: the push fails, no ref moves", async () => {
     const dir = join(root, "r");
@@ -528,7 +529,7 @@ describeGit("served smart HTTP: the alternates a quarantined pre-receive is give
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "http-served-alternates-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("GIT_ALTERNATE_OBJECT_DIRECTORIES of the server, the repository's objects appended", async () => {
     const dir = join(root, "r");
