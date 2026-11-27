@@ -7,7 +7,7 @@
  * process). Only JGit's inputs are taken; native git decides the timestamp.
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,6 +15,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { approxidateCareful } from "../src/commands/git-date.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -47,11 +48,11 @@ describeGit("JGit GitDateParserTest against native git approxidate", () => {
     root = mkdtempSync(join(tmpdir(), "jgit-date-"));
     execFileSync("git", ["init", "-q", root], { env: nativeGitEnv(root) });
   });
-  afterAll(() => {
+  afterAll(async () => {
     if (savedTz === undefined) delete process.env.TZ;
     else process.env.TZ = savedTz;
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   for (const [method, texts] of CASES) {
     it(`JGit GitDateParserTest#${method}`, () => {
