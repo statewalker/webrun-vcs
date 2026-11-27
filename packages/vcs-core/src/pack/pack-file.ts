@@ -18,9 +18,13 @@
  *    loaded awaits nothing;
  *  - a larger entry ends where the next one starts in pack order (git's reverse index, built
  *    lazily); it is read with two ranged reads: its header, then exactly its data;
- *  - a declared size above `maxObjectSize`, or above what zlib can expand the entry's compressed
- *    bytes to (~1032:1; checked for entries read with their extent, small ones being at most
- *    64 KiB), is refused before anything is allocated;
+ *  - a declared size above what zlib can expand the entry's compressed bytes to (~1032:1;
+ *    checked for entries read with their extent, small ones being at most 64 KiB) is refused
+ *    before anything is allocated, and so is a size above `maxObjectSize` for whatever must be
+ *    held in memory: a delta's instructions, a delta's result, a commit, tree or tag (read whole
+ *    by their readers) and a blob read as the base of a delta. A whole blob read on its own is
+ *    never held (above 1 MiB it streams, as git's `open_istream` streams a blob above
+ *    core.bigFileThreshold), so it may be of any size;
  *  - a whole object of at most 1 MiB read in one piece is inflated in one pass straight into its
  *    result and handed out whole (`GitObject.bytes`); larger ones stream from the inflater;
  *  - delta chains are walked down (iteratively) to a whole object or a cached one, then patched
@@ -141,7 +145,11 @@ export interface OpenPackOptions {
   baseCacheBytes?: number;
   /** A cache shared with other packs (a pack set's); `baseCacheBytes` is then ignored. */
   baseCache?: DeltaBaseCache;
-  /** Largest object accepted, by its header and by delta results. Default 1 GiB. */
+  /**
+   * Largest object held in memory: a delta's instructions, a delta's result, a commit, tree or
+   * tag, a blob read as a delta's base. A whole blob read on its own streams and is not limited.
+   * Default 1 GiB.
+   */
   maxObjectSize?: number;
   /** Resolves REF_DELTA bases outside the pack (another pack, a loose object). */
   externalBase?: PackExternalBase;
@@ -266,6 +274,7 @@ export interface PackFile extends Pack {
 }
 
 const TYPES: (ObjectTypeString | undefined)[] = [undefined, "commit", "tree", "blob", "tag"];
+const BLOB = 3;
 const OFS_DELTA = 6;
 const REF_DELTA = 7;
 const IDX_MAGIC = 0xff744f63;
@@ -1213,6 +1222,10 @@ export async function openPack(
     return bytes.subarray(start - from, start + length - from);
   };
 
+  const overLimit = (offset: number, size: number) =>
+    new PackError(
+      `${packPath}: entry at ${offset} declares ${size} bytes, over the limit of ${maxObjectSize}`,
+    );
   const headTruncated = (offset: number) =>
     new PackError(`${packPath}: entry header at ${offset} truncated`);
   /** Parses the entry header at `offset` from `h`, the pack's bytes from `offset` on. */
@@ -1232,11 +1245,10 @@ export async function openPack(
       mul *= 128;
       if (mul > 2 ** 53) throw new PackError(`${packPath}: entry size at ${offset} overflows`);
     }
-    if (size > maxObjectSize) {
-      throw new PackError(
-        `${packPath}: entry at ${offset} declares ${size} bytes, over the limit of ${maxObjectSize}`,
-      );
-    }
+    // what is read whole is held in memory: a delta's instructions, a commit, tree or tag; a
+    // whole blob is checked where it would be held (`overLimit`): read on its own it streams,
+    // whatever its size
+    if (size > maxObjectSize && kind !== BLOB) throw overLimit(offset, size);
     // one shape for every entry (the delta fields are set below when present)
     const e: EntryHead = {
       offset,
@@ -1593,7 +1605,8 @@ export async function openPack(
       const e = l.e;
       const type = TYPES[e.kind];
       if (type) {
-        // a base below a delta: cached (`chain` holds at least the delta asked for)
+        // a base below a delta: cached (`chain` holds at least the delta asked for), so held
+        if (e.size > maxObjectSize) throw overLimit(e.offset, e.size);
         const data =
           l.data && inflateLoaded(l as LoadedEntry & { data: Uint8Array }, cache.alloc(e.size));
         if (data) {

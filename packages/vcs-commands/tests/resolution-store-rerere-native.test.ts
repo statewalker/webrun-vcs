@@ -6,7 +6,7 @@
  * store replays what native git recorded as `git rerere` replays it.
  */
 
-import { mkdirSync, mkdtempSync, rmSync, utimesSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -158,6 +158,61 @@ describeGit("the resolution store records and replays as git's rerere (t4200-rer
     expect(await store.recordResolution("f2")).toBe(id);
     expect(records(t.ours)).toEqual(records(t.native));
     expect(records(t.ours)[`rr-cache/${id}/postimage.1`]).toBe("c\nR2\nd\n");
+  });
+
+  it('t4200-rerere.sh: "multiple identical conflicts": a different variant replaces the one `MERGE_RR` names', async () => {
+    // f1, f2 and g conflict with the same sides: one id; f1 and f2 are recorded as variants 0
+    // and 1, g's other context (adjacent to the hunk) replays neither and waits as variant 2
+    const n = counter++;
+    const t = { native: join(root, `native-${n}`), ours: join(root, `ours-${n}`) };
+    const files = { f1: ["a", "b"], f2: ["c", "d"], g: ["z", "w"] } as const;
+    for (const dir of [t.native, t.ours]) {
+      mkdirSync(dir, { recursive: true });
+      const run = (...args: string[]) => gitOk(root, dir, ...args);
+      const sides = (side: string) => {
+        for (const [file, [before, after]] of Object.entries(files)) {
+          put(dir, file, `${before}\n${side}\n${after}\n`);
+        }
+      };
+      run("init", "-q", "-b", "main");
+      run("config", "rerere.enabled", "true");
+      sides("X");
+      run("add", ".");
+      run("commit", "-q", "-m", "base");
+      run("checkout", "-q", "-b", "side");
+      sides("T");
+      run("commit", "-q", "-a", "-m", "theirs");
+      run("checkout", "-q", "main");
+      sides("O");
+      run("commit", "-q", "-a", "-m", "ours");
+      git(root, dir, "-c", "rerere.enabled=false", "merge", "side");
+      run("rerere");
+      put(dir, "f1", "a\nR1\nb\n");
+      put(dir, "f2", "c\nR2\nd\n");
+      expect(git(root, dir, "rerere").stderr).toContain("Recorded preimage for 'g'");
+      expect(rerereState(dir).MERGE_RR).toMatch(/^[0-9a-f]{40}\.2\tg\0$/);
+      // the user edits g's context: variant 1 now replays cleanly
+      const conflict = readFileSync(join(dir, "g"), "utf8");
+      put(dir, "g", conflict.replace(/^z$/m, "c").replace(/^w$/m, "d"));
+    }
+    expect(git(root, t.native, "rerere").stderr).toContain(
+      "Resolved 'g' using previous resolution.",
+    );
+    const store = await storeOf(t.ours);
+    expect(await store.applyRecordedResolution("g")).toBe(true);
+    expect(readFileSync(join(t.ours, "g"), "utf8")).toBe("c\nR2\nd\n");
+    expect(readFileSync(join(t.ours, "g"), "utf8")).toBe(readFileSync(join(t.native, "g"), "utf8"));
+    // variant 2's preimage removed, g dropped from MERGE_RR; native leaves thisimages behind
+    const state = (dir: string) => {
+      const { MERGE_RR, ...rest } = rerereState(dir);
+      return {
+        MERGE_RR: MERGE_RR ?? "",
+        ...Object.fromEntries(Object.entries(rest).filter(([k]) => !k.includes("thisimage"))),
+      };
+    };
+    expect(state(t.ours)).toEqual(state(t.native));
+    expect(Object.keys(state(t.ours)).filter((k) => k.endsWith(".2"))).toEqual([]);
+    expect(state(t.ours).MERGE_RR).toBe("");
   });
 
   it('t4200-rerere.sh: "rerere.enabled works, too": a conflict git would replay records nothing', async () => {
