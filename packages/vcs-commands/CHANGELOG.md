@@ -1,5 +1,56 @@
 # @statewalker/vcs-commands
 
+## 0.14.0
+
+### Minor Changes
+
+- 4abd851: Promisor remotes follow git 2.56's `promisor.acceptFromServerUrl` (advertised remotes whose URL an allowlist glob matches are accepted and created as `promisor-auto-*` or named remotes with `advertisedAs`) and git 2.54's `clone`/`fetch --filter=auto` (the accepted remotes' advertised filter, recorded as `auto`). Clone writes `remote.<name>.url` before it lists the refs, as git does; lazy fetches answer the server's `promisor-remote` capability and clone reports their lines; a local remote reached through a symbolic link opens the repository the link leads to.
+- 61e5a77: upload-archive streams the archive instead of holding it (#413). `UploadArchiveWriter` is now `(args, sink) => Promise<number>`: it writes stdout and stderr to an `UploadArchiveSink` as it goes, and `serveUploadArchive` sends each chunk on as side-band packets of at most 16 KiB, stderr interleaved in call order, waiting for the stream before the writer goes on (`UploadArchiveOutput` is gone). `runArchiveWriter(workingCopy, args, sink, options)` writes `ArchiveCommand.callStream()`'s chunks and returns the exit status. On the client side, `requestRemoteArchive`'s `output` option and `RemoteArchiveCommand.setOutput` hand the archive on chunk by chunk instead of collecting it. `ArchiveCommand.getMessages(from)` returns the messages from an index on, and `createDuplexPair({ highWaterMark })` gives a bounded in-memory pair.
+
+### Patch Changes
+
+- 62a726b: Bundle URIs: under `fetch.fsckObjects`/`transfer.fsckObjects` an unbundled pack is checked in a quarantine as git 2.46+'s `VERIFY_BUNDLE_FSCK` does (fsck's lines, no `refs/bundles/` ref, the clone goes on), and a clone reopened in the remote's object format (`GIT_DEFAULT_HASH=sha256` against a SHA-1 remote) applies `--bundle-uri` again, read in that format (git 2.43 read it in the destination's first hash).
+- 50e56dd: check-ignore: read each path as git's `parse_pathspec` does, with every magic but `:/` refused. `:]` is the path `]`, `:/x` is `x` from the top, `:!x`, `:(glob)x` and the other magic die with git's "pathspec magic not supported by this command" line, and an empty path dies ("empty string is not a valid pathspec") before any output for arguments, after the earlier records' output for `--stdin`. Every argument is checked before the first line is printed, as git parses them all first.
+- 572d699: `git commit --amend` that would make the commit empty (its tree its first parent's, without `--allow-empty`) now refuses as git does: `EmptyCommitError` carries git's `empty_amend_advice` as its message and `stderr` ("You asked to amend the most recent commit, but doing so would make it empty..."), exit status 1, nothing written. Every nothing-to-commit refusal also carries the status git prints on stdout (`EmptyCommitError.stdout`, `git commit --dry-run`'s text). `EMPTY_AMEND_ADVICE` is exported. (#259)
+- aafe7f9: fetch: commit an empty ref transaction when there is nothing to update, as git does. The reference-transaction hook hears `preparing`, `prepared`, `committed` with no ref lines. git 2.5x does this on every fetch, a dry run included; git 2.43 only with `--atomic`. New `emptyTransaction` option on `fetchFromConnection` and `applyRefUpdates`.
+- 57efd2e: `git fetch <url>` from an empty remote, or one whose HEAD is unborn, dies with git's `fatal: couldn't find remote ref HEAD` (exit 128), as does any exact refspec source such a remote lacks; wildcards and configured refspecs still go through. A clone of a repository whose HEAD is unborn but which has refs now succeeds with git's configuration (`branch.<b>.*`; no fetch refspec for `--single-branch`). (#280)
+- 66c658b: `.git` spellings: read names as git's `is_hfs_dot_generic` does, where a byte outside valid UTF-8 ends the name, so `.git` followed by a truncated UTF-8 sequence is `.git` (checkout refuses it under `core.protectHFS`, fsck reports `hasDotgit`). fsck now decodes tree entry names with git's byte escapes instead of U+FFFD.
+- 5a43830: `git init` and `git clone` read `init.defaultBranch` and `advice.defaultBranchName` as git's `repo_default_branch_name` does once the new repository exists: from its whole configuration (system, global, its own config with what a template brought in, the command line), with `includeIf "gitdir:..."` / `"gitdir/i:..."` conditions matched against the new repository's git directory. A per-directory include (`[includeIf "gitdir:~/work/"]` setting `init.defaultBranch = trunk`) now names the initial branch, and clone's guess of a remote HEAD without symref prefers that branch. `defaultInitialBranch` takes the new repository's configuration (`NewRepositoryConfig`). (#224)
+- 6ee16b0: A partial clone's lazy fetch now asks the credential helper. A transport command given `setCredentialHelper` (and `setWarningCallback`) hands them to the promisor fetcher it installs for its call, and `installPromisorFetcher`/`createPromisorFetcher` take `credentialHelper` and `warningCallback`, as git's child `git fetch --filter=blob:none --stdin` reads `credential.helper` (statewalker/webrun-vcs#401).
+- a5fe861: `git merge` of an annotated tag writes the tag object's id to MERGE_HEAD, as git's `write_merge_heads` does, when the merge stops (`--no-commit`, conflicts, refused hooks); `commit` and `merge --continue` peel MERGE_HEAD's lines to commits, as `read_merge_heads` does (statewalker/webrun-vcs#272).
+- e7bd6b4: `push --signed` with `gpg.format=ssh` and no `user.signingKey` now takes the pusher from `gpg.ssh.defaultKeyCommand` as git's `get_signing_key_id` does: the command is run through the hook runner in the worktree top and the pusher is the fingerprint of the first key it prints (a command that gives no key prints git's warning and fails with git's crash status, 139). A relative `user.signingKey` is read from the worktree top, `~/` is not expanded (git passes the key to `ssh-keygen -lf` as configured, and dies `failed to get the ssh fingerprint for key '~/...': Success`), and under 2.43 compatibility the pusher keeps the space git 2.43 to 2.51 leave after the fingerprint. `signingKeyIdOf` takes `SigningKeyIdOptions` (`host`, `compatibility`). (#415)
+- 34b4e5b: Loose objects and pack-family files (`.pack`, `.idx`, `.rev`, `.bitmap`, `.mtimes`, a multi-pack-index's bitmap and reverse index, incremental midx layers, commit-graphs) are now written 0444 under the umask in repositories that are not shared, as git writes them. The plain `multi-pack-index` and `multi-pack-index-chain` stay under the umask, as git's lock files leave them. `createGitFilesBackend` and the commands' repository FilesApi (repack, gc, maintenance) wrap their FilesApi with the new `withReadOnlyObjectFiles` (`isReadOnlyObjectPath`). Commit-graphs respect the umask (0400 under umask 077, as git). The Node FilesApi's `chmod` is synchronous now (one per loose object written). FilesApis without modes (memory, browser) are unchanged.
+- 4f3c613: `read-tree -m` (one-way and two-way) and `reset --mixed` of a crafted tree holding a link and a directory of one name keep only the directory's files in the index, as git's `add_index_entry` with `OK_TO_REPLACE` does: `Staging.readTree` of every store drops a file a directory of its name replaces, and read-tree's two-way merge reads its trees the same way (`flatTree(..., { asIndex: true })`). The index never holds a file/directory clash (webrun-vcs#247).
+- 7fb9e45: Ref filter: `--points-at` stops on a tag cycle made through replace refs instead of looping forever. It now peels with the same bound (`MAX_REF_FILTER_PEEL_DEPTH`) that `--contains`/`--merged` and `%(*atom)` already use, and counts such a tag as not matching (#263).
+- 8e8b6ee: check-attr, check-ignore: a `--stdin` line C-quoted with `\000` ends the path at the NUL, as git reads the unquoted strbuf as a C string (`"\000"` is the empty path, `"a\000b"` is `a`).
+- d8b179e: Protocol v2 upload-pack acknowledges haves as git 2.45+ does: a have whose child (or a copy of it) came earlier in the request gets no ACK (`do_got_oid`'s `THEY_HAVE`). The new `acknowledgeEveryHave` server setting keeps git 2.43's behaviour, and `servedRepositoryOf` sets it under 2.43 compatibility.
+- Updated dependencies [6e40444]
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies [c79e1ee]
+- Updated dependencies [b331c80]
+- Updated dependencies [dc9561d]
+- Updated dependencies [aafe7f9]
+- Updated dependencies [57efd2e]
+- Updated dependencies [49d5a5d]
+- Updated dependencies [66c658b]
+- Updated dependencies [4abd851]
+- Updated dependencies [34b4e5b]
+- Updated dependencies [4f3c613]
+- Updated dependencies [e953a8d]
+- Updated dependencies [e11042a]
+- Updated dependencies [74d81a7]
+- Updated dependencies [61e5a77]
+- Updated dependencies [d8b179e]
+- Updated dependencies [cbf125e]
+  - @statewalker/vcs-utils@0.11.1
+  - @statewalker/vcs-store-files@0.13.0
+  - @statewalker/vcs-store-mem@0.13.0
+  - @statewalker/vcs-working-tree@0.13.0
+  - @statewalker/vcs-core@0.13.0
+  - @statewalker/vcs-transport@0.14.0
+
 ## 0.13.0
 
 ### Minor Changes

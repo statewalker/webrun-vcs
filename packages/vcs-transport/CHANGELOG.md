@@ -1,5 +1,31 @@
 # @statewalker/vcs-transport
 
+## 0.14.0
+
+### Minor Changes
+
+- 4abd851: Promisor remotes follow git 2.56's `promisor.acceptFromServerUrl` (advertised remotes whose URL an allowlist glob matches are accepted and created as `promisor-auto-*` or named remotes with `advertisedAs`) and git 2.54's `clone`/`fetch --filter=auto` (the accepted remotes' advertised filter, recorded as `auto`). Clone writes `remote.<name>.url` before it lists the refs, as git does; lazy fetches answer the server's `promisor-remote` capability and clone reports their lines; a local remote reached through a symbolic link opens the repository the link leads to.
+- 61e5a77: upload-archive streams the archive instead of holding it (#413). `UploadArchiveWriter` is now `(args, sink) => Promise<number>`: it writes stdout and stderr to an `UploadArchiveSink` as it goes, and `serveUploadArchive` sends each chunk on as side-band packets of at most 16 KiB, stderr interleaved in call order, waiting for the stream before the writer goes on (`UploadArchiveOutput` is gone). `runArchiveWriter(workingCopy, args, sink, options)` writes `ArchiveCommand.callStream()`'s chunks and returns the exit status. On the client side, `requestRemoteArchive`'s `output` option and `RemoteArchiveCommand.setOutput` hand the archive on chunk by chunk instead of collecting it. `ArchiveCommand.getMessages(from)` returns the messages from an index on, and `createDuplexPair({ highWaterMark })` gives a bounded in-memory pair.
+
+### Patch Changes
+
+- b331c80: A clone of a shallow repository writes `.git/shallow` as native git does: the server's shallow commits in the order sent, a commit sent twice (a branch and an annotated tag reaching it, over protocol v2) on two lines (`Refs.setShallow`'s new `verbatim` option). Fetch and clone send their wants in the order the remote listed the refs (HEAD first for a clone), as fetch-pack's `filter_refs` does, so a shallow server's answer follows git's order too. Reading a shallow file merges duplicate lines. (#326)
+- dc9561d: `git fetch --atomic` now writes its refs as git does. The updated refs are written loose, and packed-refs is rewritten only to drop the refs `--prune` deletes. Before, a batch of several refs went through packed-refs. The files store's `BatchOptions.loose` now also covers a batch that deletes refs, following git's `files_transaction_finish`: every lock is taken and every check made before the first rename, the updates are renamed into place, then the deletions go (#284).
+- aafe7f9: fetch: commit an empty ref transaction when there is nothing to update, as git does. The reference-transaction hook hears `preparing`, `prepared`, `committed` with no ref lines. git 2.5x does this on every fetch, a dry run included; git 2.43 only with `--atomic`. New `emptyTransaction` option on `fetchFromConnection` and `applyRefUpdates`.
+- 57efd2e: `git fetch <url>` from an empty remote, or one whose HEAD is unborn, dies with git's `fatal: couldn't find remote ref HEAD` (exit 128), as does any exact refspec source such a remote lacks; wildcards and configured refspecs still go through. A clone of a repository whose HEAD is unborn but which has refs now succeeds with git's configuration (`branch.<b>.*`; no fetch refspec for `--single-branch`). (#280)
+- 74d81a7: The published tarballs no longer ship test code: vcs-core left out `src/__tests__/` (fixtures, setup and test utilities) and vcs-transport `src/tests/unit/*.test.ts`. Every published package's `files` now excludes test directories and `*.test.*`/`*.spec.*` files, and `scripts/check-pack-contents.mjs` (run by `lint:check`) fails a package whose `pnpm pack` would ship them or miss a file its manifest names (#342).
+- d8b179e: Protocol v2 upload-pack acknowledges haves as git 2.45+ does: a have whose child (or a copy of it) came earlier in the request gets no ACK (`do_got_oid`'s `THEY_HAVE`). The new `acknowledgeEveryHave` server setting keeps git 2.43's behaviour, and `servedRepositoryOf` sets it under 2.43 compatibility.
+- cbf125e: upload-pack (protocol v2) reads a request as git's serve.c and process_args do: a capability line the server does not advertise, or that names no client capability (`session-id=` without `transfer.advertiseSID`, a command name), ends the request as git's "unknown capability" death; a `filter` line without `uploadpack.allowFilter` dies as an unexpected line with no `ERR` packet; and `want`/`want-ref` refusals follow request order, so the first bad line is the one reported.
+- Updated dependencies [6e40444]
+- Updated dependencies [b331c80]
+- Updated dependencies [dc9561d]
+- Updated dependencies [66c658b]
+- Updated dependencies [34b4e5b]
+- Updated dependencies [e11042a]
+- Updated dependencies [74d81a7]
+  - @statewalker/vcs-utils@0.11.1
+  - @statewalker/vcs-core@0.13.0
+
 ## 0.13.0
 
 ### Minor Changes

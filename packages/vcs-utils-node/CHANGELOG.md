@@ -1,5 +1,14 @@
 # @statewalker/vcs-utils-node
 
+## 0.12.1
+
+### Patch Changes
+
+- 34b4e5b: Loose objects and pack-family files (`.pack`, `.idx`, `.rev`, `.bitmap`, `.mtimes`, a multi-pack-index's bitmap and reverse index, incremental midx layers, commit-graphs) are now written 0444 under the umask in repositories that are not shared, as git writes them. The plain `multi-pack-index` and `multi-pack-index-chain` stay under the umask, as git's lock files leave them. `createGitFilesBackend` and the commands' repository FilesApi (repack, gc, maintenance) wrap their FilesApi with the new `withReadOnlyObjectFiles` (`isReadOnlyObjectPath`). Commit-graphs respect the umask (0400 under umask 077, as git). The Node FilesApi's `chmod` is synchronous now (one per loose object written). FilesApis without modes (memory, browser) are unchanged.
+- Updated dependencies [6e40444]
+- Updated dependencies [34b4e5b]
+  - @statewalker/vcs-utils@0.11.1
+
 ## 0.12.0
 
 ### Minor Changes
