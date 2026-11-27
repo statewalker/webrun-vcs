@@ -15,6 +15,7 @@ import {
   isNtfsGitWorktreeFile,
   isValidRefName,
 } from "@statewalker/vcs-core";
+import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 
 import type { FsckMessageTypes, FsckMsgId } from "./fsck-msg-ids.js";
@@ -648,7 +649,8 @@ export function fsckTree(
     }
     if (!plain) {
       const entryId = () => bytesToHex(buf.subarray(idAt, idAt + raw));
-      const text = dec.decode(buf.subarray(start, end));
+      // git's bytes: a byte outside valid UTF-8 kept as an escape (is_hfs_dotgit reads it)
+      const text = decodeGitPath(buf.subarray(start, end));
       hasDot ||= text === ".";
       hasDotdot ||= text === "..";
       hasDotgit ||= isDotGitComponent(text);
