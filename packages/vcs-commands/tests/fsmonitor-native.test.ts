@@ -979,7 +979,7 @@ describeGit("fsmonitor against native git (t7519-status-fsmonitor.sh)", () => {
      */
     const mvTwins = (
       args: string[],
-      ours: (mv: ReturnType<Awaited<ReturnType<typeof openOurs>>["mv"]>) => unknown,
+      ours: (mv: ReturnType<Awaited<ReturnType<typeof openOurs>>["mv"]>) => Promise<unknown>,
       moved: [from: string, to: string][],
       beforeOurs?: () => void,
     ) => {
