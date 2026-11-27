@@ -18,6 +18,7 @@ import {
   type WorktreeEntry,
 } from "@statewalker/vcs-working-tree";
 import {
+  EMPTY_AMEND_ADVICE,
   EmptyCommitError,
   GitApiError,
   HookFailedError,
@@ -1077,7 +1078,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
     template = await this.withTrailers(template, state, comment);
     const isMerge = (ctx.previousCommit?.parents.length ?? 0) > 1;
     if (!committable && whence !== "merge" && !this.allowEmpty && !(this.amend && isMerge)) {
-      throw new EmptyCommitError();
+      throw await this.emptyCommitError(ctx.partialTree, whence);
     }
     // prepare-commit-msg, the editor over what it left, then commit-msg
     let text = "";
@@ -2148,7 +2149,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
       await state.write("COMMIT_EDITMSG", sb);
       // amend_file_with_trailers over COMMIT_EDITMSG
       sb = await this.withTrailers(sb, state, undefined);
-      await this.refuseNothingToCommit(treeId, parents, mergeHeads, previousCommit);
+      await this.refuseNothingToCommit(treeId, parents, mergeHeads, previousCommit, partialTree);
       // prepare-commit-msg and commit-msg, which may rewrite COMMIT_EDITMSG: the commit
       // takes the file's text (cmd_commit reads it back)
       // (git's hook arguments: read only when hooks can run)
@@ -2219,18 +2220,47 @@ export class CommitCommand extends GitCommand<CommitResult> {
     parents: ObjectId[],
     mergeHeads: ObjectId[],
     previousCommit: Commit | undefined,
+    partialTree: ObjectId | undefined,
   ): Promise<void> {
     if (this.allowEmpty || mergeHeads.length > 0) return;
     if (parents.length === 0) {
       // no first parent (an initial commit, or --amend of a root commit): git counts the
       // index, `cache_nr - ita_nr > 0`; only intent-to-add entries (or none) leave the tree
       // empty
-      if (treeId === this.objectFormat.emptyTreeId) throw new EmptyCommitError();
+      if (treeId === this.objectFormat.emptyTreeId) throw await this.emptyCommitError(partialTree);
       return;
     }
     if (this.amend && (previousCommit?.parents.length ?? 0) > 1) return;
     const parentCommit = await this.commits.load(parents[0] as ObjectId);
-    if (parentCommit && parentCommit.tree === treeId) throw new EmptyCommitError();
+    if (parentCommit && parentCommit.tree === treeId) {
+      throw await this.emptyCommitError(partialTree);
+    }
+  }
+
+  /**
+   * prepare_to_commit's refusal of an empty commit: run_status on stdout (the status of the
+   * index the commit would record, against HEAD^1 when amending: `git commit --dry-run`'s
+   * text), then `empty_amend_advice` on stderr when amending; exit status 1, nothing written.
+   */
+  private async emptyCommitError(
+    partialTree: ObjectId | undefined,
+    whence?: CommitWhence,
+  ): Promise<EmptyCommitError> {
+    const run = () =>
+      this.commitStatus({
+        format: "long",
+        ...(this.showBranch !== undefined ? { branch: this.showBranch } : {}),
+        ...(this.aheadBehind !== undefined ? { aheadBehind: this.aheadBehind } : {}),
+        verbose: this.verboseLevel(),
+        commitTemplate: true,
+        amend: this.amend,
+        ...(whence ? { whence } : {}),
+      });
+    const status = partialTree ? await this.withIndexOfTree(partialTree, run) : await run();
+    return new EmptyCommitError(undefined, {
+      stdout: status.text,
+      stderr: this.amend ? EMPTY_AMEND_ADVICE : "",
+    });
   }
 
   /** The commit of `treeId` made, HEAD moved to it, and what was in progress ended. */

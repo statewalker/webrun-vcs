@@ -13,14 +13,36 @@ export class NoMessageError extends GitApiError {
 }
 
 /**
+ * builtin/commit.c's `empty_amend_advice`: what `git commit --amend` prints on stderr when
+ * the amended commit would have its first parent's tree (the same text in 2.43 and 2.5x).
+ */
+export const EMPTY_AMEND_ADVICE =
+  "You asked to amend the most recent commit, but doing so would make\n" +
+  "it empty. You can repeat your command with --allow-empty, or you can\n" +
+  'remove the commit entirely with "git reset HEAD^".\n';
+
+/**
  * Thrown when trying to create an empty commit without allow-empty.
+ *
+ * git's prepare_to_commit refuses it with exit status 1, printing the status of what would
+ * be committed on stdout ({@link stdout}, `git commit --dry-run`'s text) and, when amending,
+ * {@link EMPTY_AMEND_ADVICE} on stderr ({@link stderr}, also the message then).
  *
  * Based on JGit's EmptyCommitException.
  */
 export class EmptyCommitError extends GitApiError {
-  constructor(message?: string) {
-    super(message ?? "Nothing to commit", { exitCode: 1 });
+  /** git's stdout: the status run_status prints before the refusal (when computed) */
+  readonly stdout?: string;
+  /** git's stderr: the amend advice, or nothing */
+  readonly stderr: string;
+
+  constructor(message?: string, output?: { stdout?: string; stderr?: string }) {
+    super(message ?? (output?.stderr ? output.stderr.replace(/\n$/, "") : "Nothing to commit"), {
+      exitCode: 1,
+    });
     this.name = "EmptyCommitError";
+    this.stdout = output?.stdout;
+    this.stderr = output?.stderr ?? "";
   }
 }
 
