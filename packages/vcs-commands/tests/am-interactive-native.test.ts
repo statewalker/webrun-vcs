@@ -6,7 +6,7 @@
  * `--resolved`. Inputs from git's t/t4257-am-interactive.sh.
  */
 
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -26,6 +26,7 @@ import {
 } from "./interactive-extras-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitAtLeast } from "./native-git-working-copy.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -114,7 +115,7 @@ describeGit("am -i as native git", () => {
     mbox = join(root, "mbox");
     put(root, "mbox", gitOk(root, src, ["format-patch", "--stdout", "-2"]));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const withMbox = (c: AmCommand) => c.addMbox(readFileSync(mbox), mbox);
 

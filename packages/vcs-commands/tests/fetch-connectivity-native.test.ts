@@ -33,6 +33,7 @@ import { openOurs } from "./merge-native-helpers.js";
 import { gitAsync } from "./native-connect-support.js";
 import { nativeGitAvailable, nativeGitHttpBackend } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -183,8 +184,8 @@ describeGit("connectivity and fsck checks after fetch and clone, as native git",
 
   afterAll(async () => {
     await server?.close();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** A native and an our repository, both with `origin` at `remoteUrl` and `main` at c1. */
   async function fetchTwins(remoteUrl: string, start?: string) {

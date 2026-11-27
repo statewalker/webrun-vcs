@@ -34,6 +34,7 @@ import {
   nativeGitEnv,
   nativeGitHttpBackend,
 } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -188,7 +189,7 @@ describeGit("attributes and line endings against native git", () => {
     home = join(root, "home");
     mkdirSync(home);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("git add: blobs, ls-files --eol and warnings for every attributes x config x content", async () => {
     let n = 0;
@@ -311,7 +312,7 @@ describeGit("attributes and line endings: scenarios against native git", () => {
     home = join(root, "home");
     mkdirSync(home);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("CRLF already in the index stays under text=auto; status is clean; --renormalize converts", async () => {
     const { native, ours } = twins("crlf-index", (dir) => {

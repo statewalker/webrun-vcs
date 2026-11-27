@@ -9,7 +9,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -18,6 +18,7 @@ import type { DiffCommand, Git } from "../src/index.js";
 import { type HookTwin, hookTwins, nativeIn, oursIn } from "./hooks-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() ? describe : describe.skip;
 
@@ -107,7 +108,7 @@ describeGit("external diff twins (t4020-diff-external.sh)", () => {
     writeFileSync(record, RECORD);
     chmodSync(record, 0o755);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t4020-diff-external.sh: "GIT_EXTERNAL_DIFF environment"', async () => {
     const twins = setup("env");
@@ -403,7 +404,7 @@ describeGit("GIT_DIFF_OPTS and GIT_MERGE_VERBOSITY twins", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "diff-opts-twins-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const lines = (n: number) => `${Array.from({ length: n }, (_, i) => `line ${i}`).join("\n")}\n`;
 

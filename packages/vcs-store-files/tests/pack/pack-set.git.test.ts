@@ -10,7 +10,6 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -20,6 +19,7 @@ import { type FilesApi, installPack, openPackSet } from "@statewalker/vcs-core";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import { createGitFilesBackend } from "../../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 
 const GIT_ENV = {
   ...process.env,
@@ -38,9 +38,9 @@ const gitText = (cwd: string, args: string[], input?: string) =>
   git(cwd, args, input).toString().trim();
 
 const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 const tmp = () => {
   const d = mkdtempSync(join(tmpdir(), "pack-set-"));
   dirs.push(d);

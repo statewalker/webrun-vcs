@@ -28,6 +28,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type AmCommand, Git } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 import { gitAtLeast } from "./native-git-working-copy.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -218,9 +219,9 @@ describeGit("git am as native git", () => {
     mkdirSync(home, { recursive: true });
     modern = gitAtLeast(gitOk(root, ["--version"]), 2, 46);
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("applies a series as native git does", async () => {
     const mbox = series();

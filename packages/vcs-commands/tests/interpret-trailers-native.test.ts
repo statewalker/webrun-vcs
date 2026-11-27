@@ -10,7 +10,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -35,6 +35,7 @@ import {
 import { nativeIs25x } from "./hooks-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -1260,7 +1261,7 @@ describeGit("git interpret-trailers against native git (t7513, JGit FooterLineTe
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "interpret-trailers-native-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   for (const scenario of SCENARIOS) {
     const skip =

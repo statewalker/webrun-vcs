@@ -38,6 +38,7 @@ import { openOurs } from "./merge-native-helpers.js";
 import { gitAsync } from "./native-connect-support.js";
 import { nativeGitAvailable, nativeGitHttpBackend } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -107,7 +108,7 @@ describeGit("alternate object directories, as native git", () => {
     const version = /(\d+)\.(\d+)/.exec(git(probe, "--version"));
     if (version && (Number(version[1]) > 2 || Number(version[2]) >= 45)) compatibility = "2.56";
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("reads through relative, absolute and nested alternates", async () => {
     const dir = fresh("chain");

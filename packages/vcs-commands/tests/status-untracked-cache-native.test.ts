@@ -47,6 +47,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { formatStatusPorcelain, Git } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -205,7 +206,7 @@ describeGit("untracked cache: native git and ours write the same UNTR", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "status-untr-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("through directory changes, ignore-file changes and index edits", async () => {
     const dir = join(root, "r");
@@ -460,7 +461,7 @@ describeGit("untracked cache in normal mode: native git and ours write the same 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "status-untr-normal-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("through directory changes, ignore-file changes and index edits (dir flags 6)", async () => {
     const dir = join(root, "r");
@@ -625,7 +626,7 @@ describeGit("untracked files under core.ignorecase: index paths matched folding 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "status-untr-icase-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   for (const [mode, build] of [
     ["all", repo],

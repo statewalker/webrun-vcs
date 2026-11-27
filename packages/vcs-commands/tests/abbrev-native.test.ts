@@ -8,7 +8,7 @@
 
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -25,6 +25,7 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { type DiffOutputFormat, formatBlame, Git } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -35,9 +36,9 @@ const atLeast = (ma: number, mi: number) => major > ma || (major === ma && minor
 const alwaysWidenAbbrev = !atLeast(2, 50);
 
 let root: string | undefined;
-afterAll(() => {
-  if (root) rmSync(root, { recursive: true, force: true });
-});
+afterAll(async () => {
+  if (root) await removeTempDir(root);
+}, CLEANUP_TIMEOUT);
 const tmp = () => {
   root ??= mkdtempSync(join(tmpdir(), "abbrev-native-"));
   return root;

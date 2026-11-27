@@ -9,7 +9,7 @@
  * - Objects written while gc runs (loose, in a pack installed meanwhile, an old object
  *   freshened by a write after gc judged it expired) are still there afterwards.
  */
-import { mkdtempSync, rmSync, statSync, utimesSync } from "node:fs";
+import { mkdtempSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -23,15 +23,16 @@ import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { afterAll, describe, expect, it } from "vitest";
 import { createGitFilesBackend, FileGcStrategy, gc } from "../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const enc = new TextEncoder();
 const DAY = 24 * 3600_000;
 type Backend = Awaited<ReturnType<typeof createGitFilesBackend>>;
 
 const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 
 /** A repository on disk (file times matter here). */
 async function repository(wrap: (files: FilesApi) => FilesApi = (f) => f) {

@@ -17,6 +17,7 @@ import { nativeIs25x } from "./hooks-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() ? describe : describe.skip;
 
@@ -60,7 +61,7 @@ describeGit("packed-refs: written as native git writes it", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "packed-refs-native-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("pack-refs --all: git's header and the peel lines of annotated tags", async () => {
     const [theirs, mine] = twins(repo());
@@ -142,7 +143,7 @@ describeGit("packed-refs: a rewrite never claims a peel it did not write", () =>
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "packed-refs-traits-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("a sorted-only packed-refs rewritten by ours still peels its tags for native git", async () => {
     const dir = repo();

@@ -19,7 +19,6 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -47,6 +46,7 @@ import {
   signingTwinsReady,
   type TwinFormat,
 } from "./signed-rewrites-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -308,9 +308,9 @@ describeGit("git rebase --apply against native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "rebase-apply-native-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   describe("t3417-rebase-whitespace-fix", () => {
     const second = "a\nb\nc\n\nd\ne\nf\n\n\n\n\n";

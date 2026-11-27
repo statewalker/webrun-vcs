@@ -8,7 +8,7 @@
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
@@ -22,6 +22,7 @@ import { InitCommand } from "../src/commands/init-command.js";
 import { Git } from "../src/git.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -61,7 +62,7 @@ describeGit("init.defaultBranch as the new repository sees it (#224)", () => {
     mkdirSync(join(root, "work"));
     mkdirSync(join(root, "other"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('a global includeIf "gitdir:<dir>/" matching the new repository names its branch', async () => {
     const extra = globalWith(`gitdir:${root}/work/`, TRUNK);

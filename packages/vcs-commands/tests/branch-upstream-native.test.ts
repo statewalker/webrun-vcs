@@ -10,7 +10,7 @@
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -25,6 +25,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Git, GitApiError, TrackMode } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 import { gitAtLeast } from "./native-git-working-copy.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -295,9 +296,9 @@ describeGit("git branch upstream management against native git", () => {
     base = fixture("base", REMOTES);
   });
 
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("t3200: --track, --no-track and branch.autoSetupMerge", { timeout: 120_000 }, async () => {
     const cases: Case[] = [

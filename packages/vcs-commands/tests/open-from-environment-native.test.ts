@@ -30,6 +30,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { Git } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -108,9 +109,9 @@ describeGit("opening the repository with a hook's variables (#375)", () => {
   beforeAll(() => {
     root = realpathSync(mkdtempSync(join(tmpdir(), "open-env-")));
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** A repository with a committed a.txt and b.txt, both changed, and an untracked u.txt. */
   function repository(objectFormat = "sha1"): string {

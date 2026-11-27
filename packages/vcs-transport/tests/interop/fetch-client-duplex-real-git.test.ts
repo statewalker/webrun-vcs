@@ -10,8 +10,8 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { fetchOverDuplex } from "../../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 import {
-  cleanupDir,
   createTransportRepo,
   git,
   gitAvailable,
@@ -73,8 +73,8 @@ describeGit.each([0, 2] as const)("fetchOverDuplex ← git upload-pack (protocol
   });
   afterEach(async () => {
     await client.close();
-    cleanupDir(root);
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("negotiates an incremental fetch, then rejects a non-fast-forward", async () => {
     const old = addCommits(dir, 100, 1_700_000_000, "c");

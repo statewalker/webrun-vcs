@@ -35,6 +35,7 @@ import {
   snapshotFolder,
   walkFolder,
 } from "../src/net/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -56,7 +57,7 @@ describe("folder walks record symbolic links as links", () => {
     symlinkSync("../outdir", join(folder, "out"));
     symlinkSync("..", join(folder, "dir/loop"));
   });
-  afterEach(() => rmSync(base, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(base), CLEANUP_TIMEOUT);
 
   it("lists links as link entries, never descending into them", async () => {
     const walk = await walkFolder(new PosixNodeFilesApi({ rootDir: folder }));

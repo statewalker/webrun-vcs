@@ -36,11 +36,12 @@ import {
   workspace,
   writeFile,
 } from "./net-helpers.js";
+import { CLEANUP_TIMEOUT } from "./temp-dir-support.js";
 
 const closers: (() => Promise<void> | void)[] = [];
 afterEach(async () => {
   for (const close of closers.splice(0).reverse()) await close();
-});
+}, CLEANUP_TIMEOUT);
 
 /** A served repository on loopback HTTP, and a remote for it. */
 async function httpServer() {

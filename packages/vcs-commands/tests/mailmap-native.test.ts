@@ -24,6 +24,7 @@ import {
   oursCheckMailmap,
   oursShortlog,
 } from "./shortlog-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -76,7 +77,7 @@ describeGit("git check-mailmap and mailmap sources, native (t4203-mailmap)", () 
     repo.git(["add", "one"]);
     repo.git(["commit", "-q", "-m", "second", "--author", "nick1 <bugs@company.xx>"]);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t4203-mailmap.sh: "check-mailmap no arguments"', async () => {
     const n = await checkMailmap([]);

@@ -24,6 +24,7 @@ import {
 } from "../src/index.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, openRepo, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -204,7 +205,7 @@ describeGit("status pathspecs: as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "status-pathspec-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("each pathspec in every untracked and ignored mode, porcelain v1 and v2", async () => {
     const dir = join(root, "r");

@@ -9,7 +9,7 @@
  * git and ours both store it and commit it under the same ids, with any git on `PATH`.
  */
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,6 +31,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Git } from "../src/index.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { git, native, plumbingEnv } from "./plumbing-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -108,9 +109,9 @@ describeGit("the SHAttered PDF as a blob, against native git (t0013's input)", (
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "sha1dc-native-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   const tool = testTool();
   it.skipIf(!tool)("test-tool sha1 of the raw PDF prefix: both die with the same id", () => {

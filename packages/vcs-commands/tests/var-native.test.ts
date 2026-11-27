@@ -8,7 +8,7 @@
  * with the same variables. Run with the system git (2.43) and with 2.56.1 first on `PATH`.
  */
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -18,6 +18,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { git, type Outcome, outcomeOf, plumbingEnv } from "./plumbing-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -99,7 +100,7 @@ describeGit("git var against native git", () => {
     buildEditor = build("GIT_EDITOR");
     buildPager = build("GIT_PAGER");
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const withConfig = async (pairs: [string, string][], body: () => Promise<void>) => {
     for (const [k, v] of pairs) git(root, repo, ["config", k, v]);

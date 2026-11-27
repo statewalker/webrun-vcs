@@ -35,6 +35,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Git } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 interface Outcome {
   status: number;
@@ -53,10 +54,10 @@ beforeAll(() => {
   mkdirSync(home);
 });
 
-afterAll(() => {
-  if (root) rmSync(root, { recursive: true, force: true });
-  if (probe) rmSync(probe, { recursive: true, force: true });
-});
+afterAll(async () => {
+  if (root) await removeTempDir(root);
+  if (probe) await removeTempDir(probe);
+}, CLEANUP_TIMEOUT);
 
 function env(extra: Record<string, string> = {}): Record<string, string> {
   const date = `${time} +0000`;

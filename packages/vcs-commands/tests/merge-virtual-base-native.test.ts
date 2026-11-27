@@ -26,6 +26,7 @@ import {
 } from "./merge-native-helpers.js";
 import { buildGraph, type Files, type Graph, text } from "./merge-native-scenarios.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -105,9 +106,9 @@ describeGit("merge with several merge bases against native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "merge-vbase-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("conflicting bases: the virtual base holds Temporary merge branch markers (diff3)", async () => {
     const graph = crissCross({

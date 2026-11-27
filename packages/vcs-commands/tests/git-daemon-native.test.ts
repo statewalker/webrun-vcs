@@ -6,7 +6,7 @@
  */
 
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { connect, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
@@ -31,6 +31,7 @@ import { daemonAccessHookOf, type Git, servedRepositoryOf } from "../src/index.j
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -189,9 +190,9 @@ describeGit("git daemon front end (native twins)", () => {
     );
   });
 
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   const advertised = () => [`${mainId} HEAD`, `${mainId} refs/heads/main`, "0000"];
 

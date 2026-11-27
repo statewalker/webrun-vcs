@@ -3,7 +3,7 @@
  * reachable, `.keep` packs honoured, loose-only mode, the prune grace period, install before
  * remove, and bounded memory for a large blob.
  */
-import { mkdtempSync, rmSync, statSync, utimesSync } from "node:fs";
+import { mkdtempSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -24,6 +24,7 @@ import {
   listReachableObjects,
   repack,
 } from "../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const enc = new TextEncoder();
 const PACK_DIR = joinPath(".git", "objects", "pack");
@@ -169,9 +170,9 @@ describe("repack -d (loose only)", () => {
 // about the unreachable objects written loose (`repack -A`); cruft-pack.git.test.ts has the rest
 describe("gc", () => {
   const dirs: string[] = [];
-  afterAll(() => {
-    for (const d of dirs) rmSync(d, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    for (const d of dirs) await removeTempDir(d);
+  }, CLEANUP_TIMEOUT);
 
   it("prunes unreachable loose objects older than the grace period, keeps younger ones", async () => {
     const dir = mkdtempSync(join(tmpdir(), "gc-prune-"));
@@ -398,9 +399,9 @@ describe("P2.6 review: a pack installed during the reachability walk", () => {
 
 describe("P2.6 review: unreachable packed objects get the grace period (repack -A)", () => {
   const dirs: string[] = [];
-  afterAll(() => {
-    for (const d of dirs) rmSync(d, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    for (const d of dirs) await removeTempDir(d);
+  }, CLEANUP_TIMEOUT);
 
   /** main and topic packed together, then topic deleted with its reflog (`git branch -D`). */
   async function deletedBranch(files: FilesApi = createInMemoryFilesApi()) {
@@ -587,9 +588,9 @@ describe("P2.6 review: an unreadable ref aborts gc and repack", () => {
 
 describe("P2.6 review: orphaned packs and the gc lock", () => {
   const dirs: string[] = [];
-  afterAll(() => {
-    for (const d of dirs) rmSync(d, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    for (const d of dirs) await removeTempDir(d);
+  }, CLEANUP_TIMEOUT);
 
   it("removes a .pack whose .idx is gone once it is older than the grace period", async () => {
     const dir = mkdtempSync(join(tmpdir(), "gc-orphan-"));
@@ -632,9 +633,9 @@ describe("P2.6 review: orphaned packs and the gc lock", () => {
 
 describe("P2.6 second review: writes freshen old loose objects (git's freshen_loose_object)", () => {
   const dirs: string[] = [];
-  afterAll(() => {
-    for (const d of dirs) rmSync(d, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    for (const d of dirs) await removeTempDir(d);
+  }, CLEANUP_TIMEOUT);
   const HOUR = 3600_000;
 
   async function looseBlob(content: string) {
@@ -750,9 +751,9 @@ describe("P2.6 second review: writes freshen old loose objects (git's freshen_lo
 
 describe("P2.6 second review: orphan packs younger than an hour stay", () => {
   const dirs: string[] = [];
-  afterAll(() => {
-    for (const d of dirs) rmSync(d, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    for (const d of dirs) await removeTempDir(d);
+  }, CLEANUP_TIMEOUT);
 
   it("keeps a .pack without an .idx younger than an hour whatever tmpExpiryMs says", async () => {
     const dir = mkdtempSync(join(tmpdir(), "gc-orphan-floor-"));
@@ -782,9 +783,9 @@ describe("P2.6 second review: orphan packs younger than an hour stay", () => {
 
 describe("P2.6 second review: the gc lock holds a token", () => {
   const dirs: string[] = [];
-  afterAll(() => {
-    for (const d of dirs) rmSync(d, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    for (const d of dirs) await removeTempDir(d);
+  }, CLEANUP_TIMEOUT);
 
   async function staleLock() {
     const dir = mkdtempSync(join(tmpdir(), "gc-lock-"));
@@ -873,9 +874,9 @@ describe("P2.6 second review: a split index is read with its shared index", () =
 
 describe("P2.6 second review: repack and the guards against removing a new pack", () => {
   const dirs: string[] = [];
-  afterAll(() => {
-    for (const d of dirs) rmSync(d, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    for (const d of dirs) await removeTempDir(d);
+  }, CLEANUP_TIMEOUT);
 
   it("a repack with no change rebuilds the same pack id and keeps it", async () => {
     const b = await open();

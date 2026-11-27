@@ -16,7 +16,7 @@
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -27,6 +27,7 @@ import {
   type XdiffAlgorithm,
   xdiff,
 } from "../../../src/diff/text-diff/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../../temp-dir-support.js";
 
 const version = spawnSync("git", ["--version"], { encoding: "utf8" });
 const hasGit = version.status === 0;
@@ -134,9 +135,9 @@ function describeCase(seed: number, c: Case, native: string, mine: string): stri
 
 describe.skipIf(!hasGit)("mergeLines against native git", () => {
   const dir = hasGit ? mkdtempSync(join(tmpdir(), "line-merge-fuzz-")) : "";
-  afterAll(() => {
-    if (dir) rmSync(dir, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (dir) await removeTempDir(dir);
+  }, CLEANUP_TIMEOUT);
   const git = (args: string[], input?: string | Buffer) =>
     execFileSync("git", args, { cwd: dir, env: gitEnv, input, maxBuffer: 1 << 30 });
 

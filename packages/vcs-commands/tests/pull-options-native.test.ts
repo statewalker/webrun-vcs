@@ -6,7 +6,7 @@
  * local (paths, `file://`), so the twins run on any git build.
  */
 
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -14,6 +14,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { CleanupMode, FastForwardMode, type PullCommand, TagOption } from "../src/index.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { PullTwins } from "./pull-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -50,7 +51,7 @@ describeGit("git pull options: as native git (t5521-pull-options)", { timeout: 1
       t.git(dir, "commit", "-q", "-m", "one");
     });
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const empty = (dir: string) => t.git(dir, "init", "-q", "-b", "main");
   const rel = (path: string) => `../${path.slice(root.length + 1)}`;
@@ -245,7 +246,7 @@ describeGit(
       root = mkdtempSync(join(tmpdir(), "pull-passed-native-"));
       t = new PullTwins(root);
     });
-    afterAll(() => rmSync(root, { recursive: true, force: true }));
+    afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
     /** A clone with a local commit, and two commits upstream: the pull merges. */
     const diverged = (config: Record<string, string> = {}) => {
@@ -379,7 +380,7 @@ describeGit("git pull --all: fetch_multiple (builtin/fetch.c)", { timeout: 120_0
     t = new PullTwins(root);
     parent = source((dir) => testCommit(dir, "one"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const rel = (path: string) => `../${path.slice(root.length + 1)}`;
   const withRemotes = (remotes: [string, string][], extra: string[][] = []) =>

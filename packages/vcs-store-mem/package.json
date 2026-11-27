@@ -28,7 +28,15 @@
   },
   "files": [
     "dist",
-    "src"
+    "src",
+    "!**/__tests__",
+    "!**/__mocks__",
+    "!**/__fixtures__",
+    "!**/fixtures",
+    "!**/tests",
+    "!**/test",
+    "!**/*.test.*",
+    "!**/*.spec.*"
   ],
   "scripts": {
     "build": "rm -rf dist && rolldown -c && tsc --emitDeclarationOnly --declaration",

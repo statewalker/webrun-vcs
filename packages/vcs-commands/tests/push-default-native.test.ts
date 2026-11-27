@@ -8,7 +8,7 @@
  * `push-modes-native-support.ts`), comparing the exit status, stderr, the refs of the pusher
  * and of both remotes, and the pusher's `branch.*` configuration.
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, it } from "vitest";
@@ -23,6 +23,7 @@ import {
   twins,
 } from "./push-modes-native-support.js";
 import { gitOut } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -63,9 +64,9 @@ describeGit("push.default (native git)", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "push-default-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("upstream: to the configured upstream, refused without a remote or a merge", async () => {
     const t = setup();

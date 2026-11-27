@@ -27,6 +27,7 @@ import {
   type UploadPackResult,
 } from "../../src/index.js";
 import { packOf, runReceivePack, ZERO } from "../helpers/receive-pack-harness.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 import {
   cleanupDir,
   createTransportRepo,
@@ -258,8 +259,8 @@ describeGit("Interop · server parity with native git", { timeout: TIMEOUT }, ()
 
   afterAll(async () => {
     await ours?.close();
-    if (root) cleanupDir(root);
-  });
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   function handler(options: Partial<HttpHandlerOptions> = {}) {
     return createHttpHandler({

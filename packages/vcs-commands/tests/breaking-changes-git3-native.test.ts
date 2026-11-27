@@ -6,12 +6,13 @@
  * that the oracle is what the twins assume.
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { git3Binary, nativeGit3Env } from "./native-git3.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 describe("GitHostEnvironment.breakingChanges", () => {
   it("is off unless the host asks for it, and has no environment variable", () => {
@@ -32,7 +33,7 @@ describe.skipIf(!git3)("the git 3.0 oracle ($GIT3)", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "git3-oracle-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("creates reftable repositories on main (objects still SHA-1)", () => {
     const run = (cwd: string, args: string[]) =>

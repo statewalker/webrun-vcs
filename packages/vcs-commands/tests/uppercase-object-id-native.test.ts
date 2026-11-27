@@ -5,7 +5,7 @@
  * commands names its object (a tag, a commit's parent).
  */
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
@@ -15,6 +15,7 @@ import type { Git } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -55,7 +56,7 @@ describeGit("object ids in upper case: as native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "upper-id-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("branch -m of a loose ref holding an uppercase id", async () => {
     const [n, o] = twins();

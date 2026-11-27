@@ -5,7 +5,7 @@
  * and `Re:` prefixes, Message-IDs, folded headers) give the same info, message and patch.
  */
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -13,6 +13,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { bytesToLatin1, latin1ToBytes } from "../src/commands/apply/latin1.js";
 import { mailinfo, mailsplit } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -70,7 +71,7 @@ describeGit("mailinfo and mailsplit as native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "mailinfo-native-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("extracts what git mailinfo extracts", () => {
     const variants: [string[], Parameters<typeof mailinfo>[1]][] = [

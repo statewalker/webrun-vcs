@@ -6,7 +6,7 @@
  * `..` segments, an `@` in an scp-like path, `[host]` followed by no colon.
  */
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { urlComponent, urlParse } from "@statewalker/vcs-utils";
@@ -15,6 +15,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { git, native, type Outcome, outcomeOf } from "./plumbing-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 /** Whether the native git has `url-parse` (`-h` prints its usage, exit 129). */
 const hasUrlParse = () =>
@@ -128,7 +129,7 @@ describeGit("git url-parse against native git", () => {
     root = mkdtempSync(join(tmpdir(), "url-parse-"));
     git(root, root, ["init", "-q", "-b", "main"]);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t9904-url-parse.sh: "git url-parse -- ssh syntax", "git url-parse -c scheme -- ssh syntax", "git url-parse -c path -- scp+IPv6", "git url-parse fails on invalid URL"', async () => {
     for (const url of [...T9904_URLS, ...MORE_URLS]) {

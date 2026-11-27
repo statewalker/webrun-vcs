@@ -11,9 +11,9 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { fetch } from "../../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 import { type GitHttpBackend, gitHttpBackend } from "./git-http-backend.js";
 import {
-  cleanupDir,
   createTransportRepo,
   git,
   gitAvailable,
@@ -96,8 +96,8 @@ describeGit.each([2, 0] as const)("fetch client review fixes (protocol v%i)", (v
   afterEach(async () => {
     backend.close();
     await client.close();
-    cleanupDir(root);
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("an interrupted fetch leaves objects behind, yet the next fetch transfers the whole history", async () => {
     const tip = addCommits(dir, 30, 1_700_000_000);

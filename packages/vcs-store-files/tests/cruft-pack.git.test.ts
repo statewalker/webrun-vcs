@@ -23,6 +23,7 @@ import { parsePackMtimes } from "@statewalker/vcs-core";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import { createGitFilesBackend, gc } from "../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const DAY = 24 * 3600;
 const now = Math.floor(Date.now() / 1000);
@@ -46,9 +47,9 @@ const git = (cwd: string, args: string[], input?: string | Buffer) =>
   execFileSync("git", args, { cwd, env: GIT_ENV, maxBuffer: 1 << 30, input }).toString();
 
 const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 const tmp = () => {
   const d = mkdtempSync(join(tmpdir(), "cruft-"));
   dirs.push(d);
