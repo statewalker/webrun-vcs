@@ -841,4 +841,53 @@ describeGit("git ls-files, native twins", () => {
       await check(dir, ["--format=%(eolinfo:index) %(path)"]);
     });
   });
+
+  describe("odd and corrupt trees (statewalker/webrun-vcs#351)", () => {
+    let dir: string;
+    let blob: string;
+    /** A tree written from raw entries (`hash-object -t tree --literally`). */
+    const tree = (...parts: (string | [string, string, string])[]): string =>
+      shell
+        .git(dir, ["hash-object", "-t", "tree", "--literally", "--stdin", "-w"], {
+          input: Buffer.concat(
+            parts.map((p) =>
+              typeof p === "string"
+                ? Buffer.from(p, "latin1")
+                : Buffer.concat([Buffer.from(`${p[0]} ${p[1]}\0`), Buffer.from(p[2], "hex")]),
+            ),
+          ),
+        })
+        .stdout.trim();
+    beforeAll(() => {
+      dir = repository("odd-trees");
+      put(dir, "f", "x\n");
+      shell.ok(dir, "add", "f");
+      shell.tick();
+      shell.ok(dir, "commit", "-q", "-m", "m");
+      blob = shell.ok(dir, "rev-parse", "HEAD:f").trim();
+    });
+
+    it("scenario from t3060: a tree entry named '..' is listed (builtin/ls-files.c overlay_tree_on_index)", async () => {
+      const odd = tree(["100644", "..", blob], ["100644", "ok", blob]);
+      await check(dir, [`--with-tree=${odd}`]);
+      await check(dir, [`--with-tree=${tree(["40000", "sub", odd])}`]);
+      await check(dir, [`--with-tree=${tree(["40000", "sub", odd])}`, "-s"]);
+    });
+
+    it("scenario from t3060: a missing subtree dies (unable to read tree entries)", async () => {
+      const missing = "1".repeat(40);
+      const t = tree(["100644", "a", blob], ["40000", "sub", missing]);
+      const commit = shell.ok(dir, "commit-tree", t, "-m", "missing").trim();
+      shell.ok(dir, "update-ref", "refs/heads/missing", commit);
+      await check(dir, ["--with-tree=missing"]);
+      await check(dir, [`--with-tree=${t}`]);
+    });
+
+    it("scenario from t3060: a corrupt tree dies as tree-walk.c's decode_tree_entry", async () => {
+      await check(dir, [`--with-tree=${tree("100644 f\0abc")}`]);
+      await check(dir, [`--with-tree=${tree(["10x644", "f", blob])}`]);
+      await check(dir, [`--with-tree=${tree(["40000", "sub", tree("100644 f")])}`]);
+      await check(dir, [`--with-tree=${tree(["100644", "", blob])}`]);
+    });
+  });
 });

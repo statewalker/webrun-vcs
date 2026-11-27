@@ -11,6 +11,7 @@ import {
   unquoteGitPath,
 } from "@statewalker/vcs-utils/encoding";
 import { wildmatch, wildmatchBytes } from "@statewalker/vcs-working-tree";
+import { SHORT_MAGIC } from "./plumbing-shared.js";
 
 export const MATCHED_RECURSIVELY = 1;
 export const MATCHED_RECURSIVELY_LEADING_PATHSPEC = 2;
@@ -206,9 +207,6 @@ function unescapeAttrValue(value: string): string {
   return out;
 }
 
-/** git's characters that may introduce short pathspec magic (`GIT_PATHSPEC_MAGIC`). */
-const SHORT_MAGIC_CHARS = new Set([..."!\"#%&',-;<=>@_`~^/"]);
-
 /**
  * The pathspec elements as git's `parse_pathspec` reads them from the top of the worktree:
  * short magic (`:/` top, `:!` and `:^` exclude) and long magic (`:(top,literal,glob,icase,
@@ -298,7 +296,7 @@ export function parsePathspecItem(elem: string, options: PathspecParseOptions = 
       if (ch === "!" || ch === "^") exclude = true;
       else if (ch === "/") {
         // top: the paths are from the top already
-      } else if (!SHORT_MAGIC_CHARS.has(ch)) break;
+      } else if (!SHORT_MAGIC.has(ch)) break;
       else throw new Error(`Unimplemented pathspec magic '${ch}' in '${elem}'`);
     }
     if (elem[pos] === ":") pos++;

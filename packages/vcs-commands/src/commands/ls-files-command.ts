@@ -56,6 +56,12 @@ import {
   untrackedScanPathspec,
 } from "./pathspec.js";
 import { PlumbingCommand, PlumbingError } from "./plumbing-command.js";
+import {
+  CorruptTreeError,
+  objectTypeOfMode,
+  readAllBytes,
+  SHORT_MAGIC,
+} from "./plumbing-shared.js";
 
 /** One entry of the index as ls-files walks it (`struct cache_entry`). */
 interface ListedEntry {
@@ -680,18 +686,29 @@ export class LsFilesCommand extends PlumbingCommand {
     let id: string;
     try {
       id = await this.resolveRevision(name);
-    } catch {
+    } catch (e) {
+      // get_oid dies on a corrupt tree on the way (`<rev>:<path>`)
+      if (e instanceof CorruptTreeError) throw e;
       throw new PlumbingError(`fatal: tree-ish ${name} not found.`);
     }
     let tree: string;
     try {
       tree = await this.resolveRevision(`${id}^{tree}`);
-    } catch {
+    } catch (e) {
+      if (e instanceof CorruptTreeError) throw e;
       throw new PlumbingError(`fatal: bad tree-ish ${name}`);
     }
     for (const e of list) if (e.stage !== 0) e.stage = 3;
+    // read_tree_at: the trees as git's readers walk them (names unchecked, a corrupt entry
+    // git's death); a tree that cannot be read ends the walk (`error: Could not read`) and
+    // overlay_tree_on_index dies
     const add = async (treeId: string, base: string) => {
-      for (const entry of await this.treeEntries(treeId)) {
+      const entries = await this.listedTreeEntries(treeId);
+      if (!entries) {
+        this.warn(`error: Could not read ${treeId}`);
+        throw new PlumbingError(`fatal: unable to read tree entries ${name}`);
+      }
+      for (const entry of entries) {
         const path = base + entry.name;
         const nameBytes = pathspecName(path);
         if ((entry.mode & S_IFMT) === 0o040000) {
@@ -789,7 +806,7 @@ export class LsFilesCommand extends PlumbingCommand {
         if (path.startsWith(".git/") && worktree.readGitDirFile) {
           return worktree.readGitDirFile(path.slice(5)).catch(() => undefined);
         }
-        return readAll(worktree.readContent(path)).catch(() => undefined);
+        return readAllBytes(worktree.readContent(path)).catch(() => undefined);
       }
       return undefined;
     };
@@ -830,7 +847,7 @@ export class LsFilesCommand extends PlumbingCommand {
       if (worktree) {
         const entry = await worktree.getEntry(path).catch(() => undefined);
         if (entry && !entry.isDirectory && entry.mode !== FileMode.SYMLINK) {
-          const bytes = await readAll(worktree.readContent(path)).catch(() => undefined);
+          const bytes = await readAllBytes(worktree.readContent(path)).catch(() => undefined);
           if (bytes) return decodeGitPatternFile(bytes);
         }
         if (entry) return undefined;
@@ -839,7 +856,7 @@ export class LsFilesCommand extends PlumbingCommand {
       const id = skipWorktree.get(path);
       if (!id) return undefined;
       const content = await this.blobs.load(id).catch(() => undefined);
-      return content ? decodeGitPatternFile(await readAll(content)) : undefined;
+      return content ? decodeGitPatternFile(await readAllBytes(content)) : undefined;
     };
     return new ExcludeRules(
       this.excludes.length > 0 ? createCommandLineExcludes(this.excludes) : undefined,
@@ -881,7 +898,7 @@ export class LsFilesCommand extends PlumbingCommand {
     }
     if (!found) return eolStatsAscii(undefined);
     const content = await this.blobs.load(found.objectId).catch(() => undefined);
-    return eolStatsAscii(content ? await readAll(content) : undefined);
+    return eolStatsAscii(content ? await readAllBytes(content) : undefined);
   }
 
   /** show_ce_fmt: one entry through `--format`. */
@@ -1055,13 +1072,6 @@ function lowerTag(tag: string): string {
   return `v${c} `;
 }
 
-/** object_type of an index mode. */
-function objectTypeOfMode(mode: number): string {
-  if ((mode & S_IFMT) === 0o040000) return "tree";
-  if (mode === FileMode.GITLINK) return "commit";
-  return "blob";
-}
-
 /**
  * show_killed_files' test of one walked path: a leading directory of it is an index file, or
  * (for the last component) the index has entries below it.
@@ -1117,27 +1127,9 @@ async function worktreeEolInfo(worktree: Worktree, path: string): Promise<string
     entry.mode === FileMode.GITLINK
   )
     return "";
-  const bytes = await readAll(worktree.readContent(path)).catch(() => undefined);
+  const bytes = await readAllBytes(worktree.readContent(path)).catch(() => undefined);
   return bytes ? eolStatsAscii(bytes) : "";
 }
-
-async function readAll(content: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  for await (const c of content) {
-    chunks.push(c);
-    size += c.length;
-  }
-  const out = new Uint8Array(size);
-  let at = 0;
-  for (const c of chunks) {
-    out.set(c, at);
-    at += c.length;
-  }
-  return out;
-}
-
-const SHORT_MAGIC = new Set([..."!\"#%&',-;<=>@_`~^/"]);
 
 /**
  * A pathspec element read against the current directory, as parse_pathspec's
