@@ -18,6 +18,7 @@ import type {
 } from "@statewalker/vcs-working-tree";
 import {
   clearSkipWorktreeFlags,
+  dropFileReplacedByDirectory,
   EntryIdentitySet,
   type GitStagingOptions,
   INDEX_VERSION_2,
@@ -508,7 +509,9 @@ export class FileStagingStore implements Staging {
       const path = prefix ? `${prefix}/${entry.name}` : entry.name;
 
       if (entry.mode === FileMode.TREE) {
+        const start = this._entries.length;
         await this.addTreeRecursive(trees, entry.id, path, stage);
+        dropFileReplacedByDirectory(this._entries, start, path, stage);
       } else {
         this._entries.push({
           path,

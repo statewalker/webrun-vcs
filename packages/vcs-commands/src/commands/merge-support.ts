@@ -66,19 +66,39 @@ import { firstInvalidPath, worktreePathRules } from "./worktree-path-rules.js";
 const sameEntry = (a: CheckedEntry | undefined, b: CheckedEntry | undefined) =>
   a === undefined || b === undefined ? a === b : a.objectId === b.objectId && a.mode === b.mode;
 
-/** The blobs, links and gitlinks of a tree, by path (none for no tree). */
+/**
+ * The blobs, links and gitlinks of a tree, by path (none for no tree).
+ *
+ * @param options.asIndex The entries as unpack-trees adds them to an index
+ *   (`add_index_entry`'s `OK_TO_REPLACE`): a file the directory of its name follows in the
+ *   same tree (a crafted tree holding both, which fsck calls `duplicateEntries`) is dropped
+ *   once a file of that directory is read, so the map never holds a file/directory clash
+ *   (webrun-vcs#247)
+ */
 export async function flatTree(
   trees: CommandTrees,
   treeId: ObjectId | undefined,
+  options?: { asIndex?: boolean },
 ): Promise<Map<string, CheckedEntry>> {
   const out = new Map<string, CheckedEntry>();
   if (!treeId) return out;
-  const walk = async (id: ObjectId, prefix: string): Promise<void> => {
+  const asIndex = options?.asIndex === true;
+  const walk = async (id: ObjectId, prefix: string): Promise<boolean> => {
+    let added = false;
     for await (const entry of trees.loadTree(id)) {
       const path = prefix ? `${prefix}/${entry.name}` : entry.name;
-      if (entry.mode === FileMode.TREE) await walk(entry.id, path);
-      else out.set(path, { objectId: entry.id, mode: entry.mode });
+      if (entry.mode === FileMode.TREE) {
+        // an empty directory adds nothing, so a file of its name stays
+        if (await walk(entry.id, path)) {
+          if (asIndex) out.delete(path);
+          added = true;
+        }
+      } else {
+        out.set(path, { objectId: entry.id, mode: entry.mode });
+        added = true;
+      }
     }
+    return added;
   };
   await walk(treeId, "");
   return out;

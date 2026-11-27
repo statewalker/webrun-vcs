@@ -415,15 +415,24 @@ export class KVStaging implements Staging {
     treeId: ObjectId,
     prefix: string,
     stage: MergeStageValue,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const treeEntries = await trees.load(treeId);
-    if (!treeEntries) return;
+    if (!treeEntries) return false;
+    let added = false;
+    // the files of this tree: one a directory of its name replaces (add_index_entry's
+    // OK_TO_REPLACE, a crafted tree holding both; webrun-vcs#247)
+    const files = new Set<string>();
     for await (const entry of treeEntries) {
       const path = prefix ? `${prefix}/${entry.name}` : entry.name;
 
       if (entry.mode === FileMode.TREE) {
-        await this.addTreeRecursive(trees, entry.id, path, stage);
+        if (await this.addTreeRecursive(trees, entry.id, path, stage)) {
+          added = true;
+          if (files.has(entry.name)) await this.kv.delete(entryKey(path, stage));
+        }
       } else {
+        added = true;
+        files.add(entry.name);
         const serialized: SerializedEntry = {
           p: path,
           s: stage,
@@ -435,6 +444,7 @@ export class KVStaging implements Staging {
         await this.kv.set(entryKey(path, stage), encoder.encode(JSON.stringify(serialized)));
       }
     }
+    return added;
   }
 
   // ============ Persistence ============
