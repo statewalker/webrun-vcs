@@ -1,4 +1,5 @@
 export * from "./for-each-ref-command.js";
+export * from "./peel-limit.js";
 export * from "./ref-atoms.js";
 export * from "./ref-filter.js";
 export * from "./ref-format.js";
