@@ -67,35 +67,73 @@ const COULD_NOT_READ =
 const NOT_A_REPOSITORY = (path: string) =>
   `fatal: '${path}' does not appear to be a git repository\n${COULD_NOT_READ}`;
 
+/** Options of {@link createDuplexPair}. */
+export interface DuplexPairOptions {
+  /**
+   * Bounds what a side holds unread: a `write` returns a promise once this many bytes wait,
+   * resolved when the reader took them below it. With a bound, `close` (unlike `end`) also
+   * stops a side's reading: waiting and later writes into it reject, as a pipe whose reader
+   * is gone. Default: unbounded, every write queued.
+   */
+  highWaterMark?: number;
+}
+
 /**
  * A connected pair of in-memory duplex streams: what one side writes, the other reads. `end`
  * half-closes a side (the other one reads to its end and can still answer); `close` ends it.
  */
-export function createDuplexPair(): [Duplex, Duplex] {
+export function createDuplexPair(options: DuplexPairOptions = {}): [Duplex, Duplex] {
+  const highWaterMark = options.highWaterMark;
   const make = () => {
     const queue: Uint8Array[] = [];
+    let queued = 0;
     let ended = false;
+    let abandoned = false;
     let wake: (() => void) | undefined;
-    const push = (chunk: Uint8Array | null) => {
+    let writers: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
+    const release = (error?: Error) => {
+      const waiting = writers;
+      writers = [];
+      for (const w of waiting) {
+        if (error) w.reject(error);
+        else w.resolve();
+      }
+    };
+    const push = (chunk: Uint8Array | null): Promise<void> | undefined => {
       if (chunk === null) ended = true;
-      else queue.push(chunk);
+      else {
+        if (abandoned) return Promise.reject(new Error("the stream's reader stopped"));
+        queue.push(chunk);
+        queued += chunk.length;
+      }
       wake?.();
       wake = undefined;
+      if (chunk === null || highWaterMark === undefined || queued < highWaterMark) return;
+      return new Promise<void>((resolve, reject) => writers.push({ resolve, reject }));
+    };
+    const abandon = () => {
+      if (highWaterMark === undefined) return;
+      abandoned = true;
+      queue.length = 0;
+      queued = 0;
+      release(new Error("the stream's reader stopped"));
     };
     async function* read(): AsyncGenerator<Uint8Array> {
       while (true) {
         const next = queue.shift();
         if (next) {
+          queued -= next.length;
+          if (highWaterMark === undefined || queued < highWaterMark) release();
           yield next;
           continue;
         }
-        if (ended) return;
+        if (ended || abandoned) return;
         await new Promise<void>((resolve) => {
           wake = resolve;
         });
       }
     }
-    return { push, read };
+    return { push, read, abandon };
   };
   const a = make();
   const b = make();
@@ -114,18 +152,24 @@ export function createDuplexPair(): [Duplex, Duplex] {
   const left: Duplex = {
     [Symbol.asyncIterator]: () => a.read()[Symbol.asyncIterator](),
     write: (data) => {
-      if (!aClosed) b.push(data.slice());
+      if (!aClosed) return b.push(data.slice());
     },
     end: endLeft,
-    close: endLeft,
+    close: async () => {
+      a.abandon();
+      await endLeft();
+    },
   };
   const right: Duplex = {
     [Symbol.asyncIterator]: () => b.read()[Symbol.asyncIterator](),
     write: (data) => {
-      if (!bClosed) a.push(data.slice());
+      if (!bClosed) return a.push(data.slice());
     },
     end: endRight,
-    close: endRight,
+    close: async () => {
+      b.abandon();
+      await endRight();
+    },
   };
   return [left, right];
 }

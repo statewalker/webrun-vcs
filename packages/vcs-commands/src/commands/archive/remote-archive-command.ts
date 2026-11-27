@@ -19,11 +19,17 @@ import { withRemoteSession } from "../remote-transport.js";
 import { ArchiveCommand } from "./archive-command.js";
 import { uploadArchiveWriterOf } from "./upload-archive-writer.js";
 
+/** What the in-process upload-archive may write ahead of the client. */
+const LOCAL_HIGH_WATER_MARK = 1 << 20;
+
 /** What `git archive --remote` gave. */
 export interface RemoteArchiveResult {
   /** 0; 1 when the remote reported an error; 128 when the client died */
   exitCode: number;
-  /** The archive (git's stdout, or `-o`'s file), the `--list` lines for `--list` */
+  /**
+   * The archive (git's stdout, or `-o`'s file), the `--list` lines for `--list`; empty when
+   * {@link RemoteArchiveCommand.setOutput} took them
+   */
   archive: Uint8Array;
   /**
    * git's stderr: the remote's messages as `remote: <line>        ` lines (`-v`'s paths, its
@@ -56,6 +62,7 @@ export class RemoteArchiveCommand extends TransportCommand<RemoteArchiveResult> 
   private exec?: string;
   private outputName?: string;
   private readonly args: string[] = [];
+  private output?: (chunk: Uint8Array) => void | Promise<void>;
 
   /** `--remote=<repo>`: a remote's name or a URL (a path for a local repository). */
   setRemote(remote: string): this {
@@ -81,6 +88,29 @@ export class RemoteArchiveCommand extends TransportCommand<RemoteArchiveResult> 
     return this;
   }
 
+  /**
+   * Takes the archive as it arrives, chunk by chunk (git writing its stdout or `-o`'s file),
+   * instead of collecting it in {@link RemoteArchiveResult.archive}: the next chunk is read
+   * once the returned promise settles, so neither end holds the archive whole. A rejection
+   * is the client's death (exit 128).
+   *
+   * @example
+   * ```typescript
+   * const writer = file.getWriter();
+   * const { exitCode } = await git
+   *   .archiveRemote()
+   *   .setRemote("origin")
+   *   .addArguments("HEAD")
+   *   .setOutput((chunk) => writer.write(chunk))
+   *   .call();
+   * ```
+   */
+  setOutput(output: (chunk: Uint8Array) => void | Promise<void>): this {
+    this.checkCallable();
+    this.output = output;
+    return this;
+  }
+
   /** `git archive`'s other arguments, as given (`--format=tar`, `-v`, `HEAD`, `--`, paths). */
   addArguments(...args: string[]): this {
     this.checkCallable();
@@ -100,7 +130,10 @@ export class RemoteArchiveCommand extends TransportCommand<RemoteArchiveResult> 
       this.outputName !== undefined
         ? new ArchiveCommand(this.workingCopy).formatFromFilename(this.outputName)
         : undefined;
-    const options = formatHint ? { formatHint } : {};
+    const options = {
+      ...(formatHint ? { formatHint } : {}),
+      ...(this.output ? { output: this.output } : {}),
+    };
     const url = RemoteConfigStore.from(this.workingCopy).remoteUrlOf(this.remote);
     const remote = await this.prepareRemote(url);
     if (remote.kind === "bundle") {
@@ -110,7 +143,8 @@ export class RemoteArchiveCommand extends TransportCommand<RemoteArchiveResult> 
       // git spawns git-upload-archive in the repository: ours serves it in process
       const writer = uploadArchiveWriterOf(remote.repository);
       if (!writer) throw new GitApiError("fatal: operation not supported by protocol");
-      const [client, server] = createDuplexPair();
+      // bounded, as git's pipe to its upload-archive child: the server waits for the client
+      const [client, server] = createDuplexPair({ highWaterMark: LOCAL_HIGH_WATER_MARK });
       const serving = serveUploadArchive(server, writer).finally(() => server.close?.());
       const [result, served] = await Promise.all([
         requestRemoteArchive(client, this.args, options).finally(() => client.close?.()),
