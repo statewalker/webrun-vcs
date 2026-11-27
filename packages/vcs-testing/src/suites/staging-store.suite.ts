@@ -605,6 +605,35 @@ export function createStagingStoreTests(name: string, factory: StagingStoreFacto
 
         expect(await ctx.stagingStore.hasEntry("file.txt")).toBe(true);
       });
+
+      it("reads a link and a directory of one name as the directory's files (webrun-vcs#247)", async () => {
+        if (!ctx.trees) return;
+        // a crafted tree (fsck: duplicateEntries) holding a link `d` and a directory `d`, and a
+        // link `e` beside an empty directory `e`: add_index_entry's OK_TO_REPLACE lets `d/x`
+        // replace the link, while an empty directory adds nothing and the link `e` stays
+        const sub = await ctx.trees.store([
+          { name: "x", mode: FileMode.REGULAR_FILE, id: fakeObjectId("x") },
+        ]);
+        const empty = await ctx.trees.store([]);
+        let treeId: string;
+        try {
+          treeId = await ctx.trees.store([
+            { name: "d", mode: FileMode.SYMLINK, id: fakeObjectId("link-d") },
+            { name: "d", mode: FileMode.TREE, id: sub },
+            { name: "e", mode: FileMode.SYMLINK, id: fakeObjectId("link-e") },
+            { name: "e", mode: FileMode.TREE, id: empty },
+          ]);
+        } catch {
+          // a tree store refusing duplicate names cannot hold the case
+          return;
+        }
+        await ctx.stagingStore.readTree(ctx.trees, treeId);
+        const entries = await collectEntries(ctx.stagingStore.entries());
+        expect(entries.map((e) => `${e.mode.toString(8)} ${e.path}`)).toEqual([
+          "100644 d/x",
+          "120000 e",
+        ]);
+      });
     });
 
     describe("Persistence", () => {

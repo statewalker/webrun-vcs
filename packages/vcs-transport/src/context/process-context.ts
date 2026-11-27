@@ -52,7 +52,7 @@ export interface RefStore {
    * With `expected` (what the fetch read), refuses when they changed meanwhile. Without it a
    * shallow fetch is refused.
    */
-  setShallow?(oids: string[], expected?: string[]): Promise<void>;
+  setShallow?(oids: string[], expected?: string[], options?: { verbatim?: boolean }): Promise<void>;
 
   /**
    * Gets the target of a symbolic ref.
