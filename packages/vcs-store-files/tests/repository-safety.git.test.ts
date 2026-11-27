@@ -394,6 +394,39 @@ describe("enter_repo's check of another repository (receive-pack)", () => {
     expect(opened).toBeDefined();
     await expect(opened?.checkOwnership?.()).rejects.toThrow("detected dubious ownership");
   });
+  it("follows symbolic links to the repository, as enter_repo's chdir does", async () => {
+    // t5710's serverTwo -> lop: a local remote named through a link
+    symlinkSync("repo", join(T, "repo-link"));
+    symlinkSync(join(T, "bare.git"), join(T, "bare-link"));
+    mkdirSync(join(T, "via"));
+    symlinkSync("..", join(T, "via", "up"));
+    const files = createNodeFilesApi({ rootDir: "/" });
+    const { history } = await createGitFilesBackend({ files, gitDir: `${T}/repo/.git` });
+    const worktree = new FileWorktree({
+      files,
+      rootPath: T,
+      gitDir: `${T}/repo/.git`,
+      blobs: history.blobs,
+      trees: history.trees,
+      environment: createNodeGitHostEnvironment({ env: BASE_ENV, effectiveUid: null }),
+    });
+    for (const [path, real] of [
+      ["repo-link", "repo"],
+      ["bare-link", "bare.git"],
+      ["via/up/repo-link", "repo"],
+    ] as const) {
+      // native git enters it (ls-remote's upload-pack), as the link's target
+      const native = spawnSync("git", ["ls-remote", join(T, path)], { env: BASE_ENV });
+      expect(native.status, String(native.stderr)).toBe(0);
+      const opened = await worktree.openRepository(join(T, path), { checkOwnership: false });
+      const direct = await worktree.openRepository(join(T, real), { checkOwnership: false });
+      expect(opened?.gitDir, path).toBe(direct?.gitDir);
+      expect(opened?.gitDir).toBeDefined();
+    }
+    // a link leading nowhere opens nothing
+    symlinkSync("missing", join(T, "dangling-link"));
+    expect(await worktree.openRepository(join(T, "dangling-link"))).toBeUndefined();
+  });
 });
 
 describe("the protected configuration has no git directory (read_protected_config)", () => {

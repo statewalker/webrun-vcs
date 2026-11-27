@@ -1534,6 +1534,58 @@ export class FileWorktree implements Worktree {
   ): Promise<OpenedRepository | undefined> {
     const base = this.locate(location);
     if (base === undefined) return undefined;
+    const opened = await this.openRepositoryFrom(base, options);
+    if (opened) return opened;
+    // enter_repo's chdir follows symbolic links: a path through one (`serverTwo -> lop`)
+    // names the repository the links lead to, which the storage reads at its physical path
+    const physical = await this.followLinks(base);
+    return physical !== undefined && physical !== base
+      ? this.openRepositoryFrom(physical, options)
+      : undefined;
+  }
+
+  /**
+   * `path` with every symbolic link on it followed through the storage's `lstat`/`readlink`
+   * (absolute targets mapped into its root); undefined where a link leads outside it, cannot
+   * be read, or more than 40 are met (ELOOP).
+   */
+  private async followLinks(path: string): Promise<string | undefined> {
+    const files = this.rootFiles;
+    if (!files.lstat || !files.readlink) return path;
+    let current = path;
+    for (let links = 0; links <= 40; links++) {
+      const parts = current.split("/");
+      let done = current.startsWith("/") ? "/" : "";
+      let relinked: string | undefined;
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i] as string;
+        if (part === "" || part === ".") continue;
+        const candidate = joinPath(done, part);
+        const kind = (await files.lstat(candidate).catch(() => undefined))?.kind;
+        if (kind !== "symlink") {
+          done = candidate;
+          continue;
+        }
+        const bytes = await files.readlink(candidate).catch(() => undefined);
+        const target = bytes ? decodeGitPath(bytes) : undefined;
+        if (!target) return undefined;
+        const resolved = target.startsWith("/")
+          ? this.locate(target)
+          : resolveDots(joinPath(done || "/", target));
+        if (resolved === undefined) return undefined;
+        relinked = [resolved, ...parts.slice(i + 1)].join("/");
+        break;
+      }
+      if (relinked === undefined) return resolveDots(done);
+      current = relinked;
+    }
+    return undefined;
+  }
+
+  private async openRepositoryFrom(
+    base: string,
+    options: OpenRepositoryOptions,
+  ): Promise<OpenedRepository | undefined> {
     // enter_repo (strict = 0): each suffix in turn, a gitfile followed
     for (const suffix of ["/.git", "", ".git/.git", ".git"]) {
       const candidate = resolveDots(`${base}${suffix}`);
