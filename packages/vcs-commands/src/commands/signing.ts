@@ -46,6 +46,7 @@ import {
 import { GitApiError, InvalidConfigError } from "../errors/index.js";
 import { type ConfigValueWhere, RemoteConfigStore } from "../remote-config/index.js";
 import { hostEnvironmentOf } from "./git-ident.js";
+import { splitCmdline } from "./split-cmdline.js";
 
 /**
  * A request to sign: the key to sign with (`""`: the default key, git's `-S` without a key
@@ -493,10 +494,82 @@ function sshPublicKeyBlob(text: string): Uint8Array | undefined {
 }
 
 /**
+ * Where {@link signingKeyIdOf} runs `gpg.ssh.defaultKeyCommand` and reads a relative key path
+ * (a command's {@link HookSession}).
+ */
+export interface SigningKeyHost {
+  /** Runs a program with its arguments in the directory git runs in (the worktree top) */
+  runShellCommand(
+    name: string,
+    command: string,
+    args: string[],
+  ): Promise<{ exitCode: number; stdout: string; stderr: string } | undefined>;
+  /** That directory on the host, where the repository's files have one */
+  hostWorkingDirectory(): Promise<string | undefined>;
+}
+
+/** How {@link signingKeyIdOf} finds the key. */
+export interface SigningKeyIdOptions {
+  /** Runs `gpg.ssh.defaultKeyCommand`, resolves a relative key path; without it neither is */
+  host?: SigningKeyHost;
+  /**
+   * The git version followed: 2.43 (up to 2.51) keeps the space after an ssh fingerprint
+   * (`strbuf_split_max`), 2.52+ cuts the fingerprint at it. Default 2.56
+   */
+  compatibility?: "2.43" | "2.56";
+}
+
+/** gpg-interface.c's `is_literal_ssh_key`: the key itself rather than a file naming it. */
+function isLiteralSshKey(key: string): boolean {
+  return key.startsWith("key::") || key.startsWith("ssh-");
+}
+
+/**
+ * gpg-interface.c's `get_default_ssh_signing_key` (as `get_signing_key_id` runs it): the
+ * first line of `command`'s output, newline kept, when it is a literal key. git goes on with
+ * a NULL key when it is not and crashes in `get_ssh_key_fingerprint` (SIGSEGV) after its
+ * warning: that is thrown with exit status 139.
+ */
+async function defaultSshSigningKey(
+  command: string,
+  sign: string,
+  host: SigningKeyHost | undefined,
+): Promise<string> {
+  const argv = splitCmdline(command);
+  if (typeof argv === "string") {
+    throw new SigningFailedError(
+      `fatal: malformed build-time gpg.ssh.defaultKeyCommand: ${argv}`,
+      sign,
+      128,
+    );
+  }
+  const [program = "", ...args] = argv;
+  const messages: string[] = [];
+  // pipe_command of an empty program: execvp("") fails, start_command names no program
+  let ran: { exitCode: number; stdout: string; stderr: string } | undefined;
+  if (program === "") messages.push("error: cannot run : No such file or directory");
+  else ran = await host?.runShellCommand("gpg.ssh.defaultKeyCommand", program, args);
+  const stdout = ran?.stdout ?? "";
+  const stderr = ran?.stderr ?? "";
+  if (ran?.exitCode === 0) {
+    const nl = stdout.indexOf("\n");
+    const first = nl < 0 ? stdout : stdout.slice(0, nl + 1);
+    if (first !== "" && isLiteralSshKey(first)) return first;
+    messages.push(
+      `warning: gpg.ssh.defaultKeyCommand succeeded but returned no keys: ${stderr} ${stdout}`,
+    );
+  } else messages.push(`warning: gpg.ssh.defaultKeyCommand failed: ${stderr} ${stdout}`);
+  throw new SigningFailedError(messages.join("\n"), sign, 139);
+}
+
+/**
  * gpg-interface.c's `get_signing_key_id()` for `sign` (`""`: the default key): the key of an
  * openpgp or x509 signature (`user.signingKey`, else the committer as `Name <email>`), the
  * SHA-256 fingerprint of an ssh key (`ssh-keygen -lf`'s `SHA256:...`, for a literal key, a
- * public key file or an OpenSSH private key file).
+ * public key file or an OpenSSH private key file). Without a key, ssh's comes from
+ * `gpg.ssh.defaultKeyCommand` (`get_default_ssh_signing_key`), run through `options.host`. A
+ * key file is read as `ssh-keygen -lf <key>` reads it in the directory git runs in: a relative
+ * path from the worktree top, `~/` not expanded (git passes the key as configured).
  *
  * @throws SigningFailedError as git dies when it cannot fingerprint an ssh key (`fatal: failed
  *   to get the ssh fingerprint for key '<key>'`), or has none
@@ -505,34 +578,44 @@ export async function signingKeyIdOf(
   workingCopy: WorkingCopy,
   sign: string,
   committer: Pick<PersonIdent, "name" | "email">,
+  options: SigningKeyIdOptions = {},
 ): Promise<string> {
   const config = signingConfigOf(workingCopy);
-  const key = sign !== "" ? sign : config.signingKey;
+  let key = sign !== "" ? sign : config.signingKey;
   if (config.format !== "ssh") return key ?? `${committer.name} <${committer.email}>`;
   if (key === undefined) {
-    throw new SigningFailedError(
-      "fatal: either user.signingkey or gpg.ssh.defaultKeyCommand needs to be configured",
-      sign,
-      128,
-    );
+    if (config.defaultKeyCommand === undefined) {
+      throw new SigningFailedError(
+        "fatal: either user.signingkey or gpg.ssh.defaultKeyCommand needs to be configured",
+        sign,
+        128,
+      );
+    }
+    key = await defaultSshSigningKey(config.defaultKeyCommand, sign, options.host);
   }
   let text: string | undefined;
   if (key.startsWith("key::")) text = key.slice(5);
   else if (key.startsWith("ssh-")) text = key;
   else {
     const environment = hostEnvironmentOf(workingCopy);
-    const path = expandUserPath(key, environment) ?? key;
+    let path = key;
+    if (!path.startsWith("/")) {
+      const cwd = await options.host?.hostWorkingDirectory().catch(() => undefined);
+      if (cwd !== undefined) path = `${cwd.replace(/\/+$/, "")}/${path}`;
+    }
     const bytes = await environment?.readFile(path).catch(() => undefined);
     text = bytes ? new TextDecoder().decode(bytes) : undefined;
   }
   const blob = text === undefined ? undefined : sshPublicKeyBlob(text);
   if (!blob) {
+    // die_errno after ssh-keygen failed: errno is still 0
     throw new SigningFailedError(
-      `fatal: failed to get the ssh fingerprint for key '${key}'`,
+      `fatal: failed to get the ssh fingerprint for key '${key}': Success`,
       sign,
       128,
     );
   }
   const digest = createSha256().update(blob).digest();
-  return `SHA256:${btoa(String.fromCharCode(...digest)).replace(/=+$/, "")}`;
+  const fingerprint = `SHA256:${btoa(String.fromCharCode(...digest)).replace(/=+$/, "")}`;
+  return options.compatibility === "2.43" ? `${fingerprint} ` : fingerprint;
 }

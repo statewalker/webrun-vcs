@@ -470,7 +470,11 @@ export class PushCommand extends TransportCommand<PushResult> {
   private pushCertSigner(remoteUrl: string): PushCertSigner {
     const committer = () => committerIdentOf(this.workingCopy);
     return {
-      pusher: () => signingKeyIdOf(this.workingCopy, "", committer()),
+      pusher: () =>
+        signingKeyIdOf(this.workingCopy, "", committer(), {
+          host: this.hooks,
+          compatibility: this.compatibility ?? this.hooks.compatibility,
+        }),
       pushee: anonymizeUrl(remoteUrl),
       date: () => {
         const timestamp = Math.floor(Date.now() / 1000);
