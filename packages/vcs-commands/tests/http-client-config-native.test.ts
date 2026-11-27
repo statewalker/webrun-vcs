@@ -65,9 +65,13 @@ const TOKEN = "a-bearer-token";
 const DIGEST_REALM = "git-auth";
 const DIGEST_NONCE = "dcd98b7102dd2f0e8b11d0f600bfb0c093";
 const DIGEST_OPAQUE = "5ccc069c403ebaf9f0171e9517f40e41";
-const DIGEST_CHALLENGE = `Digest realm="${DIGEST_REALM}", nonce="${DIGEST_NONCE}", opaque="${DIGEST_OPAQUE}", algorithm=MD5, qop="auth"`;
+const digestChallenge = (algorithm: string) =>
+  `Digest realm="${DIGEST_REALM}", nonce="${DIGEST_NONCE}", opaque="${DIGEST_OPAQUE}", algorithm=${algorithm}, qop="auth"`;
 
-const md5hex = (text: string) => createHash("md5").update(text).digest("hex");
+const hexOf = (algorithm: string) => (text: string) =>
+  createHash(algorithm === "SHA-256" ? "sha256" : "md5")
+    .update(text)
+    .digest("hex");
 
 /** The auth-params of an `Authorization: Digest ...` value. */
 function digestParams(value: string): Map<string, string> {
@@ -80,12 +84,13 @@ function digestParams(value: string): Map<string, string> {
 }
 
 /** Whether a Digest answer is right for USER/PASS (RFC 7616 3.4.1, qop=auth). */
-function validDigest(request: Request, value: string | null): boolean {
+function validDigest(request: Request, value: string | null, algorithm: string): boolean {
+  const md5hex = hexOf(algorithm);
   if (!value?.startsWith("Digest ")) return false;
   const p = digestParams(value);
   if (p.get("username") !== USER || p.get("realm") !== DIGEST_REALM) return false;
   if (p.get("nonce") !== DIGEST_NONCE || p.get("opaque") !== DIGEST_OPAQUE) return false;
-  if (p.get("qop") !== "auth") return false;
+  if (p.get("qop") !== "auth" || p.get("algorithm") !== algorithm) return false;
   const url = new URL(request.url);
   if (p.get("uri") !== `${url.pathname}${url.search}`) return false;
   const ha1 = md5hex(`${USER}:${DIGEST_REALM}:${PASS}`);
@@ -180,16 +185,17 @@ async function route(
     }
     return serve(`/${m[2]}`);
   }
-  m = /^\/digest\/smart\/(.*)$/.exec(path);
+  m = /^\/digest(-sha256)?\/smart\/(.*)$/.exec(path);
   if (m) {
-    if (!validDigest(request, request.headers.get("authorization"))) {
+    const algorithm = m[1] ? "SHA-256" : "MD5";
+    if (!validDigest(request, request.headers.get("authorization"), algorithm)) {
       await request.body?.cancel().catch(() => undefined);
       return new Response("no\n", {
         status: 401,
-        headers: { "WWW-Authenticate": DIGEST_CHALLENGE },
+        headers: { "WWW-Authenticate": digestChallenge(algorithm) },
       });
     }
-    return serve(`/${m[1]}`);
+    return serve(`/${m[2]}`);
   }
   // t5563's custom_auth with `id=default status=403`: no challenge, a refusal without credentials
   m = /^\/custom_auth\/(.*)$/.exec(path);
@@ -694,6 +700,20 @@ describeGit("http.* client configuration, as native git", () => {
         .filter((l) => !l.endsWith("\tHEAD"))
         .join("\n"),
     );
+    expect(twins.ours.helperLog).toEqual(twins.native.helperLog);
+    expect(withoutAgent(twins.ours.requests)).toEqual(withoutAgent(twins.native.requests));
+  });
+
+  it("Digest: algorithm=SHA-256 (curl 7.57+) as MD5", async () => {
+    const twins = await fetchTwins("/digest-sha256/smart/repo.git", [], {
+      helperReply: {
+        native: `username=${USER}\npassword=${PASS}\n`,
+        ours: { username: USER, password: PASS },
+      },
+    });
+    expect(twins.native.result.status).toBe(0);
+    expect(twins.ours.error).toBeUndefined();
+    expect(twins.ours.fetched).toBe(twins.native.fetched);
     expect(twins.ours.helperLog).toEqual(twins.native.helperLog);
     expect(withoutAgent(twins.ours.requests)).toEqual(withoutAgent(twins.native.requests));
   });

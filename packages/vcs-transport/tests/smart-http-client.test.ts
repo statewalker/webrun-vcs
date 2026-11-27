@@ -264,9 +264,27 @@ describe("Digest authentication (RFC 7616)", () => {
         },
       ),
     ).toContain('response="8ca523f5e9506fed4657c9700eebdbec"');
+    // RFC 7616 3.9.1's SHA-256 answer to the same challenge
+    const sha = parseDigestChallenge(
+      'Digest realm="http-auth@example.org", qop="auth", algorithm=SHA-256, nonce="7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v"',
+    ) as DigestChallenge;
+    expect(
+      digestAuthorization(
+        sha,
+        { username: "Mufasa", password: "Circle of Life" },
+        {
+          method: "GET",
+          uri: "/dir/index.html",
+          nc: 1,
+          cnonce: "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ",
+        },
+      ),
+    ).toContain(
+      'response="753927fa0e85d155564e2e272a28d1802ca10daf4496794697cf8db5856cb6c1", algorithm=SHA-256',
+    );
   });
 
-  it("answers without qop (RFC 2069), with MD5-sess and with userhash; refuses other algorithms", () => {
+  it("answers without qop (RFC 2069), with MD5-sess and with userhash; refuses unknown algorithms", () => {
     const plain = parseDigestChallenge('Digest realm="r", nonce="n"') as DigestChallenge;
     const value = digestAuthorization(
       plain,
@@ -289,7 +307,10 @@ describe("Digest authentication (RFC 7616)", () => {
     expect(sessValue).toBe(
       `Digest username="${md5Hex("u:r")}", realm="r", nonce="n", uri="/", cnonce="c", nc=00000002, qop=auth, response="${md5Hex(`${sessHa1}:n:00000002:c:auth:${md5Hex("GET:/")}`)}", algorithm=MD5-sess, userhash=true`,
     );
-    expect(parseDigestChallenge('Digest realm="r", nonce="n", algorithm=SHA-256')).toBeUndefined();
+    expect(
+      parseDigestChallenge('Digest realm="r", nonce="n", algorithm=SHA-512-256-sess'),
+    ).toBeDefined();
+    expect(parseDigestChallenge('Digest realm="r", nonce="n", algorithm=SHA-1')).toBeUndefined();
     expect(parseDigestChallenge('Digest realm="r", nonce="n", qop="auth-int"')).toBeUndefined();
     expect(parseDigestChallenge('Basic realm="r"')).toBeUndefined();
     expect(parseDigestChallenge('Digest realm="r"')).toBeUndefined();

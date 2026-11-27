@@ -6,10 +6,10 @@
  * written in curl's order and quoting (lib/vauth/digest.c), so a server sees what native git
  * sends.
  *
- * Supported: `algorithm` MD5 (the default) and MD5-sess, `qop=auth` or none (RFC 2069),
- * `userhash`, `stale`. A challenge asking for another algorithm (SHA-256, SHA-512-256) or
- * only `qop=auth-int` is not answered: the client falls back to Basic when the server offers
- * it, else the request stays refused.
+ * Supported: `algorithm` MD5 (the default), SHA-256 and SHA-512-256, each with its `-sess`
+ * variant (curl 7.57+), `qop=auth` or none (RFC 2069), `userhash`, `stale`. A challenge of
+ * another algorithm or with only `qop=auth-int` is not answered: the client falls back to
+ * Basic when the server offers it, else the request stays refused.
  *
  * @example
  * ```ts
@@ -21,15 +21,24 @@
  * ```
  */
 
-import { md5Hex } from "@statewalker/vcs-utils/hash";
+import { md5Hex, sha256Hex, sha512_256Hex } from "@statewalker/vcs-utils/hash";
+
+/** The hash of each algorithm a challenge may name (lower case, without `-sess`). */
+const HASHES: Record<string, (text: string) => string> = {
+  md5: md5Hex,
+  "sha-256": sha256Hex,
+  "sha-512-256": sha512_256Hex,
+};
 
 /** A Digest challenge the client can answer. */
 export interface DigestChallenge {
   realm: string;
   nonce: string;
   opaque?: string;
-  /** The algorithm as the server spelled it (`MD5`, `MD5-sess`), if it named one */
+  /** The algorithm as the server spelled it (`MD5`, `SHA-256-sess`), if it named one */
   algorithm?: string;
+  /** The algorithm's hash, hex digits out */
+  hash: (text: string) => string;
   /** Whether `algorithm` is a `-sess` variant */
   session: boolean;
   /** `auth` when the server offers it; undefined: RFC 2069's answer without qop */
@@ -87,8 +96,10 @@ export function parseDigestChallenge(challenge: string): DigestChallenge | undef
   const nonce = params.get("nonce");
   if (nonce === undefined) return undefined;
   const algorithm = params.get("algorithm");
-  const lower = algorithm?.toLowerCase();
-  if (lower !== undefined && lower !== "md5" && lower !== "md5-sess") return undefined;
+  const lower = algorithm?.toLowerCase() ?? "md5";
+  const session = lower.endsWith("-sess");
+  const hash = HASHES[session ? lower.slice(0, -"-sess".length) : lower];
+  if (!hash) return undefined;
   let qop: "auth" | undefined;
   const qops = params.get("qop");
   if (qops !== undefined) {
@@ -101,7 +112,8 @@ export function parseDigestChallenge(challenge: string): DigestChallenge | undef
     nonce,
     ...(params.has("opaque") ? { opaque: params.get("opaque") as string } : {}),
     ...(algorithm !== undefined ? { algorithm } : {}),
-    session: lower === "md5-sess",
+    hash,
+    session,
     ...(qop ? { qop } : {}),
     stale: params.get("stale")?.toLowerCase() === "true",
     userhash: params.get("userhash")?.toLowerCase() === "true",
@@ -145,14 +157,15 @@ export function digestAuthorization(
 ): string {
   const { realm, nonce } = challenge;
   const { username, password } = credentials;
-  let ha1 = md5Hex(`${username}:${realm}:${password}`);
-  if (challenge.session) ha1 = md5Hex(`${ha1}:${nonce}:${request.cnonce}`);
-  const ha2 = md5Hex(`${request.method}:${request.uri}`);
+  const h = challenge.hash;
+  let ha1 = h(`${username}:${realm}:${password}`);
+  if (challenge.session) ha1 = h(`${ha1}:${nonce}:${request.cnonce}`);
+  const ha2 = h(`${request.method}:${request.uri}`);
   const nc = request.nc.toString(16).padStart(8, "0");
   const response = challenge.qop
-    ? md5Hex(`${ha1}:${nonce}:${nc}:${request.cnonce}:${challenge.qop}:${ha2}`)
-    : md5Hex(`${ha1}:${nonce}:${ha2}`);
-  const user = challenge.userhash ? md5Hex(`${username}:${realm}`) : quoted(username);
+    ? h(`${ha1}:${nonce}:${nc}:${request.cnonce}:${challenge.qop}:${ha2}`)
+    : h(`${ha1}:${nonce}:${ha2}`);
+  const user = challenge.userhash ? h(`${username}:${realm}`) : quoted(username);
   let value = `Digest username="${user}", realm="${quoted(realm)}", nonce="${quoted(nonce)}", uri="${request.uri}"`;
   if (challenge.qop) {
     value += `, cnonce="${request.cnonce}", nc=${nc}, qop=${challenge.qop}`;

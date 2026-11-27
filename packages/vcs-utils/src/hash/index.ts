@@ -9,6 +9,7 @@ export * from "./rolling-checksum/index.js";
 export * from "./sha1/index.js";
 export * from "./sha256/index.js";
 export * from "./strong-checksum/index.js";
+export * from "./text-digest/index.js";
 
 // Re-export utilities
 export * from "./utils/index.js";

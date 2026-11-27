@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { md5, md5Hex } from "../../src/hash/index.js";
+import { md5, md5Hex, sha256Hex, sha512_256Hex } from "../../src/hash/index.js";
 
 describe("md5 (RFC 1321)", () => {
   // RFC 1321 A.5's test suite
@@ -42,6 +42,17 @@ describe("md5 (RFC 1321)", () => {
         0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0, 0xd6, 0x96, 0x3f, 0x7d, 0x28, 0xe1, 0x7f,
         0x72,
       ]),
+    );
+  });
+});
+
+describe("sha256Hex and sha512_256Hex (FIPS 180-4 examples)", () => {
+  it('hashes "abc"', () => {
+    expect(sha256Hex("abc")).toBe(
+      "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    );
+    expect(sha512_256Hex("abc")).toBe(
+      "53048e2681941ef99b2e29b76b4c7dabe4c2d0c634fc6d46e0e2f13107e7af23",
     );
   });
 });
