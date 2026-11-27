@@ -2,7 +2,7 @@
  * git's `core.deltaBaseCacheLimit` sizes the delta base cache of the backend's pack set.
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PackFile } from "@statewalker/vcs-core";
@@ -10,6 +10,7 @@ import { createInMemoryFilesApi } from "@statewalker/vcs-core";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import { createGitFilesBackend, readDeltaBaseCacheLimit } from "../../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 
 const GIT_ENV = {
   ...process.env,
@@ -31,9 +32,9 @@ const git = (cwd: string, args: string[], input?: string) =>
   execFileSync("git", args, { cwd, input, env: GIT_ENV, encoding: "utf8" }).trim();
 
 const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 
 describe("readDeltaBaseCacheLimit", () => {
   it("reads sizes as git_parse_ulong: units, hex and octal; undefined when unset or bad", async () => {

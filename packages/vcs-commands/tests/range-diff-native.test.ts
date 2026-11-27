@@ -7,7 +7,7 @@
  * `--creation-factor`, `--left-only`/`--right-only`, pathspecs, submodules and dual colors.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,6 +20,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { Git, type RangeDiffCommand } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -129,9 +130,9 @@ describeGit("git range-diff as native git (t3206-range-diff)", () => {
     );
     git(repo, ["fast-import", "--quiet"], {}, history);
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it('t3206-range-diff.sh "simple A..B A..C (unmodified)", "simple B...C (unmodified)", "simple A B C (unmodified)", "simple A..B A..C (unmodified) with --abbrev", "A^! and A^-<n> (unmodified)", "trivial reordering", "removed a commit", "added a commit", "new base, A B C", "new base, B...C"', async () => {
     await expectSame(repo, [

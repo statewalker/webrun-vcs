@@ -27,6 +27,7 @@ import {
 } from "./merge-native-helpers.js";
 import { buildHistory, type FileSpec, type Files, type History } from "./merge-native-scenarios.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -232,9 +233,9 @@ describeGit("merge and cherry-pick fuzz against native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "merge-fuzz-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("merge: random histories merge as native git merges them", async () => {
     const mismatches: Mismatch[] = [];

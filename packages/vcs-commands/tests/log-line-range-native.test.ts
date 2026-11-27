@@ -21,6 +21,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { GitApiError, LogOutputOptions } from "../src/index.js";
 import { openOurs, put } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -158,9 +159,9 @@ beforeAll(() => {
   home = mkdtempSync(join(tmpdir(), "log-line-range-native-"));
 });
 
-afterAll(() => {
-  rmSync(home, { recursive: true, force: true });
-});
+afterAll(async () => {
+  await removeTempDir(home);
+}, CLEANUP_TIMEOUT);
 
 /** `name` cited as t4211-line-log.sh's test of that title */
 const t4211 = (title: string) => `t4211-line-log.sh: "${title}"`;

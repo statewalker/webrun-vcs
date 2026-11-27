@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { type CommitCommand, type GitApiError, RebaseStatus } from "../src/index.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, openRepo, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -110,7 +111,7 @@ describeGit("commit -C/-c and --fixup/--squash: as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "commit-reuse-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("-C and -c: the message and the authorship of the named commit (t7501)", async () => {
     const dir = join(root, "r");

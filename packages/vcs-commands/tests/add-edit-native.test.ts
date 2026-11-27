@@ -6,7 +6,7 @@
  * `ADD_EDIT.patch` is left behind where git dies. Inputs from git's t/t3702-add-edit.sh.
  */
 
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -25,6 +25,7 @@ import {
   view,
 } from "./interactive-extras-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -131,7 +132,7 @@ describeGit("add -e as native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "add-edit-native-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t3702-add-edit.sh: "add -e"', async () => {
     await compare(

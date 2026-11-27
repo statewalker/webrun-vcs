@@ -5,7 +5,7 @@
  * and state files compared.
  */
 
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -19,6 +19,7 @@ import {
   nativeGitAvailable,
   nativeGitHttpBackend,
 } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -67,11 +68,11 @@ describeGit("pull writes the worktree as native git", () => {
     globalThis.fetch = backend.fetch;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     globalThis.fetch = originalFetch;
     backend?.close();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("a pull that merges with a conflict leaves what git pull leaves", async () => {
     const { native, ours } = setup();
@@ -156,11 +157,11 @@ describeGit("pull on an unborn branch, as native git", () => {
     globalThis.fetch = backend.fetch;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     globalThis.fetch = originalFetch;
     backend?.close();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** The remote with one commit, and two unborn repositories that track its main. */
   function setup(): { native: string; ours: string } {

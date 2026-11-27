@@ -29,6 +29,7 @@ import {
   noMaintenance,
 } from "./native-git-http-backend.js";
 import { gitOut, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -227,7 +228,7 @@ describeGit("served dumb HTTP: as git http-backend serves it", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "http-dumb-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("a repository of loose objects: the answers and a dumb clone and fetch", async () => {
     const dir = join(root, "r");

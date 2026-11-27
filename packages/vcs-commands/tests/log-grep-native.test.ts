@@ -11,7 +11,7 @@
  * on one repository and compares the commit ids listed, or the error git dies with.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
@@ -31,6 +31,7 @@ import {
   type RevListCommand,
 } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -142,7 +143,7 @@ describeGit("log/rev-list commit filters against native git", () => {
     });
     pcre = !/not compiled with USE_LIBPCRE/.test(r.stderr ?? "");
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   async function open(config: Record<string, string> = {}): Promise<Git> {
     const files = createNodeFilesApi({ rootDir: dir });

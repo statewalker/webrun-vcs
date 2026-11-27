@@ -17,6 +17,7 @@ import type { FsckCommand } from "../src/index.js";
 
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -72,7 +73,7 @@ describeGit("fsck --connectivity-only, counted", () => {
     git(["fast-import", "--quiet"], history(40));
     git(["repack", "-adq"]);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** Reachable objects by type (`rev-list --objects --all`, typed by `cat-file`). */
   function reachable(): Record<string, number> {
@@ -219,7 +220,7 @@ describeGit("fsck reads in pack order: REF_DELTA packs, memory bounds, the graph
     // REF_DELTA entries only (repack.useDeltaBaseOffset=false)
     git(["-c", "repack.useDeltaBaseOffset=false", "repack", "-adfq", "--depth=10"]);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("unpacks a REF_DELTA pack's commits and trees in the one read, as an OFS_DELTA one", async () => {
     const packDir = join(dir, ".git/objects/pack");

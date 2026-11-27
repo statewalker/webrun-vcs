@@ -14,7 +14,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -29,6 +29,7 @@ import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { git3Binary, nativeGit3Env } from "./native-git3.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -125,7 +126,7 @@ describeGit("legacy remotes (.git/remotes/, .git/branches/), as native git 2.x",
     gitOut(root, up, ["commit", "-qm", "two"], DATES);
     second = git(up, "rev-parse", "HEAD").trim();
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** Native `git fetch <args>` and ours, compared by refs, FETCH_HEAD and warnings. */
   async function expectSameFetch(n: string, o: string, remote: string, refspecs: string[] = []) {
@@ -360,7 +361,7 @@ describe.skipIf(!git3 || !nativeGitAvailable())("legacy remotes under git 3.0 ($
     gitOut(base, up, ["add", "a.txt"]);
     gitOut(base, up, ["commit", "-qm", "one"], DATES);
   });
-  afterAll(() => rmSync(base, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(base), CLEANUP_TIMEOUT);
 
   const git3Run = (cwd: string, args: string[]) => {
     const env = { ...nativeGit3Env(base), GIT_DEFAULT_REF_FORMAT: "files", ...DATES };
@@ -429,7 +430,7 @@ describeGit("pull from a branches remote, as native git 2.x (pull.c)", () => {
     run(up, "add", "b.txt");
     run(up, "commit", "-qm", "two");
   });
-  afterAll(() => rmSync(base, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(base), CLEANUP_TIMEOUT);
 
   /** Twins on main at `old` ("one"), each with `.git/branches/<name>` holding `content`. */
   function pullTwins(name: string, content: string): [string, string] {

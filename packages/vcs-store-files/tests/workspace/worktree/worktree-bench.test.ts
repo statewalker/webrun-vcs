@@ -4,7 +4,7 @@
  * It asserts only that the work completes within a generous bound; the timings are printed
  * (BENCH lines) to compare implementations.
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -12,13 +12,14 @@ import type { Blobs, Trees } from "@statewalker/vcs-core";
 import { createFileWorktree } from "@statewalker/vcs-store-files";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../../temp-dir-support.js";
 
 const FILES = 10_000;
 const enc = new TextEncoder();
 
 describe("FileWorktree benchmark (10k files, depth 5)", () => {
   const root = mkdtempSync(join(tmpdir(), "worktree-bench-"));
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
   const worktree = createFileWorktree({
     files: createNodeFilesApi({ rootDir: root }),
     rootPath: "",

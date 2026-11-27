@@ -6,7 +6,7 @@
  * there; partial clones open and gc keeps their promisor objects; in a repository with alternates they delete only its own objects. Reftable needs git 2.45 or newer: that test is skipped on older gits.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { cpSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { cpSync, mkdtempSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GcOrchestrator } from "@statewalker/vcs-core";
@@ -19,11 +19,12 @@ import {
   gc,
   repack,
 } from "../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 
 const home = mkdtempSync(join(tmpdir(), "repo-format-home-"));
 dirs.push(home);

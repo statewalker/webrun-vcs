@@ -6,7 +6,7 @@
  */
 
 import { execFile, execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -29,6 +29,7 @@ import {
   type SyncRemote,
   type SyncServer,
 } from "../src/net/index.js";
+import { removeTempDir } from "./temp-dir-support.js";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -273,7 +274,7 @@ export function git(cwd: string, args: string[]): Promise<string> {
   });
 }
 
-export function tmpDir(): { dir: string; cleanup(): void } {
+export function tmpDir(): { dir: string; cleanup(): Promise<void> } {
   const dir = mkdtempSync(join(tmpdir(), "vcs-workspace-net-"));
-  return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  return { dir, cleanup: () => removeTempDir(dir) };
 }

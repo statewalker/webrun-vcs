@@ -20,6 +20,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { formatStatusPorcelain } from "../src/index.js";
 import { INTEROP_IDENT, openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -72,9 +73,9 @@ describeGit("paths that are no valid UTF-8, against native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "non-utf8-paths-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("a tree read and stored again keeps its id", async () => {
     const dir = build();

@@ -27,6 +27,7 @@ import {
   snapshot,
 } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -103,7 +104,7 @@ describeGit("trees with 100664 modes read as git reads them", () => {
     const probe = git(root, join(root, "probe"), "fsck", "--no-references");
     noReferences = probe.status === 129 ? [] : ["--no-references"];
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("status is clean after reset --hard, as git's", async () => {
     const { native, ours } = twins();
@@ -331,7 +332,7 @@ describeGit("combined diff -U0 hunk headers as git prints them", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "combined-u0-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /**
    * A conflicted merge of `a c y y` (main) and `c y a y` (side) resolved to an empty file:
@@ -399,7 +400,7 @@ describeGit("a staged change carried over by a two-way switch stays in the cache
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "cache-tree-carried-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** c0: d/x, e/y, z, w; side changes d/x; topic changes w; main checked out, then staged. */
   function buildCarried(dir: string, branch: string, stash: boolean): void {

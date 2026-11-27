@@ -6,7 +6,7 @@
  * git build (the 2.56.1 one has no curl).
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -14,6 +14,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { FastForwardMode, MergeStrategy, type PullCommand } from "../src/index.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { nativeAtLeast, PullTwins } from "./pull-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -33,7 +34,7 @@ describeGit("git pull: as native git (t5520-pull)", { timeout: 120_000 }, () => 
     t.git(src, "add", "file");
     t.git(src, "commit", "-q", "-m", "original");
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const empty = (dir: string) => t.git(dir, "init", "-q", "-b", "main");
 
@@ -557,7 +558,7 @@ describeGit("git pull: fast-forward modes (t7601-merge-pull-config)", { timeout:
     root = mkdtempSync(join(tmpdir(), "pull-ff-native-"));
     t = new PullTwins(root);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** t7601's c0..c3: `c1` on main, `c2` (ahead) and `c3` (diverged) to pull. */
   const history = (dir: string) => {
@@ -657,7 +658,7 @@ describeGit(
       root = mkdtempSync(join(tmpdir(), "pull-strategy-native-"));
       t = new PullTwins(root);
     });
-    afterAll(() => rmSync(root, { recursive: true, force: true }));
+    afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
     /** `file` changed on both sides, on the same line. */
     const conflicting = (dir: string) => {

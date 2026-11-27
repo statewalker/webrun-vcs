@@ -8,7 +8,7 @@
  * transport never sees the client's `-c` (connect.c clears `local_repo_env`).
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -30,6 +30,7 @@ import { Git, PushStatus } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 import { gitAtLeast } from "./native-git-working-copy.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -130,9 +131,9 @@ describeGit("command-line config overrides the repository's (native twins)", () 
     home = join(root, "home");
     mkdirSync(home);
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("core.autocrlf: add stores LF", async () => {
     const t = twins();
@@ -308,9 +309,9 @@ describeGit("the remote side of a local transport does not see -c (local_repo_en
     home = join(root, "home");
     mkdirSync(home);
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** `<dir>/dst` (non-bare, on main) and `<dir>/src` cloned from it with one more commit. */
   function pushBase(dir: string): void {
@@ -418,9 +419,9 @@ describeGit("store-internal config reads see -c and the global file (native twin
     home = join(root, "home");
     mkdirSync(home);
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("-c core.logAllRefUpdates=false: branch writes no reflog", async () => {
     const t = twins();
@@ -474,9 +475,9 @@ describeGit("command-line includes and conditions as git reads them (native twin
     home = join(root, "home");
     mkdirSync(home);
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** Our config of `repo`, `pairs` on the command line, read as `compatibility`. */
   async function configOf(repo: string, pairs: Array<[string, string]>, over: Env = {}) {

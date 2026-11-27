@@ -8,7 +8,7 @@
  * own copy of one history.
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -16,6 +16,7 @@ import { RebaseStatus } from "../src/index.js";
 import { type HookTwin, hookTwins, nativeIn, oursIn } from "./hooks-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() ? describe : describe.skip;
 
@@ -50,7 +51,7 @@ describeGit("sequence editor program twins", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "sequence-editor-twins-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("GIT_SEQUENCE_EDITOR edits the todo list", async () => {
     const [native, ours] = history("sequence-env");

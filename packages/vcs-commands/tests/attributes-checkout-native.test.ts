@@ -43,6 +43,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { formatStatusPorcelain, Git, ResetMode } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -145,7 +146,7 @@ beforeAll(() => {
   home = join(root, "home");
   mkdirSync(home);
 });
-afterAll(() => rmSync(root, { recursive: true, force: true }));
+afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
 describeGit("checkout attributes: the index the checkout leaves, as git", () => {
   it("a branch switch smudges .gitattributes and files sorting before it with the target's rules", async () => {

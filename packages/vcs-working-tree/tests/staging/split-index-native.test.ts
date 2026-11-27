@@ -11,7 +11,6 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
-  rmSync,
   statSync,
   utimesSync,
   writeFileSync,
@@ -27,6 +26,7 @@ import {
   parseLinkExtension,
   type Staging,
 } from "../../src/staging/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 
 const baseEnv = (home: string) => ({
   PATH: process.env.PATH ?? "",
@@ -50,9 +50,9 @@ const baseEnv = (home: string) => ({
 const VERSIONS: { name: string; path: string }[] = [{ name: "git", path: process.env.PATH ?? "" }];
 
 const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 
 function tempDir(prefix: string): string {
   const dir = mkdtempSync(join(tmpdir(), prefix));

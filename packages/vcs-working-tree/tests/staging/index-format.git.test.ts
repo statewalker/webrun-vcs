@@ -13,6 +13,7 @@ import { createInMemoryFilesApi, type FilesApi } from "@statewalker/vcs-utils/fi
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import { createGitStaging, parseIndexFile } from "../../src/staging/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 
 const GIT_ENV = {
   ...process.env,
@@ -31,9 +32,9 @@ const git = (cwd: string, args: string[]) =>
     .trim();
 
 const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 
 /** A FilesApi that records how many chunks each write received. */
 function countingWrites(files: FilesApi): { files: FilesApi; chunks: Map<string, number> } {

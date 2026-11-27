@@ -37,6 +37,7 @@ import {
 } from "./archive-native-support.js";
 import { shellFilterDriver } from "./host-drivers-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -225,7 +226,7 @@ describeGit("git archive, native (t5000-tar-tree, t5003-archive-zip)", () => {
     rmSync(join(repo, "a/ignored"));
     git(repo, ["tag", "-a", "-m", "v1", "v1"]);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t5000-tar-tree.sh: "git archive", "git archive in a bare repo", "git archive vs. the same in a bare repo"', async () => {
     const n = await twins(repo, ["HEAD"]);
@@ -519,7 +520,7 @@ describeGit("git archive attributes, native (t5001-archive-attr)", () => {
     git(root, ["clone", "-q", "--template=", "--bare", repo, bare]);
     put(bare, "info/attributes", "ignored export-ignore\nsubstfile? export-subst\n");
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t5001-archive-attr.sh: "git archive", "export-subst"', async () => {
     const n = await twins(repo, ["HEAD"]);
@@ -586,7 +587,7 @@ describeGit("git archive corner cases, native (t5004-archive-corner-cases)", () 
     mkdirSync(repo);
     git(repo, ["init", "-q", "-b", "main"]);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t5004-archive-corner-cases.sh: "tar archive of empty tree is empty", "tar archive of empty tree with prefix", "zip archive of empty tree is empty", "zip archive of empty tree with prefix"', async () => {
     const empty = git(repo, ["hash-object", "-t", "tree", "-w", "--stdin"], {}).trim();
@@ -652,7 +653,7 @@ describeGit("git archive conversions and settings, native", () => {
     // the worktree's attributes differ from the tree's: the tree's apply
     put(repo, ".gitattributes", "*.txt text eol=crlf\n");
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("the checkout conversions (eol, ident) from the tree's attributes", async () => {
     await twins(repo, ["HEAD"]);
@@ -717,7 +718,7 @@ describeGit("git archive edge cases, native", () => {
     bare = join(root, "bare.git");
     git(root, ["clone", "-q", "--bare", repo, bare]);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("a bare repository converts (eol, ident) by the archived tree", async () => {
     await twins(bare, ["HEAD"]);
@@ -863,7 +864,7 @@ describeGit("git archive with many entries, native (t5004-archive-corner-cases)"
     root = mkdtempSync(join(tmpdir(), "archive-many-native-"));
     home = root;
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t5004-archive-corner-cases.sh: "zip archive with many entries"', async () => {
     const repo = join(root, "repo");
@@ -914,7 +915,7 @@ describeGit("git archive, JGit ArchiveCommandTest inputs (native oracle)", () =>
     git(repo, ["add", "."]);
     git(repo, ["commit", "-q", "-m", "2"]);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("ArchiveCommandTest: the whole tree, one file, a directory, by id and with a prefix", async () => {
     await twins(repo, ["HEAD"]);
@@ -1001,7 +1002,7 @@ describeGit("git archive streaming, host files and settings, native (#349)", () 
     symlinkSync("nowhere", join(repo, "dangling"));
     symlinkSync(join(root, "adir"), join(repo, "to-dir"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** Runs `fn` with `key=value` in `dir`'s configuration (written into its file), then unsets it. */
   async function withConfig(dir: string, entries: string[][], fn: () => Promise<void>) {
@@ -1304,7 +1305,7 @@ describeGit(
       root = mkdtempSync(join(tmpdir(), "archive-huge-native-"));
       home = root;
     });
-    afterAll(() => rmSync(root, { recursive: true, force: true }));
+    afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
     it('t5000-tar-tree.sh: "set up repository with huge blob", "generate tar with huge size"', async () => {
       const repo = join(root, "huge");

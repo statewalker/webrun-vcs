@@ -6,7 +6,7 @@
  * store replays what native git recorded as `git rerere` replays it.
  */
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -18,6 +18,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { git, gitOk, openOurs, put, snapshot } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { buildT4200, copyRrCache, rerereState } from "./rerere-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -78,9 +79,9 @@ describeGit("the resolution store records and replays as git's rerere (t4200-rer
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "resolution-store-rerere-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it('t4200-rerere.sh: "nothing recorded without rerere"', async () => {
     const t = conflicted();

@@ -11,14 +11,7 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import {
-  appendFileSync,
-  chmodSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { appendFileSync, chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -42,6 +35,7 @@ import {
 } from "./merge-native-helpers.js";
 import { buildGraph, type GraphStep } from "./merge-native-scenarios.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -208,9 +202,9 @@ describeGit("interactive rebase, native twins", () => {
     chmodSync(join(root, "seq-editor.sh"), 0o755);
     chmodSync(join(root, "msg-editor.sh"), 0o755);
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("the list the sequence editor gets, unchanged: the same history", async () => {
     const { native, ours: mine } = twins(linear);
@@ -1271,7 +1265,7 @@ describeGit("interactive rebase, native twins: a branch made at a stop", () => {
     chmodSync(join(root, "seq-editor.sh"), 0o755);
     chmodSync(join(root, "msg-editor.sh"), 0o755);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("checkout -b at an edit stop: --continue moves the new branch, as git's update_head_with_reflog", async () => {
     const { native, ours: mine } = twins(linear);

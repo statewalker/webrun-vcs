@@ -7,7 +7,7 @@
  * read through the worktree's FilesApi while the command runs.
  */
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
@@ -20,15 +20,16 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { Git } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
 const FILES = 12;
 let root = "";
-afterEach(() => {
-  if (root) rmSync(root, { recursive: true, force: true });
+afterEach(async () => {
+  if (root) await removeTempDir(root);
   root = "";
-});
+}, CLEANUP_TIMEOUT);
 
 /** A repository of 12 text files in three directories, two commits; ours over it. */
 async function setup(): Promise<{

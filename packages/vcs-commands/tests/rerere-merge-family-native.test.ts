@@ -36,6 +36,7 @@ import {
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 import { nativeVersion } from "./plumbing-native-support.js";
 import { rerereState } from "./rerere-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -121,9 +122,9 @@ describeGit("rerere in the merge family as native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "rerere-family-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it('t3504-cherry-pick-rerere.sh: "conflicting merge", "fixup"', async () => {
     const t = twins();

@@ -13,7 +13,7 @@
  * (`push --signed` / `push.gpgSign` against a receiving end without `push-cert`).
  */
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -39,6 +39,7 @@ import {
   nativeGitEnv,
   nativeGitHttpBackend,
 } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -117,7 +118,7 @@ describeGit("requests to sign refused as git refuses them when gpg fails", () =>
     writeFileSync(join(root, "failing-gpg"), "#!/bin/sh\nexit 1\n");
     chmodSync(join(root, "failing-gpg"), 0o755);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   describe("commit (t7510-signed-commit)", () => {
     const COMMIT_FAILED = [...GPG_FAILED, "fatal: failed to write commit object"].join("\n");

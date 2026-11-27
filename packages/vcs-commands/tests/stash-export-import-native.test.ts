@@ -6,7 +6,7 @@
  * refusal twins, ours answering as 2.43 (`setCompatibility("2.43")`).
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -15,6 +15,7 @@ import { GitApiError } from "../src/errors/index.js";
 import type { Git, StashCompatibility, StashInfoCommand } from "../src/index.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, openRepo, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -140,7 +141,7 @@ describeGit("stash export and import against native git", () => {
     nativeHasExport = `${probe.stdout}${probe.stderr}`.includes("--to-ref");
     compatibility = nativeHasExport ? "2.56" : "2.43";
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const it51 = (name: string, fn: () => Promise<void>) =>
     it(name, async (context) => {

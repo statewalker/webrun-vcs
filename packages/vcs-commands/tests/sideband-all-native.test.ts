@@ -11,7 +11,7 @@
  * included.
  */
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -39,6 +39,7 @@ import {
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { nativeAtLeast } from "./plumbing-native-support.js";
 import { gitOut, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -215,8 +216,8 @@ describeGit("protocol v2 sideband-all, as native git", () => {
 
   afterAll(async () => {
     await ours?.close();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   const nativeUrl = (repo: string) => `file://${join(srv, repo)}`;
   const ourUrl = (repo: string) => `git://127.0.0.1:${ours.port}/${repo}`;

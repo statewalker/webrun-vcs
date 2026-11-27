@@ -36,6 +36,7 @@ import {
 } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -216,7 +217,7 @@ describeGit("status untracked and ignored modes: as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "status-umodes-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("each -u mode crossed with each --ignored mode", async () => {
     const dir = join(root, "r");

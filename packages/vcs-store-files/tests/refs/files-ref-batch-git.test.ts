@@ -4,7 +4,7 @@
  * leaves every ref at its old or new value. Needs native git.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ObjectId } from "@statewalker/vcs-core";
@@ -13,6 +13,7 @@ import { atomicFilesOver } from "@statewalker/vcs-utils/files";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import { createFilesRefBatch } from "../../src/refs/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 
 /** One FilesApi per repository: atomicFilesOver excludes writers sharing an instance. */
 const sharedFiles = new Map<string, ReturnType<typeof createNodeFilesApi>>();
@@ -27,9 +28,9 @@ function atomicFor(root: string) {
 
 const IDENT = "A U Thor <author@example.com> 1700000000 +0000";
 const roots: string[] = [];
-afterAll(() => {
-  for (const r of roots) rmSync(r, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const r of roots) await removeTempDir(r);
+}, CLEANUP_TIMEOUT);
 
 /** A fixed identity, so git works on machines without user.name / user.email (CI). */
 const GIT_ENV = {

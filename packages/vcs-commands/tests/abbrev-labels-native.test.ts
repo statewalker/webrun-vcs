@@ -6,7 +6,7 @@
  * `sequencer/todo`, `could not apply <abbrev>...`, and `SQUASH_MSG`'s `Merge:` lines.
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -25,6 +25,7 @@ import {
 } from "./merge-native-helpers.js";
 import { buildGraph, buildHistory, type History, text } from "./merge-native-scenarios.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -71,9 +72,9 @@ describeGit("abbreviated ids as find_unique_abbrev gives them (core.abbrev=4)", 
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "abbrev-labels-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("cherry-pick: conflict labels, the todo and git's error", async () => {
     const dirs = twins(threePicks);

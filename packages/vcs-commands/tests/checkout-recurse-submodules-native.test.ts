@@ -25,7 +25,6 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
-  rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -38,6 +37,7 @@ import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitAtLeast } from "./native-git-working-copy.js";
 import { testEnv } from "./status-native-support.js";
+import { removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -604,8 +604,8 @@ describeGit("--recurse-submodules on checkout, switch and reset (native twins)",
     execFileSync("mkdir", ["-p", fixture]);
     sh(fixture, CREATE_LIB_SUBMODULE_REPO);
   }, 120_000);
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
   }, 120_000);
 
   // t2013 `test_submodule_switch_recursing_with_args "checkout"`, t7112 `... "reset --keep"`,

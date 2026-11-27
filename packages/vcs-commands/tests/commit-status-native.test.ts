@@ -27,6 +27,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CleanupMode, type CommitCommand, type UntrackedFilesMode } from "../src/index.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, openRepo, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -82,7 +83,7 @@ describeGit("commit --dry-run: as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "commit-status-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** Ours and native git's dry run agree, output and exit code. */
   async function expectDryRun(
@@ -199,7 +200,7 @@ describeGit("commit template: as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "commit-template-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** An editor script: copies COMMIT_EDITMSG to $COPY_TO, then adds a subject line. */
   function editorScript(): string {
@@ -418,7 +419,7 @@ describeGit("commit with an editor: the index it leaves", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "commit-racy-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("an editor --only commit keeps racily clean entries checked on the next write", async () => {
     const dir = join(root, "r");
@@ -458,7 +459,7 @@ describeGit("commit: template files, an untouched template, the index lock", () 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "commit-tmpl-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /**
    * Native git with `editor` (a shell script body over "$1") and ours with `edit` on two

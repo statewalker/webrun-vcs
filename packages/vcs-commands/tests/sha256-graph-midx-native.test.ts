@@ -56,6 +56,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Git } from "../src/index.js";
 import { put } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -72,7 +73,7 @@ describeGit("SHA-256 commit-graphs, multi-pack-indexes and bitmaps against nativ
     version = m ? Number(m[1]) * 100 + Number(m[2]) : 0;
     compatibility = version >= 250 ? "2.56" : "2.43";
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   function native(cwd: string, args: string[], input?: string | Uint8Array, env = {}) {
     const r = spawnSync("git", args, {

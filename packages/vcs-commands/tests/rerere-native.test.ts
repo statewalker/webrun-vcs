@@ -15,6 +15,7 @@ import { MergeOperation, MergeStatus } from "../src/index.js";
 import { git, gitOk, INTEROP_IDENT, openOurs, put, snapshot } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { buildT4200, copyRrCache, rerereState, rrMtime } from "./rerere-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -129,9 +130,9 @@ describeGit("rerere as native git (t4200-rerere.sh)", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "rerere-native-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it('t4200-rerere.sh: "nothing recorded without rerere"', async () => {
     const t = twins({ "rerere.enabled": "false" });

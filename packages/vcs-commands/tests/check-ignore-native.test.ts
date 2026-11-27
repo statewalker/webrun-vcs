@@ -26,6 +26,7 @@ import {
   plumbingEnv,
   writeFiles,
 } from "./plumbing-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -128,7 +129,7 @@ describeGit("git check-ignore against native git", () => {
     });
     g("add", "-f", "ignored-but-in-index", "a/ignored-but-in-index");
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   // t0008's test_expect_success_multi cases too: . corner-case, empty command line, --stdin
   // with empty STDIN, erroneous use of --, --stdin (-z) with superfluous arg, -z without --stdin

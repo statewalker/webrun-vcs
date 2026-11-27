@@ -14,7 +14,7 @@
  * --delete", "set-url bar zot baz", "show empty remote", "remote -v").
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -28,6 +28,7 @@ import { nativeIs25x } from "./hooks-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -178,7 +179,7 @@ describeGit("git remote add / set-url / -v, as native git", () => {
     gitOut(root, up, ["add", "b.txt"]);
     gitOut(root, up, ["commit", "-qm", "two"], DATES);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** Runs `git remote add <args>` in both twins and compares what they leave. */
   async function expectSameAdd(n: string, o: string, args: string[]) {

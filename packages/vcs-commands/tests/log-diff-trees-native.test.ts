@@ -25,6 +25,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type DiffTextOptions, Git } from "../src/index.js";
 import { put } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -148,9 +149,9 @@ describeGit("git log over trees that change shape, native", () => {
     commit(dir, "foo is a file");
   });
 
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("prints log -p --stat and --name-status as git does", async () => {
     const { g } = await openCounting(dir);
@@ -233,9 +234,9 @@ describeGit("git log --cc and tree modes, native", () => {
     commit(dir, "merge");
   });
 
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   const CASES: string[][] = [
     ["--cc"],

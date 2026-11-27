@@ -6,7 +6,7 @@
  * byte the same, and `git commit-graph verify` must accept ours.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
@@ -23,6 +23,7 @@ import {
   nativeGitEnv,
   nativeGitHttpBackend,
 } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -73,11 +74,11 @@ describeGit("fetch.writeCommitGraph, native twins", () => {
     backend = nativeGitHttpBackend(root, home);
     globalThis.fetch = backend.fetch;
   });
-  afterEach(() => {
+  afterEach(async () => {
     globalThis.fetch = originalFetch;
     backend?.close();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   function commit(work: string, n = 1): void {
     for (let i = 0; i < n; i++) {

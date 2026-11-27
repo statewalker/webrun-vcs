@@ -24,6 +24,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { createNodeFilesApi, PosixNodeFilesApi } from "../src/files/index.js";
 import { replaceFile, writeBatched } from "../src/files/replace-file.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const enc = new TextEncoder();
 
@@ -38,7 +39,7 @@ describe("PosixNodeFilesApi", () => {
     mkdirSync(root);
     files = new PosixNodeFilesApi({ rootDir: root });
   });
-  afterEach(() => rmSync(base, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(base), CLEANUP_TIMEOUT);
 
   it("is what createNodeFilesApi returns, with every POSIX operation", () => {
     const api = createNodeFilesApi({ rootDir: root });
@@ -131,7 +132,7 @@ describe("PosixNodeFilesApi never follows a link, in every operation", () => {
     symlinkSync("../outside.txt", join(root, "x"));
     files = new PosixNodeFilesApi({ rootDir: root });
   });
-  afterEach(() => rmSync(base, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(base), CLEANUP_TIMEOUT);
 
   const beyond = (promise: Promise<unknown>) =>
     expect(promise).rejects.toBeInstanceOf(BeyondSymlinkError);
@@ -218,7 +219,7 @@ describe("PosixNodeFilesApi writes as NodeFilesApi (replaceFile, writeBatched)",
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "posix-write-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("retries a Windows rename refused while the file is open", async () => {
     writeFileSync(join(root, "tmp"), "new");
@@ -295,7 +296,7 @@ describe("PosixNodeFilesApi caches nothing across calls; a batch view only withi
     mkdirSync(root);
     mkdirSync(join(base, "outside"));
   });
-  afterEach(() => rmSync(base, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(base), CLEANUP_TIMEOUT);
 
   it("sees a directory swapped for a link outside since its last call", async () => {
     const files = new PosixNodeFilesApi({ rootDir: root });

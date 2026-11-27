@@ -27,6 +27,7 @@ import {
 } from "./merge-native-helpers.js";
 import { buildHistory, type Files, type History, text } from "./merge-native-scenarios.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -189,9 +190,9 @@ describeGit("directory renames against native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "merge-dirren-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   for (const [name, history] of Object.entries(SCENARIOS)) {
     for (const mode of [undefined, "true", "false"]) {

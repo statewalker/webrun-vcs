@@ -15,6 +15,7 @@ import type { Git, GitApiError } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitHttpBackend } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -63,7 +64,7 @@ describeGit("clone into a destination that is not empty, as native git", () => {
     git(src, "add", "a.txt");
     git(src, "commit", "-qm", "one");
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** A destination made by `prepare` in a repository `git init` made, for each twin. */
   const destinations = (prepare: (dir: string) => void): [string, string] => {

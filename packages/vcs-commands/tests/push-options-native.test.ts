@@ -9,7 +9,7 @@
  * `push-modes-native-support.ts`), comparing the exit status, stderr, the refs of both
  * repositories and the hook logs.
  */
-import { appendFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -25,6 +25,7 @@ import {
   twins,
 } from "./push-modes-native-support.js";
 import { gitOut } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -60,9 +61,9 @@ describeGit("push options (t5545-push-options.sh)", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "push-options-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   // t5545-push-options.sh: "one push option works for a single branch"
   it("one push option reaches pre-receive and post-receive", async () => {

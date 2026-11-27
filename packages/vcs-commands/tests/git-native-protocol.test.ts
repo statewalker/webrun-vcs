@@ -38,6 +38,7 @@ import {
 } from "./native-connect-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -102,7 +103,7 @@ describeGit("git's native transports against native git", () => {
     git(src, "commit", "-qm", "feat");
     git(src, "checkout", "-q", "main");
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   describe("our client over git:// against git daemon", () => {
     const viaDaemon = (calls?: string[]) =>

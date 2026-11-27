@@ -21,7 +21,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -51,6 +50,7 @@ import { openOurs } from "./merge-native-helpers.js";
 import { daemonOpener, gitAsync, openTcpSocket, startTcpServer } from "./native-connect-support.js";
 import { nativeGitAvailable, noMaintenance } from "./native-git-http-backend.js";
 import { gitOut, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 const itSsh =
@@ -344,8 +344,8 @@ describeGit("signed pushes (t5534-push-signed.sh)", () => {
 
   afterAll(async () => {
     await daemon?.close();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   const seeded = () => ({ "receive.certNonceSeed": "sekrit", "gpg.program": gpg });
 
@@ -601,8 +601,8 @@ describeGit("push certificates as receive-pack reads them (JGit PushCertificateP
 
   afterAll(async () => {
     await daemon?.close();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** Native `git receive-pack` fed `request`: its stdout's report lines and its stderr. */
   function nativeReceive(dir: string, request: string, stateless = false) {

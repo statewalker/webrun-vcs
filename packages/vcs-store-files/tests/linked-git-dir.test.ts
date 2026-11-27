@@ -17,6 +17,7 @@ import {
   PosixNodeFilesApi,
 } from "@statewalker/vcs-utils-node/files";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const env = {
   PATH: process.env.PATH ?? "/usr/bin:/bin",
@@ -47,7 +48,7 @@ describe.skipIf(!hasGit || process.platform === "win32")(
       git(base, "init", "-q", "--initial-branch=main", "real");
       git(join(base, "real"), "commit", "-q", "--allow-empty", "-m", "first");
     });
-    afterEach(() => rmSync(base, { recursive: true, force: true }));
+    afterEach(() => removeTempDir(base), CLEANUP_TIMEOUT);
 
     it("follows a .git linked outside the worktree, as git does", async () => {
       mkdirSync(join(base, "work"));
