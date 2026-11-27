@@ -11,7 +11,7 @@
  * directory, as JGit's `CGitAttributesTest` notes).
  */
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -28,6 +28,7 @@ import {
   plumbingEnv,
   writeFiles,
 } from "./plumbing-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -100,7 +101,7 @@ describeGit("JGit AttributesMatcherTest against native check-attr", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "jgit-attributes-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("JGit AttributesMatcherTest#testBasic", async () => {
     await matcherTwin("testBasic", "/test.stp", ["/test.stp"]);
@@ -324,7 +325,7 @@ describeGit("JGit CGitAttributesTest against native check-attr", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "jgit-cgit-attributes-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const cases: [string, string[], Record<string, string>][] = [
     [
