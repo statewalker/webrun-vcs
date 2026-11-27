@@ -691,7 +691,7 @@ export async function writeCommitGraphFile(
     path = COMMIT_GRAPH_FILE;
     await writeLocked(atomic, objectsDir, path, async (lock) => {
       await atomic.write(lock, content);
-      await chmod(files, joinPath(objectsDir, lock), 0o444);
+      await makeReadOnly(files, joinPath(objectsDir, lock));
     });
     hashes.push(fileHash);
   } else {
@@ -706,7 +706,7 @@ export async function writeCommitGraphFile(
       const tmp = `${COMMIT_GRAPHS_DIR}/tmp_graph_${randomSuffix()}`;
       try {
         await atomic.write(tmp, content);
-        await chmod(files, joinPath(objectsDir, tmp), 0o444);
+        await makeReadOnly(files, joinPath(objectsDir, tmp));
         if (baseGraphName) {
           const dest = filenamesAfter[numAfter > 1 ? numAfter - 2 : numAfter - 1] as string;
           if (baseGraphName !== dest && !(await files.move(baseGraphName, dest))) {
@@ -772,7 +772,7 @@ export async function writeCommitGraphFile(
       const tmp = joinPath(dir, `tmp_graph_${randomSuffix()}`);
       try {
         if (!(await files.copy(path, tmp))) continue;
-        await chmod(files, tmp, 0o444);
+        await makeReadOnly(files, tmp);
         // not moved: the copy goes, the mtime only delays the expiry
         if (!(await files.move(tmp, path))) await files.remove(tmp).catch(() => false);
       } catch {
@@ -1492,14 +1492,17 @@ function randomSuffix(): string {
 }
 
 /** Sets a file's mode where the FilesApi can (git writes graph files 0444). */
-async function chmod(files: FilesApi, path: string, mode: number): Promise<void> {
+async function makeReadOnly(files: FilesApi, path: string): Promise<void> {
+  // git creates its graphs 0444 under the umask: the write bits dropped from what the
+  // FilesApi created (0666 under the umask)
   const posix = files as PosixFilesApi;
-  if (typeof posix.chmod === "function") {
-    try {
-      await posix.chmod(path, mode);
-    } catch {
-      // the mode is advisory
-    }
+  if (typeof posix.chmod !== "function" || typeof posix.lstat !== "function") return;
+  try {
+    const stats = await posix.lstat(path);
+    if (stats?.mode === undefined) return;
+    await posix.chmod(path, stats.mode & 0o7555);
+  } catch {
+    // the mode is advisory
   }
 }
 
