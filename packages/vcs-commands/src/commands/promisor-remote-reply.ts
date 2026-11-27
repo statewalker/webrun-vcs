@@ -61,6 +61,18 @@ export function acceptedPromisorRemotes(workingCopy: WorkingCopy): ReadonlySet<s
   return accepted.get(keyOf(workingCopy)) ?? new Set();
 }
 
+/**
+ * Forgets what earlier `promisor-remote` answers accepted for this repository, as each git
+ * process starts with none (`promisor_remote.accepted`, `advertised_filter`): a fetch or clone
+ * calls it before it connects, so `--filter=auto` and the lazy fetches' order follow only the
+ * server it talks to now.
+ */
+export function resetPromisorAcceptance(workingCopy: WorkingCopy): void {
+  const key = keyOf(workingCopy);
+  accepted.delete(key);
+  advertisedFilters.delete(key);
+}
+
 function keyOf(workingCopy: WorkingCopy): object {
   try {
     return workingCopy.history?.objects ?? workingCopy;

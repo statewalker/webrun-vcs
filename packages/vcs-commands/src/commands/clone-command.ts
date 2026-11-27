@@ -71,7 +71,11 @@ import { runPostCheckoutHook } from "./git-hooks.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { copyLocalObjects } from "./local-clone.js";
 import { promisorOf } from "./promisor-remote.js";
-import { promisorAutoFilter, promisorRemoteReplyOf } from "./promisor-remote-reply.js";
+import {
+  promisorAutoFilter,
+  promisorRemoteReplyOf,
+  resetPromisorAcceptance,
+} from "./promisor-remote-reply.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { isValidRemoteName } from "./remote-command.js";
 import { withRemoteUploadPack } from "./remote-transport.js";
@@ -1246,6 +1250,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     });
 
     const sessionId = clientSessionIdOf(this.workingCopy);
+    // a new git process: no promisor remote accepted yet (--filter=auto, lazy-fetch order)
+    resetPromisorAcceptance(this.workingCopy);
     const fetchOptions: TransportFetchOptions = {
       ...(sessionId !== undefined ? { sessionId } : {}),
       // fetch.uriProtocols: the packs a v2 server offloads to packfile URIs

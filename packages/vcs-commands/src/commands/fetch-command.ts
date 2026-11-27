@@ -65,7 +65,11 @@ import {
   promisorRemotes,
   registerPartialClone,
 } from "./promisor-remote.js";
-import { promisorAutoFilter, promisorRemoteReplyOf } from "./promisor-remote-reply.js";
+import {
+  promisorAutoFilter,
+  promisorRemoteReplyOf,
+  resetPromisorAcceptance,
+} from "./promisor-remote-reply.js";
 import { withRemoteUploadPack } from "./remote-transport.js";
 import { clientSessionIdOf } from "./session-id.js";
 import {
@@ -1024,6 +1028,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     const negotiationTips =
       tipsGiven.length > 0 ? await this.resolveNegotiationTips(messages, tipsGiven) : undefined;
     const unpackLimit = unpackLimitOf({ getAll: (key) => store.values(key) }, "fetch");
+    // a new git process: no promisor remote accepted yet (--filter=auto, lazy-fetch order)
+    resetPromisorAcceptance(this.workingCopy);
     const fetchOptions: TransportFetchOptions = {
       ...(sessionId !== undefined ? { sessionId } : {}),
       // fetch.uriProtocols: the packs a v2 server offloads to packfile URIs
