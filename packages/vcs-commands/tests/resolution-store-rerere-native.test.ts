@@ -6,7 +6,7 @@
  * store replays what native git recorded as `git rerere` replays it.
  */
 
-import { mkdtempSync, rmSync, utimesSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -122,6 +122,91 @@ describeGit("the resolution store records and replays as git's rerere (t4200-rer
     expect(await (await storeOf(t.ours)).recordResolution("a1")).toMatch(/^[0-9a-f]{40}$/);
     expect(rerereState(t.ours)).toEqual(rerereState(t.native));
     expect(rerereState(t.ours).MERGE_RR).toBe("");
+  });
+
+  it('t4200-rerere.sh: "multiple identical conflicts": a second variant of one conflict id', async () => {
+    // f1 and f2 conflict with the same sides in other context: one id, two variants
+    const n = counter++;
+    const t = { native: join(root, `native-${n}`), ours: join(root, `ours-${n}`) };
+    for (const dir of [t.native, t.ours]) {
+      mkdirSync(dir, { recursive: true });
+      const run = (...args: string[]) => gitOk(root, dir, ...args);
+      run("init", "-q", "-b", "main");
+      run("config", "rerere.enabled", "true");
+      put(dir, "f1", "a\nX\nb\n");
+      put(dir, "f2", "c\nX\nd\n");
+      run("add", ".");
+      run("commit", "-q", "-m", "base");
+      run("checkout", "-q", "-b", "side");
+      put(dir, "f1", "a\nT\nb\n");
+      put(dir, "f2", "c\nT\nd\n");
+      run("commit", "-q", "-a", "-m", "theirs");
+      run("checkout", "-q", "main");
+      put(dir, "f1", "a\nO\nb\n");
+      put(dir, "f2", "c\nO\nd\n");
+      run("commit", "-q", "-a", "-m", "ours");
+      git(root, dir, "-c", "rerere.enabled=false", "merge", "side");
+    }
+    gitOk(root, t.native, "rerere");
+    for (const dir of [t.native, t.ours]) {
+      put(dir, "f1", "a\nR1\nb\n");
+      put(dir, "f2", "c\nR2\nd\n");
+    }
+    gitOk(root, t.native, "rerere");
+    const store = await storeOf(t.ours);
+    const id = await store.recordResolution("f1");
+    expect(await store.recordResolution("f2")).toBe(id);
+    expect(records(t.ours)).toEqual(records(t.native));
+    expect(records(t.ours)[`rr-cache/${id}/postimage.1`]).toBe("c\nR2\nd\n");
+  });
+
+  it('t4200-rerere.sh: "rerere.enabled works, too": a conflict git would replay records nothing', async () => {
+    // f and g conflict with the same sides, their context differing far from the hunk
+    const n = counter++;
+    const t = { native: join(root, `native-${n}`), ours: join(root, `ours-${n}`) };
+    const lines = (first: string, mid: string) => `${first}\n2\n3\n4\n5\n${mid}\n6\n7\n8\n9\n`;
+    for (const dir of [t.native, t.ours]) {
+      mkdirSync(dir, { recursive: true });
+      const run = (...args: string[]) => gitOk(root, dir, ...args);
+      run("init", "-q", "-b", "main");
+      run("config", "rerere.enabled", "true");
+      put(dir, "f", lines("1", "X"));
+      put(dir, "g", lines("one", "X"));
+      run("add", ".");
+      run("commit", "-q", "-m", "base");
+      for (const [branch, file, side] of [
+        ["tf", "f", "T"],
+        ["of", "f", "O"],
+        ["tg", "g", "T"],
+        ["og", "g", "O"],
+      ] as const) {
+        run("checkout", "-q", "-b", branch, "main");
+        put(dir, file, lines(file === "f" ? "1" : "one", side));
+        run("commit", "-q", "-a", "-m", branch);
+      }
+      run("checkout", "-q", "of");
+      git(root, dir, "-c", "rerere.enabled=false", "merge", "tf");
+    }
+    gitOk(root, t.native, "rerere");
+    for (const dir of [t.native, t.ours]) put(dir, "f", lines("1", "R"));
+    gitOk(root, t.native, "rerere");
+    const store = await storeOf(t.ours);
+    const id = await store.recordResolution("f");
+    for (const dir of [t.native, t.ours]) {
+      gitOk(root, dir, "reset", "-q", "--hard");
+      gitOk(root, dir, "checkout", "-q", "og");
+      git(root, dir, "-c", "rerere.enabled=false", "merge", "tg");
+    }
+    expect(git(root, t.native, "rerere").stderr).toContain(
+      "Resolved 'g' using previous resolution.",
+    );
+    put(t.ours, "g", lines("one", "R"));
+    expect(await (await storeOf(t.ours)).recordResolution("g")).toBe(id);
+    // native's replay leaves its thisimage behind; the records are the same
+    const withoutThisimage = (dir: string) =>
+      Object.fromEntries(Object.entries(records(dir)).filter(([k]) => !k.includes("thisimage")));
+    expect(withoutThisimage(t.ours)).toEqual(withoutThisimage(t.native));
+    expect(Object.keys(withoutThisimage(t.ours))).toHaveLength(4);
   });
 
   it('t4200-rerere.sh: "rerere status", "rerere diff", "rerere gc" over what the store recorded', async () => {

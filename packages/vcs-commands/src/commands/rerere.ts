@@ -954,10 +954,12 @@ async function stagesOf(staging: Staging, path: string): Promise<Stages> {
  * git's, written by rerere.c's steps only.
  *
  * `record(path)` is what two `git rerere` runs record for a path, one while it was
- * conflicted and one once resolved: the preimage recreated from the stages as `rerere
- * forget` recreates it (`handle_cache`), the variant `MERGE_RR` names for the path, else the
- * one holding that preimage, else a new one (`assign_variant`), then the worktree file as
- * the postimage (`copy_file`: an existing one stays) and the path dropped from `MERGE_RR`.
+ * conflicted and one once resolved: the variant `MERGE_RR` names for the path; else the
+ * preimage recreated from the stages as `rerere forget` recreates it (`handle_cache`),
+ * nothing recorded when a recorded variant replays cleanly onto it (git's first run would
+ * have replayed it; its id is returned), else a new variant (`assign_variant`); then the
+ * worktree file as the postimage (`copy_file`: an existing one stays) and the path dropped
+ * from `MERGE_RR`.
  * `replay(path)` is `do_rerere_one_path`'s replay over the conflicted worktree file.
  * Nothing is written where rerere is off (`setup_rerere`).
  *
@@ -991,15 +993,13 @@ async function recordOnePath(host: RerereHost, path: string): Promise<string | u
     const { status, id: hex, output } = await handleCache(run, path, stages);
     if (status < 1 || !hex || !output) return undefined;
     id = await run.newId(hex);
+    // the first run: a recorded resolution that applies cleanly would have been replayed,
+    // and nothing recorded (do_rerere_one_path)
     for (let variant = 0; variant < id.dir.status.length; variant++) {
-      if (!((id.dir.status[variant] ?? 0) & RR_HAS_PREIMAGE)) continue;
-      const recorded = await run.readFile(run.path({ dir: id.dir, variant }, "preimage"));
-      if (recorded && compareBytes(recorded, output) === 0) {
-        id.variant = variant;
-        break;
-      }
+      if (((id.dir.status[variant] ?? 0) & BOTH) !== BOTH) continue;
+      if (await run.tryMerge({ dir: id.dir, variant }, path, output)) return hex;
     }
-    if (id.variant < 0) run.assignVariant(id);
+    run.assignVariant(id);
     await run.mkdir(run.path(id));
     if (!((id.dir.status[id.variant] ?? 0) & RR_HAS_PREIMAGE)) {
       await run.writeFile(run.path(id, "preimage"), output);
