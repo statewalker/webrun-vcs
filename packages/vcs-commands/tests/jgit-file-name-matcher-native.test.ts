@@ -16,7 +16,7 @@
  * `canAppendMatch`, JGit's streaming state, has no git counterpart and is not ported.
  */
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -33,6 +33,7 @@ import {
   plumbingEnv,
   writeFiles,
 } from "./plumbing-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -281,7 +282,7 @@ describeGit("JGit FileNameMatcherTest against native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "jgit-fnmatch-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   for (const { pattern, names, inputs } of groups().values()) {
     const title = names.map((n) => `JGit FileNameMatcherTest#test${n}`).join(", ");
