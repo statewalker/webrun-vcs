@@ -297,11 +297,10 @@ describeGit("repack twins", () => {
     });
 
     it("t7701-repack-unpack-unreachable 'do not bother loosening old objects'", async () => {
-      // one commit more than git's test: with nothing reachable git writes no pack but still
-      // removes the old ones, where ours leaves everything (statewalker/webrun-vcs#389)
+      // as git's test: no commit, nothing reachable; git writes no pack but still removes the
+      // old ones (statewalker/webrun-vcs#389)
       const caseDir = newCase(root, "unpack-old-pack");
       const r = initRepo(root, caseDir);
-      r.commit("base", { "a.txt": "a\n" });
       const obj1 = r.blob("one\n");
       const obj2 = r.blob("two\n");
       const pack1 = r.git(["pack-objects", join(r.gitDir, "objects/pack/pack")], {
@@ -323,6 +322,48 @@ describeGit("repack twins", () => {
       );
       expect(ours.loose).toContain(obj1);
       expect(ours.loose).not.toContain(obj2);
+    });
+
+    /** statewalker/webrun-vcs#389: a repository without commits whose packs hold only unreachable blobs */
+    function unreachablePacks(name: string) {
+      const caseDir = newCase(root, name);
+      const r = initRepo(root, caseDir);
+      const obj1 = r.blob("one\n");
+      const obj2 = r.blob("two\n");
+      r.git(["pack-objects", join(r.gitDir, "objects/pack/pack")], { input: `${obj1}\n` });
+      r.git(["pack-objects", join(r.gitDir, "objects/pack/pack")], { input: `${obj2}\n` });
+      r.git(["prune-packed"]);
+      return { caseDir, r, obj1, obj2 };
+    }
+
+    it("repack -a -d with nothing reachable removes every pack and drops their objects (statewalker/webrun-vcs#389)", async () => {
+      const { caseDir } = unreachablePacks("nothing-reachable-ad");
+      const { native, ours, result } = await repackTwins(caseDir, ["-a", "-d"], (c) =>
+        c.setAll(true).setDeleteRedundant(true),
+      );
+      expect(native.packs).toEqual([]);
+      expect(ours.loose).toEqual([]);
+      expect(result.output).toEqual(["Nothing new to pack."]);
+    });
+
+    it("repack --cruft -d with nothing reachable moves the old packs into a cruft pack (statewalker/webrun-vcs#389)", async () => {
+      const { caseDir } = unreachablePacks("nothing-reachable-cruft");
+      const { ours } = await repackTwins(caseDir, ["--cruft", "-d"], (c) =>
+        c.setCruft(true).setDeleteRedundant(true),
+      );
+      expect(ours.packs.map((p) => p.kind)).toEqual(["cruft"]);
+    });
+
+    it("repack -d with nothing new still prunes loose objects already packed (statewalker/webrun-vcs#389)", async () => {
+      const { caseDir, r } = unreachablePacks("nothing-new-prune-packed");
+      // a third blob packed but left loose too (no prune-packed after its pack)
+      const obj3 = r.blob("three\n");
+      r.git(["pack-objects", join(r.gitDir, "objects/pack/pack")], { input: `${obj3}\n` });
+      const { native, ours } = await repackTwins(caseDir, ["-d"], (c) =>
+        c.setAll(false).setDeleteRedundant(true),
+      );
+      expect(native.loose).toEqual([]);
+      expect(ours.packs.length).toBe(3);
     });
 
     it("t7701-repack-unpack-unreachable: a pack exactly as old as the cutoff is not loosened (git keeps mtime > expiration)", async () => {

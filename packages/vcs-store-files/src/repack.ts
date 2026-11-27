@@ -449,8 +449,9 @@ export interface RepackResult {
   /** `filter`: the pack of the objects the filter left out (`pack-<id>`), when any was */
   filteredPack?: string;
   /**
-   * No pack but `filteredPack` was written: git prints `Nothing new to pack.` before it writes
-   * the filtered pack
+   * pack-objects wrote no pack (`packName` is "" unless `filteredPack` was written): git prints
+   * `Nothing new to pack.`, then still removes the replaced packs (`-a -d`), writes the cruft
+   * or filtered pack and prunes the packed loose objects (`-d`)
    */
   nothingNew?: boolean;
   /** `cruft`: the cruft packs written (`pack-<id>`), when any was */
@@ -716,7 +717,13 @@ export async function repackListed(
   // nothing new: --filter's write_filtered_pack still runs over the existing packs (git's
   // `names` then holds only the filtered pack, so no "Nothing new to pack.")
   const nothingNew = ids.length === 0 && promised.length === 0 && unreachable.length === 0;
-  if (nothingNew && (!options.filter || dryRun)) return null;
+  // with nothing new pack-objects writes no pack, but git's repack still goes on: -a -d removes
+  // every replaced pack (loosening per --unpack-unreachable), --cruft writes its cruft pack,
+  // -d prunes the packed loose objects (statewalker/webrun-vcs#389)
+  const goesOn = !dryRun && (options.filter || deleteRedundant || (all && options.cruft));
+  if (nothingNew && !goesOn) return null;
+  // no pack, no bitmap (and none of its warnings)
+  if (nothingNew) bitmaps.mode = "off";
   if ((exclusions || options.filter) && bitmaps.mode !== "off") {
     // the promisor objects are not packed with the rest: no closure for a bitmap
     if (bitmaps.mode === "loud") warnings.push(NO_CLOSURE_BITMAP_WARNING);
@@ -841,8 +848,7 @@ export async function repackListed(
         await packs.refresh();
       }
     }
-    if (!mainPack && !filteredPack) return null;
-    const packId = (mainPack ?? filteredPack) as string;
+    const packId = mainPack ?? filteredPack;
     const count = mainPack ? mainCount : filteredCount;
     // Only packs of the snapshot, and none modified since the walk started (defence in depth)
     const replacedPacks: { pack: Pack; modified?: number }[] = [];
@@ -939,7 +945,7 @@ export async function repackListed(
         compatibility: options.compatibility ?? "2.56",
         ...(options.environment ? { environment: options.environment } : {}),
         stdinPacks: [...include].sort(),
-        preferredPack: `pack-${packId}.pack`,
+        ...(packId ? { preferredPack: `pack-${packId}.pack` } : {}),
         bitmap: midxBitmap,
         ...(options.writeMidxBitmap ? { writeBitmap: options.writeMidxBitmap } : {}),
       });
@@ -975,7 +981,7 @@ export async function repackListed(
     }
 
     return {
-      packName: `pack-${packId}`,
+      packName: packId ? `pack-${packId}` : "",
       objectCount: count,
       looseObjectsRemoved,
       packsRemoved,
