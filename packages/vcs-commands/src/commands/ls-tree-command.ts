@@ -28,6 +28,7 @@ import {
   treePathspec,
 } from "./pathspec.js";
 import { PlumbingCommand, PlumbingError } from "./plumbing-command.js";
+import { concatBytes, objectTypeOfMode, SHORT_MAGIC } from "./plumbing-shared.js";
 
 /** ls-tree's `cmdmode`: the output options that exclude one another. */
 export type LsTreeMode = "long" | "name-only" | "name-status" | "object-only";
@@ -51,9 +52,6 @@ const MAGIC = [
   { name: "exclude", mnemonic: "!" },
   { name: "attr", mnemonic: "" },
 ] as const;
-
-/** ctype.c's GIT_PATHSPEC_MAGIC characters (and `/`, `^`) */
-const SHORT_MAGIC = new Set([..."!\"#%&',-;<=>@_`~^/"]);
 
 const FLUSH_AT = 64 * 1024;
 
@@ -502,17 +500,17 @@ export class LsTreeCommand extends PlumbingCommand {
     const modeText = mode.toString(8).padStart(6, "0");
     switch (ctx.fn) {
       case "default":
-        return concat(
+        return concatBytes([
           latin1Bytes(`${modeText} ${type} ${await this.abbreviated(id)}\t`),
           this.fastPath(ctx, path),
-        );
+        ]);
       case "long": {
         let size = "-";
         if (type === "blob") size = String((await this.blobSize(id)) ?? "BAD");
-        return concat(
+        return concatBytes([
           latin1Bytes(`${modeText} ${type} ${await this.abbreviated(id)} ${size.padStart(7)}\t`),
           this.fastPath(ctx, path),
-        );
+        ]);
       }
       case "name-only":
         return this.fastPath(ctx, path);
@@ -627,20 +625,6 @@ interface WalkContext {
   outputPrefix: string | undefined;
   quoteFully: boolean;
   nulTerminated: boolean;
-}
-
-function objectTypeOfMode(mode: number): "tree" | "commit" | "blob" {
-  const kind = mode & 0o170000;
-  if (kind === 0o040000) return "tree";
-  if (kind === 0o160000) return "commit";
-  return "blob";
-}
-
-function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
-  const out = new Uint8Array(a.length + b.length);
-  out.set(a);
-  out.set(b, a.length);
-  return out;
 }
 
 /** A byte string as git prints it in an error message (bytes as they are). */
