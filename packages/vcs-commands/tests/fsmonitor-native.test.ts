@@ -1133,6 +1133,25 @@ describeGit("fsmonitor against native git (t7519-status-fsmonitor.sh)", () => {
         );
       });
     }
+
+    it('t7001-mv.sh: "git mv should overwrite symlink to a file": a symbolic link checked out as a file (core.symlinks=false) is a regular file to fill_stat_cache_info', async () => {
+      hook(LISTED);
+      report([]);
+      git(["config", "core.symlinks", "false"]);
+      put("link", "tracked");
+      const blob = git(["hash-object", "-w", "link"]).trim();
+      git(["-c", "core.fsmonitor=", "update-index", "--add", "--cacheinfo", `120000,${blob},link`]);
+      git(["-c", "core.fsmonitor=", "commit", "-qm", "link"]);
+      git(["-c", "core.fsmonitor=", "update-index", "-q", "--refresh"]);
+      git(["update-index", "--fsmonitor"]);
+      nextSecond();
+      await mvTwins(
+        ["link", "moved-link"],
+        (mv) => mv.addSource("link").setDestination("moved-link").call(),
+        [["link", "moved-link"]],
+      );
+      expect(git(["ls-files", "-f", "moved-link"])).toBe("h moved-link\n");
+    });
   });
 
   for (const how of ["reset --hard", "checkout -f"] as const) {

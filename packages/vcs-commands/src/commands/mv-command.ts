@@ -586,7 +586,9 @@ export class MvCommand extends GitCommand<MvResult> {
           if (basicStatMatches(moved, file, trust)) valid = true;
           else {
             moved = { ...moved, ...entryStatOf(file) };
-            valid = moved.mode !== FileMode.SYMLINK;
+            // S_ISREG of the file: a symbolic link's entry checked out as a file
+            // (core.symlinks=false) is one
+            valid = !file.isDirectory && file.mode !== FileMode.SYMLINK;
           }
         }
       }
