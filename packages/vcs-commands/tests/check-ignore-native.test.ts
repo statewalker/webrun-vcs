@@ -353,5 +353,10 @@ describeGit("git check-ignore against native git", () => {
     await twin({ args: ["-v", "-n", "--stdin"], stdin: "one\n:/one\n\nnever-reached\n" });
     await twin({ args: ["-v", "-n", "--stdin", "-z"], stdin: "one\0:!one\0one\0" });
     await twin({ args: ["-v", "-n", "--stdin"], stdin: "one\n:/one\n", cwd: "a" });
+    // JGit QuotedStringGitPathStyleTest#testDequote_OctalAll: an unquoted `\000` ends the
+    // path, so `"\000"` is the empty path, which dies as an empty argument does
+    await twin({ args: ["-v", "-n", "--stdin"], stdin: 'one\n"\\000"\nnever-reached\n' });
+    await twin({ args: ["-v", "-n", "--stdin"], stdin: '"one\\000two"\n' });
+    await twin({ args: ["-v", "-n", "--stdin"], stdin: "one\n\nnever-reached\n" });
   });
 });
