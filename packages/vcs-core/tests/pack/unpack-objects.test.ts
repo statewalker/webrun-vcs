@@ -480,11 +480,16 @@ describe("typedStoreObjects: stores of parsed objects", () => {
     const { ObjectIdMismatchError } = await import("../../src/history/objects/git-objects.js");
     const backing = new MemoryRawStorage();
     const kernel = createGitObjects(rawStorageStaging(backing));
-    // typed stores only: no `objects`, so received packs go through typedStoreObjects
+    // typed stores only: no `objects`, so received packs go through typedStoreObjects; the
+    // commits keep no bytes (no `raw`/`storeRaw`), as a store of parsed rows without them
+    const commits = Object.assign(Object.create(createCommits(kernel)), {
+      raw: undefined,
+      storeRaw: undefined,
+    });
     const history = createHistoryFromStores({
       blobs: createBlobs(kernel),
       trees: createTrees(kernel),
-      commits: createCommits(kernel),
+      commits,
       tags: createTags(kernel),
       refs: createMemoryRefs(),
     });
@@ -499,6 +504,41 @@ describe("typedStoreObjects: stores of parsed objects", () => {
     const keys: string[] = [];
     for await (const k of backing.keys()) keys.push(k);
     expect(keys).toEqual([]);
+    // importObject refuses it too, instead of storing the re-encoded commit under another id
+    const one = await api.importObject("commit", [commit], commit.length).catch((e: unknown) => e);
+    expect(one).toBeInstanceOf(ObjectIdMismatchError);
+    for await (const k of backing.keys()) keys.push(k);
+    expect(keys).toEqual([]);
+  });
+
+  it("keeps such an object byte for byte through stores that take bytes (storeRaw)", async () => {
+    const {
+      createHistoryFromStores,
+      createBlobs,
+      createTrees,
+      createCommits,
+      createTags,
+      createMemoryRefs,
+    } = await import("../../src/history/index.js");
+    const { DefaultSerializationApi } = await import("../../src/serialization/index.js");
+    const kernel = createGitObjects(rawStorageStaging(new MemoryRawStorage()));
+    const history = createHistoryFromStores({
+      blobs: createBlobs(kernel),
+      trees: createTrees(kernel),
+      commits: createCommits(kernel),
+      tags: createTags(kernel),
+      refs: createMemoryRefs(),
+    });
+    const commit = enc.encode(
+      "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor A <a@b> 1 +0000\ncommitter A <a@b> 1 +0000\nmergetag object 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n type commit\n\nmsg\n",
+    );
+    const api = new DefaultSerializationApi({ history });
+    await api.importPack(chunks(pack([{ kind: 1, data: commit }])));
+    const id = await api.importObject("commit", [commit], commit.length);
+    expect(await history.commits.raw?.(id)).toEqual(commit);
+    const parts: Uint8Array[] = [];
+    for await (const c of (await api.exportObject(id)).content) parts.push(c);
+    expect(Buffer.concat(parts).equals(Buffer.from(commit))).toBe(true);
   });
 });
 
