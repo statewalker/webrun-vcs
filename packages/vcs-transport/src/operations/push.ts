@@ -3,6 +3,7 @@
  */
 
 import type { BaseHttpOptions } from "../api/options.js";
+import type { HttpClientSettings } from "../http-client/http-client-settings.js";
 import {
   openHttpReceivePackConnection,
   type PushClientOptions,
@@ -18,6 +19,8 @@ export interface PushOptions extends BaseHttpOptions, PushClientOptions {
    * (see `HttpReceivePackOptions.streamRequestBody`)
    */
   streamRequestBody?: boolean;
+  /** git's `http.*` settings (`http.postBuffer`: a pack within it is held, a larger one streamed) */
+  http?: HttpClientSettings;
   /** Aborts the push */
   signal?: AbortSignal;
 }
