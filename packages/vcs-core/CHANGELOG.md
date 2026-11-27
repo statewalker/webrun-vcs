@@ -1,5 +1,34 @@
 # @statewalker/vcs-core
 
+## 0.13.0
+
+### Minor Changes
+
+- e11042a: Commits and tags keep their bytes through stores of parsed objects (statewalker/webrun-vcs#399).
+  `Commits` and `Tags` gain optional `raw(id)` and `storeRaw(content)`; `DefaultSerializationApi`
+  exports a commit or tag from `raw` when the store has it, imports through `storeRaw`, and without
+  it refuses (`ObjectIdMismatchError`, nothing stored) a commit or tag whose parsed form would encode
+  to other bytes, instead of storing it under another id.
+  
+  vcs-store-sql: schema migration 10 adds a nullable `raw` BLOB to `vcs_commit` and `vcs_tag`,
+  filled only for objects the columns cannot rebuild (extra headers such as `mergetag` and
+  `change-id`, names and messages that are not UTF-8); git.git now imports through `importPack` and
+  `importObject` and exports byte for byte. Rows written before keep reading as they did (what they
+  lost cannot be recovered: re-import those objects from a git source). Rolling back below version
+  10 refuses while any row keeps raw bytes; with none, it drops the column. `importToNative` and
+  `exportToGit` copy commits and tags byte for byte.
+
+### Patch Changes
+
+- b331c80: A clone of a shallow repository writes `.git/shallow` as native git does: the server's shallow commits in the order sent, a commit sent twice (a branch and an annotated tag reaching it, over protocol v2) on two lines (`Refs.setShallow`'s new `verbatim` option). Fetch and clone send their wants in the order the remote listed the refs (HEAD first for a clone), as fetch-pack's `filter_refs` does, so a shallow server's answer follows git's order too. Reading a shallow file merges duplicate lines. (#326)
+- dc9561d: `git fetch --atomic` now writes its refs as git does. The updated refs are written loose, and packed-refs is rewritten only to drop the refs `--prune` deletes. Before, a batch of several refs went through packed-refs. The files store's `BatchOptions.loose` now also covers a batch that deletes refs, following git's `files_transaction_finish`: every lock is taken and every check made before the first rename, the updates are renamed into place, then the deletions go (#284).
+- 66c658b: `.git` spellings: read names as git's `is_hfs_dot_generic` does, where a byte outside valid UTF-8 ends the name, so `.git` followed by a truncated UTF-8 sequence is `.git` (checkout refuses it under `core.protectHFS`, fsck reports `hasDotgit`). fsck now decodes tree entry names with git's byte escapes instead of U+FFFD.
+- 34b4e5b: Loose objects and pack-family files (`.pack`, `.idx`, `.rev`, `.bitmap`, `.mtimes`, a multi-pack-index's bitmap and reverse index, incremental midx layers, commit-graphs) are now written 0444 under the umask in repositories that are not shared, as git writes them. The plain `multi-pack-index` and `multi-pack-index-chain` stay under the umask, as git's lock files leave them. `createGitFilesBackend` and the commands' repository FilesApi (repack, gc, maintenance) wrap their FilesApi with the new `withReadOnlyObjectFiles` (`isReadOnlyObjectPath`). Commit-graphs respect the umask (0400 under umask 077, as git). The Node FilesApi's `chmod` is synchronous now (one per loose object written). FilesApis without modes (memory, browser) are unchanged.
+- 74d81a7: The published tarballs no longer ship test code: vcs-core left out `src/__tests__/` (fixtures, setup and test utilities) and vcs-transport `src/tests/unit/*.test.ts`. Every published package's `files` now excludes test directories and `*.test.*`/`*.spec.*` files, and `scripts/check-pack-contents.mjs` (run by `lint:check`) fails a package whose `pnpm pack` would ship them or miss a file its manifest names (#342).
+- Updated dependencies [6e40444]
+- Updated dependencies [34b4e5b]
+  - @statewalker/vcs-utils@0.11.1
+
 ## 0.12.1
 
 ### Patch Changes

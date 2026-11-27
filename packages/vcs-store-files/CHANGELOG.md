@@ -1,5 +1,36 @@
 # @statewalker/vcs-store-files
 
+## 0.13.0
+
+### Minor Changes
+
+- Release of the changes since the last published version:
+  
+  - @statewalker/vcs-core crosses a breaking line
+
+### Patch Changes
+
+- b331c80: A clone of a shallow repository writes `.git/shallow` as native git does: the server's shallow commits in the order sent, a commit sent twice (a branch and an annotated tag reaching it, over protocol v2) on two lines (`Refs.setShallow`'s new `verbatim` option). Fetch and clone send their wants in the order the remote listed the refs (HEAD first for a clone), as fetch-pack's `filter_refs` does, so a shallow server's answer follows git's order too. Reading a shallow file merges duplicate lines. (#326)
+- dc9561d: `git fetch --atomic` now writes its refs as git does. The updated refs are written loose, and packed-refs is rewritten only to drop the refs `--prune` deletes. Before, a batch of several refs went through packed-refs. The files store's `BatchOptions.loose` now also covers a batch that deletes refs, following git's `files_transaction_finish`: every lock is taken and every check made before the first rename, the updates are renamed into place, then the deletions go (#284).
+- 49d5a5d: `repack --geometric` removes the stale `.mtimes`, `.bitmap` and `.promisor` (and `.rev` when none is written) of a pack it writes under the name of one already there, as git's `generated_pack_install` does: a follow walk that rescues a whole cruft pack writes it again byte for byte, and the result is a plain pack, not a cruft one.
+- 4abd851: Promisor remotes follow git 2.56's `promisor.acceptFromServerUrl` (advertised remotes whose URL an allowlist glob matches are accepted and created as `promisor-auto-*` or named remotes with `advertisedAs`) and git 2.54's `clone`/`fetch --filter=auto` (the accepted remotes' advertised filter, recorded as `auto`). Clone writes `remote.<name>.url` before it lists the refs, as git does; lazy fetches answer the server's `promisor-remote` capability and clone reports their lines; a local remote reached through a symbolic link opens the repository the link leads to.
+- 34b4e5b: Loose objects and pack-family files (`.pack`, `.idx`, `.rev`, `.bitmap`, `.mtimes`, a multi-pack-index's bitmap and reverse index, incremental midx layers, commit-graphs) are now written 0444 under the umask in repositories that are not shared, as git writes them. The plain `multi-pack-index` and `multi-pack-index-chain` stay under the umask, as git's lock files leave them. `createGitFilesBackend` and the commands' repository FilesApi (repack, gc, maintenance) wrap their FilesApi with the new `withReadOnlyObjectFiles` (`isReadOnlyObjectPath`). Commit-graphs respect the umask (0400 under umask 077, as git). The Node FilesApi's `chmod` is synchronous now (one per loose object written). FilesApis without modes (memory, browser) are unchanged.
+- 4f3c613: `read-tree -m` (one-way and two-way) and `reset --mixed` of a crafted tree holding a link and a directory of one name keep only the directory's files in the index, as git's `add_index_entry` with `OK_TO_REPLACE` does: `Staging.readTree` of every store drops a file a directory of its name replaces, and read-tree's two-way merge reads its trees the same way (`flatTree(..., { asIndex: true })`). The index never holds a file/directory clash (webrun-vcs#247).
+- e953a8d: `repack` with nothing new to pack goes on as git's does: `-a -d` removes the replaced packs (loosening their unreachable objects under `--unpack-unreachable`), `--cruft` writes its cruft pack and `-d` prunes the loose objects already packed, instead of leaving everything in place (statewalker/webrun-vcs#389).
+- Updated dependencies [6e40444]
+- Updated dependencies
+- Updated dependencies [c79e1ee]
+- Updated dependencies [b331c80]
+- Updated dependencies [dc9561d]
+- Updated dependencies [66c658b]
+- Updated dependencies [34b4e5b]
+- Updated dependencies [4f3c613]
+- Updated dependencies [e11042a]
+- Updated dependencies [74d81a7]
+  - @statewalker/vcs-utils@0.11.1
+  - @statewalker/vcs-working-tree@0.13.0
+  - @statewalker/vcs-core@0.13.0
+
 ## 0.12.1
 
 ### Patch Changes

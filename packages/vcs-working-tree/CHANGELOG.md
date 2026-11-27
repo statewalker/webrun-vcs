@@ -1,5 +1,27 @@
 # @statewalker/vcs-working-tree
 
+## 0.13.0
+
+### Minor Changes
+
+- Release of the changes since the last published version:
+  
+  - @statewalker/vcs-core crosses a breaking line
+
+### Patch Changes
+
+- c79e1ee: attributes: a path ending in `/` is a directory, as attr.c's `collect_some_attrs` reads it: `git check-attr dir/` matches directory-only patterns (`src/`, `/src/ne?`) and reads the attribute files of the parent directory, not of `dir` itself.
+- 4f3c613: `read-tree -m` (one-way and two-way) and `reset --mixed` of a crafted tree holding a link and a directory of one name keep only the directory's files in the index, as git's `add_index_entry` with `OK_TO_REPLACE` does: `Staging.readTree` of every store drops a file a directory of its name replaces, and read-tree's two-way merge reads its trees the same way (`flatTree(..., { asIndex: true })`). The index never holds a file/directory clash (webrun-vcs#247).
+- Updated dependencies [6e40444]
+- Updated dependencies [b331c80]
+- Updated dependencies [dc9561d]
+- Updated dependencies [66c658b]
+- Updated dependencies [34b4e5b]
+- Updated dependencies [e11042a]
+- Updated dependencies [74d81a7]
+  - @statewalker/vcs-utils@0.11.1
+  - @statewalker/vcs-core@0.13.0
+
 ## 0.12.1
 
 ### Patch Changes
