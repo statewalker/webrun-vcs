@@ -12,6 +12,7 @@
  */
 import {
   Z_FINISH,
+  Z_NO_FLUSH,
   Z_OK,
   Z_STREAM_END,
   ZStream,
@@ -117,4 +118,74 @@ export function deflateSync(
   strm.output = null as unknown as Uint8Array<ArrayBuffer>;
   pool.set(key, strm);
   return out.subarray(0, length);
+}
+
+/** An incremental deflate (see {@link createDeflater}). */
+export interface Deflater {
+  /** Compresses a chunk; returns the compressed bytes ready so far (often none) */
+  push(chunk: Uint8Array): Uint8Array[];
+  /** Ends the stream: the remaining compressed bytes and the trailer */
+  finish(): Uint8Array[];
+}
+
+/** The output buffer of {@link createDeflater}. */
+const DEFLATER_OUTPUT = 64 * 1024;
+
+/**
+ * An incremental deflate, for input too large to hold whole (`git archive`'s streamed
+ * blobs, `tgz`): the chunks are compressed as they come, without flushing between them, so
+ * the result is the bytes {@link deflateSync} writes for their concatenation, whatever their
+ * sizes (zlib's output does not depend on how its input is split; level 0's stored blocks
+ * aside, whose sizes follow the buffers).
+ *
+ * @example
+ * ```typescript
+ * const deflater = createDeflater({ format: "raw", level: 6 });
+ * const out = [...deflater.push(first), ...deflater.push(second), ...deflater.finish()];
+ * ```
+ */
+export function createDeflater(options?: { level?: number; format?: DeflateFormat }): Deflater {
+  const level = options?.level ?? 6;
+  const format = options?.format ?? "zlib";
+  if (!Number.isInteger(level) || level < -1 || level > 9) {
+    throw new RangeError(`bad compression level ${level}`);
+  }
+  const strm = new ZStream();
+  if (
+    zlibDeflateInit2(strm, level, Z_DEFLATED, WINDOW_BITS_OF[format], MEM_LEVEL, STRATEGY) !== Z_OK
+  ) {
+    throw new CompressionError(`deflate init failed: ${strm.msg || "unknown error"}`);
+  }
+  let ended = false;
+  const run = (input: Uint8Array, flush: typeof Z_NO_FLUSH | typeof Z_FINISH): Uint8Array[] => {
+    if (ended) throw new CompressionError("deflate already finished");
+    const out: Uint8Array[] = [];
+    strm.input = input;
+    strm.next_in = 0;
+    strm.avail_in = input.length;
+    for (;;) {
+      const buffer = new Uint8Array(DEFLATER_OUTPUT);
+      strm.output = buffer;
+      strm.next_out = 0;
+      strm.avail_out = buffer.length;
+      const ret = zlibDeflate(strm, flush);
+      if (ret !== Z_OK && ret !== Z_STREAM_END && !(ret === -5 && strm.next_out === 0)) {
+        throw new CompressionError(`deflate failed: ${strm.msg || `code ${ret}`}`);
+      }
+      if (strm.next_out > 0) out.push(buffer.subarray(0, strm.next_out));
+      if (ret === Z_STREAM_END) {
+        ended = true;
+        break;
+      }
+      // more output pending only while the buffer came back full
+      if (strm.avail_out !== 0 && strm.avail_in === 0) break;
+    }
+    strm.input = null as unknown as Uint8Array;
+    strm.output = null as unknown as Uint8Array<ArrayBuffer>;
+    return out;
+  };
+  return {
+    push: (chunk) => (chunk.length === 0 ? [] : run(chunk, Z_NO_FLUSH)),
+    finish: () => run(new Uint8Array(0), Z_FINISH),
+  };
 }

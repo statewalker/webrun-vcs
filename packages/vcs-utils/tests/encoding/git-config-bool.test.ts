@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { parseGitBool, parseGitInt } from "../../src/encoding/index.js";
+import { parseGitBool, parseGitInt, parseGitUlong } from "../../src/encoding/index.js";
 
 describe("parseGitBool (git_config_bool)", () => {
   it("a key with no `=` (the boolean true) is true; an empty value is false", () => {
@@ -87,5 +87,19 @@ describe("parseGitInt", () => {
     expect(parseGitInt("2g")).toBeUndefined();
     expect(parseGitInt("09")).toBeUndefined();
     expect(parseGitInt("1.5")).toBeUndefined();
+  });
+});
+
+describe("parseGitUlong", () => {
+  it("reads git's unsigned long: units past 2 GiB, signs and overflow refused", () => {
+    expect(parseGitUlong("4g")).toBe(4 * 1024 * 1024 * 1024);
+    expect(parseGitUlong("0")).toBe(0);
+    expect(parseGitUlong("0x10k")).toBe(16 * 1024);
+    expect(parseGitUlong("-1")).toBe("invalid unit");
+    expect(parseGitUlong("+1")).toBe(1);
+    expect(parseGitUlong("lots")).toBe("invalid unit");
+    expect(parseGitUlong(undefined)).toBe("invalid unit");
+    expect(parseGitUlong("99999999999g")).toBe("out of range");
+    expect(parseGitUlong("18446744073709551615")).toBe(2 ** 64);
   });
 });
