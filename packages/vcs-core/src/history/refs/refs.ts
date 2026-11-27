@@ -234,7 +234,11 @@ export interface Refs {
    * await refs.setShallow?.([...(await refs.getShallow?.()) ?? [], boundary]);
    * ```
    */
-  setShallow?(commits: Iterable<ObjectId>, expected?: Iterable<ObjectId>): Promise<void>;
+  setShallow?(
+    commits: Iterable<ObjectId>,
+    expected?: Iterable<ObjectId>,
+    options?: ShallowWriteOptions,
+  ): Promise<void>;
 
   /**
    * Initialize the refs store
@@ -294,4 +298,15 @@ export interface Refs {
    * @returns How many refs were packed
    */
   packRefs?(refNames: string[], options?: PackRefsOptions): Promise<number>;
+}
+
+/** How {@link Refs.setShallow} writes the shallow commits. */
+export interface ShallowWriteOptions {
+  /**
+   * Write the commits in the order given, a commit given twice on two lines, as fetch-pack's
+   * update_shallow writes a clone's shallow file (setup_alternate_shallow appends the server's
+   * list unsorted and unmerged). Otherwise the list is merged and sorted, as git writes the
+   * file from its grafts. Stores that keep no file may ignore it.
+   */
+  verbatim?: boolean;
 }

@@ -21,6 +21,7 @@ import type {
   Refs,
   RefTransactionHook,
   RefUpdateResult,
+  ShallowWriteOptions,
   SymbolicRef,
   SymbolicRefLogOptions,
 } from "@statewalker/vcs-core";
@@ -112,11 +113,12 @@ export class FileRefStore implements Refs {
       text += decoder.decode(chunk, { stream: true });
     }
     text += decoder.decode();
-    return text
+    // a clone's file may name a commit twice (git's register_shallow keeps one graft)
+    const ids = text
       .split("\n")
       .map((line) => line.toLowerCase())
-      .filter((line) => /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(line))
-      .sort();
+      .filter((line) => /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(line));
+    return [...new Set(ids)].sort();
   }
 
   /** The `info/grafts` file's text; undefined when there is none. */
@@ -141,9 +143,14 @@ export class FileRefStore implements Refs {
    * Replace the `shallow` file under `shallow.lock`, as git does; an empty list removes it.
    * Throws when another writer holds the lock, and, with `expected`, when the file no longer
    * holds what the caller read (git's check_shallow_file_for_update), checked under the lock.
+   * The ids are merged and sorted, unless `verbatim` (a clone's list as the server sent it).
    */
-  async setShallow(commits: Iterable<ObjectId>, expected?: Iterable<ObjectId>): Promise<void> {
-    const ids = [...new Set(commits)].sort();
+  async setShallow(
+    commits: Iterable<ObjectId>,
+    expected?: Iterable<ObjectId>,
+    options?: ShallowWriteOptions,
+  ): Promise<void> {
+    const ids = options?.verbatim ? [...commits] : [...new Set(commits)].sort();
     const lock = `${SHALLOW_FILE}.lock`;
     const content = new TextEncoder().encode(ids.map((id) => `${id}\n`).join(""));
     if (!(await this.atomic.createExclusive(lock, content))) {
