@@ -104,6 +104,8 @@ export interface HttpConnectionOptions {
 
 /** The content type of a smart server's ref advertisement (remote-curl's `check_smart_http`). */
 const SMART_ADVERTISEMENT = "application/x-git-upload-pack-advertisement";
+/** remote-curl's `probe_rpc` body: a flush packet */
+const PROBE_BODY = new TextEncoder().encode("0000");
 
 /**
  * Opens a smart-HTTP connection to `git-upload-pack`: `GET info/refs` with
@@ -180,28 +182,37 @@ export async function openHttpConnection(
     advertisedShallow: greeting.shallow ?? [],
     async request(body) {
       await current?.cancel();
-      const payload =
-        options.gzipRequests === false
-          ? { bytes: concat(body), gzip: false }
-          : await gzipLargeBody(concat(body));
-      const res = await client.postAuthorized(() =>
-        client.post(
-          "git-upload-pack",
-          {
-            "Content-Type": "application/x-git-upload-pack-request",
-            Accept: "application/x-git-upload-pack-result",
-            // the version spoken: v2 as answered, v1 as asked (git's remote-curl sends its
-            // protocol header with every request)
-            ...(greeting.version === 2
-              ? { "Git-Protocol": "version=2" }
-              : asked === 1
-                ? protocolHeader
-                : {}),
-            ...(payload.gzip ? { "Content-Encoding": "gzip" } : {}),
-          },
-          { body: payload.bytes },
-          wait,
-        ),
+      const accept = {
+        "Content-Type": "application/x-git-upload-pack-request",
+        Accept: "application/x-git-upload-pack-result",
+      };
+      // post_rpc: a request within http.postBuffer is gzipped and sent again after a 401 the
+      // helper answers; a larger one follows an authenticated probe, sent once as it is
+      const res = await client.postRpc(
+        concat(body),
+        () => client.post("git-upload-pack", accept, { body: PROBE_BODY }, wait),
+        async (bytes, large) => {
+          const payload =
+            large || options.gzipRequests === false
+              ? { bytes: bytes as Uint8Array<ArrayBuffer>, gzip: false }
+              : await gzipLargeBody(bytes as Uint8Array<ArrayBuffer>);
+          return client.post(
+            "git-upload-pack",
+            {
+              ...accept,
+              // the version spoken: v2 as answered, v1 as asked (git's remote-curl sends its
+              // protocol header with every request)
+              ...(greeting.version === 2
+                ? { "Git-Protocol": "version=2" }
+                : asked === 1
+                  ? protocolHeader
+                  : {}),
+              ...(payload.gzip ? { "Content-Encoding": "gzip" } : {}),
+            },
+            { body: payload.bytes },
+            wait,
+          );
+        },
       );
       if (!res.ok) {
         await res.body?.cancel().catch(() => {});

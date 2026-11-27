@@ -47,6 +47,23 @@ export interface SmartHttpClientOptions {
 /** Runs a wait for the server under the connection's timeout. */
 export type ServerWait = <T>(next: () => Promise<T>) => Promise<T>;
 
+/** pkt-line.h's LARGE_PACKET_MAX */
+const LARGE_PACKET_MAX = 65520;
+/** http.c's `http_post_buffer` default: `16 * LARGE_PACKET_MAX` */
+const DEFAULT_POST_BUFFER = 16 * LARGE_PACKET_MAX;
+
+function concatChunks(chunks: readonly Uint8Array[], length: number): Uint8Array<ArrayBuffer> {
+  const only = chunks.length === 1 ? chunks[0] : undefined;
+  if (only && only.buffer instanceof ArrayBuffer) return only as Uint8Array<ArrayBuffer>;
+  const out = new Uint8Array(length);
+  let at = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, at);
+    at += chunk.length;
+  }
+  return out;
+}
+
 type Outcome = "ok" | "reauth" | "noauth" | "rate" | "error";
 
 /** Requests of one smart-HTTP connection (see the module notes). */
@@ -185,6 +202,88 @@ export class SmartHttpClient {
       this.noteChallenges(this.wwwAuthenticate);
       if (!(await this.fill(`${this.baseUrl}/`))) return response;
     }
+  }
+
+  /**
+   * A later request as remote-curl's `post_rpc` sends it, by its size against
+   * `http.postBuffer` (`rpc_read_from_out`: large once less than `LARGE_PACKET_MAX` bytes of
+   * the buffer are left): a request that fits is read whole and sent through
+   * {@link postAuthorized} (again after a 401 that the helper answers, the same bytes); a
+   * larger one is never held whole nor produced twice: `probe` (a POST of `0000`, `probe_rpc`)
+   * goes through {@link postAuthorized} first, and the request is then sent once, streamed,
+   * whatever it answers (`err == HTTP_REAUTH && !large_request`: no retry).
+   *
+   * @param body the request: bytes, or chunks read as far as the buffer holds them
+   * @param probe sends the probe (`0000` with the request's content type and accept headers)
+   * @param send sends the request: `bytes` whole, or the chunks once (`large`)
+   * @returns the last response, its body unread (a failed probe's when it failed)
+   */
+  async postRpc(
+    body: Uint8Array<ArrayBuffer> | AsyncIterable<Uint8Array>,
+    probe: () => Promise<Response>,
+    send: (
+      body: Uint8Array<ArrayBuffer> | AsyncIterable<Uint8Array>,
+      large: boolean,
+    ) => Promise<Response>,
+  ): Promise<Response> {
+    const limit = (this.settings.postBuffer ?? DEFAULT_POST_BUFFER) - LARGE_PACKET_MAX;
+    if (body instanceof Uint8Array) {
+      if (body.length <= limit) return this.postAuthorized(() => send(body, false));
+      return this.postLarge(probe, () => send(body, true));
+    }
+    const iterator = body[Symbol.asyncIterator]();
+    const prefix: Uint8Array[] = [];
+    let length = 0;
+    let ended = false;
+    while (length <= limit) {
+      const next = await iterator.next();
+      if (next.done) {
+        ended = true;
+        break;
+      }
+      prefix.push(next.value);
+      length += next.value.length;
+    }
+    if (ended) {
+      const bytes = concatChunks(prefix, length);
+      return this.postAuthorized(() => send(bytes, false));
+    }
+    let started = false;
+    const rest: AsyncIterable<Uint8Array> = {
+      [Symbol.asyncIterator]: () => {
+        // the chunks are read once: a second reader would send a pack it did not produce
+        if (started) throw new TransportError("A large request is sent once");
+        started = true;
+        return (async function* () {
+          yield* prefix.splice(0);
+          for (;;) {
+            const next = await iterator.next();
+            if (next.done) return;
+            yield next.value;
+          }
+        })();
+      },
+    };
+    try {
+      return await this.postLarge(probe, () => send(rest, true));
+    } finally {
+      if (!started) await iterator.return?.();
+    }
+  }
+
+  /** post_rpc's large request: the probe through re-authentication, then the request once. */
+  private async postLarge(
+    probe: () => Promise<Response>,
+    send: () => Promise<Response>,
+  ): Promise<Response> {
+    const probed = await this.postAuthorized(probe);
+    if (!probed.ok) return probed;
+    // probe_rpc reads the answer into a buffer it drops
+    await probed.arrayBuffer().catch(() => undefined);
+    const response = await send();
+    if (response.ok) await this.approve(`${this.baseUrl}/`);
+    else if (response.status === 401 && hasSecret(this.auth)) await this.reject();
+    return response;
   }
 
   /**

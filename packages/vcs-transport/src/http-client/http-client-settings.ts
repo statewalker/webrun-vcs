@@ -63,6 +63,13 @@ export interface HttpClientSettings {
    */
   maxRetries?: number;
   /**
+   * `http.postBuffer` (default `16 * 65520`, at least 65520): a later request (a POST) larger than
+   * this less 65520 bytes is "large", as remote-curl's `post_rpc` counts it: a probe (`0000`)
+   * is authenticated first and the request is then sent once, streamed; a smaller one is sent
+   * whole and again after a 401.
+   */
+  postBuffer?: number;
+  /**
    * `http.retryAfter` / `GIT_HTTP_RETRY_AFTER`: seconds to wait before a retry when the 429
    * names no `Retry-After` (default 0)
    */

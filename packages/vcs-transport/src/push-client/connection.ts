@@ -176,26 +176,43 @@ async function openHttp(
       // (listing objects, the delta search) and re-armed each time a chunk waits for the
       // request to take it, and once the body is sent; a large pack is not bounded as a
       // whole, a server that stops reading or answering is
-      const watched = () => idle.serverPaced(body());
-      // a 401 asks the helper and sends the pack again, produced anew (post_rpc's retry)
-      const res = await client.postAuthorized(() =>
-        wait(() =>
-          fetchWithRequestBody(
-            watched,
-            (init) =>
-              client.post(
-                "git-receive-pack",
-                {
-                  ...headers,
-                  "Content-Type": "application/x-git-receive-pack-request",
-                  Accept: "application/x-git-receive-pack-result",
-                },
-                init,
-                (next) => next(),
-              ),
-            shouldStreamRequestBody(options.streamRequestBody),
+      const post = (init: { body: BodyInit; duplex?: "half" }) =>
+        client.post(
+          "git-receive-pack",
+          {
+            ...headers,
+            "Content-Type": "application/x-git-receive-pack-request",
+            Accept: "application/x-git-receive-pack-result",
+          },
+          init,
+          (next) => next(),
+        );
+      // post_rpc: a pack within http.postBuffer is held and sent again after a 401 the helper
+      // answers; a larger one follows an authenticated probe and is sent once, streamed
+      const res = await client.postRpc(
+        idle.serverPaced(body()),
+        () =>
+          wait(() =>
+            client.post(
+              "git-receive-pack",
+              {
+                "Content-Type": "application/x-git-receive-pack-request",
+                Accept: "application/x-git-receive-pack-result",
+              },
+              { body: PROBE_BODY },
+              (next) => next(),
+            ),
           ),
-        ),
+        (payload) =>
+          wait(() =>
+            payload instanceof Uint8Array
+              ? post({ body: payload })
+              : fetchWithRequestBody(
+                  () => payload,
+                  post,
+                  shouldStreamRequestBody(options.streamRequestBody),
+                ),
+          ),
       );
       await checkResponse(res, "Failed to receive-pack");
       if (!res.body) throw new TransportError("Empty response from git-receive-pack");
@@ -208,6 +225,9 @@ async function openHttp(
     },
   };
 }
+
+/** remote-curl's `probe_rpc` body: a flush packet */
+const PROBE_BODY = new TextEncoder().encode("0000");
 
 /** Options of {@link openDuplexReceivePackConnection}. */
 export interface DuplexReceivePackOptions {

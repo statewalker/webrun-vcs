@@ -13,7 +13,10 @@
  *   auth with authtype from credential helper" (2.46+: `http.proactiveAuth`, ignored by 2.43)
  * - t5551-http-fetch-smart.sh "clone from auth-only-for-objects repository" and
  *   t5541-http-push-smart.sh "push to auth-only-for-push repo": a POST answering 401 after an
- *   open `info/refs` (remote-curl's `post_rpc` asks the helper and sends it again)
+ *   open `info/refs` (remote-curl's `post_rpc` asks the helper and sends it again); the same
+ *   with a request over `http.postBuffer` (a pack above it, or t5563's small `http.postBuffer`
+ *   of "clone with bearer auth and probe_rpc"): `probe_rpc`'s `0000` POST is authenticated
+ *   first and the request is sent once
  * - Digest (no git test has one): the router answers with its own challenge and checks the
  *   answer; native curl reuses the first 401's nonce, counts `nc` across requests and answers a
  *   refused Digest once more
@@ -114,6 +117,8 @@ interface Seen {
   status: number;
   /** The headers a test looks at (lower-case names): user agent, authorization, x-magic-* */
   headers: Record<string, string>;
+  /** A POST whose body is `0000` (remote-curl's `probe_rpc`) */
+  probe?: true;
 }
 
 let root: string;
@@ -419,12 +424,19 @@ describeGit("http.* client configuration, as native git", () => {
           headers[key] = key === "authorization" ? recordedAuthorization(value) : value;
         }
       });
-      const response = await route(request, backend.fetch);
+      // a POST's body is read whole first, to tell remote-curl's probe (`0000`) apart
+      const body = request.method === "POST" ? new Uint8Array(await request.arrayBuffer()) : null;
+      const probe = body !== null && Buffer.from(body).toString("latin1") === "0000";
+      const response = await route(
+        body === null ? request : new Request(request, { body, duplex: "half" } as RequestInit),
+        backend.fetch,
+      );
       seen.push({
         method: request.method,
         path: `${url.pathname}${url.search}`,
         status: response.status,
         headers,
+        ...(probe ? { probe: true as const } : {}),
       });
       return response;
     });
@@ -938,6 +950,137 @@ describeGit("http.* client configuration, as native git", () => {
     expect(normalized(ourRun.requests)).toEqual(normalized(nativeRun.requests));
   });
 
+  /** A push of a commit adding `f.bin` (`content`) on each side to `<path>`, with the helper. */
+  async function authPushTwins(path: string, content: Uint8Array, config: string[][] = []) {
+    const helper = nativeHelper(`username=${USER}\npassword=${PASS}\n`);
+    const { native, ours } = await clients([...config, ...helper.config]);
+    for (const [dir, name] of [
+      [native, "native"],
+      [ours, "ours"],
+    ] as const) {
+      writeFileSync(join(dir, "f.bin"), content);
+      writeFileSync(join(dir, "name.txt"), `${name}\n`);
+      gitOut(root, dir, ["add", "f.bin", "name.txt"]);
+      gitOut(root, dir, ["commit", "-q", "-m", name]);
+    }
+    const url = `${server.baseUrl}${path}`;
+    const n = counter++;
+    const nativeRun = await recording(() =>
+      gitAsync(root, native, ["push", "-q", url, `main:refs/heads/large-native-${n}`]),
+    );
+    const theirs = ourHelper({ username: USER, password: PASS });
+    const git = await openAt(ours);
+    const ourRun = await recording(async () => {
+      try {
+        await git
+          .push()
+          .setRemote(url)
+          .setRefSpecs(`main:refs/heads/large-ours-${n}`)
+          .setCredentialHelper(theirs.helper)
+          .call();
+        return undefined;
+      } catch (error) {
+        return error as Error;
+      }
+    });
+    const normalized = (requests: Seen[]) =>
+      withoutAgent(requests).map((r) => ({ ...r, path: r.path.replace(/large-[\w-]+/, "x") }));
+    return {
+      native: {
+        ...nativeRun,
+        requests: normalized(nativeRun.requests),
+        helperLog: sortedLog(helper.log()),
+      },
+      ours: { ...ourRun, requests: normalized(ourRun.requests), helperLog: theirs.log },
+    };
+  }
+
+  /** Incompressible bytes: a pack of them stays as large as they are. */
+  const noise = (size: number) => {
+    const bytes = new Uint8Array(size);
+    for (let at = 0; at < size; at += 65536) {
+      crypto.getRandomValues(bytes.subarray(at, Math.min(size, at + 65536)));
+    }
+    return bytes;
+  };
+
+  it('t5541-http-push-smart.sh: "push to auth-only-for-push repo": a pack above http.postBuffer is sent once, after probe_rpc', async () => {
+    const twins = await authPushTwins("/auth-push/smart/repo.git", noise(1536 * 1024));
+    expect(twins.native.result.status).toBe(0);
+    expect(twins.ours.result).toBeUndefined();
+    expect(twins.ours.helperLog).toEqual(twins.native.helperLog);
+    // GET info/refs, the probe (401, then 200 with the helper's credentials), the pack once
+    expect(twins.native.requests.filter((r) => r.method === "POST" && !r.probe)).toHaveLength(1);
+    expect(twins.ours.requests).toEqual(twins.native.requests);
+  });
+
+  it('t5541-http-push-smart.sh: "push to auth-only-for-push repo": a small pack is sent again after the 401', async () => {
+    const twins = await authPushTwins("/auth-push/smart/repo.git", noise(16 * 1024));
+    expect(twins.native.result.status).toBe(0);
+    expect(twins.ours.result).toBeUndefined();
+    expect(twins.ours.helperLog).toEqual(twins.native.helperLog);
+    expect(twins.native.requests.some((r) => r.probe)).toBe(false);
+    expect(twins.ours.requests).toEqual(twins.native.requests);
+  });
+
+  it('t5541-http-push-smart.sh: "push to auth-only-for-push repo": wrong credentials refused at the probe', async () => {
+    const helper = nativeHelper("username=baduser\npassword=wrong-passwd\n");
+    const { native, ours } = await clients(helper.config);
+    for (const dir of [native, ours]) {
+      writeFileSync(join(dir, "f.bin"), noise(1536 * 1024));
+      gitOut(root, dir, ["add", "f.bin"]);
+      gitOut(root, dir, ["commit", "-q", "-m", "big"]);
+    }
+    const url = `${server.baseUrl}/auth-push/smart/repo.git`;
+    const nativeRun = await recording(() =>
+      gitAsync(root, native, ["push", "-q", url, "main:refs/heads/refused"]),
+    );
+    const theirs = ourHelper({ username: "baduser", password: "wrong-passwd" });
+    const git = await openAt(ours);
+    const ourRun = await recording(async () => {
+      try {
+        await git
+          .push()
+          .setRemote(url)
+          .setRefSpecs("main:refs/heads/refused")
+          .setCredentialHelper(theirs.helper)
+          .call();
+        return undefined;
+      } catch (error) {
+        return error as Error;
+      }
+    });
+    expect(nativeRun.result.status).not.toBe(0);
+    expect(ourRun.result).toBeDefined();
+    expect(theirs.log).toEqual(sortedLog(helper.log()));
+    // the pack is never sent: both probes answer 401
+    expect(withoutAgent(ourRun.requests)).toEqual(withoutAgent(nativeRun.requests));
+    expect(ourRun.requests.some((r) => r.method === "POST" && !r.probe)).toBe(false);
+  });
+
+  it('t5563-simple-http-auth.sh: "clone with bearer auth and probe_rpc": a small http.postBuffer probes every POST of a fetch', async () => {
+    // t5563 sets http.postBuffer=70000 for its 70000-byte request; the least value git takes
+    // (LARGE_PACKET_MAX, from any smaller one) makes every request large. Over protocol v0:
+    // v2's stateless_connect hits its BUG with a buffer that small (remote-http dies of signal 6)
+    const config = [
+      ["protocol.version", "0"],
+      ["http.postBuffer", "1"],
+    ];
+    const twins = await fetchTwins("/auth-fetch/smart/repo.git", config, {
+      helperReply: {
+        native: `username=${USER}\npassword=${PASS}\n`,
+        ours: { username: USER, password: PASS },
+      },
+    });
+    if (process.env.DEBUG_HTTP) console.log(twins.native.result.stderr, twins.ours.error);
+    expect(twins.native.result.status).toBe(0);
+    expect(twins.ours.error).toBeUndefined();
+    expect(twins.ours.fetched).toBe(twins.native.fetched);
+    expect(twins.ours.helperLog).toEqual(twins.native.helperLog);
+    expect(twins.native.requests.some((r) => r.probe)).toBe(true);
+    expect(withoutAgent(twins.ours.requests)).toEqual(withoutAgent(twins.native.requests));
+  });
+
   it('t5581-http-curl-verbose.sh: "failure in git-upload-pack is shown"', async () => {
     const twins = await fetchTwins("/error_git_upload_pack/smart/repo.git");
     expect(twins.native.result.status).not.toBe(0);
@@ -1179,4 +1322,30 @@ describeGit("http.<url>.* matching, with git config --get-urlmatch as the oracle
       }
     });
   }
+
+  it("http.postBuffer: git_config_ssize_t, no less than LARGE_PACKET_MAX (http.c)", async () => {
+    const settingsFor = async (value: string) => {
+      const repo = join(dir, `r-${counter++}`);
+      execFileSync("git", ["init", "-q", repo], { env: testEnv(dir) });
+      writeFileSync(join(repo, ".git", "config"), `[http]\n\tpostBuffer = ${value}\n`);
+      const ours = await openOurs(repo, createNodeGitHostEnvironment({ env: testEnv(dir) }));
+      const warnings: string[] = [];
+      const settings = httpClientSettingsOf(
+        RemoteConfigStore.from(ours.workingCopy),
+        "https://example.com/repo.git",
+        undefined,
+        { onWarning: (line) => warnings.push(line) },
+      );
+      return { postBuffer: settings.postBuffer, warnings };
+    };
+    expect((await settingsFor("2m")).postBuffer).toBe(2 * 1024 * 1024);
+    expect((await settingsFor("1000")).postBuffer).toBe(65520);
+    expect(await settingsFor("-5")).toEqual({
+      postBuffer: 65520,
+      warnings: ["warning: negative value for http.postBuffer; defaulting to 65520"],
+    });
+    await expect(settingsFor("lots")).rejects.toThrow(
+      "fatal: bad numeric config value 'lots' for 'http.postbuffer': invalid unit",
+    );
+  });
 });

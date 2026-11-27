@@ -218,9 +218,11 @@ describe("push client over smart HTTP", () => {
     expect(r.posts).toBe(0);
   });
 
-  it("streams the request body by default; streamRequestBody false collects it", async () => {
-    const streamed = await run({ advert: advert("report-status"), answer: okReport() });
-    expect(streamed.postedBodyType).toBe("streamed");
+  it("holds a pack within http.postBuffer whole (post_rpc); streamRequestBody false too", async () => {
+    // large requests stream: tests/unit/streaming-push-serve.test.ts
+    const held = await run({ advert: advert("report-status"), answer: okReport() });
+    expect(held.postedBodyType).toBe("collected");
+    expect(held.posts).toBe(1);
     const collected = await run(
       { advert: advert("report-status"), answer: okReport() },
       { streamRequestBody: false },
