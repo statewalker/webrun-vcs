@@ -7,7 +7,7 @@
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
@@ -196,6 +196,14 @@ describeGit("replace refs and grafts in porcelain commands, native twins", () =>
   const open = (dir: string) => openOurs(dir, environment());
   const same = (od: string, nd: string) =>
     expect(snapshot(root, od, normalizeState)).toEqual(snapshot(root, nd, normalizeState));
+  /**
+   * Dates `.git/index` `seconds` from now: forward, every entry is stat-clean (git trusts
+   * the stat data); back, every entry written since is racily clean (git compares content).
+   */
+  const dateIndex = (dir: string, seconds: number) => {
+    const t = Date.now() / 1000 + seconds;
+    utimesSync(join(dir, ".git", "index"), t, t);
+  };
 
   it("merge of a replaced side reads the replacement's tree and parents", async () => {
     // base: a; main: b, m; side: x. side's tip is replaced by a commit of base with a and c
@@ -277,14 +285,75 @@ describeGit("replace refs and grafts in porcelain commands, native twins", () =>
       ).toString();
       expect(ours).toBe(gitOk(root, dir, "diff", a, b));
     }
+    // three.txt is checked out with the replacement's content under the original id, which
+    // git's status reads as modified when the entry is racily clean: keep every entry
+    // stat-clean (the twins below decide both cases), mtimes only as utimes sets no ctime
+    g(dir, "config", "core.trustctime", "false");
     const { nd, od } = twins(dir);
-    g(nd, "checkout", "-q", "--detach", "two");
-    await (await open(od)).checkout().setName("two").call();
-    same(od, nd);
+    for (const d of [nd, od]) g(d, "update-index", "-q", "--refresh");
+    const checkout = async (name: string) => {
+      for (const d of [nd, od]) dateIndex(d, 3600);
+      g(nd, "checkout", "-q", "--detach", name);
+      await (await open(od)).checkout().setName(name).call();
+      for (const d of [nd, od]) dateIndex(d, 3600);
+      same(od, nd);
+    };
+    await checkout("two");
+    await checkout("three");
+    expect(snapshot(root, od).files["three.txt"]).toBe("replaced content\n");
+    expect(snapshot(root, od).status).toBe("");
+  });
+
+  /** A repository whose three.txt blob is replaced, and its twins checked out at three. */
+  async function replacedBlobCheckout() {
+    const { dir, ids } = repo();
+    // utimes never sets ctime: compare mtimes only, as the racy-git fixtures do
+    g(dir, "config", "core.trustctime", "false");
+    const blob = g(dir, "rev-parse", `${ids.three}:three.txt`);
+    g(dir, "replace", blob, gitIn(dir, ["hash-object", "-w", "--stdin"], "replaced content\n"));
+    const { nd, od } = twins(dir);
+    // a copy has new inodes: refresh each index first, as git's checkout trusts the stat data
+    for (const d of [nd, od]) g(d, "update-index", "-q", "--refresh");
+    // from one, which has no three.txt, so the checkout of three writes it
+    g(nd, "checkout", "-q", "--detach", "one");
+    await (await open(od)).checkout().setName("one").call();
+    // the index read before the checkout is newer than the files it writes: neither
+    // checkout smudges the entries it writes (git's ce_smudge_racily_clean_entry)
+    dateIndex(nd, 3600);
+    dateIndex(od, 3600);
     g(nd, "checkout", "-q", "--detach", "three");
     await (await open(od)).checkout().setName("three").call();
+    // read directly: a status here would refresh the still racy index
+    for (const d of [od, nd]) {
+      expect(readFileSync(join(d, "three.txt"), "utf8")).toBe("replaced content\n");
+    }
+    return { nd, od };
+  }
+
+  it("a replaced blob checked out, stat-clean: status trusts the stat data", async () => {
+    const { nd, od } = await replacedBlobCheckout();
+    dateIndex(nd, 3600);
+    dateIndex(od, 3600);
+    for (const d of [od, nd]) {
+      expect((await (await open(d)).status().call()).isClean(), d).toBe(true);
+    }
     same(od, nd);
-    expect(snapshot(root, od).files["three.txt"]).toBe("replaced content\n");
+    expect(gitOk(root, nd, "status", "--porcelain=v2")).toBe("");
+  });
+
+  it("a replaced blob checked out, racily clean: status compares with the original blob", async () => {
+    const { nd, od } = await replacedBlobCheckout();
+    // git's ce_compare_data hashes the file (the replacement's content) and compares it
+    // with the index entry's id (the original blob): modified
+    dateIndex(nd, -120);
+    dateIndex(od, -120);
+    for (const d of [od, nd]) {
+      const status = await (await open(d)).status().call();
+      expect(status.isClean(), d).toBe(false);
+      expect([...status.modified], d).toEqual(["three.txt"]);
+    }
+    same(od, nd);
+    expect(gitOk(root, nd, "status", "--porcelain=v2")).toMatch(/^1 \.M N\.\.\. .* three\.txt\n$/);
   });
 
   it("log -- <path> compares replaced trees", async () => {
