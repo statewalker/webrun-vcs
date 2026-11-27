@@ -8,12 +8,20 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
+import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
 import {
   createBasePathResolver,
   createServedFetchHandler,
@@ -28,7 +36,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { openLocalRemote } from "../src/commands/local-transport.js";
 import {
   BundleList,
-  type Git,
+  Git,
   parseBundleListConfig,
   parseBundleListLine,
   printBundleList,
@@ -138,6 +146,17 @@ async function cloneTwins(
   };
 }
 
+/** The packs of a repository. */
+function packsOf(dir: string): string[] {
+  return readdirSync(join(dir, ".git/objects/pack")).filter((n) => n.endsWith(".pack"));
+}
+
+/** `git fsck --strict`'s exit status and lines, sorted. */
+function fsckLines(dir: string) {
+  const r = run(dir, ["fsck", "--strict"]);
+  return { status: r.status, lines: `${r.stdout}${r.stderr}`.split("\n").sort() };
+}
+
 /** The ids every ref of `from` names are objects in `dir` (the clone is complete). */
 function hasAllObjects(from: string, dir: string): boolean {
   const ids = gitOk(from, ["for-each-ref", "--format=%(objectname)"]);
@@ -183,6 +202,21 @@ git bundle create -q bundle-1.bundle base
 git bundle create -q bundle-2.bundle base..left
 git bundle create -q bundle-3.bundle base..right
 git bundle create -q bundle-4.bundle merge --not left right
+# t5558's "create bundle": a bundle holding a commit without emails
+git checkout -q topic
+cat >data <<EOF
+tree $(git rev-parse B^{tree})
+parent $(git rev-parse B)
+author A U Thor
+committer A U Thor
+
+commit: this is a commit with bad emails
+
+EOF
+bad_commit=$(git hash-object --literally -t commit -w --stdin <data)
+git branch bad $bad_commit
+git bundle create -q bad-object.bundle bad
+git update-ref -d refs/heads/bad
 `,
     );
     fromTags = join(home, "clone-from-tags");
@@ -222,6 +256,75 @@ git bundle create -q ALL.bundle --all
     const t = await cloneTwins(from, join(from, "B.bundle"));
     expect(t.ours).toEqual(t.native);
     expect(t.ours.refs).toContain("refs/bundles/");
+  });
+
+  it('t5558-clone-bundle-uri.sh: "clone with bundle that has bad object"', async () => {
+    // without fsckObjects the bundle is unbundled as it stands (2.43 maps refs/heads/bad to
+    // refs/bundles/bad, 2.5x to refs/bundles/heads/bad)
+    const badRef = compatibility === "2.43" ? "refs/bundles/bad" : "refs/bundles/heads/bad";
+    const plain = await cloneTwins(from, join(from, "bad-object.bundle"));
+    expect(plain.ours).toEqual(plain.native);
+    expect(plain.ours.refs).toContain(badRef);
+    // with it (git 2.46+'s VERIFY_BUNDLE_FSCK) unbundling fails and the clone goes on; 2.43
+    // checks nothing and writes the ref
+    const t = await cloneTwins(from, join(from, "bad-object.bundle"), {
+      config: ["fetch.fsckObjects=true"],
+    });
+    expect(t.ours).toEqual(t.native);
+    if (compatibility === "2.43") {
+      expect(t.ours.refs).toContain(badRef);
+    } else {
+      expect(t.native.messages.join("\n")).toContain("missingEmail");
+      expect(t.ours.refs).not.toContain("refs/bundles/");
+      // the quarantine is discarded: no pack is left of the bundle
+      expect(packsOf(t.oursDir)).toHaveLength(packsOf(t.nativeDir).length);
+    }
+    expect(hasAllObjects(from, t.oursDir)).toBe(true);
+  });
+
+  it('t5558-clone-bundle-uri.sh: "clone with path bundle and non-default hash"', async () => {
+    const n = ++counter;
+    const env = { GIT_DEFAULT_HASH: "sha256" };
+    const bundle = join(from, "B.bundle");
+    const nativeDir = join(home, `native-${n}`);
+    const native = await gitAsync(
+      home,
+      home,
+      ["clone", `--bundle-uri=${bundle}`, from, nativeDir],
+      env,
+    );
+    expect(native.status, native.stderr).toBe(0);
+    // ours starts as GIT_DEFAULT_HASH makes it (SHA-256) and is reopened in the remote's SHA-1
+    const oursDir = join(home, `ours-${n}`);
+    run(home, ["init", "-q", "-b", "main", oursDir], env);
+    expect(gitOk(oursDir, ["rev-parse", "--show-object-format"]).trim()).toBe("sha256");
+    const files = createNodeFilesApi({ rootDir: home });
+    const gitDir = `ours-${n}/.git`;
+    const environment = createNodeGitHostEnvironment({ env: testEnv(home, env) });
+    const { history } = await createGitFilesBackend({ files, gitDir, environment });
+    const worktrees = await openGitLinkedWorktrees({ files, gitDir, history, environment });
+    const git = Git.fromWorktreeAdmin(await worktrees.openAdmin());
+    const result = await git
+      .clone()
+      .setCompatibility(compatibility)
+      .setURI(from)
+      .setBundleUri(bundle)
+      .call();
+    expect(messageLines((result.messages ?? []).join(""))).toEqual(messageLines(native.stderr));
+    expect(bundleState(oursDir)).toEqual(bundleState(nativeDir));
+    if (compatibility === "2.43") {
+      // 2.43 reads the bundle before it learns the remote's hash: in SHA-256 it is no bundle
+      expect(messageLines(native.stderr).join("\n")).toContain("is not a bundle or bundle list");
+    } else {
+      expect(gitOk(oursDir, ["rev-parse", "refs/bundles/heads/topic"])).toBe(
+        gitOk(from, ["rev-parse", "topic"]),
+      );
+    }
+    expect(gitOk(oursDir, ["rev-parse", "--show-object-format"])).toBe(
+      gitOk(nativeDir, ["rev-parse", "--show-object-format"]),
+    );
+    // (the local clone copied clone-from's loose bad commit into both)
+    expect(fsckLines(oursDir)).toEqual(fsckLines(nativeDir));
   });
 
   it('t5558-clone-bundle-uri.sh: "clone with file:// bundle"', async () => {

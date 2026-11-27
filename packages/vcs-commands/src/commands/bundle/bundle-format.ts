@@ -85,7 +85,15 @@ const HEX = /^[0-9a-fA-F]$/;
  * if (!parsed.ok) console.error(`error: ${parsed.error}`);
  * ```
  */
-export function parseBundleHeader(bytes: Uint8Array, name = "<bundle>"): ParsedBundleHeader {
+export function parseBundleHeader(
+  bytes: Uint8Array,
+  name = "<bundle>",
+  /**
+   * The hash a header without `@object-format=` names ids in (git's `the_hash_algo`: the
+   * repository's)
+   */
+  defaultFormat: ObjectFormat = SHA1_OBJECT_FORMAT,
+): ParsedBundleHeader {
   let at = 0;
   /** strbuf_getwholeline_fd: the next line with its LF; undefined at the end */
   const nextLine = (): Uint8Array | undefined => {
@@ -106,7 +114,7 @@ export function parseBundleHeader(bytes: Uint8Array, name = "<bundle>"): ParsedB
       notABundle: true,
     };
   }
-  let objectFormat: ObjectFormat = SHA1_OBJECT_FORMAT;
+  let objectFormat: ObjectFormat = defaultFormat;
   let filter: string | undefined;
   const prerequisites: BundlePrerequisite[] = [];
   const references: BundleRef[] = [];

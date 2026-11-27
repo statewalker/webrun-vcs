@@ -6,6 +6,7 @@ import {
   type HttpCredentialHelper,
   type ProgressInfo,
 } from "@statewalker/vcs-transport";
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 import {
   type BundleUriHost,
@@ -404,10 +405,33 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
     message(line: string): void;
     setConfigValue?(key: string, value: string): Promise<void>;
     tempFileName?(): string;
+    /** The hash bundle headers are read in (default the repository's) */
+    objectFormat?: ObjectFormat;
   }): BundleUriHost {
     const store = RemoteConfigStore.from(this._workingCopy);
     const worktree = repositoryPlaceOf(this._workingCopy);
+    const environment = hostEnvironmentOf(this._workingCopy);
     return createBundleUriHost({
+      ...(options.objectFormat ? { objectFormat: options.objectFormat } : {}),
+      // git 2.46+'s unbundle_from_file: VERIFY_BUNDLE_FSCK under fetch_pack_fsck_objects, an
+      // index-pack --fsck-objects given no message types (fetch.fsck.* is not read)
+      ...(options.compatibility !== "2.43"
+        ? {
+            fsckObjects: async () => {
+              const { fetchFsckOf } = await import("./commands/fsck/index.js");
+              return fetchFsckOf({
+                value: (key) => (/^fetch\.fsck\./i.test(key) ? undefined : store.value(key)),
+                compatibility: options.compatibility,
+                ...(environment
+                  ? {
+                      readFile: (path: string) => environment.readFile(path),
+                      home: environment.home,
+                    }
+                  : {}),
+              });
+            },
+          }
+        : {}),
       workingCopy: this._workingCopy,
       setRef: (name, id, log) => this.refsStore.set(name, id, log),
       getRef: async (name) => (await this.refsStore.resolve(name).catch(() => undefined))?.objectId,
