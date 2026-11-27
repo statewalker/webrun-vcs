@@ -364,10 +364,13 @@ export async function applyRefUpdates(
   }
   if (options.atomic) {
     // one batch, each ref logged with its own message, as git's transaction logs it; the
-    // stale refs first, as prune_refs queues them before the updates
+    // stale refs first, as prune_refs queues them before the updates. Committed as git's
+    // files backend commits it (statewalker/webrun-vcs#284): the updates loose, packed-refs
+    // rewritten only to drop the pruned refs
     const batchOptions = {
       ...(options.ident !== undefined ? { ident: options.ident } : {}),
       ...(options.skipReflog ? { skipReflog: true } : {}),
+      loose: true,
     };
     const result = await refStore.batch(
       [
@@ -420,7 +423,7 @@ export async function applyRefUpdates(
       {
         ...(options.ident !== undefined ? { ident: options.ident } : {}),
         ...(options.skipReflog ? { skipReflog: true } : {}),
-        // written loose, as git's fetch writes them (not packed like an atomic batch)
+        // written loose, as git's fetch writes them
         loose: true,
       },
     );
