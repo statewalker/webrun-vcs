@@ -3,6 +3,7 @@ export * from "./crc32/index.js";
 export * from "./fnv1a/index.js";
 export * from "./fossil-checksum/index.js";
 export * from "./hasher/index.js";
+export * from "./md5/index.js";
 export * from "./object-format/index.js";
 export * from "./rolling-checksum/index.js";
 export * from "./sha1/index.js";

@@ -22,6 +22,12 @@ import type {
   HttpClientSettings,
   HttpCredentialHelper,
 } from "./http-client-settings.js";
+import {
+  type DigestChallenge,
+  digestAuthorization,
+  digestChallengeOf,
+  digestClientNonce,
+} from "./http-digest.js";
 
 /** Options of {@link SmartHttpClient}. */
 export interface SmartHttpClientOptions {
@@ -57,6 +63,16 @@ export class SmartHttpClient {
   private readonly givenOrigin: string;
   /** Empty credentials a server took (`http.emptyAuth`), sent from then on */
   private emptyAuth?: Credentials;
+  /**
+   * Whether a 401 without credentials offered Digest: git restricts curl's methods to those
+   * the server offered (`http_auth_methods &= auth_avail`), and curl prefers Digest to Basic
+   */
+  private useDigest = false;
+  /** The last Digest challenge seen (curl keeps it on the handle for the next requests) */
+  private digest?: DigestChallenge;
+  /** The nonce count of the last answer to {@link digest}'s nonce */
+  private digestNc = 0;
+  private digestCnonce?: string;
 
   constructor(private readonly options: SmartHttpClientOptions) {
     this.baseUrl = options.url.replace(/\/+$/, "");
@@ -92,6 +108,7 @@ export class SmartHttpClient {
     const settings = this.settings;
     const tail = service === undefined ? "/info/refs" : `/info/refs?service=${service}`;
     let url = `${this.baseUrl}${tail}`;
+    await this.fillProactively(url);
     let response = await this.send(url, { method: "GET", headers }, wait, true);
     let outcome = await this.outcomeOf(response);
     const retries = settings.rateLimitRetries === false ? 0 : (settings.maxRetries ?? 0);
@@ -144,6 +161,33 @@ export class SmartHttpClient {
   }
 
   /**
+   * A later request sent by `attempt` (a POST through {@link post}) as remote-curl's
+   * `post_rpc` sends it: a 401 while the connection holds no credentials asks the helper
+   * (`http_reauth_prepare`) and sends the request again, as long as the helper answers; a 401
+   * to credentials rejects them (`credential_reject`); a success approves the helper's.
+   *
+   * @returns the last response, its body unread (a refusal for the caller to report)
+   */
+  async postAuthorized(attempt: () => Promise<Response>): Promise<Response> {
+    for (;;) {
+      const response = await attempt();
+      if (response.ok) {
+        await this.approve(`${this.baseUrl}/`);
+        return response;
+      }
+      if (response.status !== 401) return response;
+      if (hasSecret(this.auth)) {
+        await this.reject();
+        return response;
+      }
+      if (!this.options.credentialHelper) return response;
+      await response.body?.cancel().catch(() => undefined);
+      this.noteChallenges(this.wwwAuthenticate);
+      if (!(await this.fill(`${this.baseUrl}/`))) return response;
+    }
+  }
+
+  /**
    * A later GET of the dumb protocol (`HEAD`, `objects/...`, an alternate's files), as
    * http-walker sends it: redirects followed only under `http.followRedirects=true`. A URL on
    * the base's origin gets the connection's headers and credentials while that is still the
@@ -177,16 +221,38 @@ export class SmartHttpClient {
     const settings = this.settings;
     const mode = settings.followRedirects ?? "initial";
     const follow = mode === "always" || (initial && mode === "initial");
-    const response = await wait(() =>
-      this.options.fetchImpl(
-        new Request(url, {
-          ...init,
-          headers: this.headersFor(init.headers, this.auth ?? this.emptyAuth),
-          redirect: follow ? "follow" : "manual",
-          signal: this.options.signal,
-        } as RequestInit),
-      ),
-    );
+    const method = init.method ?? "GET";
+    const resendable = !(init.body instanceof ReadableStream);
+    let response: Response;
+    let answeredAgain = false;
+    for (;;) {
+      const digest = this.digestAnswer(method, url);
+      response = await wait(() =>
+        this.options.fetchImpl(
+          new Request(url, {
+            ...init,
+            headers: this.headersFor(init.headers, this.auth ?? this.emptyAuth, digest),
+            redirect: follow ? "follow" : "manual",
+            signal: this.options.signal,
+          } as RequestInit),
+        ),
+      );
+      const challenges = splitChallenges(response.headers.get("www-authenticate"));
+      this.wwwAuthenticate = challenges;
+      if (response.status !== 401) break;
+      const fresh = digestChallengeOf(challenges);
+      if (fresh) {
+        if (fresh.nonce !== this.digest?.nonce) this.digestNc = 0;
+        this.digest = fresh;
+      }
+      // curl answers a refused Digest answer once more with the 401's challenge (and again
+      // whenever the server says the nonce was stale), within the same request
+      if (digest === undefined || !fresh || !resendable || (answeredAgain && !fresh.stale)) {
+        break;
+      }
+      answeredAgain = true;
+      await response.body?.cancel().catch(() => undefined);
+    }
     // http.emptyAuth=true: curl answers the 401 with empty credentials itself (CURLOPT_USERPWD
     // ":"), within the same request
     if (
@@ -207,6 +273,7 @@ export class SmartHttpClient {
           } as RequestInit),
         ),
       );
+      this.wwwAuthenticate = splitChallenges(retried.headers.get("www-authenticate"));
       // curl keeps sending what worked
       if (retried.status !== 401) this.emptyAuth = empty;
       return retried;
@@ -218,7 +285,11 @@ export class SmartHttpClient {
    * The headers of a request: the caller's, the request's own, the user agent, the
    * credentials, then `http.extraHeader` lines over all of them.
    */
-  private headersFor(own: Record<string, string>, auth: Credentials | undefined): Headers {
+  private headersFor(
+    own: Record<string, string>,
+    auth: Credentials | undefined,
+    digest?: string,
+  ): Headers {
     const headers = new Headers(this.options.headers);
     if (this.dropCallerCredentials) {
       for (const name of ["authorization", "cookie", "proxy-authorization"]) headers.delete(name);
@@ -226,7 +297,8 @@ export class SmartHttpClient {
     for (const [name, value] of Object.entries(own)) headers.set(name, value);
     const settings = this.settings;
     if (settings.userAgent !== undefined) headers.set("User-Agent", settings.userAgent);
-    if (auth && (hasSecret(auth) || (auth.username === "" && auth.password === ""))) {
+    if (digest !== undefined) headers.set("Authorization", digest);
+    else if (auth && (hasSecret(auth) || (auth.username === "" && auth.password === ""))) {
       headers.set("Authorization", authorizationHeader(auth));
     }
     const extra = new Set<string>();
@@ -248,16 +320,65 @@ export class SmartHttpClient {
     return headers;
   }
 
+  /**
+   * The Digest answer of a request: when the server's 401 offered Digest and the
+   * credentials are a user and password (a helper's `authtype` goes as it is).
+   */
+  private digestAnswer(method: string, url: string): string | undefined {
+    const auth = this.auth;
+    const challenge = this.digest;
+    if (!this.useDigest || !challenge || !auth || auth.authtype || !hasSecret(auth)) {
+      return undefined;
+    }
+    const username = auth.token !== undefined ? (auth.username ?? "x-access-token") : auth.username;
+    const password = auth.token ?? auth.password;
+    if (username === undefined || password === undefined) return undefined;
+    this.digestCnonce ??= digestClientNonce();
+    const parsed = new URL(url);
+    this.digestNc += 1;
+    return digestAuthorization(
+      challenge,
+      { username, password },
+      {
+        method,
+        uri: `${parsed.pathname}${parsed.search}`,
+        nc: this.digestNc,
+        cnonce: this.digestCnonce,
+      },
+    );
+  }
+
+  /**
+   * A 401 without credentials: git restricts curl to the methods the server offered
+   * (handle_curl_result's `http_auth_methods &= auth_avail`), so Digest is used from then on
+   * when it was offered (curl picks it over Basic).
+   */
+  private noteChallenges(challenges: readonly string[]): void {
+    if (challenges.length === 0) return;
+    this.useDigest = digestChallengeOf(challenges) !== undefined;
+  }
+
+  /**
+   * http.proactiveAuth (git 2.46+, `basic` or `auto`): the helper is asked before the first
+   * request (`init_curl_http_auth`; under `basic` with `wwwauth[]=Basic` unless the URL names
+   * a user), and what it gives is sent with it as Basic (or as its `authtype`).
+   */
+  private async fillProactively(url: string): Promise<void> {
+    const mode = this.settings.proactiveAuth;
+    if ((mode !== "basic" && mode !== "auto") || hasSecret(this.auth)) return;
+    const named = new URL(url).username !== "";
+    await this.fill(url, mode === "basic" && !named ? ["Basic"] : []);
+  }
+
   /** handle_curl_result's reading of a response (credentials rejected on a refused 401). */
   private async outcomeOf(response: Response): Promise<Outcome> {
-    // each response's challenges replace the last ones (fwrite_wwwauth)
-    this.wwwAuthenticate = splitChallenges(response.headers.get("www-authenticate"));
     if (response.ok) return "ok";
     if (response.status === 401) {
       if (hasSecret(this.auth)) {
         await this.reject();
         return "noauth";
       }
+      this.noteChallenges(this.wwwAuthenticate);
       return "reauth";
     }
     if (response.status === 429 && this.settings.rateLimitRetries !== false) return "rate";
@@ -317,15 +438,19 @@ export class SmartHttpClient {
       delete this.auth;
       this.filled = false;
       this.dropCallerCredentials = true;
+      delete this.digest;
+      this.useDigest = false;
     }
     return effective;
   }
 
   /** credential_fill: the helper's credentials for the URL, after a 401. */
-  private async fill(url: string): Promise<boolean> {
+  private async fill(url: string, wwwAuthenticate?: string[]): Promise<boolean> {
     const helper = this.options.credentialHelper;
     if (!helper) return false;
-    const credentials = await helper.fill(this.credentialRequest(url));
+    const request = this.credentialRequest(url);
+    if (wwwAuthenticate) request.wwwAuthenticate = wwwAuthenticate;
+    const credentials = await helper.fill(request);
     if (!credentials || !hasSecret(credentials)) return false;
     this.auth = credentials;
     this.filled = true;
