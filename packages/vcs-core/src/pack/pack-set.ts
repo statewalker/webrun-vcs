@@ -61,7 +61,10 @@ export interface OpenPackSetOptions {
    * core.deltaBaseCacheLimit). Default 96 MiB, as git's.
    */
   baseCacheBytes?: number;
-  /** Largest object accepted, by its header, by delta results and for external bases. Default 1 GiB. */
+  /**
+   * Largest object held in memory: delta instructions and results, delta bases (external ones
+   * too). A whole object read on its own streams and is not limited. Default 1 GiB.
+   */
   maxObjectSize?: number;
   /**
    * Minimum time between two rescans of the directory triggered by lookup misses (the first

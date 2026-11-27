@@ -8,20 +8,18 @@
  */
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { once } from "node:events";
 import {
-  createWriteStream,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
   symlinkSync,
+  truncateSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pipeline } from "node:stream/promises";
-import { createDeflate, deflateSync, constants as zlibConstants } from "node:zlib";
+import { deflateSync, constants as zlibConstants } from "node:zlib";
 import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
 import { type FilterDriverRegistry, installContentFilter } from "@statewalker/vcs-working-tree";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -1283,27 +1281,17 @@ async function streamedDigests(
 /** git's EXPENSIVE prerequisite (`GIT_TEST_LONG`): tests that write gigabytes. */
 const itExpensive = process.env.GIT_TEST_LONG ? it : it.skip;
 
-/** Writes `size` zero bytes as a loose blob of `dir`, streamed; its id. */
-async function writeZeroBlob(dir: string, size: number): Promise<string> {
-  const header = Buffer.from(`blob ${size}\0`);
-  const zeros = Buffer.alloc(1 << 20);
-  const hash = createHash("sha1").update(header);
-  for (let left = size; left > 0; left -= zeros.length) {
-    hash.update(left >= zeros.length ? zeros : zeros.subarray(0, left));
-  }
-  const id = hash.digest("hex");
-  const path = join(dir, ".git/objects", id.slice(0, 2), id.slice(2));
-  mkdirSync(join(path, ".."), { recursive: true });
-  const deflate = createDeflate({ level: 1 });
-  const done = pipeline(deflate, createWriteStream(path));
-  if (!deflate.write(header)) await once(deflate, "drain");
-  for (let left = size; left > 0; left -= zeros.length) {
-    if (!deflate.write(left >= zeros.length ? zeros : zeros.subarray(0, left))) {
-      await once(deflate, "drain");
-    }
-  }
-  deflate.end();
-  await done;
+/**
+ * Writes `size` zero bytes as a blob of `dir`, packed as t5004's `big-pack.zip` holds it:
+ * native `git hash-object -w` streams a file above core.bigFileThreshold into a pack
+ * (`stream_to_pack`); its id.
+ */
+function writePackedZeroBlob(dir: string, size: number): string {
+  const path = join(dir, "zeros");
+  writeFileSync(path, "");
+  truncateSync(path, size);
+  const id = git(dir, ["hash-object", "-w", "zeros"]).trim();
+  rmSync(path);
   return id;
 }
 
@@ -1384,9 +1372,9 @@ describeGit(
           const dir = join(root, "big-whole");
           mkdirSync(dir);
           git(dir, ["init", "-q", "-b", "main"]);
-          // written loose: git's hash-object -w packs it, and our pack reader refuses
-          // packed objects above 1 GiB
-          const blob = await writeZeroBlob(dir, SIZE);
+          // packed, as in t5004's big-pack.zip (statewalker/webrun-vcs#477)
+          const blob = writePackedZeroBlob(dir, SIZE);
+          expect(blob).toBe("754a93d6fada4c6873360e6cb4b209132271ab0e");
           const whole = execFileSync("git", ["mktree"], {
             cwd: dir,
             env: archiveEnv(home),
