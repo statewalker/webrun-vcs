@@ -293,10 +293,13 @@ export class AttributesResolver {
     names: readonly string[] | undefined,
     memo: AttributesMemo,
   ): Map<string, AttributeValue> | undefined {
-    const slash = path.lastIndexOf("/");
-    const stack = memo.ready.get(slash > 0 ? path.slice(0, slash) : "");
+    const asked = askedPath(path);
+    const stack = memo.ready.get(asked.dir);
     if (!stack) return undefined;
-    return collectAttributes(stack, path, names, { ignoreCase: this.ignoreCase() });
+    return collectAttributes(stack, asked.path, names, {
+      ignoreCase: this.ignoreCase(),
+      ...(asked.isDirectory ? { isDirectory: true } : {}),
+    });
   }
 
   private ignoreCase(): boolean | undefined {
@@ -318,15 +321,14 @@ export class AttributesResolver {
     names?: readonly string[],
     options: { isDirectory?: boolean; sources?: AttributesSources; memo?: AttributesMemo } = {},
   ): Promise<Map<string, AttributeValue>> {
-    const slash = path.lastIndexOf("/");
-    const dir = slash > 0 ? path.slice(0, slash) : "";
+    const asked = askedPath(path);
     const stack = await this.stack(
-      dir,
+      asked.dir,
       options.sources ?? this.sources,
       options.memo ?? new AttributesMemo(),
     );
-    return collectAttributes(stack, path, names, {
-      isDirectory: options.isDirectory,
+    return collectAttributes(stack, asked.path, names, {
+      isDirectory: options.isDirectory || asked.isDirectory,
       ignoreCase:
         typeof this.options.ignoreCase === "function"
           ? this.options.ignoreCase()
@@ -345,8 +347,7 @@ export class AttributesResolver {
     order: Set<string>,
     options: { sources?: AttributesSources; memo?: AttributesMemo } = {},
   ): Promise<Set<string>> {
-    const slash = path.lastIndexOf("/");
-    const dir = slash > 0 ? path.slice(0, slash) : "";
+    const { dir } = askedPath(path);
     const sources = options.sources ?? this.sources;
     const memo = options.memo ?? new AttributesMemo();
     memo.outer ??= this.outer(sources, memo.onWarning);
@@ -361,6 +362,18 @@ export class AttributesResolver {
     }
     return order;
   }
+}
+
+/**
+ * A path as attr.c's `collect_some_attrs` reads it: a trailing `/` marks a directory
+ * (`path_matches`' `isdir`, matched without the slash) and is no directory separator, so
+ * `src/new/` reads the files of `src`, as `src/new` does.
+ */
+function askedPath(path: string): { path: string; dir: string; isDirectory: boolean } {
+  const isDirectory = path.length > 1 && path.endsWith("/");
+  const name = isDirectory ? path.slice(0, -1) : path;
+  const slash = name.lastIndexOf("/");
+  return { path: name, dir: slash > 0 ? name.slice(0, slash) : "", isDirectory };
 }
 
 /**
