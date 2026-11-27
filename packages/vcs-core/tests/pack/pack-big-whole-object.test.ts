@@ -59,8 +59,8 @@ describe("packed objects above maxObjectSize (statewalker/webrun-vcs#477)", () =
   it("a whole blob over the limit gives its size from the header and streams", async () => {
     const { files, packPath, idxPath } = await packOf([{ kind: 3, data: big }]);
     const pack = await openPack(files, packPath, idxPath, { maxObjectSize: MiB });
-    expect(await pack.header(bigId)).toEqual({ type: "blob", size: big.length });
-    expect(await pack.objectType(bigId)).toBe("blob");
+    expect(await pack.header?.(bigId)).toEqual({ type: "blob", size: big.length });
+    expect(await pack.objectType?.(bigId)).toBe("blob");
     for (const verify of [false, true]) {
       const o = await pack.get(bigId, { verify });
       expect(o?.type).toBe("blob");
