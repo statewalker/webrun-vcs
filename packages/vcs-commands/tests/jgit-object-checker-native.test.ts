@@ -14,7 +14,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
@@ -22,6 +22,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FsckCommand } from "../src/index.js";
 import { gitOk, openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -49,7 +50,7 @@ describeGit("JGit ObjectCheckerTest against native git fsck", () => {
     const version = /(\d+)\.(\d+)/.exec(native(probe, ["--version"]).stdout);
     if (version && (Number(version[1]) > 2 || Number(version[2]) >= 45)) compatibility = "2.56";
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** A fresh repository holding the objects, written as they are. */
   function repository(objects: [string, string][]): string {
