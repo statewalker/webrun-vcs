@@ -346,6 +346,16 @@ describeGit("repack twins", () => {
       expect(result.output).toEqual(["Nothing new to pack."]);
     });
 
+    it("repack -a -d --write-midx with nothing reachable removes every pack and writes no midx (statewalker/webrun-vcs#389)", async () => {
+      const { caseDir, r } = unreachablePacks("nothing-reachable-midx");
+      r.git(["multi-pack-index", "write"]);
+      const { native } = await repackTwins(caseDir, ["-a", "-d", "--write-midx"], (c) =>
+        c.setAll(true).setDeleteRedundant(true).setWriteMidx(true),
+      );
+      expect(native.packs).toEqual([]);
+      expect(native.midx).toBeNull();
+    });
+
     it("repack --cruft -d with nothing reachable moves the old packs into a cruft pack (statewalker/webrun-vcs#389)", async () => {
       const { caseDir } = unreachablePacks("nothing-reachable-cruft");
       const { ours } = await repackTwins(caseDir, ["--cruft", "-d"], (c) =>

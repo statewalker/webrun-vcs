@@ -933,12 +933,15 @@ export async function repackListed(
     const packsRemoved = removable.map((r) => packNameOf(r.pack));
     // --write-midx: the midx of what stays, written before anything is removed
     let midxWritten: string | undefined;
+    const include = new Set<string>();
     if (options.writeMidx) {
       const removed = new Set(removable.map((r) => r.pack.packId));
-      const include = new Set<string>();
       for (const p of [...kept, ...keptInCore]) include.add(`${packNameOf(p)}.idx`);
       for (const id of newPacks) include.add(`pack-${id}.idx`);
       for (const p of replaced) if (!removed.has(p.packId)) include.add(`${packNameOf(p)}.idx`);
+    }
+    // write_midx_included_packs writes nothing when no pack stays (nothing reachable)
+    if (options.writeMidx && include.size > 0) {
       const midx = await multiPackIndexWrite({
         files,
         gitDir,
