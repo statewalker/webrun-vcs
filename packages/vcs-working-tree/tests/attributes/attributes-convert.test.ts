@@ -312,3 +312,17 @@ describe("attribute patterns: byte-exact literal parts, ASCII-only case folding"
     expect(match("\u212a", "k", "", true)).toBe(false);
   });
 });
+
+describe("attributes: a path ending in a slash", () => {
+  // JGit AttributesMatcherTest#testTrailingSlash / #testFileNameWildcards, values from
+  // `git check-attr`: attr.c's collect_some_attrs reads `src/new/` as the directory
+  // `src/new` (path_matches' isdir), in the files of `src`
+  it("is a directory, matched without its slash", async () => {
+    const r = resolver({ "": "/src/ne? test\nsrc/ dir\n", "src/new": "* inner\n" });
+    expect((await r.get("src/new/", ["test", "inner"])).get("test")).toBe(true);
+    expect((await r.get("src/new/", ["inner"])).get("inner")).toBe(undefined);
+    expect((await r.get("src/", ["dir"])).get("dir")).toBe(true);
+    expect((await r.get("src", ["dir"])).get("dir")).toBe(undefined);
+    expect((await r.get("foo/src/", ["dir"])).get("dir")).toBe(true);
+  });
+});

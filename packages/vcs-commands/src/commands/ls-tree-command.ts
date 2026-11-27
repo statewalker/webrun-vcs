@@ -343,17 +343,8 @@ export class LsTreeCommand extends PlumbingCommand {
         }
         match = normalized;
       }
-      const unsupported = MAGIC.filter((m) => m.name !== "top" && m.name !== "literal").filter(
-        (m) => magic.has(m.name),
-      );
-      if (unsupported.length > 0) {
-        const names = unsupported
-          .map((m) => (m.mnemonic ? `'${m.name}' (mnemonic: '${m.mnemonic}')` : `'${m.name}'`))
-          .join(", ");
-        throw new PlumbingError(
-          `fatal: ${elem}: pathspec magic not supported by this command: ${names}`,
-        );
-      }
+      const unsupported = unsupportedPathspecMagic(elem, magic, ["top", "literal"]);
+      if (unsupported) throw new PlumbingError(`fatal: ${unsupported}`);
       items.push(literal(match));
     }
     return items;
@@ -639,8 +630,25 @@ function quoteBytes(path: string, quoteFully: boolean): string {
   return latin1String(encodeGitPath(`"${body}"`));
 }
 
+/**
+ * git's `unsupported_magic` message for the magic of `elem` outside `allowed` (a command's
+ * `magic_mask`), undefined when it has none.
+ */
+export function unsupportedPathspecMagic(
+  elem: string,
+  magic: ReadonlySet<string>,
+  allowed: readonly string[],
+): string | undefined {
+  const unsupported = MAGIC.filter((m) => !allowed.includes(m.name) && magic.has(m.name));
+  if (unsupported.length === 0) return undefined;
+  const names = unsupported
+    .map((m) => (m.mnemonic ? `'${m.name}' (mnemonic: '${m.mnemonic}')` : `'${m.name}'`))
+    .join(", ");
+  return `${elem}: pathspec magic not supported by this command: ${names}`;
+}
+
 /** parse_element_magic: the magic names an element carries and the path after them. */
-function parseElementMagic(elem: string): { magic: Set<string>; rest: string } {
+export function parseElementMagic(elem: string): { magic: Set<string>; rest: string } {
   const magic = new Set<string>();
   if (!elem.startsWith(":")) return { magic, rest: elem };
   if (elem[1] === "(") {
