@@ -23,15 +23,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import {
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  symlinkSync,
-  unlinkSync,
-  utimesSync,
-} from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseIndexFile } from "@statewalker/vcs-working-tree";
@@ -42,6 +34,7 @@ import { AddFailedError, NoFilepatternError } from "../src/errors/index.js";
 import type { Git } from "../src/index.js";
 import { git, gitOk, normalizeState, openOurs, put, snapshot } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -160,7 +153,7 @@ describeGit("git add, as native git stages paths", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "add-native-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("add -u removes a tracked file that became a directory", async () => {
     const { native, ours } = twins((dir) => {

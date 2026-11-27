@@ -5,7 +5,7 @@
  * `.git/config`, the values git refuses (empty, a newline, more than one character in 2.43),
  * and bytes that are no UTF-8. Run with the system git (2.43) and with 2.56.1 first on `PATH`.
  */
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -20,6 +20,7 @@ import {
   type Outcome,
   outcomeOf,
 } from "./plumbing-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -81,7 +82,7 @@ describeGit("git stripspace against native git", () => {
     mkdirSync(repo);
     git(root, repo, ["init", "-q", "-b", "main"]);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t0030-stripspace.sh: "long lines without spaces should be unchanged", "lines with spaces at the beginning should be unchanged", "lines with intermediate spaces should be unchanged"', async () => {
     for (const input of [

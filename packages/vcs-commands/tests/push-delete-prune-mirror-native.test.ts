@@ -16,6 +16,7 @@ import { afterAll, beforeAll, describe, it } from "vitest";
 import { nativeGitAvailable, noMaintenance } from "./native-git-http-backend.js";
 import { both, pushBoth, type Twins, twins } from "./push-modes-native-support.js";
 import { gitOut, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -35,9 +36,9 @@ describeGit("push: delete, prune, all, tags (t5516-fetch-push.sh)", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "push-modes-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** t5516's setup: `w` with two commits (`repo`, `second`). */
   function setup(): Twins {
@@ -186,9 +187,9 @@ describeGit("push --mirror (t5517-push-mirror.sh)", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "push-mirror-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** t5517's mk_repo_pair: `mirror` (denyCurrentBranch warn) and `main` with remote `up`. */
   function mkRepoPair(mirrorRemote = false): Twins {

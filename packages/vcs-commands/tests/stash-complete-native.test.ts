@@ -7,7 +7,7 @@
  * found (`setCompatibility`).
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -16,6 +16,7 @@ import { GitApiError } from "../src/errors/index.js";
 import type { Git, StashCompatibility, StashInfoCommand } from "../src/index.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, openRepo, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -150,7 +151,7 @@ describeGit("stash pop, show, branch, store and list against native git", () => 
     const version = gitOut(root, root, ["--version"]);
     compatibility = /git version 2\.43\./.test(version) ? "2.43" : "2.56";
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   // --- pop (t3903-stash.sh) ---
 

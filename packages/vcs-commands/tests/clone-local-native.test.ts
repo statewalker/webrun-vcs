@@ -14,7 +14,6 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
-  rmSync,
   symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -29,6 +28,7 @@ import { copyLocalObjects } from "../src/commands/local-clone.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -133,7 +133,7 @@ describeGit("local clone (clone_local), as native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "clone-local-native-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** A source with a pack, a commit-graph, loose objects, a tag and a relative alternate. */
   function source() {

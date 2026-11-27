@@ -48,6 +48,7 @@ import {
 } from "./gc-native-twins-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const hasScript = spawnSync("script", ["--version"]).status === 0;
 const describeGit =
@@ -188,7 +189,7 @@ describeGit("progress callbacks against native git's --progress", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "progress-native-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t5301-sliding-window.sh: "repack -a -d, packedGit{WindowSize,Limit} == 1 page"', async () => {
     const caseDir = newCase(root, "repack");

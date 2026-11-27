@@ -6,7 +6,7 @@
  * `--refspec-pattern --allow-onelevel`), native git deciding each. Run with the system git
  * (2.43) and with 2.56.1 first on `PATH`.
  */
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -15,6 +15,7 @@ import { checkRefFormat, type Git } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { fromBytes, git, native, type Outcome, outcomeOf } from "./plumbing-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -205,7 +206,7 @@ describeGit("git check-ref-format against native git", () => {
     mkdirSync(repo);
     git(root, repo, ["init", "-q", "-b", "main"]);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("t1402-check-ref-format.sh: valid_ref, invalid_ref, valid_ref_normalized and invalid_ref_normalized names", async () => {
     for (const [ref, options] of T1402) {

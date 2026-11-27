@@ -6,7 +6,7 @@
  */
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -22,6 +22,7 @@ import {
 } from "./hooks-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -78,7 +79,7 @@ describeGit("pre-auto-gc hook: gc --auto as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-auto-gc-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("below the thresholds: no hook, nothing done", async () => {
     const [theirs, mine] = hookTwins(root, base(1));
@@ -133,7 +134,7 @@ describeGit("gc --auto: pack-refs --auto in 2.5x (as native git)", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-auto-gc-refs-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const refState = (dir: string) =>
     [

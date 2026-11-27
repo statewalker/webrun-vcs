@@ -35,6 +35,7 @@ import type { Git } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 function gitLfsAvailable(): boolean {
   if (!nativeGitAvailable()) return false;
@@ -186,9 +187,9 @@ describe.skipIf(!hasGitLfs)("LFS endpoint as git-lfs resolves it", { timeout: 60
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "lfs-config-native-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("LfsConfigGitTest: the remote URL with and without .git", async () => {
     for (const url of [

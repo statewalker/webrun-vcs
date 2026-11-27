@@ -12,7 +12,7 @@
  * t7502-commit-porcelain.sh, t7509-commit-authorship.sh and t7513-interpret-trailers.sh.
  */
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -25,6 +25,7 @@ import { CleanupMode, type CommitCommand } from "../src/index.js";
 import { nativeIs25x } from "./hooks-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -206,9 +207,9 @@ describeGit("commit -s, --trailer, --author, --date, -C: native twins", () => {
     home = join(root, "home");
     mkdirSync(home);
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   // t7500 "--signoff", t7501 "sign off (1)" / "sign off (2)", t7502 "-s and message"
   it("-s: the committer's sign-off, after a blank line unless the message ends with trailers", async () => {

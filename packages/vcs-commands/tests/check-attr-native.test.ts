@@ -26,6 +26,7 @@ import {
   plumbingEnv,
   writeFiles,
 } from "./plumbing-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -171,7 +172,7 @@ describeGit("git check-attr against native git", () => {
     g("tag", "tag-2");
     rmSync(join(repo, "foo/bar/.gitattributes"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t0003-attributes.sh: "command line checks"', async () => {
     for (const args of [

@@ -8,7 +8,7 @@
  * exit status and the `fatal:`/`error:` lines of stderr.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
@@ -25,6 +25,7 @@ import type {
 } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -43,9 +44,9 @@ const versionOptions: DiffTextOptions = {
 };
 
 let root: string | undefined;
-afterAll(() => {
-  if (root) rmSync(root, { recursive: true, force: true });
-});
+afterAll(async () => {
+  if (root) await removeTempDir(root);
+}, CLEANUP_TIMEOUT);
 const tmp = () => {
   root ??= mkdtempSync(join(tmpdir(), "diff-check-"));
   return root;

@@ -19,6 +19,7 @@ import { approxidateCareful } from "../src/commands/git-date.js";
 import { Git, ResetMode, RevisionError } from "../src/index.js";
 import { craft, objectId } from "./craft-objects.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -118,9 +119,9 @@ describeGit("revision syntax, native rev-parse --verify", () => {
     mkdirSync(home);
     repo = build(join(root, "base"));
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("refs, ids, @, ~ and ^, peeling, <rev>:<path> and index paths", async () => {
     const head = run(repo, undefined, "rev-parse", "HEAD").trim();
@@ -401,9 +402,9 @@ describeGit("revision syntax in commands, native twins", () => {
     home = join(root, "home");
     mkdirSync(home);
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   const lastHeadLine = (repo: string) => {
     const log = run(repo, undefined, "reflog", "-1", "--format=%gs").trim();
@@ -747,9 +748,9 @@ describeGit("abbreviated object ids and describe names, native rev-parse --verif
     repo = buildRanges(join(root, "base"));
     ids = craftCollisions(repo, "loose");
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
   const setConfig = (key: string, value?: string) => {
     if (value === undefined)
       spawnSync("git", ["config", "--unset", key], { cwd: repo, env: envAt() });
@@ -906,9 +907,9 @@ describeGit("revision ranges and sets, native rev-parse and log", () => {
     mkdirSync(home);
     repo = buildRanges(join(root, "base"));
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
   const short = (rev: string) => run(repo, undefined, "rev-parse", "--short", rev).trim();
 
   it("rev-parse prints ranges, exclusions and parent shorthands as git does", async () => {
@@ -1068,9 +1069,9 @@ describeGit("revision arguments: --not alone, .., non-commits, core.disambiguate
     blob = run(repo, undefined, "rev-parse", "main:a.txt").trim();
     tree = run(repo, undefined, "rev-parse", "main^{tree}").trim();
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("log: --not alone falls back to HEAD; .. is HEAD..HEAD as before --", async () => {
     await expectSameLog(repo, [

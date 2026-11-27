@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
@@ -17,6 +17,7 @@ import {
 import { collect, drain, prng } from "./helpers.js";
 import { serveOnLoopback } from "./node-server.js";
 import { checkCases, smudgeCases } from "./pointer-cases.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 /**
  * Interop with the native git-lfs binary (3.4 when this was written): `git
@@ -31,8 +32,8 @@ const dirs: string[] = [];
 const closers: (() => Promise<void>)[] = [];
 afterAll(async () => {
   for (const close of closers) await close();
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 function tmp(): string {
   const d = mkdtempSync(join(tmpdir(), "lfs-native-"));
   dirs.push(d);

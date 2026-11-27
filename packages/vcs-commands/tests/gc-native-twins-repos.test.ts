@@ -32,6 +32,7 @@ import {
   seventeenBlobs,
 } from "./gc-native-twins-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -40,7 +41,7 @@ let root: string;
 beforeAll(() => {
   root = mkdtempSync(join(tmpdir(), "gc-twins-repos-"));
 });
-afterAll(() => rmSync(root, { recursive: true, force: true }));
+afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
 /** A repository on main with two commits and a tag. */
 function base(name: string, bare = false) {

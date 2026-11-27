@@ -8,7 +8,7 @@
  */
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
@@ -25,6 +25,7 @@ import {
   nativeGitEnv,
   nativeGitHttpBackend,
 } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -87,11 +88,11 @@ describeGit("abbreviated ids in fetch and push summaries, native twins", () => {
     backend = nativeGitHttpBackend(root, home);
     globalThis.fetch = backend.fetch;
   });
-  afterEach(() => {
+  afterEach(async () => {
     globalThis.fetch = originalFetch;
     backend?.close();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** `work` published as `src.git`, cloned as `native` and `ours` (ours fetching over HTTP). */
   function setup(abbrev: string | undefined) {
@@ -203,11 +204,11 @@ describeGit("fetch refusals: summary width and checked-out branches, native twin
     backend = nativeGitHttpBackend(root, home);
     globalThis.fetch = backend.fetch;
   });
-  afterEach(() => {
+  afterEach(async () => {
     globalThis.fetch = originalFetch;
     backend?.close();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /**
    * `work` published as `src.git` and cloned as `native` and `ours` with a fetch refspec
@@ -388,11 +389,11 @@ describeGit(
       backend = nativeGitHttpBackend(root, home);
       globalThis.fetch = backend.fetch;
     });
-    afterEach(() => {
+    afterEach(async () => {
       globalThis.fetch = originalFetch;
       backend?.close();
-      rmSync(root, { recursive: true, force: true });
-    });
+      await removeTempDir(root);
+    }, CLEANUP_TIMEOUT);
 
     /**
      * `work` published as `src.git`, cloned as `native` and `ours`; then main advances, a long

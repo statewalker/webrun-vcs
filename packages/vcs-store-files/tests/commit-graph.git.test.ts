@@ -27,6 +27,7 @@ import {
 } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import { createGitFilesBackend, gc, writeCommitGraph } from "../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const GIT_ENV = {
   ...process.env,
@@ -58,9 +59,9 @@ const version = (() => {
 })();
 
 const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 const tempDir = () => {
   const d = mkdtempSync(join(tmpdir(), "commit-graph-"));
   dirs.push(d);

@@ -4,7 +4,7 @@
  * readers that never combine states, and D/F races on disk.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { FilesApi } from "@statewalker/vcs-core";
@@ -19,6 +19,7 @@ import {
   FileRefStore,
   readAllRefs,
 } from "../../src/refs/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 
 /** One FilesApi per repository: atomicFilesOver excludes writers sharing an instance. */
 const sharedFiles = new Map<string, ReturnType<typeof createNodeFilesApi>>();
@@ -43,9 +44,9 @@ const GIT_ENV = {
   GIT_AUTHOR_DATE: "1700000000 +0000",
 };
 const roots: string[] = [];
-afterAll(() => {
-  for (const r of roots) rmSync(r, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const r of roots) await removeTempDir(r);
+}, CLEANUP_TIMEOUT);
 const git = (cwd: string, args: string[], input?: string) =>
   execFileSync("git", args, { cwd, input, env: GIT_ENV, encoding: "utf8" }).trim();
 

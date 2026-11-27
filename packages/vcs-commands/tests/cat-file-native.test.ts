@@ -15,6 +15,7 @@ import { catFileTwin } from "./cat-file-native-support.js";
 import { compatibilityOf, Shell } from "./describe-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -62,9 +63,9 @@ describeGit("git cat-file, native twins", () => {
       .git(repo, ["hash-object", "-t", "tag", "--stdin", "-w"], { input: tag })
       .stdout.trim();
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   const objects = () => [
     ["blob", ids.hello],
@@ -456,9 +457,9 @@ describeGit("git cat-file, bytes and odd trees", () => {
       .git(dir, ["hash-object", "-t", "tree", "--literally", "--stdin", "-w"], { input: tree })
       .stdout.trim();
   });
-  afterAll(() => {
-    rmSync(base, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(base);
+  }, CLEANUP_TIMEOUT);
 
   it("scenario from t1006: a path that is not UTF-8, -p of its tree and in --batch input", async () => {
     await checkHere(["-p", "HEAD^{tree}"]);
@@ -539,9 +540,9 @@ describeGit("git cat-file, corrupt trees (statewalker/webrun-vcs#351)", () => {
     trees.unsortedBad = tree(["100644", "abc", blob], ["40000", "ab", sub], ["10x644", "z", blob]);
     trees.third = tree(["100644", "a", blob], ["100644", "b", blob], ["10x644", "c", blob]);
   });
-  afterAll(() => {
-    rmSync(base, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(base);
+  }, CLEANUP_TIMEOUT);
 
   it("scenario from t1006: -p of a corrupt tree dies as tree-walk.c's decode_tree_entry", async () => {
     await checkHere(["-p", trees.short as string]);

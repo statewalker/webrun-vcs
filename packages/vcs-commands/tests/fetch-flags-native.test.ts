@@ -18,7 +18,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -47,6 +46,7 @@ import {
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -185,7 +185,7 @@ describeGit("git fetch flags: as native git", () => {
     root = mkdtempSync(join(tmpdir(), "fetch-flags-"));
     setupUpstream();
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   // the unforced namespace of t5574's porcelain test, printed in full: a refused
   // non-fast-forward, the rest written; -f forces it
@@ -364,7 +364,7 @@ describeGit("git fetch --set-upstream: as native git (t5553-set-upstream.sh)", (
     git(work, "push", "-q", "upstream", "other");
     git(work, "checkout", "-q", "main");
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** Copies of `work` (native, ours), `prepare` run in each. */
   function pair(prepare: (dir: string) => void = () => {}): [string, string] {
@@ -471,7 +471,7 @@ describeGit("git fetch --atomic: the reference-transaction hook, as native git",
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "fetch-atomic-hooks-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /**
    * A repository fetching from `up.git` inside it (so each twin has its own copy), with
@@ -580,7 +580,7 @@ describe.skipIf(!nativeGitAvailable() || process.platform !== "linux" || !native
     beforeAll(() => {
       root = mkdtempSync(join(tmpdir(), "fetch-head-hook-"));
     });
-    afterAll(() => rmSync(root, { recursive: true, force: true }));
+    afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
     it("the hook hears preparing, then aborted, and the fetch dies (refs.c)", async () => {
       const dir = join(root, "r");

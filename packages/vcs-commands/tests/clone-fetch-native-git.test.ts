@@ -46,6 +46,7 @@ import {
   nativeGitEnv,
   nativeGitHttpBackend,
 } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() ? describe : describe.skip;
 
@@ -194,8 +195,8 @@ describeGit("clone and fetch parity with native git", () => {
     globalThis.fetch = originalFetch;
     for (const wc of opened.splice(0)) await wc.close().catch(() => {});
     backend?.close();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it.each([
     { name: "default", ours: (c: CloneLike) => c, native: [] as string[] },
@@ -610,8 +611,8 @@ describeGit("clone, add and reset never follow symbolic links (native git)", () 
     globalThis.fetch = originalFetch;
     for (const wc of opened.splice(0)) await wc.close().catch(() => {});
     backend?.close();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("reset --hard from links to files replaces the links, never writing through them", async () => {
     const dir = join(root, "ours");

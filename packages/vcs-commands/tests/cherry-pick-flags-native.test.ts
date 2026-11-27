@@ -33,6 +33,7 @@ import {
 } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 import { gitAtLeast } from "./native-git-working-copy.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -193,9 +194,9 @@ beforeAll(() => {
   hasEmptyOption = gitAtLeast(version, 2, 45);
   modern = gitAtLeast(version, 2, 50);
 });
-afterAll(() => {
-  rmSync(root, { recursive: true, force: true });
-});
+afterAll(async () => {
+  await removeTempDir(root);
+}, CLEANUP_TIMEOUT);
 
 // ---------------------------------------------------------------------------------------
 // t3511-cherry-pick-x.sh

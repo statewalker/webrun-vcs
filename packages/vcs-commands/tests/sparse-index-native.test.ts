@@ -23,6 +23,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { type Git, ResetMode } from "../src/index.js";
 import { openOurs, put } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 const version = (() => {
@@ -56,9 +57,9 @@ const run = (cwd: string, args: string[]) => {
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "sparse-index-native-"));
 });
-afterEach(() => {
-  rmSync(root, { recursive: true, force: true });
-});
+afterEach(async () => {
+  await removeTempDir(root);
+}, CLEANUP_TIMEOUT);
 
 /** Every file of the worktree dated well in the past (never racily clean), the index refreshed. */
 function settle(dir: string): void {

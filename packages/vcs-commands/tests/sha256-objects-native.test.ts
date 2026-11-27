@@ -33,6 +33,7 @@ import { Git, ReinitializeHashError, UnknownHashAlgorithmError } from "../src/in
 import { put } from "./merge-native-helpers.js";
 import { createMockWorktree } from "./mock-worktree-store.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -46,7 +47,7 @@ describeGit("SHA-256 repositories against native git", () => {
     const m = /(\d+)\.(\d+)/.exec(native(root, ["--version"]).stdout);
     modern = !!m && (Number(m[1]) > 2 || Number(m[2]) >= 45);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   function native(cwd: string, args: string[], input?: string | Uint8Array, env = {}) {
     const r = spawnSync("git", args, { cwd, env: { ...nativeGitEnv(root), ...env }, input });

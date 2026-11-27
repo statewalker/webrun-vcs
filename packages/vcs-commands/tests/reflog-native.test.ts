@@ -18,7 +18,6 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -43,6 +42,7 @@ import {
   nativeGitEnv,
   nativeGitHttpBackend,
 } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -173,9 +173,9 @@ describeGit("reflog lines, native twins", () => {
     home = join(root, "home");
     mkdirSync(home);
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("commit: initial, plain, amend; the subject is the first line", async () => {
     const t = twins(true);
@@ -488,11 +488,11 @@ describeGit("reflog lines of clone, fetch and pull, native twins", () => {
     backend = nativeGitHttpBackend(root, home);
     globalThis.fetch = backend.fetch;
   });
-  afterEach(() => {
+  afterEach(async () => {
     globalThis.fetch = originalFetch;
     backend?.close();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** The upstream `work`, published as the bare `src.git`. */
   function upstream(): { work: string; src: string } {
@@ -689,9 +689,9 @@ describeGit("reflog lines of merge --abort, tags and one command's clock, native
     home = join(root, "home");
     mkdirSync(home);
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("merge --abort: git's reset --merge logs `reset: moving to HEAD`", async () => {
     const t = twins();
@@ -797,11 +797,11 @@ describeGit(
       backend = nativeGitHttpBackend(root, home);
       globalThis.fetch = backend.fetch;
     });
-    afterEach(() => {
+    afterEach(async () => {
       globalThis.fetch = originalFetch;
       backend?.close();
-      rmSync(root, { recursive: true, force: true });
-    });
+      await removeTempDir(root);
+    }, CLEANUP_TIMEOUT);
 
     /** The upstream `work` (main and dev at `base`), published as the bare `src.git`. */
     function upstream(): { work: string; src: string } {

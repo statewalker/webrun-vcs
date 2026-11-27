@@ -23,6 +23,7 @@ import { createFileWorktree, createGitFilesBackend } from "@statewalker/vcs-stor
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -100,7 +101,7 @@ describeGit("JGit's ignore rule cases against native git", () => {
     root = mkdtempSync(join(tmpdir(), "ignore-jgit-"));
     home = root;
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it(`${CASES.length} cases: ours answers as git check-ignore`, async () => {
     const byPattern = new Map<string, JGitCase[]>();

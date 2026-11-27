@@ -4,7 +4,7 @@
  * Runs conformance tests against the Git file-based Checkout implementation.
  */
 
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryRefs } from "@statewalker/vcs-core";
@@ -15,6 +15,7 @@ import type { Checkout, Staging } from "@statewalker/vcs-working-tree";
 import { createMemoryGitStaging } from "@statewalker/vcs-working-tree";
 import { afterEach, describe, expect, it } from "vitest";
 import { checkoutConformanceTests } from "./checkout.conformance.test.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../../temp-dir-support.js";
 
 let checkout: GitCheckout;
 let staging: Staging;
@@ -89,10 +90,10 @@ checkoutConformanceTests(
 
 describe("GitCheckout state files survive a crash mid-write", () => {
   let dir: string | undefined;
-  afterEach(() => {
-    if (dir) rmSync(dir, { recursive: true, force: true });
+  afterEach(async () => {
+    if (dir) await removeTempDir(dir);
     dir = undefined;
-  });
+  }, CLEANUP_TIMEOUT);
 
   /**
    * A checkout over a real directory whose writes "crash" (throw) after the first byte

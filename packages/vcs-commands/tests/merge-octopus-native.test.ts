@@ -39,6 +39,7 @@ import {
   text,
 } from "./merge-native-scenarios.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -138,9 +139,9 @@ describeGit("octopus merges against native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "merge-octopus-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("three branches with separate changes: one commit with four parents", async () => {
     const graph = branches(

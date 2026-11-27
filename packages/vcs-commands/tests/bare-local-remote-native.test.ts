@@ -19,6 +19,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Git } from "../src/index.js";
 import { nativeGitAvailable, noMaintenance } from "./native-git-http-backend.js";
 import { gitOut, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -67,7 +68,7 @@ describeGit("local remotes from a bare repository: as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "bare-local-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("ls-remote and fetch from a bare and a non-bare remote", async () => {
     const dir = join(root, "r");

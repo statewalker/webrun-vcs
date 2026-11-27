@@ -29,6 +29,7 @@ import { archiveEnv, openArchiveRepo } from "./archive-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { childDuplex, startTcpServer } from "./native-connect-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -122,7 +123,7 @@ describeGit("git archive --remote (native twins)", () => {
     unreachable = git(repo, ["rev-parse", "HEAD"]).trim();
     git(repo, ["reset", "-q", "--hard", "HEAD^"]);
   });
-  afterAll(() => rmSync(home, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(home), CLEANUP_TIMEOUT);
 
   /** native `git archive --remote=<remote> <args>` and ours, in `repo`. */
   async function localTwins(

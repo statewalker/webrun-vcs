@@ -8,7 +8,7 @@
  * of t5516-fetch-push.sh, t5533-push-cas.sh.
  */
 
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
@@ -18,6 +18,7 @@ import type { PushCommand, PushResult } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, noMaintenance } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -124,9 +125,9 @@ describeGit("push flags (native git)", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "push-flags-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   // t5523-push-upstream.sh
   describe("push -u / --set-upstream (t5523-push-upstream.sh)", () => {

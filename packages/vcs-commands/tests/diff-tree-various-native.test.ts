@@ -4,7 +4,7 @@
  * compared byte for byte.
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -13,6 +13,7 @@ import type { Git } from "../src/index.js";
 import { runNative, runOurs } from "./diff-plumbing-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -185,9 +186,9 @@ describeGit("t4013-diff-various.sh: diff-tree against native git", () => {
     execFileSync("sh", ["-c", SETUP], { cwd: dir, env: env(), stdio: "ignore" });
     ours = await openOurs(dir);
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   const check = async (cmd: string, input?: string) => {
     const args = cmd.split(" ");

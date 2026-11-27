@@ -45,6 +45,7 @@ import {
 } from "./hooks-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -177,7 +178,7 @@ describeGit("reference-transaction hook in a linked worktree (as native git)", (
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-wt-reftx-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("a commit: HEAD asked for, the branch it names written", async () => {
     const dir = join(root, "c");
@@ -308,7 +309,7 @@ describeGit("pack-refs and gc in a linked worktree (as native git)", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-wt-pack-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** Loose refs of both kinds, some packed, and the worktree's own refs (never packed). */
   function packBase(dir: string): void {
@@ -379,7 +380,7 @@ describeGit("GIT_DIR in hooks of linked worktrees and bare repositories (as nati
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-wt-gitdir-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** Only the logging post-checkout hook in the repository's hooks directory. */
   const postCheckoutOnly = (twin: HookTwin) => {

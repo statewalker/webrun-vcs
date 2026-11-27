@@ -21,6 +21,7 @@ import {
   type RefStorageFormat,
   readRepositoryFormat,
 } from "../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const GIT_ENV = {
   ...process.env,
@@ -53,10 +54,10 @@ const nativeReftable =
   ).status === 0;
 
 const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-  rmSync(join(tmpdir(), `rt-probe-${process.pid}`), { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+  await removeTempDir(join(tmpdir(), `rt-probe-${process.pid}`));
+}, CLEANUP_TIMEOUT);
 
 /** The fixture (a files repository): t1460's "a bunch of refs" with reflogs and a stash. */
 function fixture(): string {

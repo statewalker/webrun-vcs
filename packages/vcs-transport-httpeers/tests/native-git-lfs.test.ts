@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createFilesLfsStore } from "@statewalker/vcs-transport-lfs";
@@ -9,6 +9,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { bindProvenPeer, meshLfsHandler } from "../src/index.js";
 import { createHub, prng } from "./helpers.js";
 import { serveOnLoopback } from "./node-server.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 /**
  * Native git-lfs against the mesh LFS handler: it offers only `basic` and gets it, sends the
@@ -21,8 +22,8 @@ const dirs: string[] = [];
 const closers: (() => Promise<void>)[] = [];
 afterAll(async () => {
   for (const close of closers) await close();
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 function tmp(): string {
   const d = mkdtempSync(join(tmpdir(), "mesh-lfs-native-"));
   dirs.push(d);

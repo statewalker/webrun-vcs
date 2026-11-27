@@ -6,7 +6,7 @@
  * Skips when git-http-backend is not available.
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createMemoryHistoryWithOperations } from "@statewalker/vcs-core";
@@ -21,6 +21,7 @@ import {
   gitHttpBackendAvailable,
   startGitHttpBackendServer,
 } from "./helpers/git-http-backend-server.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../../../temp-dir-support.js";
 
 const GIT_ENV = {
   ...process.env,
@@ -47,8 +48,8 @@ describeWithGit("fetch streams the pack into importPack (git-http-backend)", () 
   });
   afterAll(async () => {
     await server.close();
-    for (const d of dirs) rmSync(d, { recursive: true, force: true });
-  });
+    for (const d of dirs) await removeTempDir(d);
+  }, CLEANUP_TIMEOUT);
 
   it("imports every object byte for byte, without collecting the pack", async () => {
     const url = await server.createBareRepo("streamed.git");

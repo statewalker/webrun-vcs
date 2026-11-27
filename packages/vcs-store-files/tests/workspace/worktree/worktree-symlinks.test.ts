@@ -11,7 +11,6 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
-  rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -25,6 +24,7 @@ import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { createNodeFilesApi, PosixNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import type { Worktree } from "@statewalker/vcs-working-tree";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../../temp-dir-support.js";
 
 const enc = new TextEncoder();
 const noStores = { blobs: {} as Blobs, trees: {} as Trees };
@@ -60,7 +60,7 @@ describe("FileWorktree and symbolic links", () => {
       ...noStores,
     });
   });
-  afterEach(() => rmSync(base, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(base), CLEANUP_TIMEOUT);
 
   it("reports what a Node worktree can represent", () => {
     expect(worktree.capabilities).toEqual({
@@ -178,7 +178,7 @@ describe("FileWorktree beneath links, special files, umask, case folding", () =>
       ...noStores,
     });
   });
-  afterEach(() => rmSync(base, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(base), CLEANUP_TIMEOUT);
 
   it("never reads or hashes a file beneath a link", async () => {
     await expect(collect(worktree.readContent("d/secret.txt"))).rejects.toThrow(/symbolic link/);
@@ -301,7 +301,7 @@ describe("FileWorktree path rules follow the FilesApi's platform", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "worktree-platform-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const worktreeOn = (platform: NodeJS.Platform) =>
     createFileWorktree({

@@ -30,6 +30,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Git } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGit3Env } from "./native-git3.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 /** `$GIT3` when it can open a compatibility repository (a build with Rust) */
 function compatGit(): string | undefined {
@@ -127,7 +128,7 @@ describe.skipIf(!git3)("extensions.compatObjectFormat (git master)", () => {
   beforeAll(() => {
     root = realpathSync(mkdtempSync(join(tmpdir(), "compat-format-git3-")));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("ours opens a native compatibility repository and translates its ids as git does", async () => {
     const dir = compatRepo();

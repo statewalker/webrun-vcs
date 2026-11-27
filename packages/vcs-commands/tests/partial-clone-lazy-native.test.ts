@@ -39,6 +39,7 @@ import {
   noMaintenance,
 } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -233,8 +234,8 @@ describeGit("partial clones with lazy fetch, as native git", () => {
   afterAll(async () => {
     await native?.close();
     await mine?.server.close();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** An empty repository for our side. */
   async function oursAt(name: string): Promise<{ dir: string; ours: Git }> {
