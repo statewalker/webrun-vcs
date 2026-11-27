@@ -34,6 +34,7 @@ import {
   FetchCheckError,
   fetchPromisedObjects,
   type GitTransportRegistry,
+  type HttpCredentialHelper,
   unpackLimitOf,
 } from "@statewalker/vcs-transport";
 import { parseGitBool } from "@statewalker/vcs-utils";
@@ -134,6 +135,13 @@ export interface PromisorFetcherOptions {
   headers?: Record<string, string>;
   timeout?: number;
   /**
+   * Asked for HTTP credentials after a 401, per URL (git's child fetch reads
+   * `credential.helper`): an answer for one host never goes to another
+   */
+  credentialHelper?: HttpCredentialHelper;
+  /** git's `warning:` lines of the HTTP client (`rate limited, waiting ...`) */
+  warningCallback?: (line: string) => void;
+  /**
    * git's behaviour to follow: 2.43 knows no `GIT_NO_LAZY_FETCH` (default: the host's hook
    * runner's, else 2.56)
    */
@@ -215,8 +223,16 @@ export function createPromisorFetcher(
           ...(options.headers ? { headers: options.headers } : {}),
           ...(options.timeout !== undefined ? { timeout: options.timeout } : {}),
           protocolVersion: protocolVersionOf(config),
-          httpSettings: (remoteUrl) =>
-            httpClientSettingsOf(config, remoteUrl, environment, { compatibility }),
+          httpSettings: (remoteUrl) => {
+            const settings = httpClientSettingsOf(config, remoteUrl, environment, {
+              compatibility,
+              ...(options.warningCallback ? { onWarning: options.warningCallback } : {}),
+            });
+            return options.warningCallback
+              ? { ...settings, onWarning: options.warningCallback }
+              : settings;
+          },
+          ...(options.credentialHelper ? { credentialHelper: options.credentialHelper } : {}),
         },
         async (connection) => {
           try {

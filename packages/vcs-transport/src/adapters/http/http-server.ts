@@ -158,6 +158,8 @@ export interface HttpServerOptions {
   allowRefInWant?: boolean;
   /** Protocol v2: `fetch=... sideband-all` (git's `uploadpack.allowSidebandAll`) */
   allowSidebandAll?: boolean;
+  /** Protocol v2 acknowledges every have held (git before 2.45; see `ProcessConfiguration`) */
+  acknowledgeEveryHave?: boolean;
   /**
    * Protocol v2: `fetch=... packfile-uris` and the `uploadpack.blobPackfileUri` values
    * (`<object-hash> <pack-hash> <uri>`): objects left out of the pack for a client taking
@@ -963,6 +965,7 @@ export async function handleUploadPackV2(
     requestPolicy: options.requestPolicy ?? "ANY",
     ...(options.allowRefInWant ? { allowRefInWant: true } : {}),
     ...(options.allowSidebandAll ? { allowSidebandAll: true } : {}),
+    ...(options.acknowledgeEveryHave ? { acknowledgeEveryHave: true } : {}),
     ...(options.blobPackfileUris?.length ? { blobPackfileUris: options.blobPackfileUris } : {}),
     ...(options.bundleUris !== undefined ? { bundleUris: options.bundleUris } : {}),
     ...(advertisedSessionId(options) !== undefined
@@ -1524,6 +1527,8 @@ export interface HttpHandlerOptions {
   allowRefInWant?: boolean;
   /** v2 `sideband-all` (see {@link HttpServerOptions.allowSidebandAll}) */
   allowSidebandAll?: boolean;
+  /** v2 ACKs of every have (see {@link HttpServerOptions.acknowledgeEveryHave}) */
+  acknowledgeEveryHave?: boolean;
   /**
    * Protocol v2: `fetch=... packfile-uris` and the `uploadpack.blobPackfileUri` values
    * (`<object-hash> <pack-hash> <uri>`): objects left out of the pack for a client taking
@@ -1589,6 +1594,7 @@ export function createHttpHandler(
     advertiseObjectInfo,
     allowRefInWant,
     allowSidebandAll,
+    acknowledgeEveryHave,
     blobPackfileUris,
     bundleUris,
     advertiseSID,
@@ -1622,6 +1628,7 @@ export function createHttpHandler(
       advertiseObjectInfo,
       ...(allowRefInWant ? { allowRefInWant } : {}),
       ...(allowSidebandAll ? { allowSidebandAll } : {}),
+      ...(acknowledgeEveryHave ? { acknowledgeEveryHave } : {}),
       ...(blobPackfileUris?.length ? { blobPackfileUris } : {}),
       ...(bundleUris !== undefined ? { bundleUris } : {}),
       ...(advertiseSID ? { advertiseSID } : {}),

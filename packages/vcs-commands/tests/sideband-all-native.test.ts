@@ -37,6 +37,7 @@ import {
   startTcpServer,
 } from "./native-connect-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { nativeAtLeast } from "./plumbing-native-support.js";
 import { gitOut, testEnv } from "./status-native-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
@@ -89,20 +90,11 @@ function fetchResponse(trace: string): string[] {
 }
 
 /**
- * The same fetch response, except for which haves are acknowledged: git 2.45+'s upload-pack
- * skips a have whose child it acknowledged first, ours (as 2.43) acknowledges every one
- * (statewalker/webrun-vcs#396). Every native ACK is ours too, each on the same band.
+ * The same fetch response, ACKs included: our server acknowledges the haves the native git's
+ * upload-pack acknowledges (2.45+ skips a have whose child came first, 2.43 does not).
  */
 function expectSameResponse(mine: string[], theirs: string[], label: string): void {
-  const isAck = (l: string) => /^(\\1)?ACK /.test(l);
-  expect(
-    mine.filter((l) => !isAck(l)),
-    label,
-  ).toEqual(theirs.filter((l) => !isAck(l)));
-  const acks = mine.filter(isAck);
-  for (const ack of theirs.filter(isAck)) expect(acks, label).toContain(ack);
-  const band = (l: string) => l.startsWith("\\1");
-  for (const ack of acks) expect(band(ack), label).toBe(theirs.some(band));
+  expect(mine, label).toEqual(theirs);
 }
 
 /** Whether a native client's packet trace shows it sent `sideband-all`. */
@@ -211,7 +203,9 @@ describeGit("protocol v2 sideband-all, as native git", () => {
         const opened = await openLocalRemote(host.workingCopy, `..${gitDir}`).catch(
           () => undefined,
         );
-        return opened ? servedRepositoryOf(opened) : undefined;
+        // git before 2.45 acknowledges every have it holds
+        const compatibility = nativeAtLeast(2, 45) ? "2.56" : "2.43";
+        return opened ? servedRepositoryOf(opened, { host: { compatibility } }) : undefined;
       },
     });
     ours = await startTcpServer(async (duplex) => {

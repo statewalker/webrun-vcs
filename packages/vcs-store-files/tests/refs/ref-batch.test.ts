@@ -163,3 +163,67 @@ describe("initial ref batches (git clone's write_remote_refs) [Git files]", () =
     ]);
   });
 });
+
+describe("loose ref batches (git's files_transaction_finish) [Git files]", () => {
+  const oid = (n: number): ObjectId => n.toString(16).padStart(40, "a");
+  const text = async (files: FilesApi, path: string) => {
+    if ((await files.stats(path))?.kind !== "file") return undefined;
+    const chunks: Uint8Array[] = [];
+    for await (const c of files.read(path)) chunks.push(c);
+    return new TextDecoder().decode(Buffer.concat(chunks));
+  };
+
+  /** p, q and gone packed; `loose`'s batch then updates p, creates r and deletes gone. */
+  async function packedThree() {
+    const { files, refs } = await gitFilesRefs();
+    for (const [name, n] of [
+      ["refs/heads/p", 1],
+      ["refs/heads/q", 2],
+      ["refs/heads/gone", 3],
+    ] as const) {
+      await refs.batch([{ name, new: oid(n) }]);
+    }
+    await packRefs(files, "/.git", ["refs/heads/p", "refs/heads/q", "refs/heads/gone"], true);
+    return { files, refs };
+  }
+
+  // statewalker/webrun-vcs#284: git fetch --atomic --prune
+  it("writes the updates loose and drops the deletions from packed-refs", async () => {
+    const { files, refs } = await packedThree();
+    const result = await refs.batch(
+      [
+        { name: "refs/heads/gone", old: oid(3), new: null },
+        { name: "refs/heads/p", old: oid(1), new: oid(4) },
+        { name: "refs/heads/r", old: null, new: oid(5) },
+      ],
+      { loose: true },
+    );
+    expect(result).toEqual({ ok: true, rejected: [] });
+    expect(await text(files, "/.git/refs/heads/p")).toBe(`${oid(4)}\n`);
+    expect(await text(files, "/.git/refs/heads/r")).toBe(`${oid(5)}\n`);
+    const packed = await text(files, "/.git/packed-refs");
+    expect(packed).toContain(`${oid(1)} refs/heads/p\n`); // shadowed by the loose file, as git leaves it
+    expect(packed).toContain(`${oid(2)} refs/heads/q\n`);
+    expect(packed).not.toContain("refs/heads/gone");
+    expect(await refs.has("refs/heads/gone")).toBe(false);
+    expect((await refs.resolve("refs/heads/p"))?.objectId).toBe(oid(4));
+    expect(await files.stats("/.git/packed-refs.lock")).toBeUndefined();
+  });
+
+  it("changes nothing when one update is refused", async () => {
+    const { files, refs } = await packedThree();
+    const before = await text(files, "/.git/packed-refs");
+    const result = await refs.batch(
+      [
+        { name: "refs/heads/gone", old: oid(3), new: null },
+        { name: "refs/heads/p", old: oid(1), new: oid(4) },
+        { name: "refs/heads/q", old: oid(9), new: oid(6) },
+      ],
+      { loose: true },
+    );
+    expect(result.ok).toBe(false);
+    expect(await text(files, "/.git/packed-refs")).toBe(before);
+    expect(await files.stats("/.git/refs/heads/p")).toBeUndefined();
+    expect(await refs.has("refs/heads/gone")).toBe(true);
+  });
+});

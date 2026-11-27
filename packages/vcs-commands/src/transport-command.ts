@@ -85,13 +85,15 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
   constructor(workingCopy: WorkingCopy) {
     super(workingCopy);
     // a partial clone's lazy fetch during the call (a clone's checkout, a pull's merge) reaches
-    // the promisor remote as this command does: its transports, credentials, headers, timeout;
+    // the promisor remote as this command does: its transports, credentials, headers, timeout,
+    // credential helper and warning sink;
     // the store's previous fetcher comes back when the call ends
     this.aroundEntryPoints(() => {
       if (
         !this.transportRegistry &&
         !this.credentials &&
         !this.headers &&
+        !this.credentialHelper &&
         this.timeout === undefined
       ) {
         return undefined;
@@ -102,6 +104,10 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
       const fetcher = createPromisorFetcher(this._workingCopy, {
         ...this.promisorFetcherAuth(),
         ...(this.timeout !== undefined ? { timeout: this.timeout } : {}),
+        // git's child fetch reads credential.helper: the helper is asked per URL, so the
+        // guarded commands hand it over too
+        ...(this.credentialHelper ? { credentialHelper: this.credentialHelper } : {}),
+        ...(this.warningCallback ? { warningCallback: this.warningCallback } : {}),
       });
       promisor.setFetcher(fetcher);
       return () => {
