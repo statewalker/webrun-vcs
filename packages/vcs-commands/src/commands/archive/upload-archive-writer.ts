@@ -5,7 +5,7 @@
  * upload-archive protocol (vcs-transport `serveUploadArchive`).
  */
 
-import type { UploadArchiveOutput, UploadArchiveWriter } from "@statewalker/vcs-transport";
+import type { UploadArchiveSink, UploadArchiveWriter } from "@statewalker/vcs-transport";
 import { parseGitBool } from "@statewalker/vcs-utils";
 import type { OpenedRepository, WorkingCopy } from "@statewalker/vcs-working-tree";
 import { GitApiError } from "../../errors/index.js";
@@ -25,20 +25,34 @@ export interface ArchiveWriterOptions {
 /**
  * Runs `git archive <args>` as upload-archive's writer runs it in `workingCopy` (a
  * repository's, its worktree never read): git's options parsed from `args`, only formats
- * served remotely, a tree-ish only by ref unless `allowUnreachable`. Never throws: git's
- * deaths are its stderr and exit status.
+ * served remotely, a tree-ish only by ref unless `allowUnreachable`. The archive goes to
+ * `sink` as it is written ({@link ArchiveCommand.callStream}: never held whole, the writer
+ * waiting on each chunk), stderr's lines with it as they are printed; resolves with git's
+ * exit status. Never throws: git's deaths are a stderr line and the status (a sink that
+ * rejects, the client gone, stops the writer the same way).
  *
  * @example
  * ```ts
- * const { stdout, exitCode } = await runArchiveWriter(workingCopy, ["--format=zip", "HEAD"]);
+ * const exitCode = await runArchiveWriter(workingCopy, ["--format=zip", "HEAD"], {
+ *   stdout: async (chunk) => file.write(chunk),
+ *   stderr: async (text) => log(text),
+ * });
  * ```
  */
 export async function runArchiveWriter(
   workingCopy: WorkingCopy,
   args: readonly string[],
+  sink: UploadArchiveSink,
   options: ArchiveWriterOptions = {},
-): Promise<UploadArchiveOutput> {
+): Promise<number> {
   let command: ArchiveCommand | undefined;
+  let sent = 0;
+  const flushMessages = async () => {
+    if (!command) return;
+    const lines = command.getMessages(sent);
+    sent += lines.length;
+    if (lines.length > 0) await sink.stderr(lines.map((m) => `${m}\n`).join(""));
+  };
   try {
     command = new ArchiveCommand(workingCopy).setUploadArchive({
       allowUnreachable: options.allowUnreachable === true,
@@ -47,27 +61,25 @@ export async function runArchiveWriter(
     const list = applyArchiveArgs(command, args);
     if (list) {
       const lines = command.listFormats().map((name) => `${name}\n`);
-      return { exitCode: 0, stdout: encoder.encode(lines.join("")), stderr: "" };
+      await sink.stdout(encoder.encode(lines.join("")));
+      return 0;
     }
-    const archive = await command.call();
-    return { exitCode: 0, stdout: archive, stderr: messagesOf(command) };
+    for await (const chunk of command.callStream()) {
+      // what was printed while this chunk was made goes first (git's -v: the path, then
+      // its entry)
+      await flushMessages();
+      await sink.stdout(chunk);
+    }
+    await flushMessages();
+    return 0;
   } catch (error) {
     const message = (error as Error).message ?? String(error);
     const exitCode = error instanceof GitApiError ? error.exitCode : 128;
     const text = /^(fatal|error|usage|warning):/.test(message) ? message : `fatal: ${message}`;
-    return {
-      exitCode,
-      stdout: new Uint8Array(0),
-      stderr: `${command ? messagesOf(command) : ""}${text}\n`,
-    };
+    await flushMessages().catch(() => {});
+    await sink.stderr(`${text}\n`).catch(() => {});
+    return exitCode;
   }
-}
-
-function messagesOf(command: ArchiveCommand): string {
-  return command
-    .getMessages()
-    .map((m) => `${m}\n`)
-    .join("");
 }
 
 /**
@@ -88,11 +100,11 @@ export function uploadArchiveWriterOf(
 ): UploadArchiveWriter | undefined {
   const worktrees = repository.worktrees;
   if (!worktrees) return undefined;
-  return async (args) => {
+  return async (args, sink) => {
     const value = repository.config?.getAll("uploadarchive.allowUnreachable").at(-1);
     const allowUnreachable = value === undefined ? false : (parseGitBool(value ?? "true") ?? false);
     const admin = await worktrees.openAdmin();
-    return runArchiveWriter(withoutWorktree(worktreeAdminWorkingCopy(admin)), args, {
+    return runArchiveWriter(withoutWorktree(worktreeAdminWorkingCopy(admin)), args, sink, {
       allowUnreachable,
       ...options,
     });
