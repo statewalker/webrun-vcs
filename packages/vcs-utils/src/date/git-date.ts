@@ -568,8 +568,9 @@ function localtime(seconds: number): ApproxTm {
 /**
  * glibc's `mktime`: the local fields as seconds since the epoch, out-of-range fields
  * carried. `tm_isdst` is honoured as glibc honours it: a time on the other side of a
- * summer-time change from what `isdst` says is read in the offset `isdst` names (git's
- * approxidate keeps now's `tm_isdst`, so "june" asked in November is an hour off).
+ * summer-time change from what `isdst` says, or in the hour a spring-forward change skips,
+ * is read in the offset `isdst` names (git's approxidate keeps now's `tm_isdst`, so "june"
+ * asked in November is an hour off).
  */
 function mktime(tm: ApproxTm): number {
   const d = new Date(0);
@@ -580,6 +581,9 @@ function mktime(tm: ApproxTm): number {
   if (tm.isdst < 0) return t;
   const { std, dst } = yearOffsets(t);
   if (std === dst) return t;
+  // a time in a spring-forward gap names no instant: glibc reads it in the offset `isdst`
+  // names (`2:30` on the day the clocks skip it is 1:30 standard time when isdst is 1)
+  if (t + localOffsetAt(t) !== wall) return wall - (tm.isdst > 0 ? dst : std);
   const actual = localOffsetAt(t) === dst ? 1 : 0;
   if (actual === (tm.isdst > 0 ? 1 : 0)) return t;
   return wall - (tm.isdst > 0 ? dst : std);
