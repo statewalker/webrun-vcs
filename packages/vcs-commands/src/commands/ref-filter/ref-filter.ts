@@ -20,6 +20,7 @@ import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils";
 import { wildmatch } from "@statewalker/vcs-working-tree";
 
 import { RefFilterError } from "../../errors/index.js";
+import { MAX_REF_FILTER_PEEL_DEPTH } from "./peel-limit.js";
 import {
   type RefFilterItem,
   type RefFormat,
@@ -213,7 +214,7 @@ export interface FilteredRefs {
 /** The commit an object peels to (lookup_commit_reference_gently), undefined when none. */
 async function commitOf(source: RefFilterSource, id: ObjectId): Promise<ObjectId | undefined> {
   let current = id;
-  for (let depth = 0; depth < 1000; depth++) {
+  for (let depth = 0; depth < MAX_REF_FILTER_PEEL_DEPTH; depth++) {
     const object = await source.readObject(current);
     if (!object) return undefined;
     if (object.type === "commit") return current;
@@ -225,7 +226,11 @@ async function commitOf(source: RefFilterSource, id: ObjectId): Promise<ObjectId
   return undefined;
 }
 
-/** match_points_at: the ref's object, or one a tag on the way names, is wanted. */
+/**
+ * match_points_at: the ref's object, or one a tag on the way names, is wanted. A chain longer
+ * than {@link MAX_REF_FILTER_PEEL_DEPTH} (a tag cycle through replace refs, where git loops
+ * forever) does not match.
+ */
 async function matchPointsAt(
   source: RefFilterSource,
   wanted: ReadonlySet<ObjectId>,
@@ -235,7 +240,8 @@ async function matchPointsAt(
   if (wanted.has(id)) return true;
   let object = await source.readObject(id);
   let current = id;
-  while (object && object.type === "tag") {
+  for (let depth = 0; object && object.type === "tag"; depth++) {
+    if (depth >= MAX_REF_FILTER_PEEL_DEPTH) return false;
     const target = tagHeader(decodeGitPath(object.bytes)).object;
     if (!target) {
       object = undefined;

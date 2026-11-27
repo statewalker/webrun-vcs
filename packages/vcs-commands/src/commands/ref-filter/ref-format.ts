@@ -24,6 +24,7 @@ import { type DateMode, parseDateMode, type ShowDateContext, showDate } from "..
 import type { Mailmap } from "../mailmap.js";
 import { sanitizedSubject } from "../pretty-format.js";
 import { appendTrailers, type TrailerConfig } from "../trailers.js";
+import { MAX_REF_FILTER_PEEL_DEPTH } from "./peel-limit.js";
 import { type AtomCmpType, parseAtom, type UsedAtom } from "./ref-atoms.js";
 import { quoteRefValue, type RefQuoteStyle } from "./ref-quote.js";
 
@@ -715,7 +716,7 @@ export class RefFormat {
   private async peel(id: ObjectId, object: RefFormatObject): Promise<ObjectId | undefined> {
     let current = object;
     let currentId = id;
-    for (let depth = 0; current.type === "tag" && depth < 1000; depth++) {
+    for (let depth = 0; current.type === "tag" && depth < MAX_REF_FILTER_PEEL_DEPTH; depth++) {
       const header = tagHeader(decodeGitPath(current.bytes));
       if (!header.object || !header.type) return undefined;
       const next = await this.source.readObject(header.object);

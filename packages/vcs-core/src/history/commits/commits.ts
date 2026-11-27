@@ -219,6 +219,27 @@ export interface Commits extends ObjectStorage<Commit> {
    * @returns True if commit exists
    */
   has(id: ObjectId): Promise<boolean>;
+
+  /**
+   * The commit's content as stored (git's commit format, without the object header), byte for
+   * byte: extra headers (`mergetag`, `change-id`, ...) and bytes that are not UTF-8 included,
+   * which `load`'s `Commit` does not carry. Undefined if it is absent or not a commit.
+   * Optional: stores that keep commits as git objects give `objects.get` instead.
+   */
+  raw?(id: ObjectId): Promise<Uint8Array | undefined>;
+
+  /**
+   * Stores a commit given as its content (without the object header) byte for byte, and returns
+   * its id: the hash of exactly these bytes. Refuses content that does not parse as a commit.
+   * Optional: stores of parsed commits that offer it keep what their columns cannot rebuild
+   * (`importObject` stores through it, so no commit comes back under another id).
+   *
+   * @example
+   * ```typescript
+   * const id = (await commits.storeRaw?.(bytes)) ?? (await commits.store(parsed));
+   * ```
+   */
+  storeRaw?(content: Uint8Array): Promise<ObjectId>;
 }
 
 /**
