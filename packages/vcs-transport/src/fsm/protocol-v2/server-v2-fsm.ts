@@ -398,7 +398,8 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
 
           if (line.startsWith("want ")) {
             req.wants.push(line.slice(5));
-            (req.wantOrder ??= []).push({ want: line.slice(5) });
+            req.wantOrder ??= [];
+            req.wantOrder.push({ want: line.slice(5) });
           } else if (line.startsWith("want-ref ")) {
             // only with uploadpack.allowRefInWant (process_args): else git dies on an
             // unexpected line, with no ERR packet
@@ -407,7 +408,8 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
               return "ERROR";
             }
             req.wantRefs.push(line.slice(9));
-            (req.wantOrder ??= []).push({ wantRef: line.slice(9) });
+            req.wantOrder ??= [];
+            req.wantOrder.push({ wantRef: line.slice(9) });
           } else if (line.startsWith("have ")) {
             req.haves.push(line.slice(5));
           } else if (line === "done") {
