@@ -4,14 +4,24 @@
  * written under `refs/bundles/`) and `fetch.bundleCreationToken`.
  */
 
-import { historyWithoutLazyFetch, type ObjectId, type RefLogOptions } from "@statewalker/vcs-core";
+import {
+  historyWithoutLazyFetch,
+  type ObjectId,
+  objectFormatOf,
+  type RefLogOptions,
+} from "@statewalker/vcs-core";
 import {
   type Credentials,
+  checkReceivedPack,
   createRepositoryFacade,
+  FetchCheckError,
   type HttpClientSettings,
   type HttpCredentialHelper,
+  ReceivedObjects,
+  type ReceivedObjectsFsck,
   SmartHttpClient,
 } from "@statewalker/vcs-transport";
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 
 import type { WorkingCopy } from "../../types.js";
 import type { BundleUriHost } from "./bundle-uri.js";
@@ -47,6 +57,16 @@ export interface BundleUriHostOptions {
   message(line: string): void;
   /** How the downloaded list file is named in errors */
   tempFileName?(): string;
+  /**
+   * The hash a bundle header without `@object-format=` is read in (git's `the_hash_algo`):
+   * default the repository's
+   */
+  objectFormat?: ObjectFormat;
+  /**
+   * git 2.46+'s `VERIFY_BUNDLE_FSCK` (`fetch.fsckObjects`, else `transfer.fsckObjects`): the
+   * fsck index-pack's `--fsck-objects` runs over the bundle's objects, or undefined for none
+   */
+  fsckObjects?(): Promise<ReceivedObjectsFsck | undefined>;
 }
 
 /** The origin of a URL, or undefined for one `new URL` cannot read. */
@@ -61,6 +81,7 @@ function originOf(url: string): string | undefined {
 /** A host over a repository (see {@link BundleUriHostOptions}). */
 export function createBundleUriHost(options: BundleUriHostOptions): BundleUriHost {
   const history = options.workingCopy.history;
+  const objectFormat = options.objectFormat ?? objectFormatOf(history);
   return {
     async download(uri) {
       if (/^https?:/.test(uri)) return downloadHttp(options, uri);
@@ -69,7 +90,7 @@ export function createBundleUriHost(options: BundleUriHostOptions): BundleUriHos
       return options.readLocalFile(path).catch(() => undefined);
     },
     async unbundle(bytes) {
-      const opened = openBundle(bytes, "<bundle>");
+      const opened = openBundle(bytes, "<bundle>", objectFormat);
       if (!opened.ok) return false;
       const { header, pack } = opened.bundle;
       const objects = historyWithoutLazyFetch(history);
@@ -85,18 +106,56 @@ export function createBundleUriHost(options: BundleUriHostOptions): BundleUriHos
       for (const line of verified.stderr.split("\n")) if (line) options.message(line);
       if (!verified.ok) return false;
       const facade = createRepositoryFacade({ history: objects });
+      const fsck = await options.fsckObjects?.();
       let packId: string | undefined;
       try {
-        const imported = await facade.importPack(
-          (async function* () {
-            yield pack;
-          })(),
-          { keepPack: true },
-        );
-        packId = imported.packId;
+        if (fsck) {
+          // index-pack --fsck-objects: the objects checked in a quarantine (no links: a bundle
+          // has prerequisites), which a refusal discards
+          const received = new ReceivedObjects(objectFormat.rawLength);
+          const { quarantine, ...imported } = await facade.importPack(
+            (async function* () {
+              yield pack;
+            })(),
+            {
+              keepPack: true,
+              quarantine: true,
+              onObject: (id, type, entry) => received.add(id, type, entry),
+            },
+          );
+          let committed = false;
+          try {
+            const checked = await checkReceivedPack(quarantine?.repository ?? facade, received, {
+              fsck,
+              links: false,
+              shallow: new Set<string>(),
+              kept: true,
+              tail: null,
+            });
+            // index-pack's fsck warnings (stderr; VERIFY_BUNDLE_QUIET quiets verify_bundle only)
+            for (const line of checked.messages) options.message(line);
+            await quarantine?.commit();
+            committed = true;
+          } finally {
+            if (!committed) await quarantine?.discard().catch(() => {});
+          }
+          packId = imported.packId;
+        } else {
+          const imported = await facade.importPack(
+            (async function* () {
+              yield pack;
+            })(),
+            { keepPack: true },
+          );
+          packId = imported.packId;
+        }
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        options.message(message.startsWith("fatal: ") ? message : `fatal: ${message}`);
+        if (error instanceof FetchCheckError) {
+          for (const line of error.lines) options.message(line);
+        } else {
+          const message = error instanceof Error ? error.message : String(error);
+          options.message(message.startsWith("fatal: ") ? message : `fatal: ${message}`);
+        }
         options.message("error: index-pack died");
         return false;
       }
@@ -130,6 +189,7 @@ export function createBundleUriHost(options: BundleUriHostOptions): BundleUriHos
     creationToken: () => options.configValue("fetch.bundleCreationToken"),
     setCreationToken: (value) => options.setConfigValue("fetch.bundleCreationToken", value),
     message: (line) => options.message(line),
+    objectFormat,
     ...(options.tempFileName ? { tempFileName: options.tempFileName } : {}),
   };
 }

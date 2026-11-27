@@ -105,6 +105,7 @@ const CLONE_SETTINGS = [
   "rejectShallow",
   "serverOptions",
   "compatibility",
+  "bundleUri",
   "cloneAllBranches",
   "mirror",
   "singleBranch",
@@ -229,6 +230,11 @@ export class CloneCommand extends TransportCommand<CloneResult> {
   /** The git version reproduced; default the hooks' */
   private compatibility?: "2.43" | "2.56";
   private bundleUri?: string;
+  /**
+   * The hash `--bundle-uri`'s bundles are read in: git 2.43 fetches them before it learns the
+   * remote's hash, in the destination's first one (set on a clone reopened under 2.43)
+   */
+  private bundleObjectFormat?: ObjectFormat;
   private cloneAllBranches = true;
   private mirror = false;
   private singleBranch?: boolean;
@@ -869,6 +875,12 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     const self = this as unknown as Record<string, unknown>;
     const other = next as unknown as Record<string, unknown>;
     for (const key of CLONE_SETTINGS) if (key in self) other[key] = self[key];
+    // 2.43's clone ran fetch_bundle_uri in the repository GIT_DEFAULT_HASH had initialized,
+    // before transport_get_remote_refs: its bundles were read in that hash (a SHA-1 bundle in a
+    // SHA-256 destination is no bundle there); 2.5x reads them in the remote's
+    if ((this.compatibility ?? this.hooks.compatibility) === "2.43") {
+      other.bundleObjectFormat = this.bundleObjectFormat ?? this.objectFormat;
+    }
     next.shareHooksOf(this);
     const result = await next.call();
     this.reopenedListener?.(workingCopy);
@@ -1596,6 +1608,9 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       remoteUrl,
       compatibility,
       message,
+      ...(this.bundleUri !== undefined && this.bundleObjectFormat
+        ? { objectFormat: this.bundleObjectFormat }
+        : {}),
       setConfigValue: (key, value) => this.writeConfigValue(key, value, "add"),
       // odb_mkstemp's `<objects>/bundles/tmp_uri_XXXXXX`, as git's errors name the list
       tempFileName: () =>
