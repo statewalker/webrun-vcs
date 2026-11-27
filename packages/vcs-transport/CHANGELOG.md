@@ -1,5 +1,17 @@
 # @statewalker/vcs-transport
 
+## 0.13.0
+
+### Minor Changes
+
+- b4d6c72: Smart-HTTP POSTs follow remote-curl's `post_rpc` by size: a request within `http.postBuffer` (now read, `HttpClientSettings.postBuffer`) is held whole and sent again after a 401 the credential helper answers; a larger one first authenticates `probe_rpc`'s `0000` POST and is then sent once, streamed, so a push never builds or uploads its pack twice. `SmartHttpClient.postRpc` and `PushOptions.http` are new.
+
+### Patch Changes
+
+- Updated dependencies [2bd8d77]
+- Updated dependencies [55072b7]
+  - @statewalker/vcs-core@0.12.1
+
 ## 0.12.0
 
 ### Minor Changes
