@@ -142,7 +142,7 @@ export class FileGcStrategy implements GcStrategy {
     // git repack -d: the reachable loose objects into one pack, existing packs untouched
     const result = await repack({ ...this.target, all: false, local: true });
 
-    if (!result) {
+    if (!result || result.nothingNew) {
       return { packsCreated: 0, objectsPacked: 0, packsMerged: 0 };
     }
 

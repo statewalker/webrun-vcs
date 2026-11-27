@@ -279,7 +279,12 @@ describeGit(
           );
         expect(error, label).toBeInstanceOf(EmptyCommitError);
         expect((error as EmptyCommitError).exitCode, label).toBe(1);
-        expect(error?.message.toLowerCase(), label).toContain("nothing to commit");
+        // git's stderr: empty_amend_advice when amending, else nothing (our message then
+        // says "Nothing to commit"); stdout: run_status's text
+        expect((error as EmptyCommitError).stderr, label).toBe(native.stderr);
+        expect((error as EmptyCommitError).stdout, label).toBe(native.stdout);
+        if (native.stderr) expect(`${error?.message}\n`, label).toBe(native.stderr);
+        else expect(error?.message.toLowerCase(), label).toContain("nothing to commit");
         expect(headOf(mine), label).toBe(headOf(theirs));
         // allowed with --allow-empty
         const allowedNative = gitRun(root, theirs, ["commit", "--allow-empty", ...args]);

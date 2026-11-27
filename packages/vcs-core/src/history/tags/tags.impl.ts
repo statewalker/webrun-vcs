@@ -9,6 +9,7 @@ import type { GitObjects } from "../objects/git-objects.js";
 import { ObjectType } from "../objects/object-types.js";
 import {
   hasObjectOfType,
+  loadTypedBytes,
   loadTypedObject,
   objectHeader,
   removeObject,
@@ -44,6 +45,17 @@ class GitTagStore implements Tags {
       return undefined;
     }
     return this.loadTagInternal(id);
+  }
+
+  /** The stored content (see `Tags.raw`). */
+  raw(id: ObjectId): Promise<Uint8Array | undefined> {
+    return loadTypedBytes(this.objects, id, "tag");
+  }
+
+  /** Stores the content as it is (see `Tags.storeRaw`), once it parses as a tag. */
+  async storeRaw(content: Uint8Array): Promise<ObjectId> {
+    await entriesToTag(decodeTagEntries([content]));
+    return storeObject(this.objects, "tag", [content]);
   }
 
   /**

@@ -202,6 +202,14 @@ export interface FetchClientOptions {
    */
   batchNonAtomic?: boolean;
   /**
+   * Commit the ref transaction even when it holds no update, so the reference-transaction
+   * hook hears an empty one (`preparing`, `prepared`, `committed`): git 2.5x's do_fetch
+   * always commits its transaction, a dry run's and one whose every update was refused
+   * included; git 2.43's only with `--atomic`. An `--atomic` fetch that refused an update
+   * commits nothing.
+   */
+  emptyTransaction?: boolean;
+  /**
    * Negotiate and download, but write no ref, no shallow change (`--dry-run`): the objects are
    * stored as git's dry run stores them, so each ref's update is told (fast-forward, forced,
    * rejected) as a real fetch tells it
@@ -477,8 +485,8 @@ export async function fetchFromConnection(
   const refspecs = withTagSpec(resolver ? resolver.resolve(remoteRefs) : (given as string[]));
   const autoTags = writesRefs(refspecs);
   // git: a refspec naming a ref the remote does not have is an error (not for configured
-  // refspecs, `missingRefsOk`, nor against an empty remote, where nothing can match)
-  if (!options.missingRefsOk && !isEmpty) {
+  // refspecs, `missingRefsOk`)
+  if (!options.missingRefsOk) {
     const missing = missingSources(remoteRefs, refspecs);
     if (missing.length > 0) throw new TransportError(`couldn't find remote ref ${missing[0]}`);
   }
@@ -1111,6 +1119,7 @@ export async function fetchFromConnection(
     const failure = await applyRefUpdates(result.refUpdates, refStore, {
       atomic: options.atomic,
       ...(options.batchNonAtomic ? { batchNonAtomic: true } : {}),
+      ...(options.emptyTransaction ? { emptyTransaction: true } : {}),
       deletes,
       message: options.reflogMessage,
       reflogAction: options.reflogAction,
@@ -1126,6 +1135,12 @@ export async function fetchFromConnection(
         : {}),
     });
     if (failure !== undefined) result.refTransactionError = failure;
+  } else if (
+    options.emptyTransaction &&
+    !(options.atomic && result.refUpdates.some((u) => u.status === "rejected"))
+  ) {
+    // a dry run queues no update (s_update_ref), but do_fetch still commits its transaction
+    await refStore.batch?.([], { emptyTransaction: true });
   }
   return result;
 }

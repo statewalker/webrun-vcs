@@ -259,6 +259,32 @@ describe("applyRefUpdates", () => {
     expect(updates.map((u) => u.status)).toEqual(["rejected", "rejected"]);
     expect(store.get("refs/heads/a")).toBe(C);
   });
+
+  // statewalker/webrun-vcs#340: git 2.5x's do_fetch commits its transaction with no update
+  it("emptyTransaction: nothing to write still commits an empty batch; a refused atomic one does not", async () => {
+    const refused = () => ({
+      ...update("refs/heads/c", undefined, B),
+      status: "rejected" as const,
+      summary: "[rejected]",
+    });
+    const upToDate = { ...update("refs/heads/a", C, C), status: "up-to-date" as const };
+    for (const [updates, atomic, expected] of [
+      [[upToDate], false, [[]]],
+      [[upToDate], true, [[]]],
+      // every update refused before the transaction (non-atomic): the empty commit
+      [[refused()], false, [[]]],
+      // --atomic with a refusal: git aborts its transaction, nothing is committed
+      [[refused()], true, []],
+    ] as const) {
+      const { refStore, batches } = local({ "refs/heads/a": C });
+      await applyRefUpdates([...updates], refStore, { atomic, emptyTransaction: true });
+      expect(batches, `atomic ${atomic}`).toEqual(expected);
+    }
+    // without the option (git 2.43 without --atomic) nothing runs
+    const { refStore, batches } = local({ "refs/heads/a": C });
+    await applyRefUpdates([upToDate], refStore);
+    expect(batches).toEqual([]);
+  });
 });
 
 describe("isFastForward under clock skew", () => {

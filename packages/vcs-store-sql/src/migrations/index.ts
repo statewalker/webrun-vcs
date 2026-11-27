@@ -343,6 +343,35 @@ export const migrations: Migration[] = [
         WHERE instr(name, char(1)) > 0;
     `,
   },
+  {
+    version: 10,
+    name: "raw_commit_tag_bytes",
+    // statewalker/webrun-vcs#399: a commit or tag the parsed columns cannot rebuild byte for
+    // byte (extra headers such as `mergetag`/`change-id`, bytes that are not UTF-8) keeps its
+    // content here; NULL means the columns rebuild it exactly, as every row written before does
+    // (what those rows lost cannot be recovered). Rolling back would drop bytes no column holds
+    // and change those objects' ids, so `downgrade` refuses while any row has them.
+    up: `
+      ALTER TABLE vcs_commit ADD COLUMN raw BLOB;
+      ALTER TABLE vcs_tag ADD COLUMN raw BLOB;
+    `,
+    down: `
+      ALTER TABLE vcs_commit DROP COLUMN raw;
+      ALTER TABLE vcs_tag DROP COLUMN raw;
+    `,
+    downgrade: async (db) => {
+      for (const table of ["vcs_commit", "vcs_tag"]) {
+        const rows = await db.query<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM ${table} WHERE raw IS NOT NULL`,
+        );
+        const n = rows[0]?.n ?? 0;
+        if (n > 0)
+          throw new Error(
+            `cannot roll back below version 10: ${n} row(s) of ${table} keep raw bytes their columns cannot rebuild (their objects would change ids)`,
+          );
+      }
+    },
+  },
 ];
 
 /**

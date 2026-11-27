@@ -1233,6 +1233,9 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       repository: createRepositoryFacade({ history: historyWithoutLazyFetch(history) }),
       refStore: createTransportRefStore(history.refs),
       refspecs,
+      // clone maps what wanted_peer_refs finds: its own refspecs never die on a source the
+      // remote lacks (an unborn HEAD's branch); the configured ones are checked above
+      missingRefsOk: true,
       tags,
       depth,
       deepenSince: shallowSince,
@@ -1349,6 +1352,11 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       )?.name;
     }
     let defaultBranch = branchToClone ?? toBranchName(advertisedDefaultBranch);
+    // the remote HEAD names a branch it does not have (ls-refs' `unborn`)
+    const unbornHead =
+      remoteHeadRef !== undefined &&
+      remoteHeadRef.oid === undefined &&
+      remoteHeadRef.symref !== undefined;
     let headCommit: ObjectId | undefined;
     let checkedOutBranch: string | undefined;
     // the commit to check out once refs and configuration are in place (git: last)
@@ -1428,8 +1436,9 @@ export class CloneCommand extends TransportCommand<CloneResult> {
         headCommit = tip.objectId;
         if (!this.noCheckout) checkoutId = tip.objectId;
       }
-      // git's install_branch_config: the branch tracks its remote counterpart
-      if (tip?.objectId || result.isEmpty) checkedOutBranch = defaultBranch;
+      // git's install_branch_config: the branch tracks its remote counterpart, also when the
+      // remote's HEAD is unborn (v2's unborn_head_target), refs or not
+      if (tip?.objectId || result.isEmpty || unbornHead) checkedOutBranch = defaultBranch;
     } else if (this.bare || this.mirror) {
       // For bare/mirror repos, HEAD points to default branch
       if (defaultBranch) {
@@ -1445,7 +1454,9 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       detachedTag,
       remoteHead,
       checkedOutBranch,
-      isEmpty: result.isEmpty,
+      // a single-branch clone of an unborn HEAD maps no ref (wanted_peer_refs): git's empty
+      // clone, without a fetch refspec
+      isEmpty: result.isEmpty || (singleBranch && unbornHead && branchToClone === undefined),
       revision: this.revision !== undefined,
     });
 

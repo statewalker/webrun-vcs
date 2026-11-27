@@ -5,7 +5,7 @@
  * Uses the History interface for accessing typed object stores.
  */
 
-import { deflate } from "@statewalker/vcs-utils";
+import { collect, deflate } from "@statewalker/vcs-utils";
 import type { ObjectId } from "../common/id/index.js";
 import type { Blobs } from "../history/blobs/blobs.js";
 import {
@@ -18,7 +18,7 @@ import {
 } from "../history/commits/commit-format.js";
 import type { Commits } from "../history/commits/commits.js";
 import type { History } from "../history/history.js";
-import type { GitObjects } from "../history/objects/git-objects.js";
+import { type GitObjects, ObjectIdMismatchError } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
 import {
   collectTagBytes,
@@ -117,7 +117,10 @@ export class DefaultSerializationApi implements SerializationApi {
           (await this._blobs.has(id)),
         exportObject: (id) => this.exportObject(id),
         importObject: (type, content, size) => this.importObject(type, content, size),
-        reencode: (type, data) => reencode(type, data),
+        reencode: (type, data) =>
+          (type === "commit" && this._commits.storeRaw) || (type === "tag" && this._tags.storeRaw)
+            ? Promise.resolve(data)
+            : reencode(type, data),
       });
     this.packs = config.packs ?? config.history.packs;
     this.unpackLimit = config.unpackLimit;
@@ -303,12 +306,23 @@ export class DefaultSerializationApi implements SerializationApi {
   }
 
   private async *serializeCommit(id: ObjectId): AsyncIterable<Uint8Array> {
+    // the stored bytes: `Commit` carries no extra header (`mergetag`) nor bytes that are not UTF-8
+    const raw = await this._commits.raw?.(id);
+    if (raw) {
+      yield raw;
+      return;
+    }
     const commit = await this._commits.load(id);
     if (!commit) throw new Error(`Commit not found: ${id}`);
     yield* encodeCommitEntries(commitToEntries(commit));
   }
 
   private async *serializeTag(id: ObjectId): AsyncIterable<Uint8Array> {
+    const raw = await this._tags.raw?.(id);
+    if (raw) {
+      yield raw;
+      return;
+    }
     const tag = await this._tags.load(id);
     if (!tag) throw new Error(`Tag not found: ${id}`);
     yield* encodeTagEntries(tagToEntries(tag));
@@ -321,19 +335,41 @@ export class DefaultSerializationApi implements SerializationApi {
     return await this._trees.store(entries);
   }
 
+  /**
+   * Stores the commit byte for byte: through `storeRaw` when the store keeps bytes, else parsed,
+   * refused (`ObjectIdMismatchError`, nothing stored) when the parsed commit would encode to
+   * other bytes, so its id would not be the object's.
+   */
   private async storeCommitFromStream(
     content: Iterable<Uint8Array> | AsyncIterable<Uint8Array>,
   ): Promise<ObjectId> {
-    const commit = await entriesToCommit(decodeCommitEntries(content));
+    const data = await collect(content);
+    if (this._commits.storeRaw) return this._commits.storeRaw(data);
+    const commit = await entriesToCommit(decodeCommitEntries([data]));
+    assertRebuilt("commit", data, await collectCommitBytes(commit));
     return this._commits.store(commit);
   }
 
+  /** As `storeCommitFromStream`, for a tag. */
   private async storeTagFromStream(
     content: Iterable<Uint8Array> | AsyncIterable<Uint8Array>,
   ): Promise<ObjectId> {
-    const tag = await entriesToTag(decodeTagEntries(content));
+    const data = await collect(content);
+    if (this._tags.storeRaw) return this._tags.storeRaw(data);
+    const tag = await entriesToTag(decodeTagEntries([data]));
+    assertRebuilt("tag", data, await collectTagBytes(tag));
     return this._tags.store(tag);
   }
+}
+
+/** Refuses an object whose parsed form encodes to other bytes (another id) than it came with. */
+function assertRebuilt(type: ObjectTypeString, data: Uint8Array, kept: Uint8Array): void {
+  let same = kept.length === data.length;
+  for (let i = 0; same && i < data.length; i++) same = kept[i] === data[i];
+  if (!same)
+    throw new ObjectIdMismatchError(
+      `${type} object cannot be stored byte for byte by these stores (its parsed form encodes to other bytes)`,
+    );
 }
 
 /** The content typed stores keep for `data`: parsed, then encoded again (blobs as they are). */
