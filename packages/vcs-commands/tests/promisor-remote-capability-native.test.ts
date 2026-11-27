@@ -10,7 +10,7 @@
  * server had to fetch the blob. The second part has our server advertise to native clients.
  *
  * git 2.43 has no promisor-remote capability: these twins need 2.49 (fields 2.52, stored
- * fields 2.54).
+ * fields and `--filter=auto` 2.54, `promisor.acceptFromServerUrl` 2.56).
  */
 import { execFileSync, spawn } from "node:child_process";
 import {
@@ -50,10 +50,13 @@ const nativeVersion = (() => {
 const describeGit = nativeVersion >= 249 && process.platform === "linux" ? describe : describe.skip;
 const itFields = nativeVersion >= 252 ? it : it.skip; // promisor.sendFields, checkFields
 const itStore = nativeVersion >= 254 ? it : it.skip; // promisor.storeFields
+const itAuto = nativeVersion >= 254 ? it : it.skip; // clone/fetch --filter=auto
+const itUrl = nativeVersion >= 256 ? it : it.skip; // promisor.acceptFromServerUrl
 
 let root: string;
 let lopUrl: string;
 let largeOid: string;
+let barOid: string;
 let counter = 0;
 const git = (cwd: string, ...args: string[]) => gitOut(root, cwd, args);
 const env = (extra: Record<string, string> = {}) => ({ GIT_NO_LAZY_FETCH: "0", ...extra });
@@ -80,9 +83,9 @@ function missingOnServer(): string[] {
 }
 
 /** A fresh server (the large blob missing again, as t5710's initialize_server), configured. */
-function freshServer(config: string[][] = []): void {
+function freshServer(config: string[][] = [], pristine = "server.pristine"): void {
   rmSync(join(root, "server"), { recursive: true, force: true });
-  execFileSync("cp", ["-a", join(root, "server.pristine"), join(root, "server")]);
+  execFileSync("cp", ["-a", join(root, pristine), join(root, "server")]);
   for (const args of config) git(join(root, "server"), "config", ...args);
 }
 
@@ -97,6 +100,20 @@ function acceptedLines(trace: string): string[] {
   return text
     .split("\n")
     .map((l) => /packet:\s+upload-pack< (promisor-remote=.*)$/.exec(l)?.[1])
+    .filter((l): l is string => l !== undefined);
+}
+
+/** The `filter` lines upload-pack read, from its GIT_TRACE_PACKET. */
+function filterLines(trace: string): string[] {
+  let text = "";
+  try {
+    text = readFileSync(trace, "latin1");
+  } catch {
+    return [];
+  }
+  return text
+    .split("\n")
+    .map((l) => /packet:\s+upload-pack< (filter .*)$/.exec(l)?.[1])
     .filter((l): l is string => l !== undefined);
 }
 
@@ -123,10 +140,26 @@ async function ours(name: string): Promise<Git> {
   );
 }
 
+/** Our transports: each connection a `git daemon --inetd` tracing its packets to `trace`. */
+const daemonTransports = (trace: string) =>
+  createDefaultTransports({
+    openSocket: async () =>
+      childDuplex(
+        spawn("git", daemonArgs(root, false), {
+          env: testEnv(root, env({ GIT_TRACE_PACKET: trace })),
+        }),
+      ),
+  });
+
+/** The environment of a native client reaching `git daemon` through the proxy. */
+const proxied = (trace: string, extra: Record<string, string> = {}) =>
+  env({ GIT_PROXY_COMMAND: join(root, "proxy"), SERVER_TRACE: trace, ...extra });
+
 /** The scenario's clone by native git and by ours, each against a fresh server. */
 async function cloneTwins(
   clientConfig: string[],
   serverConfig: string[][] = [],
+  filter = "blob:limit=5k",
 ): Promise<{ native: Outcome; ours: Outcome }> {
   const k = counter++;
   const outcome = async (side: "n" | "o"): Promise<Outcome> => {
@@ -142,7 +175,7 @@ async function cloneTwins(
         [
           "clone",
           ...clientConfig.flatMap((c) => ["-c", c]),
-          "--filter=blob:limit=5k",
+          `--filter=${filter}`,
           "git://localhost/server",
           dir,
         ],
@@ -166,7 +199,7 @@ async function cloneTwins(
           .clone()
           .setURI("git://localhost/server")
           .setConfig(clientConfig)
-          .setFilter("blob:limit=5k")
+          .setFilter(filter)
           .setTransports(transports)
           .call();
         status = 0;
@@ -251,32 +284,44 @@ describeGit("promisor-remote capability (t5710) against native git", () => {
     git(lop, "config", "uploadpack.allowAnySHA1InWant", "true");
 
     // the server: everything but the large blob, in a promisor pack (initialize_server)
-    git(root, "clone", "-q", "--bare", "--no-local", template, "server.pristine");
-    const server = join(root, "server.pristine");
-    mkdirSync(join(root, "filtered"));
-    git(
-      server,
-      "-c",
-      "repack.writebitmaps=false",
-      "repack",
-      "-a",
-      "-d",
-      "-q",
-      "--filter=blob:limit=5k",
-      `--filter-to=${join(root, "filtered", "pack")}`,
-    );
-    for (const pack of execFileSync("ls", [join(server, "objects", "pack")])
-      .toString()
-      .split("\n")) {
-      if (pack.endsWith(".pack")) {
-        writeFileSync(join(server, "objects", "pack", pack.replace(/\.pack$/, ".promisor")), "");
+    const buildServer = (name: string, filtered: string) => {
+      git(root, "clone", "-q", "--bare", "--no-local", template, name);
+      const server = join(root, name);
+      mkdirSync(join(root, filtered));
+      git(
+        server,
+        "-c",
+        "repack.writebitmaps=false",
+        "repack",
+        "-a",
+        "-d",
+        "-q",
+        "--filter=blob:limit=5k",
+        `--filter-to=${join(root, filtered, "pack")}`,
+      );
+      for (const pack of execFileSync("ls", [join(server, "objects", "pack")])
+        .toString()
+        .split("\n")) {
+        if (pack.endsWith(".pack")) {
+          writeFileSync(join(server, "objects", "pack", pack.replace(/\.pack$/, ".promisor")), "");
+        }
       }
-    }
-    git(server, "remote", "add", "lop", lopUrl);
-    git(server, "config", "remote.lop.promisor", "true");
-    git(server, "config", "uploadpack.allowFilter", "true");
-    git(server, "config", "uploadpack.allowAnySHA1InWant", "true");
-    git(server, "config", "promisor.advertise", "true");
+      git(server, "remote", "add", "lop", lopUrl);
+      git(server, "config", "remote.lop.promisor", "true");
+      git(server, "config", "uploadpack.allowFilter", "true");
+      git(server, "config", "uploadpack.allowAnySHA1InWant", "true");
+      git(server, "config", "promisor.advertise", "true");
+    };
+    buildServer("server.pristine", "filtered");
+    // "setup for subsequent fetches": a later commit adds another large blob, `bar`, which
+    // the server lacks too and lop holds
+    const bar = Buffer.from(largeContent().map((b) => b ^ 0x5a));
+    writeFileSync(join(template, "bar"), bar);
+    git(template, "add", "bar");
+    git(template, "commit", "-qm", "bar");
+    barOid = git(template, "rev-parse", "HEAD:bar").trim();
+    git(lop, "hash-object", "-w", join(template, "bar"));
+    buildServer("server2.pristine", "filtered2");
     symlinkSync("lop", join(root, "serverTwo"));
     freshServer();
     expect(missingOnServer()).toEqual([largeOid]);
@@ -469,6 +514,378 @@ describeGit("promisor-remote capability (t5710) against native git", () => {
       const t = await cloneTwins(lopClient("KnownUrl"), [["remote.lop.url", ""]]);
       expectFailedTwins(t);
       expect(t.native.missing).toEqual([largeOid]);
+    });
+
+    // the URL allowlist (git 2.56): t5710's `$ENCODED_TRASH_DIRECTORY_URL/*`
+    const allowAll = () => `promisor.acceptFromServerUrl=file://${root}/*`;
+    const lopNone = (url = lopUrl) => [
+      "remote.lop.promisor=true",
+      "remote.lop.fetch=+refs/heads/*:refs/remotes/lop/*",
+      `remote.lop.url=${url}`,
+      "promisor.acceptfromserver=None",
+    ];
+
+    itUrl(
+      `t5710-promisor-remote-capability.sh: "clone with 'None' but URL allowlisted"`,
+      async () => {
+        const t = await cloneTwins([...lopNone(), allowAll()]);
+        expectTwins(t);
+        expect(t.native.accepted).toEqual(["promisor-remote=lop"]);
+        expect(t.native.missing).toEqual([largeOid]);
+      },
+    );
+
+    itUrl(
+      `t5710-promisor-remote-capability.sh: "clone with 'None' but URL not in allowlist"`,
+      async () => {
+        const t = await cloneTwins([
+          ...lopNone(),
+          "promisor.acceptFromServerUrl=https://example.com/*",
+        ]);
+        expectTwins(t);
+        expect(t.native.missing).toEqual([]);
+      },
+    );
+
+    itUrl(
+      `t5710-promisor-remote-capability.sh: "clone with 'None' but URL allowlisted in one pattern out of two"`,
+      async () => {
+        const t = await cloneTwins([
+          ...lopNone(),
+          "promisor.acceptFromServerUrl=https://example.com/*",
+          allowAll(),
+        ]);
+        expectTwins(t);
+        expect(t.native.missing).toEqual([largeOid]);
+      },
+    );
+
+    itUrl(
+      `t5710-promisor-remote-capability.sh: "clone with 'None', URL allowlisted, but client has different URL"`,
+      async () => {
+        const t = await cloneTwins([...lopNone(`file://${root}/serverTwo`), allowAll()]);
+        expectTwins(t);
+        expect(t.native.accepted).toEqual([]);
+        expect(t.native.missing).toEqual([]);
+      },
+    );
+
+    itUrl(
+      `t5710-promisor-remote-capability.sh: "clone with URL allowlisted and no remote already configured"`,
+      async () => {
+        const t = await cloneTwins(["promisor.acceptfromserver=None", allowAll()]);
+        expectTwins(t);
+        expect(t.native.config).toMatch(/\[remote "promisor-auto-[^"]+-lop"\]/);
+        expect(t.native.config).toContain("advertisedAs = lop");
+        expect(t.native.missing).toEqual([largeOid]);
+      },
+    );
+
+    itUrl(
+      `t5710-promisor-remote-capability.sh: "clone with named URL allowlisted and no pre-configured remote"`,
+      async () => {
+        const t = await cloneTwins([
+          "promisor.acceptfromserver=None",
+          `promisor.acceptFromServerUrl=cdn=file://${root}/*`,
+        ]);
+        expectTwins(t);
+        expect(t.native.config).toContain('[remote "cdn"]');
+        expect(t.native.missing).toEqual([largeOid]);
+      },
+    );
+
+    itUrl(
+      `t5710-promisor-remote-capability.sh: "clone with URL allowlisted but colliding name"`,
+      async () => {
+        const t = await cloneTwins([
+          "remote.cdn.promisor=true",
+          "remote.cdn.fetch=+refs/heads/*:refs/remotes/lop/*",
+          "remote.cdn.url=https://example.com/cdn",
+          "promisor.acceptfromserver=None",
+          `promisor.acceptFromServerUrl=cdn=file://${root}/*`,
+        ]);
+        expectTwins(t);
+        expect(t.native.config).toContain('[remote "cdn-1"]');
+        expect(t.native.missing).toEqual([largeOid]);
+      },
+    );
+
+    itUrl(
+      `t5710-promisor-remote-capability.sh: "clone with URL allowlisted and reusable remote"`,
+      async () => {
+        const t = await cloneTwins([
+          "remote.cdn.fetch=+refs/heads/*:refs/remotes/lop/*",
+          `remote.cdn.url=${lopUrl}`,
+          "promisor.acceptfromserver=None",
+          `promisor.acceptFromServerUrl=cdn=file://${root}/*`,
+        ]);
+        expectTwins(t);
+        expect(t.native.config).not.toContain('[remote "cdn-1"]');
+        expect(t.native.missing).toEqual([largeOid]);
+      },
+    );
+
+    itUrl(
+      `t5710-promisor-remote-capability.sh: "clone with invalid promisor.acceptFromServerUrl"`,
+      async () => {
+        const t = await cloneTwins([
+          "promisor.acceptfromserver=None",
+          "promisor.acceptFromServerUrl=bad name=https://example.com/*",
+        ]);
+        expectTwins(t);
+        expect(t.native.stderr.some((l) => l.includes("invalid remote name 'bad name'"))).toBe(
+          true,
+        );
+        expect(t.native.missing).toEqual([]);
+      },
+    );
+
+    itAuto(
+      `t5710-promisor-remote-capability.sh: "clone and fetch with --filter=auto"`,
+      async () => {
+        const outcome = async (side: "n" | "o") => {
+          freshServer([
+            ["remote.lop.partialCloneFilter", "blob:limit=9500"],
+            ["promisor.sendFields", "partialCloneFilter"],
+          ]);
+          const server = join(root, "server");
+          const dir = `${side}${counter++}`;
+          const c = join(root, dir);
+          const clientConfig = [
+            "remote.lop.promisor=true",
+            `remote.lop.url=${lopUrl}`,
+            "promisor.acceptfromserver=All",
+          ];
+          const traces: string[] = [];
+          const step = async (args: "clone" | string[]) => {
+            const trace = join(root, `${dir}.${traces.length}.trace`);
+            traces.push(trace);
+            if (side === "n") {
+              const r =
+                args === "clone"
+                  ? await gitAsync(
+                      root,
+                      root,
+                      [
+                        "clone",
+                        ...clientConfig.flatMap((v) => ["-c", v]),
+                        "--filter=auto",
+                        "git://localhost/server",
+                        dir,
+                      ],
+                      proxied(trace),
+                    )
+                  : await gitAsync(root, c, ["fetch", ...args], proxied(trace));
+              expect(r.status, r.stderr).toBe(0);
+            } else if (args === "clone") {
+              mkdirSync(c);
+              git(c, "init", "-q");
+              await (await ours(dir))
+                .clone()
+                .setURI("git://localhost/server")
+                .setConfig(clientConfig)
+                .setFilter("auto")
+                .setTransports(daemonTransports(trace))
+                .call();
+            } else {
+              const fetch = (await ours(dir)).fetch().setTransports(daemonTransports(trace));
+              if (args.length > 0) fetch.setFilter("auto");
+              await fetch.call();
+            }
+          };
+          /** A new commit on the server, so that a fetch runs fetch-pack */
+          const newCommit = (message: string) => {
+            const head = git(server, "rev-parse", "refs/heads/main").trim();
+            const id = git(server, "commit-tree", "-p", head, "-m", message, `${head}^{tree}`);
+            git(server, "update-ref", "refs/heads/main", id.trim());
+          };
+          await step("clone");
+          const config = readFileSync(join(c, ".git", "config"), "utf8");
+          const missing = [missingOnServer()];
+          git(server, "config", "remote.lop.partialCloneFilter", "blob:limit=5678");
+          newCommit("new-commit");
+          await step(["--filter=auto"]);
+          missing.push(missingOnServer());
+          git(server, "config", "remote.lop.partialCloneFilter", "blob:limit=5432");
+          newCommit("yet-a-new-commit");
+          await step([]);
+          missing.push(missingOnServer());
+          return { config, filters: traces.map(filterLines), missing };
+        };
+        const native = await outcome("n");
+        const oursOutcome = await outcome("o");
+        expect(native.filters).toEqual([
+          ["filter blob:limit=9500"],
+          ["filter blob:limit=5678"],
+          ["filter blob:limit=5432"],
+        ]);
+        expect(native.config).toContain("partialclonefilter = auto");
+        expect(oursOutcome).toEqual(native);
+      },
+    );
+
+    it(`t5710-promisor-remote-capability.sh: "init + fetch two promisors but only one advertised"`, async () => {
+      const outcome = async (side: "n" | "o") => {
+        freshServer();
+        git(root, "init", "-q", "--bare", "unused_lop");
+        const dir = `${side}${counter++}`;
+        const trace = join(root, `${dir}.trace`);
+        git(root, "init", "-q", dir);
+        const c = join(root, dir);
+        const set = (k: string, v: string) => git(c, "config", k, v);
+        set("remote.unused_lop.promisor", "true");
+        set("remote.unused_lop.fetch", "+refs/heads/*:refs/remotes/unused_lop/*");
+        set("remote.unused_lop.url", `file://${root}/unused_lop`);
+        set("remote.lop.promisor", "true");
+        set("remote.lop.fetch", "+refs/heads/*:refs/remotes/lop/*");
+        set("remote.lop.url", lopUrl);
+        set("remote.server.url", "git://localhost/server");
+        set("remote.server.fetch", "+refs/heads/*:refs/remotes/server/*");
+        set("promisor.acceptfromserver", "All");
+        let lazy: string[] = [];
+        if (side === "n") {
+          const r = await gitAsync(
+            root,
+            c,
+            ["fetch", "-q", "--filter=blob:limit=5k", "server"],
+            proxied(trace, { GIT_TRACE: join(root, `${dir}.client-trace`) }),
+          );
+          expect(r.status, r.stderr).toBe(0);
+          // the fetch itself never needs the blob: no promisor remote is fetched from
+          lazy = readFileSync(join(root, `${dir}.client-trace`), "utf8")
+            .split("\n")
+            .filter((l) => / fetch (unused_)?lop /.test(l));
+        } else {
+          const ourGit = await ours(dir);
+          await ourGit
+            .fetch()
+            .setRemote("server")
+            .setFilter("blob:limit=5k")
+            .setTransports(daemonTransports(trace))
+            .call();
+        }
+        const result = {
+          config: readFileSync(join(c, ".git", "config"), "utf8"),
+          accepted: acceptedLines(trace),
+          missing: missingOnServer(),
+          lazy,
+        };
+        rmSync(join(root, "unused_lop"), { recursive: true, force: true });
+        return result;
+      };
+      const native = await outcome("n");
+      const oursOutcome = await outcome("o");
+      expect(oursOutcome).toEqual(native);
+      expect(native.accepted).toEqual(["promisor-remote=lop"]);
+      expect(native.lazy).toEqual([]);
+      expect(native.missing).toEqual([largeOid]);
+    });
+
+    it(`t5710-promisor-remote-capability.sh: "init + fetch two promisors but only one advertised" (the accepted remote first)`, async () => {
+      // within the fetching process (git's r->accepted), a lazy fetch tries the accepted lop
+      // before unused_lop, which comes first in the configuration: the child fetch registers
+      // the filter of the remote it tries (partial_clone_register), so only lop gets one
+      freshServer();
+      git(root, "init", "-q", "--bare", "unused_lop");
+      const dir = `o${counter++}`;
+      git(root, "init", "-q", dir);
+      const c = join(root, dir);
+      git(c, "config", "remote.unused_lop.promisor", "true");
+      git(c, "config", "remote.unused_lop.url", `file://${root}/unused_lop`);
+      git(c, "config", "remote.lop.promisor", "true");
+      git(c, "config", "remote.lop.url", lopUrl);
+      git(c, "config", "remote.server.url", "git://localhost/server");
+      git(c, "config", "remote.server.fetch", "+refs/heads/*:refs/remotes/server/*");
+      git(c, "config", "promisor.acceptfromserver", "All");
+      try {
+        const ourGit = await ours(dir);
+        await ourGit
+          .fetch()
+          .setRemote("server")
+          .setFilter("blob:limit=5k")
+          .setTransports(daemonTransports(join(root, `${dir}.trace`)))
+          .call();
+        const blob = await ourGit.workingCopy.history.objects?.get(largeOid);
+        expect(blob).toBeDefined();
+        const config = readFileSync(join(c, ".git", "config"), "utf8");
+        expect(config).toContain('[remote "lop"]\n\tpromisor = true\n\turl = ');
+        expect(config).toMatch(/\[remote "lop"\][^[]*partialclonefilter = blob:none/);
+        expect(config).not.toMatch(/\[remote "unused_lop"\][^[]*partialclonefilter/);
+      } finally {
+        rmSync(join(root, "unused_lop"), { recursive: true, force: true });
+      }
+    });
+
+    /** A clone, then a pull of a commit adding `bar` (t5710's subsequent fetches). */
+    async function subsequentTwins(advertise: boolean) {
+      const outcome = async (side: "n" | "o") => {
+        freshServer();
+        const dir = `${side}${counter++}`;
+        const c = join(root, dir);
+        const trace = join(root, `${dir}.trace`);
+        if (side === "n") {
+          const r = await gitAsync(
+            root,
+            root,
+            [
+              "clone",
+              ...lopClient("All").flatMap((v) => ["-c", v]),
+              "--filter=blob:limit=5k",
+              "git://localhost/server",
+              dir,
+            ],
+            proxied(join(root, `${dir}.clone-trace`)),
+          );
+          expect(r.status, r.stderr).toBe(0);
+        } else {
+          mkdirSync(c);
+          git(c, "init", "-q");
+          await (await ours(dir))
+            .clone()
+            .setURI("git://localhost/server")
+            .setConfig(lopClient("All"))
+            .setFilter("blob:limit=5k")
+            .setTransports(daemonTransports(join(root, `${dir}.clone-trace`)))
+            .call();
+        }
+        freshServer([["promisor.advertise", String(advertise)]], "server2.pristine");
+        if (side === "n") {
+          const r = await gitAsync(root, c, ["pull", "-q", "origin"], proxied(trace));
+          expect(r.status, r.stderr).toBe(0);
+        } else {
+          await (await ours(dir))
+            .pull()
+            .setRemote("origin")
+            .setTransports(daemonTransports(trace))
+            .call();
+        }
+        return {
+          config: readFileSync(join(c, ".git", "config"), "utf8"),
+          head: git(c, "rev-parse", "HEAD").trim(),
+          bar: readFileSync(join(c, "bar")).equals(readFileSync(join(root, "template", "bar"))),
+          accepted: acceptedLines(trace),
+          missing: missingOnServer(),
+        };
+      };
+      const native = await outcome("n");
+      const oursOutcome = await outcome("o");
+      expect(oursOutcome).toEqual(native);
+      expect(native.head).toBe(git(join(root, "template"), "rev-parse", "HEAD").trim());
+      expect(native.bar).toBe(true);
+      return native;
+    }
+
+    it(`t5710-promisor-remote-capability.sh: "subsequent fetch from a client when promisor.advertise is true"`, async () => {
+      const native = await subsequentTwins(true);
+      expect(native.accepted).toEqual(["promisor-remote=lop"]);
+      expect(native.missing.sort()).toEqual([largeOid, barOid].sort());
+    });
+
+    it(`t5710-promisor-remote-capability.sh: "subsequent fetch from a client when promisor.advertise is false"`, async () => {
+      const native = await subsequentTwins(false);
+      expect(native.accepted).toEqual([]);
+      // the server fetched bar from lop itself
+      expect(native.missing).toEqual([largeOid]);
     });
   });
 

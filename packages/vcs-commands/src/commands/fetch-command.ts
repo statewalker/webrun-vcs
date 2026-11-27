@@ -65,7 +65,7 @@ import {
   promisorRemotes,
   registerPartialClone,
 } from "./promisor-remote.js";
-import { promisorRemoteReplyOf } from "./promisor-remote-reply.js";
+import { promisorAutoFilter, promisorRemoteReplyOf } from "./promisor-remote-reply.js";
 import { withRemoteUploadPack } from "./remote-transport.js";
 import { clientSessionIdOf } from "./session-id.js";
 import {
@@ -441,7 +441,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
    * (git's fetch_one_setup_partial); a filter given registers the remote as a promisor remote
    * first when it is not one with a filter (partial_clone_register:
    * `core.repositoryformatversion = 1`, `remote.<name>.promisor`, `.partialclonefilter`). A
-   * pack fetched under a filter is kept as a promisor pack.
+   * pack fetched under a filter is kept as a promisor pack. `auto` (git 2.54) is the filter
+   * the promisor remotes accepted from the server's `promisor-remote` capability advertise.
    */
   setFilter(spec: string | false): this {
     this.checkCallable();
@@ -1110,6 +1111,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       onWarning: (line: string) => messages.push(line),
       // the server's promisor-remote capability (promisor.acceptFromServer, storeFields)
       promisorRemote: promisorRemoteReplyOf(this.workingCopy, (line) => messages.push(line)),
+      // --filter=auto (or a recorded `auto`): the accepted promisor remotes' advertised filter
+      autoFilter: () => promisorAutoFilter(this.workingCopy, (line) => messages.push(line)),
     };
     // --upload-pack, else remote.<name>.uploadpack (transport_get)
     const uploadPack = this.uploadPack ?? this.remoteProgram(this.remote, "uploadpack");

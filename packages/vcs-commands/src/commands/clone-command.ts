@@ -4,6 +4,7 @@ import {
   historyWithoutLazyFetch,
   isSymbolicRef,
   isValidRefName,
+  ObjectFilterError,
   type ObjectId,
   parseObjectFilter,
 } from "@statewalker/vcs-core";
@@ -68,7 +69,7 @@ import { runPostCheckoutHook } from "./git-hooks.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { copyLocalObjects } from "./local-clone.js";
 import { promisorOf } from "./promisor-remote.js";
-import { promisorRemoteReplyOf } from "./promisor-remote-reply.js";
+import { promisorAutoFilter, promisorRemoteReplyOf } from "./promisor-remote-reply.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { isValidRemoteName } from "./remote-command.js";
 import { withRemoteUploadPack } from "./remote-transport.js";
@@ -338,11 +339,21 @@ export class CloneCommand extends TransportCommand<CloneResult> {
    * Objects left out are fetched lazily from the remote when read (the checkout fetches the
    * blobs it writes in one batch, as git's).
    *
+   * `auto` (git 2.54) takes the filter the promisor remotes accepted from the server's
+   * `promisor-remote` capability advertise (none: no filter) and is recorded as `auto`, so
+   * later fetches resolve it again.
+   *
    * @param spec The filter spec; `blob:limit=1k` is recorded and sent as `blob:limit=1024`
    * @throws ObjectFilterError with git's message for a spec git refuses
    */
   setFilter(spec: string): this {
     this.checkCallable();
+    // `auto` (git 2.54): the filter the promisor remotes the server advertises and this
+    // clone accepts propose (promisor_remote_construct_filter), recorded as `auto`
+    if (spec === "auto") {
+      this.filterSpec = spec;
+      return this;
+    }
     const filter = parseObjectFilter(spec);
     // expand_list_objects_filter_spec: a blob limit in bytes
     this.filterSpec = filter.choice === "blob:limit" ? `blob:limit=${filter.limit}` : spec;
@@ -906,6 +917,10 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       );
     }
     const compatibility = this.compatibility ?? this.hooks.compatibility;
+    // git 2.43 has no `auto` filter
+    if (this.filterSpec === "auto" && compatibility === "2.43") {
+      throw new ObjectFilterError("invalid filter-spec 'auto'");
+    }
     // parse_options: --revision is unknown to 2.43
     if (this.revision !== undefined && compatibility === "2.43") {
       throw new GitApiError(`error: unknown option \`revision=${this.revision}'`, {
@@ -1013,6 +1028,14 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     }
 
     this.repoUrl = repo;
+    // clone.c writes remote.<name>.url (and tagOpt) before it asks for the refs: what the
+    // server's promisor-remote capability makes the fetch write (an auto-created remote)
+    // comes after that section
+    store.setValue(`remote.${this.remoteName}.url`, repo);
+    if (this.tagOption === TagOption.NO_TAGS || this.mirror) {
+      store.setValue(`remote.${this.remoteName}.tagOpt`, "--no-tags");
+    }
+    await store.save();
     const sourceUrl = store.aliasUrl(repo) ?? repo;
     const remote = await this.prepareRemote(bundleFile ?? sourceUrl);
     if (remote.kind === "bundle" && remote.remote.bundle.header.filter !== undefined) {
@@ -1254,6 +1277,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       onWarning: (line: string) => messages.push(`${line}\n`),
       // the server's promisor-remote capability (promisor.acceptFromServer, storeFields)
       promisorRemote: promisorRemoteReplyOf(this.workingCopy, (line) => messages.push(`${line}\n`)),
+      // --filter=auto: the accepted promisor remotes' advertised filter
+      autoFilter: () => promisorAutoFilter(this.workingCopy, (line) => messages.push(`${line}\n`)),
       ...(fsck ? { fsckObjects: fsck } : {}),
       ...(serverOptions.length > 0 ? { serverOptions } : {}),
       ...(rejectShallow ? { rejectShallow: true } : {}),
@@ -1496,11 +1521,20 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     if (this.dissociate) await history.objects?.alternates?.dissociate?.();
 
     if (checkoutId) {
+      // what the checkout's lazy fetches print (git's child `git fetch` shares its stderr)
+      const promisorWarnings = promisorOf(this._workingCopy)?.warnings;
+      const warned = promisorWarnings?.length ?? 0;
       try {
         const collided = await this.checkoutHead(checkoutId);
         if (collided.length > 0) cloneResult.collidedPaths = collided;
       } catch (error) {
         throw new CloneCheckoutError(cloneResult, error);
+      } finally {
+        const lines = promisorWarnings?.slice(warned) ?? [];
+        if (lines.length > 0) {
+          messages.push(...lines.map((line) => `${line}\n`));
+          if (cloneResult.messages === undefined) cloneResult.messages = messages;
+        }
       }
       // checkout()'s post-checkout hook: from no commit to the one checked out, a branch
       // switch; its exit code becomes the clone's exit status

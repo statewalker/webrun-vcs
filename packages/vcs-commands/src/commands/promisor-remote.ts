@@ -41,7 +41,7 @@ import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { httpClientSettingsOf } from "./http-config.js";
-import { acceptedPromisorRemotes } from "./promisor-remote-reply.js";
+import { acceptedPromisorRemotes, promisorRemoteReplyOf } from "./promisor-remote-reply.js";
 
 /** A promisor remote (git's `struct promisor_remote`). */
 export interface PromisorRemote {
@@ -225,6 +225,12 @@ export function createPromisorFetcher(
               ids,
               filter: "blob:none",
               url: anonymizeUrl(url),
+              // the child fetch's fetch-pack answers the server's promisor-remote too
+              promisorRemote: promisorRemoteReplyOf(
+                workingCopy,
+                (line) => promisor()?.warnings.push(line),
+                { remember: false },
+              ),
               compatibility,
               ...(fsck ? { fsckObjects: fsck } : {}),
               // the child fetch's fetch.unpackLimit: whether fetch-pack keeps the pack itself
