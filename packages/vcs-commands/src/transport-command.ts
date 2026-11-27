@@ -251,7 +251,10 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
       RemoteConfigStore.from(this._workingCopy),
       url,
       hostEnvironmentOf(this._workingCopy),
-      { compatibility: this.hooks.compatibility },
+      {
+        compatibility: this.hooks.compatibility,
+        ...(this.warningCallback ? { onWarning: this.warningCallback } : {}),
+      },
     );
     return this.warningCallback ? { ...settings, onWarning: this.warningCallback } : settings;
   }

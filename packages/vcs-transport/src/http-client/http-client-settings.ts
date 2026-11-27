@@ -6,7 +6,8 @@
  *
  * What stays the host `fetch`'s: TLS (`http.sslVerify`, `sslCAInfo`, client certificates),
  * proxies (`http.proxy`, `HTTPS_PROXY`), cookies, HTTP versions, low-speed limits and the
- * Negotiate/NTLM schemes (a browser speaks them itself). A browser also drops a
+ * Negotiate/NTLM schemes (a browser speaks them itself). Basic, Digest (RFC 7616, MD5) and a
+ * helper's `authtype` are the client's own. A browser also drops a
  * `User-Agent` it does not allow and follows redirects it cannot show (`opaqueredirect`).
  *
  * @example
@@ -48,6 +49,13 @@ export interface HttpClientSettings {
    * Negotiate, which is the host's).
    */
   emptyAuth?: boolean | "auto";
+  /**
+   * `http.proactiveAuth` (git 2.46+): `basic` and `auto` ask the credential helper before the
+   * first request and send its credentials with it (`basic` tells the helper
+   * `wwwauth[]=Basic`; a user and password go as Basic, an `authtype` as it is); `none`
+   * (default) waits for a 401. The commands leave it unset under git 2.43 compatibility.
+   */
+  proactiveAuth?: "basic" | "auto" | "none";
   /**
    * `http.maxRetries` / `GIT_HTTP_MAX_RETRIES`: requests made in all when the first request
    * (`info/refs`) answers 429 Too Many Requests (git counts the first: 3 retries twice);

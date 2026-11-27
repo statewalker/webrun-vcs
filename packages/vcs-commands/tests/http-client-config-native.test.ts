@@ -8,7 +8,15 @@
  *   "re-rooting dies on insane schemes"), credentials ("http auth remembers successful
  *   credentials", "http auth forgets bogus credentials")
  * - t5563-simple-http-auth.sh: "access using basic auth", "access using basic auth invalid
- *   credentials", "access using bearer auth" (2.46+: `authtype`)
+ *   credentials", "access using bearer auth" (2.46+: `authtype`), "access using basic proactive
+ *   auth", "access using auto proactive auth with basic default", "access using auto proactive
+ *   auth with authtype from credential helper" (2.46+: `http.proactiveAuth`, ignored by 2.43)
+ * - t5551-http-fetch-smart.sh "clone from auth-only-for-objects repository" and
+ *   t5541-http-push-smart.sh "push to auth-only-for-push repo": a POST answering 401 after an
+ *   open `info/refs` (remote-curl's `post_rpc` asks the helper and sends it again)
+ * - Digest (no git test has one): the router answers with its own challenge and checks the
+ *   answer; native curl reuses the first 401's nonce, counts `nc` across requests and answers a
+ *   refused Digest once more
  * - t5584-http-429-retry.sh (2.52+; 2.43 fails on the first 429)
  * - t5581-http-curl-verbose.sh: "failure in git-upload-pack is shown"
  * - JGit HttpConfigTest, HttpConfigUriPathTest: `http.<url>.*` matching, with `git config
@@ -16,11 +24,15 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CredentialRequest, Credentials } from "@statewalker/vcs-transport";
-import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
+import {
+  createNodeGitHostEnvironment,
+  createNodeHookRunner,
+} from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { httpClientSettingsOf } from "../src/index.js";
 import { RemoteConfigStore } from "../src/remote-config/index.js";
@@ -42,11 +54,58 @@ const compatibility = nativeMinor < 45 ? ("2.43" as const) : ("2.56" as const);
 const itRetries = nativeMinor >= 52 ? it : it.skip;
 /** git 2.46 hands credential helpers `authtype` and `credential` */
 const itAuthtype = nativeMinor >= 46 ? it : it.skip;
+/** git 2.46 reads http.proactiveAuth (2.43 ignores it) */
+const proactive = nativeMinor >= 46;
 
 const USER = "alice";
 const PASS = "secret-passwd";
 const BASIC = `Basic ${Buffer.from(`${USER}:${PASS}`).toString("base64")}`;
 const TOKEN = "a-bearer-token";
+/** The router's Digest challenge (RFC 7616 3.3, as Apache's mod_auth_digest words it) */
+const DIGEST_REALM = "git-auth";
+const DIGEST_NONCE = "dcd98b7102dd2f0e8b11d0f600bfb0c093";
+const DIGEST_OPAQUE = "5ccc069c403ebaf9f0171e9517f40e41";
+const digestChallenge = (algorithm: string) =>
+  `Digest realm="${DIGEST_REALM}", nonce="${DIGEST_NONCE}", opaque="${DIGEST_OPAQUE}", algorithm=${algorithm}, qop="auth"`;
+
+const hexOf = (algorithm: string) => (text: string) =>
+  createHash(algorithm === "SHA-256" ? "sha256" : "md5")
+    .update(text)
+    .digest("hex");
+
+/** The auth-params of an `Authorization: Digest ...` value. */
+function digestParams(value: string): Map<string, string> {
+  const params = new Map<string, string>();
+  const re = /([A-Za-z0-9_-]+)=(?:"((?:[^"\\]|\\.)*)"|([^,\s]*))/g;
+  for (const m of value.slice("Digest ".length).matchAll(re)) {
+    params.set((m[1] as string).toLowerCase(), m[2] ?? m[3] ?? "");
+  }
+  return params;
+}
+
+/** Whether a Digest answer is right for USER/PASS (RFC 7616 3.4.1, qop=auth). */
+function validDigest(request: Request, value: string | null, algorithm: string): boolean {
+  const md5hex = hexOf(algorithm);
+  if (!value?.startsWith("Digest ")) return false;
+  const p = digestParams(value);
+  if (p.get("username") !== USER || p.get("realm") !== DIGEST_REALM) return false;
+  if (p.get("nonce") !== DIGEST_NONCE || p.get("opaque") !== DIGEST_OPAQUE) return false;
+  if (p.get("qop") !== "auth" || p.get("algorithm") !== algorithm) return false;
+  const url = new URL(request.url);
+  if (p.get("uri") !== `${url.pathname}${url.search}`) return false;
+  const ha1 = md5hex(`${USER}:${DIGEST_REALM}:${PASS}`);
+  const ha2 = md5hex(`${request.method}:${p.get("uri")}`);
+  const expected = md5hex(`${ha1}:${DIGEST_NONCE}:${p.get("nc")}:${p.get("cnonce")}:auth:${ha2}`);
+  return p.get("response") === expected;
+}
+
+/** A Digest answer as recorded: its client nonce and response vary by run. */
+const recordedAuthorization = (value: string) =>
+  value.startsWith("Digest ")
+    ? value
+        .replace(/cnonce="[^"]*"/, 'cnonce="<cnonce>"')
+        .replace(/response="[^"]*"/, 'response="<response>"')
+    : value;
 
 /** One request as the recording server saw it. */
 interface Seen {
@@ -110,6 +169,40 @@ async function route(
         status: 403,
         headers: { "Content-Type": "text/plain" },
       });
+    }
+    return serve(`/${m[1]}`);
+  }
+  // lib-httpd's auth-fetch and auth-push: only the POST asks for credentials
+  m = /^\/(auth-fetch|auth-push)\/smart\/(.*)$/.exec(path);
+  if (m) {
+    const guarded = m[1] === "auth-fetch" ? "/git-upload-pack" : "/git-receive-pack";
+    if (path.endsWith(guarded) && request.headers.get("authorization") !== BASIC) {
+      await request.body?.cancel().catch(() => undefined);
+      return new Response("no\n", {
+        status: 401,
+        headers: { "WWW-Authenticate": 'Basic realm="git-auth"' },
+      });
+    }
+    return serve(`/${m[2]}`);
+  }
+  m = /^\/digest(-sha256)?\/smart\/(.*)$/.exec(path);
+  if (m) {
+    const algorithm = m[1] ? "SHA-256" : "MD5";
+    if (!validDigest(request, request.headers.get("authorization"), algorithm)) {
+      await request.body?.cancel().catch(() => undefined);
+      return new Response("no\n", {
+        status: 401,
+        headers: { "WWW-Authenticate": digestChallenge(algorithm) },
+      });
+    }
+    return serve(`/${m[2]}`);
+  }
+  // t5563's custom_auth with `id=default status=403`: no challenge, a refusal without credentials
+  m = /^\/custom_auth\/(.*)$/.exec(path);
+  if (m) {
+    const auth = request.headers.get("authorization");
+    if (auth !== BASIC && auth !== `Bearer ${TOKEN}`) {
+      return new Response("forbidden\n", { status: 403 });
     }
     return serve(`/${m[1]}`);
   }
@@ -179,7 +272,11 @@ async function clients(config: string[][] = []): Promise<{ native: string; ours:
 async function openAt(dir: string, extra: Record<string, string> = {}) {
   return openOurs(
     root,
-    createNodeGitHostEnvironment({ env: testEnv(root, extra) }),
+    // the runner tells the commands which git they follow (http.proactiveAuth is 2.46+)
+    createNodeGitHostEnvironment({
+      env: testEnv(root, extra),
+      hookRunner: createNodeHookRunner({ compatibility }),
+    }),
     undefined,
     dir.slice(root.length + 1),
   );
@@ -190,6 +287,11 @@ async function recording<T>(run: () => Promise<T>): Promise<{ result: T; request
   seen = [];
   rateContexts.clear();
   const result = await run();
+  if (process.env.DEBUG_HTTP) {
+    console.log(
+      `REQ ${JSON.stringify(seen.map((r) => [r.method, r.path, r.status, r.headers.authorization ?? ""]))}`,
+    );
+  }
   return { result, requests: seen };
 }
 
@@ -313,7 +415,9 @@ describeGit("http.* client configuration, as native git", () => {
       const url = new URL(request.url);
       const headers: Record<string, string> = {};
       request.headers.forEach((value, key) => {
-        if (KEPT_HEADERS.test(key)) headers[key] = value;
+        if (KEPT_HEADERS.test(key)) {
+          headers[key] = key === "authorization" ? recordedAuthorization(value) : value;
+        }
       });
       const response = await route(request, backend.fetch);
       seen.push({
@@ -442,14 +546,26 @@ describeGit("http.* client configuration, as native git", () => {
   });
 
   /** `git fetch <url> main` on each side: the requests and the fetched commit. */
-  async function fetchTwins(path: string, config: string[][] = []) {
-    const { native, ours } = await clients(config);
+  async function fetchTwins(
+    path: string,
+    config: string[][] = [],
+    options: { helperReply?: { native: string; ours: Credentials | undefined } } = {},
+  ) {
+    const helper = options.helperReply ? nativeHelper(options.helperReply.native) : undefined;
+    const { native, ours } = await clients([...config, ...(helper?.config ?? [])]);
     const url = `${server.baseUrl}${path}`;
     const nativeRun = await recording(() => gitAsync(root, native, ["fetch", "-q", url, "main"]));
+    const theirs = ourHelper(options.helperReply?.ours);
     const git = await openAt(ours);
     const ourRun = await recording(async () => {
       try {
-        await git.fetch().setRemote(url).setRefSpecs("main").setCompatibility(compatibility).call();
+        const command = git
+          .fetch()
+          .setRemote(url)
+          .setRefSpecs("main")
+          .setCompatibility(compatibility);
+        if (options.helperReply) command.setCredentialHelper(theirs.helper);
+        await command.call();
         return undefined;
       } catch (error) {
         return error as Error;
@@ -463,8 +579,17 @@ describeGit("http.* client configuration, as native git", () => {
       }
     };
     return {
-      native: { ...nativeRun, fetched: fetched(native) },
-      ours: { error: ourRun.result, requests: ourRun.requests, fetched: fetched(ours) },
+      native: {
+        ...nativeRun,
+        fetched: fetched(native),
+        helperLog: helper ? sortedLog(helper.log()) : [],
+      },
+      ours: {
+        error: ourRun.result,
+        requests: ourRun.requests,
+        fetched: fetched(ours),
+        helperLog: theirs.log,
+      },
     };
   }
 
@@ -559,6 +684,133 @@ describeGit("http.* client configuration, as native git", () => {
     expect(withoutAgent(twins.ours.requests)).toEqual(withoutAgent(twins.native.requests));
   });
 
+  it("Digest: the helper's credentials answer the server's challenge (RFC 7616, qop=auth)", async () => {
+    const twins = await lsRemoteTwins("/digest/smart/repo.git", [], {
+      helperReply: {
+        native: `username=${USER}\npassword=${PASS}\n`,
+        ours: { username: USER, password: PASS },
+      },
+    });
+    expect(twins.native.result.status).toBe(0);
+    expect(twins.ours.result.error).toBeUndefined();
+    expect(twins.ours.result.refs.join("\n")).toBe(
+      twins.native.result.stdout
+        .trim()
+        .split("\n")
+        .filter((l) => !l.endsWith("\tHEAD"))
+        .join("\n"),
+    );
+    expect(twins.ours.helperLog).toEqual(twins.native.helperLog);
+    expect(withoutAgent(twins.ours.requests)).toEqual(withoutAgent(twins.native.requests));
+  });
+
+  it("Digest: algorithm=SHA-256 (curl 7.57+) as MD5", async () => {
+    const twins = await fetchTwins("/digest-sha256/smart/repo.git", [], {
+      helperReply: {
+        native: `username=${USER}\npassword=${PASS}\n`,
+        ours: { username: USER, password: PASS },
+      },
+    });
+    expect(twins.native.result.status).toBe(0);
+    expect(twins.ours.error).toBeUndefined();
+    expect(twins.ours.fetched).toBe(twins.native.fetched);
+    expect(twins.ours.helperLog).toEqual(twins.native.helperLog);
+    expect(withoutAgent(twins.ours.requests)).toEqual(withoutAgent(twins.native.requests));
+  });
+
+  it("Digest: a fetch answers each request's challenge, the POSTs too", async () => {
+    const twins = await fetchTwins("/digest/smart/repo.git", [], {
+      helperReply: {
+        native: `username=${USER}\npassword=${PASS}\n`,
+        ours: { username: USER, password: PASS },
+      },
+    });
+    expect(twins.native.result.status).toBe(0);
+    expect(twins.ours.error).toBeUndefined();
+    expect(twins.ours.fetched).toBe(twins.native.fetched);
+    expect(twins.ours.helperLog).toEqual(twins.native.helperLog);
+    expect(withoutAgent(twins.ours.requests)).toEqual(withoutAgent(twins.native.requests));
+  });
+
+  it("Digest: wrong credentials are refused and erased, as Basic ones", async () => {
+    const twins = await lsRemoteTwins("/digest/smart/repo.git", [], {
+      helperReply: {
+        native: "username=baduser\npassword=wrong-passwd\n",
+        ours: { username: "baduser", password: "wrong-passwd" },
+      },
+    });
+    expect(twins.native.result.status).toBe(128);
+    expect(twins.ours.result.error?.message.split("\n")).toEqual(
+      gitLines(twins.native.result.stderr),
+    );
+    expect(twins.ours.helperLog).toEqual(twins.native.helperLog);
+    expect(withoutAgent(twins.ours.requests)).toEqual(withoutAgent(twins.native.requests));
+  });
+
+  it('t5563-simple-http-auth.sh: "access using basic proactive auth"', async () => {
+    const twins = await lsRemoteTwins("/custom_auth/repo.git", [["http.proactiveAuth", "basic"]], {
+      helperReply: {
+        native: `username=${USER}\npassword=${PASS}\n`,
+        ours: { username: USER, password: PASS },
+      },
+    });
+    // git 2.43 ignores the key: the server's 403 refuses it
+    expect(twins.native.result.status).toBe(proactive ? 0 : 128);
+    if (proactive) expect(twins.ours.result.error).toBeUndefined();
+    else {
+      expect(twins.ours.result.error?.message.split("\n")).toEqual(
+        gitLines(twins.native.result.stderr),
+      );
+    }
+    expect(twins.ours.helperLog).toEqual(twins.native.helperLog);
+    expect(withoutAgent(twins.ours.requests)).toEqual(withoutAgent(twins.native.requests));
+  });
+
+  it('t5563-simple-http-auth.sh: "access using auto proactive auth with basic default"', async () => {
+    const twins = await lsRemoteTwins("/custom_auth/repo.git", [["http.proactiveAuth", "auto"]], {
+      helperReply: {
+        native: `username=${USER}\npassword=${PASS}\n`,
+        ours: { username: USER, password: PASS },
+      },
+    });
+    expect(twins.native.result.status).toBe(proactive ? 0 : 128);
+    expect(twins.ours.result.error === undefined).toBe(proactive);
+    expect(twins.ours.helperLog).toEqual(twins.native.helperLog);
+    expect(withoutAgent(twins.ours.requests)).toEqual(withoutAgent(twins.native.requests));
+  });
+
+  itAuthtype(
+    't5563-simple-http-auth.sh: "access using auto proactive auth with authtype from credential helper"',
+    async () => {
+      const twins = await lsRemoteTwins("/custom_auth/repo.git", [["http.proactiveAuth", "auto"]], {
+        helperReply: {
+          native: `capability[]=authtype\nauthtype=Bearer\ncredential=${TOKEN}\n`,
+          ours: { authtype: "Bearer", credential: TOKEN },
+        },
+      });
+      expect(twins.native.result.status).toBe(0);
+      expect(twins.ours.result.error).toBeUndefined();
+      expect(twins.ours.helperLog).toEqual(twins.native.helperLog);
+      expect(withoutAgent(twins.ours.requests)).toEqual(withoutAgent(twins.native.requests));
+    },
+  );
+
+  it("http.proactiveAuth=none and an unknown value ask nothing before a challenge", async () => {
+    for (const value of ["none", "bogus"]) {
+      const twins = await lsRemoteTwins("/auth/smart/repo.git", [["http.proactiveAuth", value]], {
+        helperReply: {
+          native: `username=${USER}\npassword=${PASS}\n`,
+          ours: { username: USER, password: PASS },
+        },
+      });
+      expect(twins.native.result.status).toBe(0);
+      expect(twins.ours.result.error).toBeUndefined();
+      expect(twins.ours.warnings).toEqual(gitLines(twins.native.result.stderr));
+      expect(twins.ours.helperLog).toEqual(twins.native.helperLog);
+      expect(withoutAgent(twins.ours.requests)).toEqual(withoutAgent(twins.native.requests));
+    }
+  });
+
   it("http.emptyAuth=true tries empty credentials before the helper", async () => {
     const twins = await lsRemoteTwins("/auth/smart/repo.git", [["http.emptyAuth", "true"]], {
       helperReply: {
@@ -616,6 +868,74 @@ describeGit("http.* client configuration, as native git", () => {
       withoutAgent(requests).map((r) => ({ ...r, path: r.path.replace(/pushed-\w+/, "x") }));
     expect(normalized(ourRun.requests)).toEqual(normalized(nativeRun.requests));
     expect(ourRun.requests.every((r) => r.headers["x-magic-push"] === "yes")).toBe(true);
+  });
+
+  it('t5551-http-fetch-smart.sh: "clone from auth-only-for-objects repository"', async () => {
+    // info/refs is open, the POST answers 401: remote-curl's post_rpc asks the helper and
+    // sends the request again
+    const twins = await fetchTwins("/auth-fetch/smart/repo.git", [], {
+      helperReply: {
+        native: `username=${USER}\npassword=${PASS}\n`,
+        ours: { username: USER, password: PASS },
+      },
+    });
+    expect(twins.native.result.status).toBe(0);
+    expect(twins.ours.error).toBeUndefined();
+    expect(twins.ours.fetched).toBe(twins.native.fetched);
+    expect(twins.ours.helperLog).toEqual(twins.native.helperLog);
+    expect(withoutAgent(twins.ours.requests)).toEqual(withoutAgent(twins.native.requests));
+  });
+
+  it('t5551-http-fetch-smart.sh: "clone from auth-only-for-objects repository": wrong credentials', async () => {
+    const twins = await fetchTwins("/auth-fetch/smart/repo.git", [], {
+      helperReply: {
+        native: "username=baduser\npassword=wrong-passwd\n",
+        ours: { username: "baduser", password: "wrong-passwd" },
+      },
+    });
+    expect(twins.native.result.status).not.toBe(0);
+    expect(twins.ours.error).toBeDefined();
+    if (process.env.DEBUG_HTTP) console.log(twins.native.result.stderr, twins.ours.error);
+    expect(twins.ours.helperLog).toEqual(twins.native.helperLog);
+    expect(withoutAgent(twins.ours.requests)).toEqual(withoutAgent(twins.native.requests));
+  });
+
+  it('t5541-http-push-smart.sh: "push to auth-only-for-push repo"', async () => {
+    const helper = nativeHelper(`username=${USER}\npassword=${PASS}\n`);
+    const { native, ours } = await clients(helper.config);
+    for (const [dir, name] of [
+      [native, "native"],
+      [ours, "ours"],
+    ] as const) {
+      writeFileSync(join(dir, "f.txt"), `${name}\n`);
+      gitOut(root, dir, ["add", "f.txt"]);
+      gitOut(root, dir, ["commit", "-q", "-m", name]);
+    }
+    const url = `${server.baseUrl}/auth-push/smart/repo.git`;
+    const nativeRun = await recording(() =>
+      gitAsync(root, native, ["push", "-q", url, "main:refs/heads/half-native"]),
+    );
+    const theirs = ourHelper({ username: USER, password: PASS });
+    const git = await openAt(ours);
+    const ourRun = await recording(async () => {
+      try {
+        await git
+          .push()
+          .setRemote(url)
+          .setRefSpecs("main:refs/heads/half-ours")
+          .setCredentialHelper(theirs.helper)
+          .call();
+        return undefined;
+      } catch (error) {
+        return error as Error;
+      }
+    });
+    expect(nativeRun.result.status).toBe(0);
+    expect(ourRun.result).toBeUndefined();
+    expect(theirs.log).toEqual(sortedLog(helper.log()));
+    const normalized = (requests: Seen[]) =>
+      withoutAgent(requests).map((r) => ({ ...r, path: r.path.replace(/half-\w+/, "x") }));
+    expect(normalized(ourRun.requests)).toEqual(normalized(nativeRun.requests));
   });
 
   it('t5581-http-curl-verbose.sh: "failure in git-upload-pack is shown"', async () => {
