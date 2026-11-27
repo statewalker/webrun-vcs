@@ -1,7 +1,8 @@
 /**
  * The initial branch of a new repository, as git's `repo_default_branch_name` (refs.c) picks
- * it: `init.defaultBranch` from the configuration a new repository sees (system, global, the
- * command line), else `master`, or `main` in a git built with `WITH_BREAKING_CHANGES`
+ * it: `init.defaultBranch` from the configuration the new repository sees (system, global, its
+ * own config with what a template brought in, the command line; `includeIf "gitdir:..."`
+ * matched against the new repository's git directory), else `master`, or `main` in a git built with `WITH_BREAKING_CHANGES`
  * (`GitHostEnvironment.breakingChanges`, git 3.0). With no name configured, git explains the
  * default in an `advice.defaultBranchName` hint, which {@link DefaultBranch.hint} holds.
  *
@@ -68,16 +69,29 @@ export function isValidBranchName(name: string): boolean {
 }
 
 /**
- * The initial branch of a repository created now. Reads the protected configuration (the
- * repository's own does not exist yet); without an environment, nothing is configured.
+ * The configuration of the new repository, as git's `repo_config_get_string` reads it once
+ * `create_repository` made it: a loaded `GitWorkingCopyConfig` of its git directory (its
+ * values with their origins, in git's order).
+ */
+export interface NewRepositoryConfig {
+  listWithOrigin(): { key: string; text: string | undefined; file?: string; line?: number }[];
+}
+
+/**
+ * The initial branch of a repository created now, from `config` (the new repository's, see
+ * {@link NewRepositoryConfig}); without one, from the protected configuration (system,
+ * global, command line, `gitdir:` conditions false). Without either, nothing is configured.
  *
  * @throws InvalidDefaultBranchError when `init.defaultBranch` names no valid branch (empty too)
  * @throws MissingDefaultBranchValueError when `init.defaultBranch` has no value
  */
 export async function defaultInitialBranch(
   environment: GitHostEnvironment | undefined,
+  repositoryConfig?: NewRepositoryConfig,
 ): Promise<DefaultBranch> {
-  const config = await readProtectedConfig(environment);
+  const config = repositoryConfig
+    ? repositoryConfig.listWithOrigin().map((e) => ({ ...e, value: e.text }))
+    : await readProtectedConfig(environment);
   const last = (key: string) => config.filter((e) => e.key === key).at(-1);
   const configured = last("init.defaultbranch");
   if (configured && configured.value === undefined) {

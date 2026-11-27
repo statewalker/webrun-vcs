@@ -59,6 +59,7 @@ import {
   defaultRefFormat,
   InvalidInitialBranchError,
   isValidBranchName,
+  type NewRepositoryConfig,
 } from "./default-branch.js";
 
 /**
@@ -388,14 +389,16 @@ export class InitCommand {
     let initialBranch = "";
     let hints: string[] | undefined;
     const warnings: string[] = [];
-    const chooseBranch = async () => {
+    // `config`: the new repository's (git reads init.defaultBranch once its templates are
+    // copied, `includeIf "gitdir:"` matching its git directory); none in memory
+    const chooseBranch = async (config?: NewRepositoryConfig) => {
       if (this.initialBranch !== undefined && !isValidBranchName(this.initialBranch)) {
         throw new InvalidInitialBranchError(this.initialBranch);
       }
       const chosen =
         this.initialBranch !== undefined
           ? { name: this.initialBranch }
-          : await defaultInitialBranch(this.environment);
+          : await defaultInitialBranch(this.environment, config);
       initialBranch = chosen.name;
       hints = chosen.hint;
     };
@@ -478,8 +481,10 @@ export class InitCommand {
           throw new ReinitializeHashError();
         }
       }
-      if (!hasHead) await chooseBranch();
-      else if (this.initialBranch !== undefined) {
+      // --initial-branch is checked before anything is written; the configured default once
+      // the templates are in place (below)
+      if (!hasHead && this.initialBranch !== undefined) await chooseBranch();
+      else if (hasHead && this.initialBranch !== undefined) {
         warnings.push(`warning: re-init: ignored --initial-branch=${this.initialBranch}`);
       }
       // the ref storage of a repository created here (an existing one keeps its own)
@@ -500,6 +505,21 @@ export class InitCommand {
       await this.copyTemplates(sharedFiles, dir, warnings);
       shared = this.shared ?? (await this.configuredShared(repoFiles, dir));
       if (shared) await adjustSharedPerm(repoFiles, dir, shared);
+      // repo_default_branch_name after the templates (2.43's create_default_files, 2.5x's
+      // create_reference_database): the whole configuration of the new repository, its
+      // `includeIf "gitdir:"` conditions matched against its git directory as the host names it
+      if (!hasHead && this.initialBranch === undefined) {
+        const newConfig = await createWorkingCopyConfig(
+          configFilesApiOf(repoFiles, { readOnly: "init reads the configuration only" }),
+          dir,
+          undefined,
+          {
+            ...(this.environment ? { environment: this.environment } : {}),
+            gitDirPath: await this.hostPath(repoFiles, dir),
+          },
+        );
+        await chooseBranch(newConfig);
+      }
 
       // the config, set as create_default_files and init_db set it
       const configPath = `${dir}/config`;
