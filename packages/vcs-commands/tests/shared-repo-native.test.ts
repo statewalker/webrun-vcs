@@ -472,7 +472,7 @@ describeGit("core.sharedRepository, as native git (t1301-shared-repo)", () => {
   }
 
   for (const umask of [0o077, 0o022]) {
-    it(`unshared: repack -a -d -b --write-midx under umask ${umask.toString(8).padStart(3, "0")}: bitmaps and the midx's .rev read-only, the midx itself not`, async () => {
+    it(`unshared: repack -a -d -b --write-midx under umask ${umask.toString(8).padStart(3, "0")}: bitmaps read-only, the multi-pack-index itself not`, async () => {
       const [n, o] = await sharedAndFetched("umask", umask);
       const args = ["repack", "-q", "-a", "-d", "-b", "--write-midx"];
       const theirs = native(join(root, n), args, umask);
