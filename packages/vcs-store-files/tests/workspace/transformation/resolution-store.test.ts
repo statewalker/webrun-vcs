@@ -1,7 +1,7 @@
 import { GitResolutionStore } from "@statewalker/vcs-store-files";
 import { createInMemoryFilesApi, type FilesApi, joinPath } from "@statewalker/vcs-utils/files";
 import { createMemoryGitStaging, MergeStage, type Staging } from "@statewalker/vcs-working-tree";
-import type { ResolutionStore } from "@statewalker/vcs-working-tree/transformation";
+import type { RerereEngine, ResolutionStore } from "@statewalker/vcs-working-tree/transformation";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 /**
@@ -510,25 +510,51 @@ describe("ResolutionStore", () => {
       );
     });
 
-    it("records and retrieves resolutions", async () => {
-      // Write resolved content to worktree
+    it("records nothing without a rerere engine (statewalker/webrun-vcs#359)", async () => {
+      // git reads rr-cache/ as its own records: only git's rerere may write there
       await files.write(joinPath(worktreePath, "test.txt"), [
         new TextEncoder().encode("resolved content"),
       ]);
+      expect(await store.recordResolution("test.txt")).toBeUndefined();
+      expect(await files.stats("/.git/rr-cache")).toBeUndefined();
+      expect(await store.listRecordedResolutions()).toEqual([]);
+    });
 
-      // Record resolution
-      const signature = await store.recordResolution("test.txt");
-      expect(signature).toBeDefined();
-      expect(signature).toHaveLength(40); // SHA-1 hex
-
-      // Retrieve recorded resolution
-      if (signature) {
-        const recorded = await store.getRecordedResolution(signature);
-        expect(recorded).toBeDefined();
-        if (recorded?.resolvedContent) {
-          expect(new TextDecoder().decode(recorded.resolvedContent)).toBe("resolved content");
-        }
-      }
+    it("records and replays through its rerere engine", async () => {
+      const calls: string[] = [];
+      const engine: RerereEngine = {
+        record: async (path) => {
+          calls.push(`record ${path}`);
+          return "a".repeat(40);
+        },
+        replay: async (path, options) => {
+          calls.push(`replay ${path}${options?.apply ? " apply" : ""}`);
+          return {
+            signature: "a".repeat(40),
+            variant: 0,
+            preimage: new TextEncoder().encode("pre"),
+            postimage: new TextEncoder().encode("post"),
+            content: new TextEncoder().encode("replayed"),
+          };
+        },
+      };
+      const withEngine = new GitResolutionStore(
+        files,
+        staging,
+        blobs as never,
+        gitDir,
+        worktreePath,
+        undefined,
+        engine,
+      );
+      expect(await withEngine.recordResolution("test.txt")).toBe("a".repeat(40));
+      const suggested = await withEngine.getSuggestedResolution("test.txt");
+      expect(new TextDecoder().decode(suggested?.resolvedContent)).toBe("replayed");
+      expect(new TextDecoder().decode(suggested?.conflictContent)).toBe("pre");
+      expect(await withEngine.autoResolve()).toEqual(["test.txt"]);
+      // a path without a conflict is never handed to the engine
+      expect(await withEngine.recordResolution("other.txt")).toBeUndefined();
+      expect(calls).toEqual(["record test.txt", "replay test.txt", "replay test.txt apply"]);
     });
 
     it("lists recorded resolutions", async () => {
@@ -570,54 +596,12 @@ describe("ResolutionStore", () => {
       expect(signatures).toHaveLength(0);
     });
 
-    it("getSuggestedResolution finds matching resolution", async () => {
-      // Write resolved content to worktree
+    it("getSuggestedResolution finds nothing without a rerere engine", async () => {
       await files.write(joinPath(worktreePath, "test.txt"), [
         new TextEncoder().encode("resolved content"),
       ]);
-
-      // Record the resolution
       await store.recordResolution("test.txt");
-
-      // Get suggested resolution (for same conflict)
-      const suggested = await store.getSuggestedResolution("test.txt");
-      expect(suggested).toBeDefined();
-      expect(suggested?.resolvedContent).toBeDefined();
-      if (suggested?.resolvedContent) {
-        expect(new TextDecoder().decode(suggested.resolvedContent)).toBe("resolved content");
-      }
-    });
-
-    it("applyRecordedResolution writes to worktree", async () => {
-      // Write resolved content
-      await files.write(joinPath(worktreePath, "test.txt"), [
-        new TextEncoder().encode("resolved content"),
-      ]);
-
-      // Record the resolution
-      await store.recordResolution("test.txt");
-
-      // Clear worktree file
-      await files.remove(joinPath(worktreePath, "test.txt"));
-
-      // Apply recorded resolution
-      const applied = await store.applyRecordedResolution("test.txt");
-      expect(applied).toBe(true);
-
-      // Check worktree was updated
-      const chunks: Uint8Array[] = [];
-      for await (const chunk of files.read(joinPath(worktreePath, "test.txt"))) {
-        chunks.push(chunk);
-      }
-      const content = new TextDecoder().decode(
-        chunks.reduce((acc, c) => {
-          const result = new Uint8Array(acc.length + c.length);
-          result.set(acc);
-          result.set(c, acc.length);
-          return result;
-        }, new Uint8Array(0)),
-      );
-      expect(content).toBe("resolved content");
+      expect(await store.getSuggestedResolution("test.txt")).toBeUndefined();
     });
 
     it("applyRecordedResolution returns false when no match", async () => {
@@ -625,19 +609,12 @@ describe("ResolutionStore", () => {
       expect(applied).toBe(false);
     });
 
-    it("autoResolve applies all matching resolutions", async () => {
-      // Write resolved content and record
+    it("autoResolve resolves nothing without a rerere engine", async () => {
       await files.write(joinPath(worktreePath, "test.txt"), [
         new TextEncoder().encode("resolved content"),
       ]);
       await store.recordResolution("test.txt");
-
-      // Clear worktree
-      await files.remove(joinPath(worktreePath, "test.txt"));
-
-      // Auto-resolve
-      const resolved = await store.autoResolve();
-      expect(resolved).toContain("test.txt");
+      expect(await store.autoResolve()).toEqual([]);
     });
   });
 

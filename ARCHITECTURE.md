@@ -256,7 +256,9 @@ interface TransformationStore {
 
 ### ResolutionStore
 
-Conflict tracking with rerere-like functionality:
+Conflict tracking with git's rerere. The store records and replays through a
+`RerereEngine` (vcs-commands' rerere.c port, `git.rerere().engine()`), so `rr-cache/` holds
+git's own records; without an engine it records nothing:
 
 ```typescript
 interface ResolutionStore {
@@ -270,7 +272,7 @@ interface ResolutionStore {
   acceptTheirs(path: string): Promise<void>;
 
   // Rerere (reuse recorded resolution)
-  recordResolution(path: string): Promise<void>;
+  recordResolution(path: string): Promise<string | undefined>;
   getSuggestedResolution(path: string): Promise<RecordedResolution | undefined>;
   autoResolve(): Promise<string[]>;
 }

@@ -9,6 +9,7 @@ import type { Blobs } from "@statewalker/vcs-core";
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import type { Staging } from "@statewalker/vcs-working-tree";
 import type {
+  RerereEngine,
   ResolutionStore,
   TransformationCapabilities,
   TransformationState,
@@ -96,6 +97,11 @@ export interface TransformationStoreConfig {
   blobs?: Blobs;
   /** Path to working tree (defaults to parent of gitDir) */
   worktreePath?: string;
+  /**
+   * git's rerere over the same index and worktree (vcs-commands `git.rerere().engine()`);
+   * without it the resolution store records and replays nothing
+   */
+  rerere?: RerereEngine;
 }
 
 /**
@@ -128,6 +134,7 @@ export class GitTransformationStore implements TransformationStore {
     let staging: Staging | undefined;
     let blobs: Blobs | undefined;
     let worktreePath: string | undefined;
+    let rerere: RerereEngine | undefined;
 
     if (typeof filesOrConfig === "object" && "gitDir" in filesOrConfig) {
       // Config object
@@ -136,6 +143,7 @@ export class GitTransformationStore implements TransformationStore {
       staging = filesOrConfig.staging;
       blobs = filesOrConfig.blobs;
       worktreePath = filesOrConfig.worktreePath;
+      rerere = filesOrConfig.rerere;
     } else {
       // Legacy signature
       files = filesOrConfig as FilesApi;
@@ -153,7 +161,15 @@ export class GitTransformationStore implements TransformationStore {
 
     // Create resolution store if dependencies are provided
     if (staging && blobs) {
-      this.resolution = new GitResolutionStore(files, staging, blobs, dir, worktreePath);
+      this.resolution = new GitResolutionStore(
+        files,
+        staging,
+        blobs,
+        dir,
+        worktreePath,
+        undefined,
+        rerere,
+      );
     }
   }
 
