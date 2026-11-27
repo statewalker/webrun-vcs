@@ -6,6 +6,7 @@
 
 import { type History, historyWithoutLazyFetch, type ObjectId } from "@statewalker/vcs-core";
 import { connectivityErrors, createRepositoryFacade } from "@statewalker/vcs-transport";
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 
 import { type BundleHeader, listBundleRefs, parseBundleHeader } from "./bundle-format.js";
 
@@ -61,8 +62,10 @@ export interface OpenedBundle {
 export function openBundle(
   bytes: Uint8Array,
   name: string,
+  /** The hash of a header without `@object-format=` (the repository's) */
+  defaultFormat?: ObjectFormat,
 ): { ok: true; bundle: OpenedBundle } | { ok: false; error: string } {
-  const parsed = parseBundleHeader(bytes, name);
+  const parsed = parseBundleHeader(bytes, name, defaultFormat);
   if (!parsed.ok) return { ok: false, error: `error: ${parsed.error}\n` };
   return { ok: true, bundle: { header: parsed.header, pack: bytes.subarray(parsed.packOffset) } };
 }
