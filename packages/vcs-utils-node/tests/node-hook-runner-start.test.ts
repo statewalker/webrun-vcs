@@ -3,11 +3,12 @@
  * proc-receive): its stderr streamed as it comes (git's copy_to_sideband), and `kill` for a
  * hook receive-pack gave up on.
  */
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createNodeHookRunner } from "../src/files/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeUnix = process.platform === "win32" ? describe.skip : describe;
 
@@ -16,7 +17,7 @@ describeUnix("createNodeHookRunner().start", () => {
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), "hook-start-"));
   });
-  afterEach(() => rm(dir, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(dir), CLEANUP_TIMEOUT);
 
   async function script(body: string): Promise<string> {
     const path = join(dir, "hook");

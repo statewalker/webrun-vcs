@@ -37,13 +37,14 @@ import {
   workspace,
   writeFile,
 } from "./net-helpers.js";
+import { CLEANUP_TIMEOUT } from "./temp-dir-support.js";
 
 const enc = new TextEncoder();
 const who = { name: "T", email: "t@example.com", timestamp: 1, tzOffset: "+0000" };
-const cleanups: (() => void)[] = [];
-afterEach(() => {
-  for (const c of cleanups.splice(0)) c();
-});
+const cleanups: (() => Promise<void>)[] = [];
+afterEach(async () => {
+  for (const c of cleanups.splice(0)) await c();
+}, CLEANUP_TIMEOUT);
 
 /** A folder whose clock ticks in steps of `granularity` ms: modification times are floored. */
 function coarse(folder: FilesApi, granularity: number): FilesApi {

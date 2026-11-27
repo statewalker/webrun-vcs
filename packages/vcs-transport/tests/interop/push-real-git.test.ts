@@ -12,8 +12,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { pushOverDuplex } from "../../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 import {
-  cleanupDir,
   commitInRepo,
   createTransportRepo,
   git,
@@ -39,8 +39,8 @@ describeGit("Interop A · push → real git receive-pack", () => {
   });
   afterEach(async () => {
     await server.close();
-    cleanupDir(root);
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   async function push(refspec: string) {
     const duplex = spawnGitService("receive-pack", bare);
