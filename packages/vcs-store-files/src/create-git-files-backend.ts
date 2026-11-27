@@ -28,7 +28,12 @@ import {
   withLazyFetch,
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
-import { type AtomicFiles, sharedRepositoryOf, withSharedPerm } from "@statewalker/vcs-utils/files";
+import {
+  type AtomicFiles,
+  sharedRepositoryOf,
+  withReadOnlyObjectFiles,
+  withSharedPerm,
+} from "@statewalker/vcs-utils/files";
 import {
   type ObjectFormat,
   SHA1_OBJECT_FORMAT,
@@ -283,7 +288,11 @@ export async function createGitFilesBackend(
   } catch {
     shared = 0;
   }
-  const files = shared ? withSharedPerm(linked, () => shared, gitDir) : linked;
+  // outside a shared repository git still creates loose objects and packs read-only (0444
+  // under the umask); withSharedPerm makes them so in a shared one
+  const files = shared
+    ? withSharedPerm(linked, () => shared, gitDir)
+    : withReadOnlyObjectFiles(linked, objectsDir);
 
   // Objects: the installed packs first, then the kernel over git's loose layout
   // (tmp_obj_* and a rename). A REF_DELTA base outside its pack resolves through the
