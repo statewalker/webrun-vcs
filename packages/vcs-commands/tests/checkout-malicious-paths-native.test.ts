@@ -92,6 +92,7 @@ type Command =
   | "checkout"
   | "checkout-unborn"
   | "read-tree"
+  | "read-tree-one-way"
   | "reset-hard"
   | "reset-mixed"
   | "clone";
@@ -447,8 +448,17 @@ const CASES: Case[] = [
     ],
     divergence:
       "ours refuses the tree (a path below a planned link) where git keeps `d/x` and drops the link",
-    // read-tree -m and reset --mixed keep both `d` and `d/x` in our index (webrun-vcs#247)
-    commands: ["checkout", "checkout-unborn", "reset-hard", "clone"],
+    // read-tree -m and reset --mixed keep `d/x` alone, as add_index_entry's OK_TO_REPLACE
+    // (webrun-vcs#247)
+    commands: [
+      "checkout",
+      "checkout-unborn",
+      "read-tree",
+      "read-tree-one-way",
+      "reset-hard",
+      "reset-mixed",
+      "clone",
+    ],
   },
 ];
 
@@ -526,6 +536,8 @@ function nativeArgs(command: Command, c2: string): string[] {
       return ["checkout", "-q", "-b", "master", c2];
     case "read-tree":
       return ["read-tree", "-u", "-m", "HEAD", c2];
+    case "read-tree-one-way":
+      return ["read-tree", "-u", "-m", c2];
     case "reset-hard":
       return ["reset", "-q", "--hard", c2];
     case "reset-mixed":
@@ -602,6 +614,8 @@ async function runOurs(
           .addTree("HEAD")
           .addTree(c2)
           .call();
+      } else if (command === "read-tree-one-way") {
+        await ours.readTree().setMerge(true).setUpdate(true).addTree(c2).call();
       } else {
         await ours
           .reset()

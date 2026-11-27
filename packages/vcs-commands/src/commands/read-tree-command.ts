@@ -337,8 +337,8 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
       const [h, m] = treeIds as [ObjectId, ObjectId];
       const refusal = await switchTrees(
         sequencerCtx,
-        await flatTree(this.trees, h),
-        await flatTree(this.trees, m),
+        await flatTree(this.trees, h, { asIndex: true }),
+        await flatTree(this.trees, m, { asIndex: true }),
         {
           action: "merge",
           operation: "read-tree",

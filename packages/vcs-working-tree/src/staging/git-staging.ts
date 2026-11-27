@@ -333,7 +333,9 @@ export class GitStaging implements Staging {
       const path = prefix ? `${prefix}/${entry.name}` : entry.name;
 
       if (entry.mode === FileMode.TREE) {
+        const start = this._entries.length;
         await this.addTreeRecursive(trees, entry.id, path, stage);
+        dropFileReplacedByDirectory(this._entries, start, path, stage);
       } else {
         this._entries.push({
           path,
@@ -1043,6 +1045,30 @@ function comparePaths(a: string, b: string): number {
 }
 
 // ========== Helper Functions ==========
+
+/**
+ * `add_index_entry`'s `OK_TO_REPLACE` as a tree is read entry by entry into `entries`: once
+ * the files of the directory `path` were appended from `start` on, a file of that name the
+ * same tree gave before it (a crafted tree holding both a link `d` and a directory `d`, which
+ * sorts first) is dropped, as git keeps `d/x` alone (webrun-vcs#247). Only the entries just
+ * before `start` that share the prefix are looked at, so a normal tree costs one comparison.
+ */
+export function dropFileReplacedByDirectory(
+  entries: { path: string; stage: number }[],
+  start: number,
+  path: string,
+  stage: number,
+): void {
+  if (entries.length === start) return;
+  for (let at = start - 1; at >= 0; at--) {
+    const e = entries[at] as { path: string; stage: number };
+    if (!e.path.startsWith(path)) return;
+    if (e.path === path && e.stage === stage) {
+      entries.splice(at, 1);
+      return;
+    }
+  }
+}
 
 /** What `ReadTreeOptions.keepMatching` keeps of an unchanged entry. */
 export function keepMatchingMode(options?: ReadTreeOptions): "entry" | "flags" {
