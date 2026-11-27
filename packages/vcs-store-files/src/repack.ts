@@ -114,7 +114,7 @@ export interface RepackOptions extends RepackTarget {
    */
   all?: boolean;
   /**
-   * `git repack --filter=<spec>` (with `all`): the new pack leaves out what the filter omits,
+   * `git repack --filter=<spec>` (with `all` or not): the new pack leaves out what the filter omits,
    * and those objects of the replaced packs go into a pack of their own beside it (git's
    * `write_filtered_pack`: pack-objects `--stdin-packs` of the replaced packs, the new ones
    * excluded). A `sparse:oid` filter must come resolved (`resolveObjectFilter`).
@@ -249,6 +249,12 @@ export interface RepackOptions extends RepackTarget {
    * (`-delta`): its objects are never searched for a delta. Asked once per path listed.
    */
   noDelta?: (path: string) => boolean | Promise<boolean>;
+  /**
+   * git's warnings of a repack that writes no pack (`warning: disabling bitmap writing, ...`
+   * before `Nothing new to pack.`): `geometric` hands them here when it returns null, else
+   * they are in the result's `warnings`.
+   */
+  onWarning?: (line: string) => void;
 }
 
 /** The bitmap settings of a repository's config. */
@@ -563,7 +569,6 @@ export async function repack(options: RepackOptions): Promise<RepackResult | nul
 /** The filter of a repack, parsed and resolved (a `sparse:oid` one must come resolved). */
 async function repackFilterOf(options: RepackOptions): Promise<ResolvedObjectFilter | undefined> {
   if (options.filter === undefined) return undefined;
-  if (!(options.all ?? true)) throw new Error("repack --filter without -a is not supported");
   if (typeof options.filter !== "string") return options.filter;
   return resolveObjectFilter(parseObjectFilter(options.filter), async (name) => {
     throw new Error(`unable to access sparse blob in '${name}'`);
@@ -722,8 +727,14 @@ export async function repackListed(
     (await readPackWriteSettings(files, gitDir, {
       ...(options.environment ? { environment: options.environment } : {}),
     }));
+  // marks propagate through every commit the walk showed, those of kept packs included
   const islands = options.deltaIslands
-    ? await deltaIslandsOf(options, [...ids, ...unreachable], warnings)
+    ? await deltaIslandsOf(
+        options,
+        [...ids, ...unreachable],
+        reachable.filter((o) => o.type === "commit").map((o) => o.id),
+        warnings,
+      )
     : undefined;
   const packOptions = {
     packs,
@@ -779,9 +790,10 @@ export async function repackListed(
     bitmapWritten: boolean,
   ): Promise<RepackResult> {
     const newPacks = new Set([packId, ...(promisorPack ? [promisorPack] : [])]);
-    // --filter: what the replaced packs hold and the new packs do not, in a pack of its own
+    // --filter (write_filtered_pack, -a or not): what the existing packs hold and the new packs
+    // do not, in a pack of its own
     let filteredPack: string | undefined;
-    if (options.filter && all) {
+    if (options.filter) {
       const fresh = (await packs.packs()).filter((p) => newPacks.has(p.packId));
       const sources = packKeptObjects ? replaced.concat(kept) : replaced;
       const left: ListedObject[] = [];
@@ -804,19 +816,21 @@ export async function repackListed(
       }
     }
     // Only packs of the snapshot, and none modified since the walk started (defence in depth)
-    const removable: { pack: Pack; modified?: number }[] = [];
-    if (all && deleteRedundant) {
+    const replacedPacks: { pack: Pack; modified?: number }[] = [];
+    if (all && (deleteRedundant || options.cruft)) {
       for (const p of replaced) {
         if (newPacks.has(p.packId)) continue;
         const modified = (await files.stats(joinPath(packDir, `${packNameOf(p)}.pack`)))
           ?.lastModified;
         if (modified !== undefined && modified > snapshot.walkStartedAt) continue;
-        removable.push({ pack: p, modified });
+        replacedPacks.push({ pack: p, modified });
       }
     }
+    const removable = deleteRedundant ? [...replacedPacks] : [];
 
-    // --cruft: the unreachable objects of the packs about to go, and the unreachable loose
-    // ones, into a cruft pack (pack-objects --cruft, the new packs and .keep packs fresh)
+    // --cruft: the unreachable objects of the replaced packs (git's `-<pack>` lines, -d or
+    // not), and the unreachable loose ones, into a cruft pack (pack-objects --cruft, the new
+    // packs and .keep packs fresh)
     let cruft: { packNames: string[]; objectCount: number } | undefined;
     if (options.cruft && all) {
       cruft = await writeCruftPacks({
@@ -825,7 +839,7 @@ export async function repackListed(
         objects,
         packs,
         looseStorage,
-        discard: removable,
+        discard: replacedPacks,
         now: Math.floor(Date.now() / 1000),
         packOptions,
         writeReverseIndex: settings.writeReverseIndex,
@@ -1239,11 +1253,12 @@ export async function prunePacked(
 
 /**
  * The delta islands of a repack (`-i`): `pack.island` (config order) and `pack.islandCore`
- * over every ref under `refs/`, marks propagated through the objects packed.
+ * over every ref under `refs/`, marks propagated through the commits walked and the trees packed.
  */
 async function deltaIslandsOf(
   options: RepackOptions,
   listed: readonly ListedObject[],
+  walkedCommits: readonly ObjectId[],
   warnings: string[],
 ): Promise<DeltaIslandRules> {
   const config = await createWorkingCopyConfig(
@@ -1275,6 +1290,7 @@ async function deltaIslandsOf(
     refs,
     objects: options.objects,
     listed,
+    walkedCommits,
     idLength: objectFormatOf(options.objects).rawLength,
     warn: (line) => warnings.push(line),
   });

@@ -22,6 +22,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { GEOMETRIC_PROMISOR_REMOTE_2_43 } from "@statewalker/vcs-store-files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { RepackCommand, RepackCommandResult } from "../src/commands/repack-command.js";
 import {
@@ -32,11 +33,12 @@ import {
   gcEnv,
   gcSnapshot,
   initRepo,
-  type NativeRepo,
+  NativeRepo,
   newCase,
   openOursGc,
   verifyAuxiliaries,
 } from "./gc-native-twins-support.js";
+import { nativeIs25x } from "./hooks-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
@@ -82,6 +84,8 @@ interface RepackTwinResult {
   ours: GcSnapshot;
   result: RepackCommandResult;
   twins: { native: string; ours: string };
+  /** native git's stderr */
+  stderr: string;
 }
 
 /**
@@ -146,7 +150,13 @@ async function repackTwins(
   expect(verifyAuxiliaries(root, join(oursDir, repo), gitDirOf(oursDir))).toEqual(
     verifyAuxiliaries(root, join(native, repo), gitDirOf(native)),
   );
-  return { native: a, ours: b, result, twins: { native, ours: oursDir } };
+  return {
+    native: a,
+    ours: b,
+    result,
+    twins: { native, ours: oursDir },
+    stderr: theirs.stderr.toString(),
+  };
 }
 
 /**
@@ -379,6 +389,20 @@ describeGit("repack twins", () => {
       });
     }
 
+    it("t7700-repack 'repacking with a filter works' (without -a: an incremental pack, then write_filtered_pack of every existing pack)", async () => {
+      const { caseDir, r } = history("filter-incremental");
+      // two packs: the filtered pack (both of them) is none of the old ones (git would rewrite
+      // an old pack in place, by its bytes)
+      r.git(["repack", "-q", "-a", "-d"]);
+      r.commit("four", { "d.txt": "d\n" });
+      r.git(["repack", "-q", "-d"]);
+      r.commit("five", { "e.txt": "e\n", "a.txt": "a5\n" });
+      const { ours } = await repackTwins(caseDir, ["-d", "--filter=blob:none"], (c) =>
+        c.setDeleteRedundant(true).setFilter("blob:none"),
+      );
+      expect(ours.packs).toHaveLength(4);
+    });
+
     it("t7703-repack-geometric: --geometric=0 is no geometric repack", async () => {
       const { caseDir, r } = history("geo-zero");
       r.blob("unreachable\n");
@@ -569,6 +593,139 @@ describeGit("repack twins", () => {
         withoutInfoPacks,
       );
     });
+
+    it("t7703-repack-geometric '--geometric ignores --keep-pack packs' (with --pack-kept-objects, git still passes --keep-pack=)", async () => {
+      const caseDir = newCase(root, "geo-keep-pack-kept-objects");
+      const r = initRepo(root, caseDir);
+      commitBulk(r, 1, 1);
+      const pack = readdirSync(join(r.gitDir, "objects/pack")).find((n) =>
+        n.endsWith(".pack"),
+      ) as string;
+      commitBulk(r, 2, 1);
+      await repackTwins(
+        caseDir,
+        ["--geometric", "2", "-d", "--pack-kept-objects", `--keep-pack=${pack}`],
+        (c) =>
+          c.setGeometric(2).setDeleteRedundant(true).setPackKeptObjects(true).addKeepPack(pack),
+      );
+    });
+
+    for (const bitmap of [true, false]) {
+      it(`t7703-repack-geometric '--geometric -l disables writing bitmaps with non-local packfiles'${bitmap ? "" : " (without -b: git's write_bitmaps is -1, true, with --write-midx)"}`, async () => {
+        const caseDir = newCase(root, `geo-local-bitmap-${bitmap}`);
+        const shared = initRepo(root, caseDir, false, "shared");
+        commitBulk(shared, 1, 1);
+        shared.git(["clone", "-q", "--shared", "shared", "repo"], { cwd: join(caseDir, "src") });
+        const r = new NativeRepo(root, join(caseDir, "src", "repo"));
+        commitBulk(r, 2, 1);
+        const args = [
+          "-l",
+          "--geometric=2",
+          "--write-midx",
+          ...(bitmap ? ["--write-bitmap-index"] : []),
+        ];
+        const { result, stderr, twins } = await repackTwins(
+          caseDir,
+          args,
+          (c) => {
+            const set = c.setLocal(true).setGeometric(2).setWriteMidx(true);
+            return bitmap ? set.setWriteBitmaps(true) : set;
+          },
+          {},
+          withoutInfoPacks,
+        );
+        const warning = "warning: disabling bitmap writing, as some objects are not being packed";
+        expect(stderr.split("\n").filter(Boolean)).toEqual([warning]);
+        expect(result.warnings).toEqual([warning]);
+        const pack = join(twins.ours, "repo/.git/objects/pack");
+        expect(readdirSync(pack).some((n) => n.endsWith(".bitmap"))).toBe(false);
+      });
+    }
+
+    /** t7703's write_packfile: `n` blobs `<prefix> <i>` (fast-import), packed and dated `at`. */
+    function writePackfile(r: NativeRepo, n: number, prefix: string, at: number, promisor = false) {
+      let stream = "";
+      for (let i = 1; i <= n; i++) stream += `blob\ndata <<EOB\n${prefix} ${i}\nEOB\n`;
+      r.git(["fast-import", "--quiet"], { input: stream });
+      const id = r.git(
+        ["pack-objects", "-q", "--pack-loose-unreachable", join(r.gitDir, "objects/pack/pack")],
+        {
+          input: "",
+        },
+      );
+      r.git(["prune-packed"]);
+      const base = join(r.gitDir, "objects/pack", `pack-${id}`);
+      if (promisor) writeFileSync(`${base}.promisor`, "");
+      for (const ext of ["pack", "idx", "rev", "promisor"])
+        if (existsSync(`${base}.${ext}`)) utimesSync(`${base}.${ext}`, at, at);
+      return id;
+    }
+
+    /** t7703's packs: three normal ones (2, 2, 14 blobs), five promisor ones (1, 3, 3, 20, 40). */
+    function promisorPacks(name: string, remote: boolean) {
+      const caseDir = newCase(root, name);
+      const r = initRepo(root, caseDir);
+      if (remote) {
+        r.git(["remote", "add", "promisor", "garbage"]);
+        r.git(["config", "remote.promisor.promisor", "true"]);
+      }
+      let at = 1700000000;
+      for (const [n, p] of [
+        [2, "normal-a"],
+        [2, "normal-b"],
+        [14, "normal-c"],
+      ] as const) {
+        at += 10;
+        writePackfile(r, n, p, at);
+      }
+      for (const [n, p] of [
+        [1, "promisor-a"],
+        [3, "promisor-b"],
+        [3, "promisor-c"],
+        [20, "promisor-d"],
+        [40, "promisor-e"],
+      ] as const) {
+        at += 10;
+        writePackfile(r, n, p, at, true);
+      }
+      return { caseDir, r };
+    }
+
+    it("t7703-repack-geometric 'geometric repack works with promisor packs'", async () => {
+      const { caseDir } = promisorPacks("geo-promisor", true);
+      if (!nativeIs25x) {
+        // 2.43's pack-objects refuses --exclude-promisor-objects with --stdin-packs
+        const native = copyTwin(caseDir, "native");
+        const theirs = spawnSync("git", ["repack", "--geometric=2", "-d"], {
+          cwd: join(native, "repo"),
+          env: gcEnv(root),
+        });
+        expect(theirs.status).toBe(128);
+        expect(theirs.stderr.toString()).toContain(GEOMETRIC_PROMISOR_REMOTE_2_43);
+        const oursDir = copyTwin(caseDir, "ours");
+        const git = await openOursGc(root, oursDir);
+        await expect(git.repack().setGeometric(2).setDeleteRedundant(true).call()).rejects.toThrow(
+          GEOMETRIC_PROMISOR_REMOTE_2_43,
+        );
+        expect(gcSnapshot(join(oursDir, "repo/.git"), oursDir).packs).toEqual(
+          gcSnapshot(join(native, "repo/.git"), native).packs,
+        );
+        return;
+      }
+      const { ours } = await repackTwins(caseDir, ["--geometric=2", "-d"], (c) =>
+        c.setGeometric(2).setDeleteRedundant(true),
+      );
+      expect(ours.packs).toHaveLength(5);
+      expect(ours.packs.filter((p) => p.kind === "promisor")).toHaveLength(3);
+    });
+
+    it("t7703-repack-geometric 'geometric repack works with promisor packs' (no promisor remote: 2.43 rolls them up with the rest)", async () => {
+      const { caseDir } = promisorPacks("geo-promisor-no-remote", false);
+      const { ours } = await repackTwins(caseDir, ["--geometric=2", "-d"], (c) =>
+        c.setGeometric(2).setDeleteRedundant(true),
+      );
+      expect(ours.packs).toHaveLength(nativeIs25x ? 5 : 1);
+    });
   });
 
   describe("--cruft", () => {
@@ -596,6 +753,31 @@ describeGit("repack twins", () => {
         c.setCruft(true).setDeleteRedundant(true),
       );
       expect(ours.packs.map((p) => p.kind).sort()).toEqual(["cruft", "pack"]);
+    });
+
+    it("t7704-repack-cruft 'cruft packs are not included in geometric repack' (its git repack --cruft, without -d)", async () => {
+      const { caseDir, r } = cruftRepo("cruft-no-d", true);
+      // new objects, reachable and not, so that neither new pack is one of the old ones (git
+      // would then rewrite an old pack in place, by its bytes)
+      r.commit("more", { "more.t": "more\n" });
+      r.blob("dangling\n");
+      const { ours } = await repackTwins(caseDir, ["--cruft"], (c) => c.setCruft(true));
+      expect(ours.packs.map((p) => p.kind).sort()).toEqual(["cruft", "pack", "pack", "pack"]);
+    });
+
+    it("t7704-repack-cruft 'repack --geometric collects once-cruft objects' (its git repack --cruft, without -d: the loose copies stay)", async () => {
+      const caseDir = newCase(root, "cruft-no-d-loose");
+      const r = initRepo(root, caseDir);
+      r.commit("reachable", { "reachable.t": "reachable\n" });
+      r.git(["repack", "-q", "-A", "-d"]);
+      r.git(["checkout", "-q", "--orphan", "other"]);
+      r.git(["rm", "-q", "-rf", "."]);
+      r.commit("cruft", { "cruft.t": "cruft\n" });
+      r.git(["checkout", "-q", "main"]);
+      r.git(["branch", "-D", "other"]);
+      r.git(["reflog", "expire", "--all", "--expire=all"]);
+      const { ours } = await repackTwins(caseDir, ["--cruft"], (c) => c.setCruft(true));
+      expect(ours.loose.length).toBeGreaterThan(0);
     });
 
     it("t7704-repack-cruft 'cruft packs are not included in geometric repack'", async () => {
@@ -797,6 +979,154 @@ describeGit("repack twins", () => {
       const zero = " 0000000000000000000000000000000000000000";
       expect(ours[0]?.endsWith(zero) && ours[2]?.endsWith(zero)).toBe(true);
       expect([ours[1], ours[3]].some((l) => !l?.endsWith(zero))).toBe(true);
+    });
+
+    it("t5320-delta-islands 'deltas allowed against superset islands' (marks through a commit of a .keep pack)", async () => {
+      // pack-objects' show_commit propagates the marks of every walked commit, those a .keep
+      // pack holds included: `one` reaches the root through the kept commit
+      const caseDir = newCase(root, "islands-kept-commit");
+      const r = initRepo(root, caseDir);
+      const root0 = islandCommit(r, "root", "shared", "root");
+      const rootCommit = r.git(["rev-parse", "refs/heads/root"]);
+      const rootTree = r.git(["rev-parse", "refs/heads/root^{tree}"]);
+      const kept = r.git(["commit-tree", rootTree, "-p", rootCommit], { input: "kept\n" });
+      const pack = r.git(["pack-objects", join(r.gitDir, "objects/pack/pack")], {
+        input: `${kept}\n`,
+      });
+      writeFileSync(join(r.gitDir, "objects/pack", `pack-${pack}.keep`), "");
+      const one = islandCommit(r, "one", "shared", "1", kept);
+      const two = islandCommit(r, "two", "shared", "12-long", rootCommit);
+      r.git(["update-ref", "-d", "refs/heads/root"]);
+      r.git(["config", "pack.island", "refs/heads/(.*)"]);
+      const { twins } = await repackTwins(caseDir, ["-adfi"], adfi);
+      const ids = [root0, one, two];
+      expect(deltaBases(twins.ours, ids)).toEqual(deltaBases(twins.native, ids));
+    });
+
+    it("t5320-delta-islands 'separate islands disallows delta' (--geometric: pack-objects --stdin-packs loads no islands)", async () => {
+      const { caseDir, ids } = islands("islands-geometric", [["pack.island", "refs/heads/(.*)"]]);
+      const { twins } = await repackTwins(caseDir, ["--geometric=2", "-d", "-f", "-i"], (c) =>
+        c.setGeometric(2).setDeleteRedundant(true).setReuseDeltas(false).setDeltaIslands(true),
+      );
+      const ours = deltaBases(twins.ours, ids);
+      expect(ours).toEqual(deltaBases(twins.native, ids));
+      expect(ours.some((l) => !l.endsWith(" 0000000000000000000000000000000000000000"))).toBe(true);
+    });
+
+    /** Three commits of `a.bin` and `a.txt` (`big(n, kind)`), as files git deltas. */
+    const big = (n: number, s: string) =>
+      `${Array.from({ length: 400 }, (_, i) => `${s} line ${i} of a long file ${i % 7}`).join("\n")}\n${n}\n`;
+    const zero = " 0000000000000000000000000000000000000000";
+
+    for (const packFirst of [false, true])
+      it(`t5300-pack-object: the delta attribute unset under --geometric (pack-objects' --stdin-packs hint walk, ${packFirst ? "packed" : "loose: 2.43 names no loose object"})`, async () => {
+        const caseDir = newCase(root, `delta-attribute-geometric-${packFirst}`);
+        const r = initRepo(root, caseDir);
+        r.commit("one", {
+          ".gitattributes": "*.bin -delta\n",
+          "a.bin": big(1, "b"),
+          "a.txt": big(1, "t"),
+        });
+        if (packFirst) {
+          r.git(["repack", "-q", "-d"]);
+          // date the first pack back: packs of one second tie on mtime, which orders them
+          const dir = join(r.gitDir, "objects/pack");
+          for (const n of readdirSync(dir)) utimesSync(join(dir, n), 1700000000, 1700000000);
+        }
+        r.commit("two", { "a.bin": big(2, "b"), "a.txt": big(2, "t") });
+        if (packFirst) r.git(["repack", "-q", "-d"]);
+        const ids = [1, 2].flatMap((n) => [r.blob(big(n, "b")), r.blob(big(n, "t"))]);
+        const { twins } = await repackTwins(caseDir, ["--geometric=2", "-d", "-f"], (c) =>
+          c.setGeometric(2).setDeleteRedundant(true).setReuseDeltas(false),
+        );
+        const ours = deltaBases(twins.ours, ids);
+        const native = deltaBases(twins.native, ids);
+        const binsWhole = (bases: string[]) =>
+          !!bases[0]?.endsWith(zero) && !!bases[2]?.endsWith(zero);
+        expect(binsWhole(ours)).toBe(packFirst || nativeIs25x);
+        expect(binsWhole(native)).toBe(packFirst || nativeIs25x);
+        // which of two blobs of one size is the base is a tie git breaks by its list position:
+        // compare what the attribute decides, the blobs left whole
+        const whole = (bases: string[]) => bases.map((l) => l.endsWith(zero));
+        if (packFirst || nativeIs25x)
+          expect(whole(ours).filter(Boolean).length).toBe(whole(native).filter(Boolean).length);
+      });
+
+    it("t5300-pack-object: the delta attribute unset under --geometric in a shallow clone (the hint walk stops at the shallow commits)", async () => {
+      const caseDir = newCase(root, "delta-attribute-geometric-shallow");
+      const up = initRepo(root, caseDir, false, "up");
+      up.commit("one", {
+        ".gitattributes": "*.bin -delta\n",
+        "a.bin": big(1, "b"),
+        "a.txt": big(1, "t"),
+      });
+      up.commit("two", { "a.bin": big(2, "b"), "a.txt": big(2, "t") });
+      up.git(["clone", "-q", "--depth=1", `file://${up.dir}`, "repo"], {
+        cwd: join(caseDir, "src"),
+      });
+      const r = new NativeRepo(root, join(caseDir, "src", "repo"));
+      const dir = join(r.gitDir, "objects/pack");
+      for (const n of readdirSync(dir)) utimesSync(join(dir, n), 1700000000, 1700000000);
+      r.commit("three", { "a.bin": big(3, "b"), "a.txt": big(3, "t") });
+      r.git(["repack", "-q", "-d"]);
+      const ids = [2, 3].flatMap((n) => [r.blob(big(n, "b")), r.blob(big(n, "t"))]);
+      const { twins } = await repackTwins(caseDir, ["--geometric=2", "-d", "-f"], (c) =>
+        c.setGeometric(2).setDeleteRedundant(true).setReuseDeltas(false),
+      );
+      const ours = deltaBases(twins.ours, ids);
+      const native = deltaBases(twins.native, ids);
+      const binsWhole = (bases: string[]) =>
+        !!bases[0]?.endsWith(zero) && !!bases[2]?.endsWith(zero);
+      expect(binsWhole(native)).toBe(true);
+      expect(binsWhole(ours)).toBe(true);
+    });
+
+    /** A bare repository whose two commits hold `a.bin` and `a.txt`, by fast-import. */
+    function bareDeltaRepo(name: string, inTree: string) {
+      const caseDir = newCase(root, name);
+      const r = initRepo(root, caseDir, true);
+      let stream = "";
+      for (const n of [1, 2]) {
+        stream += `commit refs/heads/main\ncommitter C O Mitter <c@example.com> ${1700000000 + n} +0000\n`;
+        stream += `data <<EOF\ncommit ${n}\nEOF\n`;
+        for (const [path, content] of [
+          ["a.bin", big(n, "b")],
+          ["a.txt", big(n, "t")],
+          ...(inTree ? [[".gitattributes", inTree]] : []),
+        ])
+          stream += `M 644 inline ${path}\ndata ${Buffer.byteLength(content as string)}\n${content}\n`;
+        stream += "\n";
+      }
+      r.git(["fast-import", "--quiet"], { input: stream });
+      const ids = [1, 2].flatMap((n) => [r.blob(big(n, "b")), r.blob(big(n, "t"))]);
+      return { caseDir, r, ids };
+    }
+
+    it("t5300-pack-object: the delta attribute in a bare repository's info/attributes", async () => {
+      const { caseDir, r, ids } = bareDeltaRepo("delta-attribute-bare", "");
+      writeFileSync(join(r.gitDir, "info", "attributes"), "*.bin -delta\n");
+      const { twins } = await repackTwins(caseDir, ["-a", "-d", "-f"], (c) =>
+        c.setAll(true).setDeleteRedundant(true).setReuseDeltas(false),
+      );
+      const ours = deltaBases(twins.ours, ids);
+      expect(ours).toEqual(deltaBases(twins.native, ids));
+      expect(ours[0]?.endsWith(zero) && ours[2]?.endsWith(zero)).toBe(true);
+    });
+
+    it("t5300-pack-object: a bare repository's HEAD .gitattributes (2.43's default attribute source, none in 2.5x)", async () => {
+      const { caseDir, ids } = bareDeltaRepo("delta-attribute-bare-head", "*.bin -delta\n");
+      const { twins } = await repackTwins(caseDir, ["-a", "-d", "-f"], (c) =>
+        c.setAll(true).setDeleteRedundant(true).setReuseDeltas(false),
+      );
+      const ours = deltaBases(twins.ours, ids);
+      const native = deltaBases(twins.native, ids);
+      const binsWhole = (bases: string[]) =>
+        !!bases[0]?.endsWith(zero) && !!bases[2]?.endsWith(zero);
+      expect(binsWhole(ours)).toBe(!nativeIs25x);
+      expect(binsWhole(native)).toBe(!nativeIs25x);
+      // with the attribute applied (2.43) the delta choices are git's; without it, the .bin
+      // blobs may be deltas, and ours may pair the other blobs differently
+      if (!nativeIs25x) expect(ours).toEqual(native);
     });
   });
 });

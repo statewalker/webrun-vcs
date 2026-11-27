@@ -22,8 +22,13 @@ export interface DeltaIslandOptions {
   refs: Iterable<{ name: string; id: ObjectId }>;
   /** Where commits, trees and tags are read. */
   objects: Pick<GitObjects, "get">;
-  /** The objects being packed (git's `to_pack`): marks propagate through these only. */
+  /** The objects being packed (git's `to_pack`): marks propagate through their trees. */
   listed: readonly ListedObject[];
+  /**
+   * The commits the traversal showed (pack-objects' `show_commit` propagates through each,
+   * those a `.keep` pack holds included); default the listed commits.
+   */
+  walkedCommits?: readonly ObjectId[];
   /** Raw id length of the repository's format (20, or 32 for SHA-256). */
   idLength?: number;
   /** git's warnings (a regex with too many capture groups). */
@@ -130,9 +135,9 @@ export async function computeDeltaIslands(o: DeltaIslandOptions): Promise<DeltaI
   }
 
   if (marks.size > 0) {
-    // propagate_island_marks, from each packed commit (topologically, children first) to its
+    // propagate_island_marks, from each walked commit (topologically, children first) to its
     // tree and parents
-    const commits = o.listed.filter((l) => l.type === "commit").map((l) => l.id);
+    const commits = o.walkedCommits ?? o.listed.filter((l) => l.type === "commit").map((l) => l.id);
     const info = new Map<ObjectId, { tree: ObjectId; parents: ObjectId[] }>();
     for (const id of commits) {
       const obj = await read(id);
