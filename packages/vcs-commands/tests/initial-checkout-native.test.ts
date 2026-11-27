@@ -18,7 +18,6 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -32,6 +31,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { CheckoutStatus, Git, ResetMode } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -133,9 +133,9 @@ describeGit("an unborn index (clone --no-checkout), native twins", () => {
     home = join(root, "home");
     mkdirSync(home);
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("checkout <current branch> and switch <current branch> check the whole tree out", async () => {
     for (const command of ["checkout", "switch"] as const) {
@@ -489,9 +489,9 @@ describeGit("an unborn index: autostash and checkout --orphan <start-point>, nat
     home = join(root, "home");
     mkdirSync(home);
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("checkout -m with an untracked file in the way: no autostash (2.5x refuses as a plain switch, 2.43 dies on the staged deletions)", async () => {
     const legacy = nativeIs243();

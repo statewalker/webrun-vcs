@@ -12,7 +12,7 @@
  * JGit's FetchAndPullCommandsRecurseSubmodulesTest (its pull cases).
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -26,6 +26,7 @@ import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitAtLeast } from "./native-git-working-copy.js";
 import { testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 const versionLine = nativeGitAvailable() ? execFileSync("git", ["--version"]).toString() : "";
@@ -202,9 +203,9 @@ describeGit("git pull --recurse-submodules (native twins)", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "pull-recurse-"));
   });
-  afterAll(() => {
-    if (!process.env.KEEP_TWINS) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (!process.env.KEEP_TWINS) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it('t5572-pull-submodule.sh: "recursive pull updates working tree"', async () => {
     const t = twins(T5572_SETUP);

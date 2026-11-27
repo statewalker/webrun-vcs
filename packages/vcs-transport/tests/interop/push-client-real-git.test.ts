@@ -27,9 +27,9 @@ import {
   type ReceivePackHooks,
   serveOverDuplex,
 } from "../../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 import { gitHttpBackend } from "./git-http-backend.js";
 import {
-  cleanupDir,
   commitInRepo,
   createTransportRepo,
   git,
@@ -260,8 +260,8 @@ describeGit.each(targets)("push client → %s", (_name, makeTarget) => {
     await target.close();
     await client.close();
     await other.close();
-    cleanupDir(root);
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** A file large enough that its next version is stored as a delta of this one. */
   const big = (n: number) =>

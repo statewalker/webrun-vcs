@@ -13,15 +13,7 @@
  * byte. Each test names the t/ script and test title its inputs come from.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import {
-  chmodSync,
-  cpSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -40,6 +32,7 @@ import {
 import { nativeIs25x } from "./hooks-native-support.js";
 import { openOurs, put } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const has = (program: string, ...args: string[]) =>
   spawnSync(program, args, { stdio: "ignore" }).error === undefined;
@@ -247,10 +240,10 @@ describeGit("signature checks against native git", { timeout: 120_000 }, () => {
     for (const tag of TAGS) ids[tag] = gitOk(repo, ["rev-parse", tag]).trim();
   }, 120_000);
 
-  afterAll(() => {
+  afterAll(async () => {
     spawnSync("gpgconf", ["--kill", "all"], { env: env() });
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** git verify-commit / verify-tag with `args` against ours, compared whole. */
   async function compareVerify(

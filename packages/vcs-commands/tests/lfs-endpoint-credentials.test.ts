@@ -7,7 +7,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
@@ -17,6 +17,7 @@ import type { Git } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 let root: string;
 let counter = 0;
@@ -48,9 +49,9 @@ describe.skipIf(!nativeGitAvailable())("LFS endpoint credentials", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "lfs-endpoint-credentials-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("the remote's own endpoint gets the credentials and headers", async () => {
     const g = await repoWith({});
@@ -251,9 +252,9 @@ describe.skipIf(!nativeGitAvailable())("LFS endpoint across git-lfs versions", (
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "lfs-endpoint-versions-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   async function lfsOf(
     setup: (dir: string) => void,

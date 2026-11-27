@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemFilesApi } from "@statewalker/webrun-files-mem";
@@ -13,6 +13,7 @@ import {
   serveLfs,
 } from "../src/index.js";
 import { serveOnLoopback } from "./node-server.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 /**
  * The File Locking API against native git-lfs: `git lfs lock`, `locks`,
@@ -29,8 +30,8 @@ const dirs: string[] = [];
 const closers: (() => Promise<void>)[] = [];
 afterAll(async () => {
   for (const close of closers) await close();
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 function tmp(): string {
   const d = mkdtempSync(join(tmpdir(), "lfs-locks-"));
   dirs.push(d);

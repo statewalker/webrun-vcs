@@ -27,8 +27,8 @@ import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { createFetchHandler } from "../../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 import {
-  cleanupDir,
   commitInRepo,
   createTransportRepo,
   gitAvailable,
@@ -98,8 +98,8 @@ describe("Interop B · smart-HTTP server over a real socket", () => {
   afterAll(async () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await repo.close();
-    cleanupDir(root);
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("advertises refs (GET /info/refs) and returns a valid pack (POST /git-upload-pack)", async () => {
     const base = `http://127.0.0.1:${port}/repo.git`;

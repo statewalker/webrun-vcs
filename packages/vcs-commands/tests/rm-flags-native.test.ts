@@ -9,7 +9,7 @@
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -18,6 +18,7 @@ import type { RmResult } from "../src/commands/rm-command.js";
 import { RmFailedError } from "../src/errors/index.js";
 import { git, gitOk, openOurs, put, snapshot } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 /** The git version on PATH: 2.43 or 2.5x. */
@@ -104,7 +105,7 @@ describeGit("git rm -n and -q against native git (t3600-rm)", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "rm-flags-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const cases: string[][] = [
     ["a"], // t3600-rm.sh: '"rm" command printed'
@@ -156,7 +157,7 @@ describeGit("git rm --sparse against native git (t3602-rm-sparse-checkout)", () 
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "rm-sparse-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   for (const sparseIndex of [false, true]) {
     const cone = (dir: string) => {

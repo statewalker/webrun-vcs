@@ -7,7 +7,7 @@
  * for byte with `--stdout`.
  */
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,6 +20,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { type FormatPatchCommand, Git } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -136,9 +137,9 @@ describeGit("git format-patch --interdiff/--range-diff as native git", () => {
       .trim()
       .replace(/^git version /, "");
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it('t4014-format-patch.sh "interdiff: setup", "interdiff: cover-letter", "interdiff: reroll-count", "interdiff: reroll-count with a non-integer", "interdiff: solo-patch", "range-diff: solo-patch", "interdiff: multi-patch, implicit --cover-letter", "interdiff: explicit --no-cover-letter defeats implied --cover-letter"', async () => {
     const repo = join(root, "t4014");

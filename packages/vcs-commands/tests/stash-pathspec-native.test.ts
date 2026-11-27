@@ -32,6 +32,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { Git, NoStagedChangesError, StashPathspecResetError } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 /** The git version whose messages ours reproduces: the one on PATH. */
@@ -228,7 +229,7 @@ describeGit("stash push -- <pathspec> against native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "stash-pathspec-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("stashes and resets only the named file; ORIG_HEAD is not written", async () => {
     const { ours } = await twinStash(
@@ -348,7 +349,7 @@ describeGit("stash push --staged against native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "stash-staged-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("stashes the staged changes alone; unstaged ones stay in the worktree", async () => {
     const { ours } = await twinStash(
@@ -452,7 +453,7 @@ describeGit("stash push -- <pathspec>: git's reset fails after the stash is save
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "stash-pathspec-reset-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const magic = () => (compatibility === "2.43" ? ":(,prefix:0)" : ":(prefix:0)");
 

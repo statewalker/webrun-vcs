@@ -30,6 +30,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type AmCommand, Git, type MailsplitOptions, mailsplitFiles } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 import { gitAtLeast } from "./native-git-working-copy.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -255,9 +256,9 @@ describeGit("git am options as native git", () => {
     mkdirSync(join(root, "inputs"), { recursive: true });
     modern = gitAtLeast(gitOk(root, ["--version"]), 2, 46);
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it('t4150-am.sh: "am --scissors cuts the message at the scissors line", "am --no-scissors overrides mailinfo.scissors"', async () => {
     const src = t4150Source();
@@ -981,7 +982,7 @@ describeGit("git mailsplit as native git", () => {
   beforeAll(() => {
     base = mkdtempSync(join(tmpdir(), "mailsplit-native-"));
   });
-  afterAll(() => rmSync(base, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(base), CLEANUP_TIMEOUT);
 
   function listFiles(dir: string): [string, string][] {
     if (!existsSync(dir)) return [];

@@ -27,6 +27,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { UpdateIndexFailedError } from "../src/index.js";
 import { gitOk, openOurs, put } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -139,7 +140,7 @@ describeGit("git update-index against native git", () => {
     root = mkdtempSync(join(tmpdir(), "update-index-native-"));
   });
 
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t2107-update-index-basic.sh: "--cacheinfo does not accept blob null sha1"', async () => {
     const dir = fixture((d) => {

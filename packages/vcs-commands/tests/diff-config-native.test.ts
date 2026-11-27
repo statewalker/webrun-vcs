@@ -50,6 +50,7 @@ import {
   type TextconvRunner,
 } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 const SEEDS = Number(process.env.DIFF_CONFIG_SEEDS ?? 12);
@@ -69,9 +70,9 @@ const versionOptions: DiffTextOptions = {
 const configPrefixes = atLeast(2, 45);
 
 let root: string | undefined;
-afterAll(() => {
-  if (root) rmSync(root, { recursive: true, force: true });
-});
+afterAll(async () => {
+  if (root) await removeTempDir(root);
+}, CLEANUP_TIMEOUT);
 const tmp = () => {
   root ??= mkdtempSync(join(tmpdir(), "diff-config-"));
   return root;

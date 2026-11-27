@@ -30,6 +30,7 @@ import {
 } from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { setupGitDirectory } from "../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const nativeGit = spawnSync("git", ["--version"]).status === 0;
 const describeGit = nativeGit && process.platform !== "win32" ? describe : describe.skip;
@@ -192,9 +193,9 @@ describeGit("repository setup (t1510, t1501 native twins)", () => {
   beforeAll(() => {
     here = realpathSync(mkdtempSync(join(tmpdir(), "repo-setup-")));
   });
-  afterAll(() => {
-    if (here) rmSync(here, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (here) await removeTempDir(here);
+  }, CLEANUP_TIMEOUT);
 
   for (let n = 0; n < 32; n++) {
     const wtEnv = (n & 1) !== 0;

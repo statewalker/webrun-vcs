@@ -3,7 +3,7 @@
  * an in-memory and a real file system, and interop with native git.
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGitObjects } from "@statewalker/vcs-core";
@@ -12,6 +12,7 @@ import { createInMemoryFilesApi } from "@statewalker/vcs-utils/files";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import { filesStagingStore } from "../../../src/storage/loose/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../../temp-dir-support.js";
 
 const GIT_ENV = {
   ...process.env,
@@ -33,9 +34,9 @@ const tempDir = (prefix: string) => {
   dirs.push(dir);
   return dir;
 };
-afterAll(() => {
-  for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const dir of dirs) await removeTempDir(dir);
+}, CLEANUP_TIMEOUT);
 
 function gitRepo(): { dir: string; files: ReturnType<typeof createNodeFilesApi> } {
   const dir = tempDir("loose-git-");

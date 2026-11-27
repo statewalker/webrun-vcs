@@ -10,7 +10,7 @@
  * run through init and open, and its `submodule add`/`update` and `clone` options.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGitFilesBackend } from "@statewalker/vcs-store-files";
@@ -23,6 +23,7 @@ import { Git } from "../src/index.js";
 import { ourClone, ourCloneFails } from "./clone-options-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { git3Binary, nativeGit3Env } from "./native-git3.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const git3 = git3Binary();
 
@@ -76,7 +77,7 @@ describe.skipIf(!git3)("extensions.objectStorage (git master)", () => {
   beforeAll(() => {
     root = realpathSync(mkdtempSync(join(tmpdir(), "object-storage-git3-")));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("a plain files storage opens as any repository; files:// reads as files", async () => {
     // a plain `files` storage is the repository as always: both read the same history

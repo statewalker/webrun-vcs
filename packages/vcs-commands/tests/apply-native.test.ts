@@ -33,6 +33,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type ApplyCommand, Git } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 import { gitAtLeast } from "./native-git-working-copy.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -221,9 +222,9 @@ describeGit("git apply as native git", () => {
     mkdirSync(home, { recursive: true });
     modern = gitAtLeast(gitOk(root, "--version"), 2, 46);
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("applies a modification, a new file, a deletion, a rename and a mode change", async () => {
     const { patch, base } = nativeDiff(
@@ -1135,9 +1136,9 @@ describeGit("t4124-apply-ws-rule", () => {
     mkdirSync(home, { recursive: true });
     modern = gitAtLeast(gitOk(root, "--version"), 2, 46);
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   // prepare_test_file: a line with X is touched iff RULE is in effect (! trailing-space,
   // @ space-before-tab, # indent-with-non-tab, = indent-with-non-tab,tabwidth=16, % tab-in-indent)

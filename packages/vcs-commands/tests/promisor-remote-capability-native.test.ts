@@ -40,6 +40,7 @@ import { openOurs } from "./merge-native-helpers.js";
 import { childDuplex, daemonArgs, gitAsync, startTcpServer } from "./native-connect-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const nativeVersion = (() => {
   if (!nativeGitAvailable()) return 0;
@@ -326,7 +327,7 @@ describeGit("promisor-remote capability (t5710) against native git", () => {
     freshServer();
     expect(missingOnServer()).toEqual([largeOid]);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   describe("our client, git daemon serving", () => {
     it(`t5710-promisor-remote-capability.sh: "clone with promisor.advertise set to 'true'"`, async () => {

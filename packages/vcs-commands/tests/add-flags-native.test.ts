@@ -19,6 +19,7 @@ import type { GitApiError } from "../src/errors/git-api-error.js";
 import { AddFailedError } from "../src/errors/index.js";
 import { gitOk, openOurs, put, snapshot } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 /** The git version on PATH: 2.43 or 2.5x. */
@@ -122,7 +123,7 @@ describeGit("git add --sparse against native git (t3705-add-sparse-checkout)", (
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "add-sparse-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t3705-add-sparse-checkout.sh: "git add does not remove sparse entries"', async () => {
     const twin = twins((dir) => {
@@ -349,7 +350,7 @@ describeGit("git add --ignore-errors against native git (t3700-add)", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "add-ignore-errors-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** Our FilesApi refusing to read `foo2` (root reads any file). */
   const unreadable: Wrap = (files) =>

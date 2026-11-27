@@ -14,7 +14,7 @@
  * run the system's git (the 2.56 build here has no curl).
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
@@ -48,6 +48,7 @@ import {
   noMaintenance,
 } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -240,8 +241,8 @@ describeGit("SHA-256 over the wire, as native git", () => {
     await ourDaemon?.close();
     await ourHttp?.close();
     await nativeHttp?.close();
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   describe("native clients against our servers", () => {
     for (const version of ["0", "2"] as const) {

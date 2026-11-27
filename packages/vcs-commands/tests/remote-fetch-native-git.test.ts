@@ -30,6 +30,7 @@ import {
   runGit,
   runGitResult,
 } from "./native-git-working-copy.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() ? describe : describe.skip;
 
@@ -130,8 +131,8 @@ describeGit("remote and fetch behaviours as native git", () => {
     globalThis.fetch = originalFetch;
     for (const wc of opened.splice(0)) await wc.close().catch(() => {});
     backend?.close();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   describe("opportunistic remote-tracking update", () => {
     it("`fetch origin main` also moves refs/remotes/origin/main; FETCH_HEAD as native", async () => {

@@ -6,7 +6,7 @@
  * rewritten list on stdin. Each case runs native git in one copy of a repository with
  * logging hooks and ours (with the Node hook runner) in the other.
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -25,6 +25,7 @@ import {
 } from "./hooks-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -102,7 +103,7 @@ describeGit("rebase, cherry-pick and revert hooks: as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-rebase-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("rebase: pre-rebase, post-checkout, the picks' hooks and post-rewrite", async () => {
     const dir = join(root, "r");
@@ -167,7 +168,7 @@ describeGit("rebase -i hooks: reword and edit (as native git)", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-rebase-i-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** A sequence editor turning the pick of `subject` (`# subject` in 2.5x) into `action`. */
   function sequenceEditor(action: string, subject: string): string {

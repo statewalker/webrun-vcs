@@ -7,7 +7,7 @@
  * and from the other with ours, and compares which remote received `main`.
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
@@ -17,6 +17,7 @@ import type { Git } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, noMaintenance } from "./native-git-http-backend.js";
 import { gitOut, gitRun, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -83,9 +84,9 @@ describeGit("push without a remote (native git)", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "push-default-remote-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("pushes to branch.<name>.pushRemote first", async () => {
     const r = await pushBoth((dir, add) => {

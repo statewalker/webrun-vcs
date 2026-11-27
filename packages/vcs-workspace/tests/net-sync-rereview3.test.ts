@@ -33,11 +33,12 @@ import {
   workspace,
   writeFile,
 } from "./net-helpers.js";
+import { CLEANUP_TIMEOUT } from "./temp-dir-support.js";
 
-const cleanups: (() => void)[] = [];
-afterEach(() => {
-  for (const c of cleanups.splice(0)) c();
-});
+const cleanups: (() => Promise<void>)[] = [];
+afterEach(async () => {
+  for (const c of cleanups.splice(0)) await c();
+}, CLEANUP_TIMEOUT);
 
 function nodeDir(): string {
   const t = tmpDir();

@@ -6,7 +6,7 @@
  * native `--keys` lists (2.54/2.55, 2.56, master).
  */
 
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
@@ -22,6 +22,7 @@ import {
   openOursFromEnvironment,
   outcomeOf,
 } from "./repo-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const runnable = process.platform !== "win32";
 
@@ -81,9 +82,9 @@ function describeRepo(native: NativeGit) {
       shell.ok(shell.home, "init", "-q", "probe");
       compatibility = shell.repoCompatibility(join(shell.home, "probe"));
     });
-    afterAll(() => {
-      rmSync(root, { recursive: true, force: true });
-    });
+    afterAll(async () => {
+      await removeTempDir(root);
+    }, CLEANUP_TIMEOUT);
 
     /** A new repository made by `git init <args>`. */
     const init = (...args: string[]): string => {

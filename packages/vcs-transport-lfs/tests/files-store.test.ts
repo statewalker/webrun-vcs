@@ -1,4 +1,4 @@
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { FilesApi } from "@statewalker/vcs-utils/files";
@@ -7,11 +7,12 @@ import { MemFilesApi } from "@statewalker/webrun-files-mem";
 import { afterAll, describe, expect, it } from "vitest";
 import { createFilesLfsStore, sha256Hex } from "../src/index.js";
 import { collect, prng } from "./helpers.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 
 async function listAll(files: FilesApi, path: string): Promise<string[]> {
   const out: string[] = [];

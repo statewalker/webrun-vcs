@@ -13,6 +13,7 @@ import { FileRefStore, GitCheckout, type GitCheckoutFilesApi } from "@statewalke
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { createMemoryGitStaging } from "@statewalker/vcs-working-tree";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 
 /**
  * Run git command in a directory
@@ -54,8 +55,8 @@ describe("GitCheckout Git Interoperability", () => {
     } catch {
       // Ignore chmod errors
     }
-    await fs.rm(testDir, { recursive: true, force: true });
-  });
+    await await removeTempDir(testDir);
+  }, CLEANUP_TIMEOUT);
 
   describe("Reading native git state", () => {
     it("reads symbolic HEAD created by native git", async () => {

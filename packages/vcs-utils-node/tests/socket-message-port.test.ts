@@ -3,13 +3,14 @@
  * speaking webrun-rpc's stream tier. A plain `net` peer on one side (half-open, as git's
  * simple-ipc and git:// peers are), a `duplexOverPort` caller on the other.
  */
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { duplexOverPort } from "@statewalker/webrun-rpc";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { connectSocketPort, listenSocketPorts } from "../src/files/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeUnix = process.platform === "win32" ? describe.skip : describe;
 
@@ -68,8 +69,8 @@ describeUnix("socketMessagePort", () => {
     for (const socket of peerSockets) socket.destroy();
     peerSockets.clear();
     for (const s of servers.splice(0)) await new Promise((r) => s.close(r));
-    await rm(dir, { recursive: true, force: true });
-  });
+    await await removeTempDir(dir);
+  }, CLEANUP_TIMEOUT);
 
   it("half-close: the caller's end is the peer's end of file, the peer still answers", async () => {
     const path = join(dir, "s");

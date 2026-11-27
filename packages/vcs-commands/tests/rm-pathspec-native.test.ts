@@ -14,6 +14,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { git, gitOk, openOurs, put, snapshot } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 /** The git version on PATH: 2.43 or 2.5x. */
@@ -55,7 +56,7 @@ describeGit("git rm --cached pathspecs against native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "rm-pathspec-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const cases: [string[], boolean][] = [
     [["b*"], false],
@@ -149,7 +150,7 @@ describeGit("git rm refusing to lose content, and its worktree removal, against 
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "rm-local-mod-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const cases: { args: string[]; cached?: boolean; force?: boolean; hints?: boolean }[] = [
     { args: ["a"], cached: true },
@@ -200,11 +201,11 @@ describeGit("git rm data safety against native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "rm-safety-"));
   });
-  afterAll(() => {
+  afterAll(async () => {
     // a directory left read-only by the failing-removal case
     spawnSync("chmod", ["-R", "u+rwx", root]);
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** One repository built twice by `build` (run in each twin). */
   function built(build: (dir: string) => void): { native: string; ours: string } {

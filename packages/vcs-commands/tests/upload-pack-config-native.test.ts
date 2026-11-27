@@ -49,6 +49,7 @@ import {
 } from "./native-connect-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -289,8 +290,8 @@ describeGit("upload-pack configuration, as native git", () => {
 
   afterAll(async () => {
     await ours?.close();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   // ── uploadpack.allow*SHA1InWant (t5516) ────────────────────────────────────────────────
 

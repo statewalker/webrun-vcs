@@ -22,11 +22,12 @@ import { afterAll, describe, expect, it } from "vitest";
 import { commitsBaseSource, MergeBaseGraph } from "../src/commands/merge-bases.js";
 import { Git } from "../src/index.js";
 import { nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 const tempDir = () => {
   const d = mkdtempSync(join(tmpdir(), "cgraph-trust-"));
   dirs.push(d);

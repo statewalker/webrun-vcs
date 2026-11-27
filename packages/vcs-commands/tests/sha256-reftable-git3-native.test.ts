@@ -14,7 +14,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -30,6 +29,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { InitCommand } from "../src/index.js";
 import { git3Binary, nativeGit3Env } from "./native-git3.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const git3 = git3Binary();
 const git2561 =
@@ -72,7 +72,7 @@ describe.skipIf(!git3)("SHA-256 reftable repositories (git 3.0 oracle)", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "sha256-reftable-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   function run(bin: string, cwd: string, args: string[], env: Record<string, string> = {}) {
     return spawnSync(bin, args, {

@@ -14,7 +14,6 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
-  rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -34,6 +33,7 @@ import { compatibility, ourClone, ourCloneFails } from "./clone-options-native-s
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -165,9 +165,9 @@ git checkout -q main; m tags/v2 "Merge commit O"; c "Commit P" main.txt`,
     b3 = bundle("3.bdl", ["^release", "^topic/1", "^topic/2", "main", "HEAD"], ["--version=3"]);
     b4 = bundle("4.bdl", ["^main", "^release", "^topic/1", "^topic/2", "--all"]);
   });
-  afterAll(() => {
-    rmSync(home, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(home);
+  }, CLEANUP_TIMEOUT);
 
   it('t6020-bundle-misc.sh: "clone from bundle"', async () => {
     const native = join(home, "mirror-native.git");

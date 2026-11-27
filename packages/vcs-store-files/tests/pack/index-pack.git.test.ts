@@ -4,7 +4,7 @@
  * and the hand-built packs git refuses are refused too.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -17,6 +17,7 @@ import {
 import { buildPack, copyAll, craftDelta, oidOf } from "@statewalker/vcs-testing";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 
 const GIT_ENV = {
   ...process.env,
@@ -33,9 +34,9 @@ const git = (cwd: string, args: string[], input?: string | Uint8Array, env = GIT
   execFileSync("git", args, { cwd, env, input, maxBuffer: 1 << 30 });
 
 const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 const tmp = () => {
   const d = mkdtempSync(join(tmpdir(), "index-pack-"));
   dirs.push(d);

@@ -29,6 +29,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { type Git, IndexVersionConfigError, ResetMode, takeIndexWarnings } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -45,9 +46,9 @@ const git = (cwd: string, args: string[], extra?: Record<string, string>) =>
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "index-version-native-"));
 });
-afterEach(() => {
-  rmSync(root, { recursive: true, force: true });
-});
+afterEach(async () => {
+  await removeTempDir(root);
+}, CLEANUP_TIMEOUT);
 
 /** Seconds far in the past, a fresh one each time: no entry is ever racily clean. */
 let clock = 1_500_000_000;

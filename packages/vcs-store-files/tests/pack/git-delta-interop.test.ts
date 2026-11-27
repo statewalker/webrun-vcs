@@ -3,12 +3,13 @@
  * pack carrying them (OFS and REF) and reads the objects back.
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildPack, oidOf } from "@statewalker/vcs-testing";
 import { createGitDeltaIndex, encodeGitDelta } from "@statewalker/vcs-utils/diff";
 import { afterAll, describe, expect, it } from "vitest";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 
 const GIT_ENV = {
   ...process.env,
@@ -25,9 +26,9 @@ const git = (cwd: string, args: string[]) =>
   execFileSync("git", args, { cwd, env: GIT_ENV, maxBuffer: 1 << 26 });
 
 const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 
 function text(n: number, seed: number): Uint8Array {
   const lines: string[] = [];

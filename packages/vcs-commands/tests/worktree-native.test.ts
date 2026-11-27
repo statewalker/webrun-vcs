@@ -41,6 +41,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { Git } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -178,9 +179,9 @@ describeGit("git worktree, native twins", () => {
     home = join(root, "home");
     mkdirSync(home);
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("add: branch, detached, -b, -B, --orphan, --no-checkout, --lock, the name from the path", async () => {
     const { native, ours } = twins();
@@ -817,9 +818,9 @@ describeGit("git worktree: storage roots, bare repositories, renames and HEAD re
     home = join(root, "home");
     mkdirSync(home);
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("a FilesApi rooted at / maps linked worktrees: list, prune and openCurrent", async () => {
     const base = join(root, "slash");
@@ -1141,9 +1142,9 @@ describeGit("git worktree from inside a bare repository, native twins", () => {
     home = join(root, "home");
     mkdirSync(home);
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** Our Git for `git worktree` in the bare repository `base/bare.git`. */
   async function openBare(base: string) {
@@ -1258,9 +1259,9 @@ describeGit("git worktree add of a replaced HEAD, native twins", () => {
     home = join(root, "home");
     mkdirSync(home);
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("add --detach checks out the replacement's tree and blobs, and status is clean", async () => {
     const { native, ours } = twins();
@@ -1324,9 +1325,9 @@ describeGit("git worktree: a linked worktree with a sparse index", () => {
     home = join(root, "home");
     mkdirSync(home);
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** A linked worktree `name` of `repo` whose index git made sparse (dir/ collapsed). */
   function sparseWorktree(base: string, repo: string, name: string): string {

@@ -6,7 +6,7 @@
  * changed, and native git fails while ours is held.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { FilesApi } from "@statewalker/vcs-core";
@@ -14,6 +14,7 @@ import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import type { Staging, Worktree } from "@statewalker/vcs-working-tree";
 import { afterAll, describe, expect, it } from "vitest";
 import { createGitFilesBackend, GitStashStore } from "../../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 
 /** A clean git environment: no user or system config, a fixed identity (CI has none). */
 const env = {
@@ -35,9 +36,9 @@ const gitTry = (cwd: string, args: string[]) =>
   spawnSync("git", args, { cwd, env, encoding: "utf8" });
 
 const roots: string[] = [];
-afterAll(() => {
-  for (const r of roots) rmSync(r, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const r of roots) await removeTempDir(r);
+}, CLEANUP_TIMEOUT);
 
 /** A repository with two commits on main. */
 function newRepo() {

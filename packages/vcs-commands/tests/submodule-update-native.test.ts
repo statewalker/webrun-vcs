@@ -20,7 +20,6 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
-  rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -53,6 +52,7 @@ import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitAtLeast } from "./native-git-working-copy.js";
 import { testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -273,7 +273,7 @@ describeGit(
     beforeAll(() => {
       root = mkdtempSync(join(tmpdir(), "submodule-update-"));
     });
-    afterAll(() => rmSync(root, { recursive: true, force: true }));
+    afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
     it('t7406-submodule-update.sh: "submodule update detaching the HEAD " (t7400 "update --init")', async () => {
       const t = twins(BASIC);
@@ -593,7 +593,7 @@ describeGit(
     beforeAll(() => {
       root = mkdtempSync(join(tmpdir(), "submodule-update-jgit-"));
     });
-    afterAll(() => rmSync(root, { recursive: true, force: true }));
+    afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
     it("SubmoduleUpdateTest.repositoryWithNoSubmodules, SubmoduleStatusTest.repositoryWithNoSubmodules", async () => {
       const t = twins("git init -q -b main sup; cd sup; echo a > a; git add a; git commit -qm a");
@@ -717,7 +717,7 @@ describeGit("git submodule update through the superproject's transports", () => 
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "submodule-update-transports-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("clones and fetches go through the given connector, with credentials for a named origin", async () => {
     const t = twins(`${BASIC}
@@ -891,7 +891,7 @@ describeGit("git submodule update over HTTP: credentials never leave their origi
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "submodule-update-http-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /**
    * `deep`, `up` (with `deep` at `<deepUrl>`), `sup` and `clone` (remote

@@ -30,6 +30,7 @@ import {
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -99,7 +100,7 @@ describeGit("commit hooks: as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-commit-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("-m: pre-commit, prepare-commit-msg, commit-msg and post-commit in order", async () => {
     const dir = join(root, "r");
@@ -301,7 +302,7 @@ describeGit("commit hooks: what pre-commit stages (as native git)", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-commit-stage-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   function stagingBase(dir: string): void {
     mkdirSync(dir, { recursive: true });
@@ -344,7 +345,7 @@ describeGit("commit hooks: symbolic links (as native git)", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-commit-link-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("a hook linked to a file that is not executable is ignored with the hint; one linked to an executable file runs", async () => {
     const dir = join(root, "r");
@@ -371,10 +372,10 @@ describeGit("commit hooks: nothing read for them without a runner", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-commit-norunner-"));
   });
-  afterEach(() => {
+  afterEach(async () => {
     vi.restoreAllMocks();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("commit -m reads MERGE_MSG and SQUASH_MSG once each (not again for hook arguments)", async () => {
     const dir = join(root, "r");

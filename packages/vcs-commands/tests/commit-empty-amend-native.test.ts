@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { type CommitCommand, EMPTY_AMEND_ADVICE, EmptyCommitError } from "../src/index.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, openRepo, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -69,7 +70,7 @@ describeGit("commit --amend that would make the commit empty: as native git", ()
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "commit-empty-amend-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const identity = async (_path: string, text: string) => text;
 

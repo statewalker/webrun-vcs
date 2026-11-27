@@ -15,7 +15,6 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
 import { createServer, type Server } from "node:http";
@@ -48,6 +47,7 @@ import {
 } from "./native-connect-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -325,8 +325,8 @@ describeGit("protocol v2 packfile URIs, as native git", () => {
     await ours?.close();
     await oursHttp?.close();
     await files?.close();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   const nativeUrl = (repo: string) => `file://${join(srv, repo)}`;
   const ourUrl = (repo: string) => `git://127.0.0.1:${ours.port}/${repo}`;

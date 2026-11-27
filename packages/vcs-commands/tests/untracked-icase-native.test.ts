@@ -22,6 +22,7 @@ import { IndexDirnameCase } from "../src/commands/index-adder.js";
 import { type Git, ResetMode } from "../src/index.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, openRepo, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -89,7 +90,7 @@ describeGit("untracked walks under core.ignorecase: native git's name hashes", (
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "untracked-icase-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   for (const [flags, d, x, X] of [
     ["-n", false, false, false],
@@ -277,7 +278,7 @@ describeGit(
     beforeEach(() => {
       root = mkdtempSync(join(tmpdir(), "untracked-icase-dir-"));
     });
-    afterEach(() => rmSync(root, { recursive: true, force: true }));
+    afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
     /** `d/x.txt` and `d/sub/a.txt` on main, a file `d` on `side`, then `extra` put in `d/` */
     function buildReplaced(dir: string, extra: string[]): void {
@@ -354,7 +355,7 @@ describeGit(
     beforeEach(() => {
       root = mkdtempSync(join(tmpdir(), "untracked-icase-unpack-"));
     });
-    afterEach(() => rmSync(root, { recursive: true, force: true }));
+    afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
     /**
      * `d/x.txt` and `d/sub/a.txt` on main, a file `d` on `side` (and, with `diverged`, a
