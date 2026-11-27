@@ -11,7 +11,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -25,6 +25,7 @@ import {
   userdiffFindFunction,
   type XdiffAlgorithm,
 } from "../../../src/diff/text-diff/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../../temp-dir-support.js";
 
 const version = spawnSync("git", ["--version"], { encoding: "utf8" });
 const hasGit = version.status === 0;
@@ -216,10 +217,10 @@ function makeCase(seed: number): Case {
 }
 
 let dir: string | undefined;
-afterAll(() => {
+afterAll(async () => {
   if (process.env.UD_ONLY) return;
-  if (dir) rmSync(dir, { recursive: true, force: true });
-});
+  if (dir) await removeTempDir(dir);
+}, CLEANUP_TIMEOUT);
 
 function native(c: Case): Buffer {
   dir ??= mkdtempSync(join(tmpdir(), "ud-fuzz-"));

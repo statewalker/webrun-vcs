@@ -34,8 +34,8 @@ import {
   pushToConnection,
   type ServeGitConnectionResult,
 } from "../../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 import {
-  cleanupDir,
   createTransportRepo,
   git,
   gitAvailable,
@@ -187,8 +187,8 @@ describeGit("git:// over the socket adapter, against native git", { timeout: TIM
   afterAll(async () => {
     native?.kill();
     await ours?.close();
-    if (root) cleanupDir(root);
-  });
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("our ls-remote and fetch (v0, v2) from native git daemon", async () => {
     const expected = refLines((await gitAsync(root, ["ls-remote", join(base, "repo.git")])).stdout);

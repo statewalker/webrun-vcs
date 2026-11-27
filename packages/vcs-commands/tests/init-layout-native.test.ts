@@ -16,7 +16,6 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -30,6 +29,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { InitCommand, InitOptionsError } from "../src/commands/init-command.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -106,7 +106,7 @@ describeGit("git init's layout, as native git (t0001-init)", () => {
     chmodSync(join(root, "template-source/hooks/post-update"), 0o755);
     writeFileSync(join(root, "template-source/.hidden"), "skipped\n");
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
   afterEach(() => process.umask(savedUmask));
 
   it('t0001-init.sh: "init --bare"', async () => {

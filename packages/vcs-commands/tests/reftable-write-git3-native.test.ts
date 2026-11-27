@@ -39,6 +39,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Git, InitCommand, ResetMode } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { git3Binary, nativeGit3Env } from "./native-git3.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const git3 = git3Binary();
 /** A git 2.56.x binary (`$GIT2561`): it reads what ours writes too */
@@ -53,7 +54,7 @@ describe.skipIf(!git3)("writing reftable repositories (git 3.0 oracle)", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "reftable-write-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   function run(
     bin: string,

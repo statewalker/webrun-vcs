@@ -9,7 +9,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -17,6 +17,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type Git, type LogOutputOptions, mergesMode, RevFilter } from "../src/index.js";
 import { openOurs, put } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -259,7 +260,7 @@ describeGit("git log output, native", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "log-output-native-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const CASES: string[][] = [
     [],
@@ -445,7 +446,7 @@ describeGit("git log --graph over random DAGs, native", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "log-graph-native-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const CASES: string[][] = [
     ["--graph", "--oneline", "--all"],
@@ -516,7 +517,7 @@ describeGit("git log output under its configuration, native", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "log-config-native-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const CONFIGS: { config: [string, string][]; cases: string[][] }[] = [
     { config: [["format.pretty", "oneline"]], cases: [[], ["--graph"]] },
@@ -622,7 +623,7 @@ describeGit("git log review fixes, native", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "log-fixes-native-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** root; side changes f; main changes g; merge; side appends to g; `merge -X ours side` */
   function buildMerges(dir: string): void {
@@ -937,7 +938,7 @@ describeGit("git log follow-up review fixes, native", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "log-followup-native-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const commitAll = (dir: string, message: string, args: string[] = []) => {
     clock += 3600;
@@ -1109,7 +1110,7 @@ describeGit("git log and git diff follow-up fixes, native", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "log-copies-native-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const commitAll = (dir: string, message: string) => {
     clock += 3600;

@@ -31,6 +31,7 @@ import {
 } from "./host-drivers-native-support.js";
 import { openOurs, snapshot } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -46,9 +47,9 @@ let counter = 0;
 beforeAll(() => {
   root = mkdtempSync(join(tmpdir(), "host-drivers-"));
 });
-afterAll(() => {
-  rmSync(root, { recursive: true, force: true });
-});
+afterAll(async () => {
+  await removeTempDir(root);
+}, CLEANUP_TIMEOUT);
 
 /** The environment of both twins, with `-c` settings as git's GIT_CONFIG_COUNT. */
 function envOf(commandLine: Record<string, string> = {}): Record<string, string> {

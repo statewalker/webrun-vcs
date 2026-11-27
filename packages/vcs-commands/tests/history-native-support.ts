@@ -20,7 +20,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -34,6 +33,7 @@ import {
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { Git, type HistoryResult, type PatchRequest } from "../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 /** A native git and the environment it runs with. */
 export interface NativeGit {
@@ -271,9 +271,9 @@ export function historyTwins(title: string, native: NativeGit | undefined): void
     beforeAll(() => {
       root = mkdtempSync(join(tmpdir(), "history-native-"));
     });
-    afterAll(() => {
-      rmSync(root, { recursive: true, force: true });
-    });
+    afterAll(async () => {
+      await removeTempDir(root);
+    }, CLEANUP_TIMEOUT);
 
     /** first, second, third on main */
     const linear = () => {

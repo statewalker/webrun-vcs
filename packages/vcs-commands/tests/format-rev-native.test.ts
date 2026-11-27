@@ -5,7 +5,7 @@
  * `$GIT3`, each skipped when it has no `format-rev` (2.43).
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -19,6 +19,7 @@ import {
   openOursAt,
   outcomeOf,
 } from "./repo-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const EMPTY_BLOB = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
 
@@ -52,9 +53,9 @@ function describeFormatRev(native: NativeGit) {
         ])
           shell.commit(repo, name);
       });
-      afterAll(() => {
-        rmSync(root, { recursive: true, force: true });
-      });
+      afterAll(async () => {
+        await removeTempDir(root);
+      }, CLEANUP_TIMEOUT);
 
       /** `git format-rev <argv>` with `input` on stdin, native and ours. */
       async function formatRev(argv: string[], input: string): Promise<Outcome> {

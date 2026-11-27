@@ -4,7 +4,7 @@
  * above 1%), for text, CRLF, binary, long-line and unterminated contents.
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -17,6 +17,7 @@ import {
   spanCounts,
 } from "../src/rename/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -73,7 +74,7 @@ describeGit("git's similarity estimate (native git oracle)", () => {
     root = mkdtempSync(join(tmpdir(), "similarity-"));
     git(["init", "-q"]);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** git's score (percent) for renaming `a` to `b`, or undefined when not a rename at 1%. */
   const nativeScore = (a: Uint8Array, b: Uint8Array) => {

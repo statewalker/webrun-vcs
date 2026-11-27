@@ -28,13 +28,14 @@ import {
   giteaRelease,
   redactCredentials,
 } from "../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 /** No binary needed: the configuration, command lines and checks that a launch is made of. */
 
 const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 const tmp = () => {
   const d = mkdtempSync(join(tmpdir(), "gitea-config-"));
   dirs.push(d);

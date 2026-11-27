@@ -9,7 +9,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -19,6 +19,7 @@ import type { Git } from "../src/index.js";
 import { gitOk, git as gitRun, openOurs, put, snapshot } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 import { gitAtLeast } from "./native-git-working-copy.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -166,7 +167,7 @@ describeGit("add -p as native git", () => {
     modern = gitAtLeast(gitOk(root, root, "--version"), 2, 50);
     compat = modern ? "2.56" : "2.43";
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("stages some hunks of several files, splitting one", async () => {
     const answers = ["n", "s", "y", "n", "y", "y"];
@@ -264,7 +265,7 @@ describeGit("reset -p, checkout -p, restore -p, stash -p as native git", () => {
     modern = gitAtLeast(gitOk(root, root, "--version"), 2, 50);
     compat = modern ? "2.56" : "2.43";
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("reset -p unstages hunks (HEAD), applies another commit's to the index", async () => {
     const answers = ["y", "n", "s", "n", "y", "y"];
@@ -477,7 +478,7 @@ describeGit("patch mode details as native git", () => {
     modern = gitAtLeast(gitOk(root, root, "--version"), 2, 50);
     compat = modern ? "2.56" : "2.43";
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("edits a split hunk and merges it with its neighbour", async () => {
     const good: Edit = { sed: "s/^+four/+FOUR/", js: (t) => t.replace(/^\+four$/m, "+FOUR") };
@@ -538,7 +539,7 @@ describeGit("patch mode refreshes, conflicts and errors as native git", () => {
     modern = gitAtLeast(gitOk(root, root, "--version"), 2, 50);
     compat = modern ? "2.56" : "2.43";
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** A merge stopped on a conflict in `f`, and an unstaged change of `g`. */
   const conflicted = (dir: string) => {

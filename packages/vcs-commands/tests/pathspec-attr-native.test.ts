@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, openRepo, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -92,7 +93,7 @@ describeGit(":(attr:...) pathspecs: as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "pathspec-attr-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("status: tracked changes and the untracked scan, normal and -uall", async () => {
     const dir = join(root, "r");

@@ -16,7 +16,6 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -33,6 +32,7 @@ import { Git } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -129,7 +129,7 @@ describeGit("git clone's layout, as native git (t5601-clone)", () => {
     writeFileSync(join(root, "templates/hooks/pre-commit.sample"), "#!/bin/sh\n");
     chmodSync(join(root, "templates/hooks/pre-commit.sample"), 0o755);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t5601-clone.sh: "clone creates intermediate directories for bare repo"', async () => {
     const n = "long/path/to/bare/native";

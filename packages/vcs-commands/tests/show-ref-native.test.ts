@@ -5,7 +5,7 @@
  * exit status compared).
  */
 
-import { mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,6 +15,7 @@ import type { Git, ShowRefCommand } from "../src/index.js";
 import { compatibilityOf, type Outcome, Shell } from "./describe-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -134,9 +135,9 @@ describeGit("git show-ref, native twins", () => {
     compatibility = compatibilityOf(shell);
     dir = t1403Setup("t1403");
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   describe("t1403-show-ref.sh", () => {
     it('t1403-show-ref.sh: "show-ref"', async () => {

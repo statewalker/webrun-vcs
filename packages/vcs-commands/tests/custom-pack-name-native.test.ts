@@ -9,7 +9,7 @@
  * it (git writes the pack's own `.idx` name in PNAM).
  */
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -24,6 +24,7 @@ import {
   openOursGc,
 } from "./gc-native-twins-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -32,9 +33,9 @@ let root: string;
 beforeAll(() => {
   root = mkdtempSync(join(tmpdir(), "custom-pack-name-"));
 });
-afterAll(() => {
-  rmSync(root, { recursive: true, force: true });
-});
+afterAll(async () => {
+  await removeTempDir(root);
+}, CLEANUP_TIMEOUT);
 
 /** Native git in `cwd`: its stdout, stderr and exit status. */
 function git(home: string, cwd: string, args: string[], input?: string) {

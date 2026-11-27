@@ -15,7 +15,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -32,6 +31,7 @@ import { InitCommand } from "../src/commands/init-command.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -117,7 +117,7 @@ describeGit("core.sharedRepository, as native git (t1301-shared-repo)", () => {
       native(join(root, "src"), ["commit", "-q", "-m", name]);
     }
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
   afterEach(() => process.umask(savedUmask));
 
   it('t1301-shared-repo.sh: "shared = 0400 (faulty permission u-w)"', async () => {

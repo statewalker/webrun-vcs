@@ -7,7 +7,7 @@
  * `lstat` reports one.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -20,6 +20,7 @@ import {
   FilesystemBoundaryError,
   NotAGitRepositoryError,
 } from "../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const nativeGit = spawnSync("git", ["--version"]).status === 0;
 const describeGit = nativeGit && process.platform !== "win32" ? describe : describe.skip;
@@ -69,9 +70,9 @@ describeGit("GIT_CEILING_DIRECTORIES (native twins)", () => {
     mkdirSync(join(T, "repo", "a", "b", "c"), { recursive: true });
     symlinkSync(join(T, "repo"), join(T, "link"));
   });
-  afterAll(() => {
-    if (T) rmSync(T, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (T) await removeTempDir(T);
+  }, CLEANUP_TIMEOUT);
 
   const cases: Array<[string, string, () => string]> = [
     ["no ceiling", "repo/a/b", () => ""],
@@ -117,9 +118,9 @@ describe("the file system boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM)", () => {
     execFileSync("git", ["init", "-q", join(root, "outer")], { env: envOf({}) });
     mkdirSync(join(root, "outer", "mnt", "sub"), { recursive: true });
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** A FilesApi rooted at `root` whose `lstat` puts `/outer/mnt` on device 2. */
   function mounted() {
@@ -204,9 +205,9 @@ describeGit("discovery climbs the physical directory (native twins)", () => {
     mkdirSync(join(top, "a", "b", "c", "r", "s"), { recursive: true });
     symlinkSync(join(top, "a", "b", "c", "r"), join(top, "l"));
   });
-  afterAll(() => {
-    if (top) rmSync(top, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (top) await removeTempDir(top);
+  }, CLEANUP_TIMEOUT);
 
   it("a ceiling on the physical path is not bypassed through a linked cwd", async () => {
     const over = { GIT_CEILING_DIRECTORIES: join(top, "a", "b") };

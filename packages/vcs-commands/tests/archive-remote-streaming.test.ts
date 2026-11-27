@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { archiveEnv, openArchiveRepo } from "./archive-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -48,7 +49,7 @@ describeGit("git archive --remote streams the archive (#413)", () => {
     git(["config", "core.bigFileThreshold", "1m"]);
     rmSync(join(repo, "big"));
   });
-  afterAll(() => rmSync(home, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(home), CLEANUP_TIMEOUT);
 
   it("holds neither the archive nor its packets while the client waits", async () => {
     const expected = createHash("sha1")

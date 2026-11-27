@@ -5,7 +5,7 @@
  * the other's merge in progress.
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -23,6 +23,7 @@ import {
 } from "./merge-native-helpers.js";
 import { buildHistory, type History, text } from "./merge-native-scenarios.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -82,9 +83,9 @@ describeGit("merge writes the worktree as native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "merge-worktree-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("a clean merge of edits to different lines writes the merged file and commits", async () => {
     const { result } = await compareMerge({

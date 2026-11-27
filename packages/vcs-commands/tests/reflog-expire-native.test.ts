@@ -40,6 +40,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { Git, type ReflogCommand, type ReflogUpdateResult } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -330,9 +331,9 @@ describeGit("reflog expire, delete, exists, write and drop against native git", 
     home = join(root, "home");
     mkdirSync(home);
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   describe.each(FORMATS)("%s", (format) => {
     it('t1410-reflog.sh: "reflog expire should not barf on an annotated tag"', async () => {

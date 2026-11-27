@@ -17,6 +17,7 @@ import type { FilesApi } from "@statewalker/vcs-core";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import { createGitFilesBackend, gc } from "../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const DAY = 24 * 3600;
 const GIT_ENV = {
@@ -38,9 +39,9 @@ const git = (cwd: string, args: string[], input?: string) =>
 const gitAvailable = spawnSync("git", ["--version"]).status === 0;
 
 const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 
 /** Every file under `dir`, its mtime set `days` ago. */
 function ageTree(dir: string, days: number) {

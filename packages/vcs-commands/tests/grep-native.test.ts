@@ -30,6 +30,7 @@ import {
 } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 import { openRepo } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -485,7 +486,7 @@ describeGit("git grep against native git", () => {
     const r = spawnSync("git", ["grep", "-P", "x+", "HEAD"], { cwd: dir, env: envWith() });
     pcre = !/not compiled with USE_LIBPCRE/.test(r.stderr.toString());
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   for (const [H, L] of [
     [["HEAD"], "HEAD"],

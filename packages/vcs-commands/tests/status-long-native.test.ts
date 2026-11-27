@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { StatusCallTextOptions } from "../src/index.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, openRepo, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -115,7 +116,7 @@ describeGit("status text forms: as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "status-long-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("a clean repository, a dirty one, and one before its first commit", async () => {
     const dir = join(root, "r");
@@ -257,7 +258,7 @@ describeGit("status -v / -vv with unmerged paths: as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "status-vv-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** `status -v`, `status -vv` and `commit --dry-run -vv` agree with native git. */
   async function expectVerbose(dir: string, label: string) {
@@ -295,7 +296,7 @@ describeGit("status -v / -vv with submodules: the submodule ignore configuration
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "status-v-sub-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** A repository with two submodules: `s1` moved and staged, `s2` moved, unstaged, dirty. */
   function withSubmodules(dir: string) {

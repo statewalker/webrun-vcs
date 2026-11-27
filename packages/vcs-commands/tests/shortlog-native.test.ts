@@ -6,13 +6,14 @@
  * format groups with their de-duplication, `--no-group`, and the errors. Run with the
  * system git (2.43) and with 2.56.1 first on `PATH`.
  */
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { Fixture, native, type Outcome, oursShortlog } from "./shortlog-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -73,7 +74,7 @@ describeGit("git shortlog, native (t4201-shortlog)", () => {
     ]);
     repo.git(["config", "--unset", "i18n.commitencoding"]);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t4201-shortlog.sh: "default output format"', async () => {
     await expectSame(["HEAD"]);

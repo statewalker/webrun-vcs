@@ -25,6 +25,7 @@ import {
   newCase,
 } from "./gc-native-twins-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -34,7 +35,7 @@ describeGit("gc twins: objects", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "gc-twins-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** A small history on main, a topic branch, a tag. */
   function history(name: string) {
@@ -215,7 +216,7 @@ describeGit("gc twins: expiry and storage", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "gc-twins-expiry-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   function base(name: string) {
     const caseDir = newCase(root, name);
@@ -351,7 +352,7 @@ describeGit("gc twins: roots", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "gc-twins-roots-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const both = [
     ["default", [], undefined],

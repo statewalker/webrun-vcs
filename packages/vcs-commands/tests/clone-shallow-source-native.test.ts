@@ -8,7 +8,7 @@
  * `--no-local`) must leave the same `.git/shallow` bytes.
  */
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -16,6 +16,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { cloneStateOf, ourClone } from "./clone-options-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -87,7 +88,7 @@ describeGit("clone of a shallow repository: the shallow file as native git write
     );
     git(branches, "fetch", "-q", "--depth=1", "origin", "refs/tags/*:refs/tags/*");
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("a shallow commit a branch and an annotated tag reach (protocol v2: listed twice)", async () => {
     const shallow = await twinClone(tagged, 2);

@@ -28,6 +28,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { CheckoutStatus, FastForwardMode, Git } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -168,9 +169,9 @@ describeGit("switch -m, checkout -m/-b/-B, merge -m, several -m, --discard-chang
     home = join(root, "home");
     mkdirSync(home);
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   itAutostash("switch -m: a clean path, a conflicting one and a new staged file", async () => {
     const t = twins();

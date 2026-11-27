@@ -4,7 +4,7 @@
  * never the file it names), and accepting a side replaces the link rather than writing
  * into its target.
  */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -13,6 +13,7 @@ import { GitResolutionStore } from "@statewalker/vcs-store-files";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { createMemoryGitStaging, MergeStage } from "@statewalker/vcs-working-tree";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../../temp-dir-support.js";
 
 const enc = new TextEncoder();
 
@@ -26,7 +27,7 @@ describe("GitResolutionStore and symbolic links", () => {
     mkdirSync(join(repo, ".git"), { recursive: true });
     writeFileSync(join(base, "secret.txt"), "SECRET, never staged\n");
   });
-  afterEach(() => rmSync(base, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(base), CLEANUP_TIMEOUT);
 
   async function conflicted(path: string) {
     const { blobs } = createMemoryHistory();

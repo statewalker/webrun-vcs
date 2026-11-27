@@ -6,7 +6,7 @@
  * deterministic; the wall-clock bounds are generous, for slow CI machines.
  */
 
-import { mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -28,6 +28,7 @@ import { Git, MergeStatus, RebaseOperation, RebaseStatus } from "../src/index.js
 import { git, INTEROP_IDENT } from "./merge-native-helpers.js";
 import { buildHistory, type Files, type History } from "./merge-native-scenarios.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -146,9 +147,9 @@ describeGit("the merge family reads only what it changes", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "merge-perf-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   function twins(history: History): { native: string; ours: string } {
     const n = counter++;

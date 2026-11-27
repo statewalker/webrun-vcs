@@ -21,7 +21,7 @@
  *   id.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createNodeGitHostEnvironment, createNodeSigner } from "@statewalker/vcs-utils-node/files";
@@ -31,6 +31,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createSshSigner, type Git, InvalidConfigError, SigningFailedError } from "../src/index.js";
 import { openOurs, put } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const has = (program: string, ...args: string[]) =>
   spawnSync(program, args, { stdio: "ignore" }).error === undefined;
@@ -185,10 +186,10 @@ describeGit("signed commits against native git", () => {
       );
     }
   }, 60_000);
-  afterAll(() => {
+  afterAll(async () => {
     spawnSync("gpgconf", ["--kill", "all"], { env: env() });
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   describe("a deterministic gpg.program: the same signer output, the same commit", () => {
     it("-S, -S<keyid>, commit.gpgSign, user.signingKey: same bytes, same program call", async () => {

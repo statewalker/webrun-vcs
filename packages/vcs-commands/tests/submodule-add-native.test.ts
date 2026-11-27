@@ -20,7 +20,6 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
-  rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -35,6 +34,7 @@ import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitAtLeast } from "./native-git-working-copy.js";
 import { testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -244,7 +244,7 @@ describeGit("git submodule add (t7400-submodule-basic, SubmoduleAddTest)", () =>
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "submodule-add-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t7400-submodule-basic.sh: "submodule add", "submodule add --branch" (SubmoduleAddTest.addSubmodule, addSubmoduleWithName)', async () => {
     const t = twins(BASIC);

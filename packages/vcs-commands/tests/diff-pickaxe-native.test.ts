@@ -35,6 +35,7 @@ import {
   nativeGitHttpBackend,
 } from "./native-git-http-backend.js";
 import { testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -52,9 +53,9 @@ const versionOptions: DiffTextOptions = {
 };
 
 let root: string | undefined;
-afterAll(() => {
-  if (root) rmSync(root, { recursive: true, force: true });
-});
+afterAll(async () => {
+  if (root) await removeTempDir(root);
+}, CLEANUP_TIMEOUT);
 const tmp = () => {
   root ??= mkdtempSync(join(tmpdir(), "diff-pickaxe-"));
   return root;
@@ -818,8 +819,8 @@ describeHttp("pickaxe in a partial clone", () => {
   afterAll(async () => {
     await server?.close();
     closeBackend?.();
-    if (home) rmSync(home, { recursive: true, force: true });
-  });
+    if (home) await removeTempDir(home);
+  }, CLEANUP_TIMEOUT);
 
   let n = 0;
   /** A native partial clone and ours, each made with native git (no checkout) */

@@ -5,7 +5,7 @@
  * configuration" on a git built with `WITH_BREAKING_CHANGES`.
  */
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,6 +15,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { openOurs } from "./merge-native-helpers.js";
 import { git3Binary, nativeGit3Env } from "./native-git3.js";
 import { type Outcome, outcomeOf } from "./plumbing-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const git3 = git3Binary();
 
@@ -40,7 +41,7 @@ describe.skipIf(!git3)("git var under git 3.0", () => {
     mkdirSync(repo);
     expect(run(["init", "-q"]).status).toBe(0);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t0007-git-var.sh: "get GIT_DEFAULT_BRANCH without configuration", "get GIT_DEFAULT_BRANCH with configuration"', async () => {
     expect((await twin("GIT_DEFAULT_BRANCH")).out).toBe("main\n");

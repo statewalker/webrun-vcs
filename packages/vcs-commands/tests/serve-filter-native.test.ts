@@ -53,6 +53,7 @@ import { openOurs } from "./merge-native-helpers.js";
 import { gitAsync, startTcpServer } from "./native-connect-support.js";
 import { nativeGitAvailable, nativeGitHttpBackend } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -189,8 +190,8 @@ describeGit("serving partial clone filters, as native git", () => {
     await nativeHttp?.close();
     await ourHttp?.close();
     await ourDaemon?.close();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** A native clone, its exit status, stderr and what it holds. */
   const clone = async (

@@ -4,13 +4,14 @@
  * files `a-`, `a.b` and `a0` sorts after `a-` and `a.b` and before `a0`.
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { git, gitOk, INTEROP_IDENT, openOurs } from "./merge-native-helpers.js";
 import { applyFiles, buildHistory, type History } from "./merge-native-scenarios.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -29,7 +30,7 @@ describeGit("tree entry order against native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "tree-order-native-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
   const tree = (dir: string, rev = "HEAD") => gitOk(root, dir, "rev-parse", `${rev}^{tree}`).trim();
   const twins = (history: History) => {
     const nd = join(root, `n${n}`);

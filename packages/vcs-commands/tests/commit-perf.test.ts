@@ -8,15 +8,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import {
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  statSync,
-  utimesSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -40,6 +32,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { IndexAdder } from "../src/commands/index-adder.js";
 import { Git } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -83,9 +76,9 @@ describeGit("commit stays proportional to the change", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "commit-perf-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /**
    * A repository of 2000 files committed; the files dated well before the index, so no

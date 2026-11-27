@@ -8,7 +8,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseIndexFile } from "@statewalker/vcs-working-tree";
@@ -24,6 +24,7 @@ import {
 } from "./merge-native-helpers.js";
 import { buildHistory, type History } from "./merge-native-scenarios.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -60,7 +61,7 @@ describeGit("the index merge and cherry-pick leave, against native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "merge-index-native-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** Both twins, native run on one and ours on the other; native's exit status. */
   async function run(history: History, op: Op, after?: string) {

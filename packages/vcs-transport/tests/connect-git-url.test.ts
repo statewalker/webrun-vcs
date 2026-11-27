@@ -5,12 +5,13 @@
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { isGitUrl, parseGitUrl, urlIsLocalNotSsh } from "../src/connect/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 describe("parseGitUrl", () => {
   it("reads scp-like host:path as ssh", () => {
@@ -169,7 +170,7 @@ describeGit("parseGitUrl: as native git's fetch-pack --diag-url", () => {
     dir = mkdtempSync(join(tmpdir(), "diag-url-"));
     execFileSync("git", ["init", "-q", dir]);
   });
-  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(dir), CLEANUP_TIMEOUT);
 
   /** native git's Diag lines, as a map */
   const diag = (url: string) => {

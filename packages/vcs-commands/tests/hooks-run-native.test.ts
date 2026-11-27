@@ -7,7 +7,7 @@
  * `--show-scope`. Each case runs native git in one copy of a repository and ours (with the
  * Node hook runner) in the other.
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -25,6 +25,7 @@ import {
 } from "./hooks-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 const it25x = nativeIs25x ? it : it.skip;
@@ -98,7 +99,7 @@ describeGit("git hook run: as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-run-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("runs the hook with the arguments after --, its exit code git's", async () => {
     const dir = base();
@@ -218,7 +219,7 @@ describeGit("git hook list: as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-list-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it25x("the configured hooks, disabled ones marked, then the script (2.5x)", async () => {
     const dir = base();
@@ -269,7 +270,7 @@ describeGit("git hook run --to-stdin: a path above the repository", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-run-up-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("reads the host file a `..` path names, never the worktree's file of that name", async () => {
     const dir = base();
@@ -297,7 +298,7 @@ describeGit("git hook run: hook settings from included config files", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-run-inc-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("include.path=../inc (the worktree top) and ../../inc (above it) are read", async () => {
     const dir = base();
