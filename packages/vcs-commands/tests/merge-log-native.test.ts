@@ -26,6 +26,7 @@ import {
   FastForwardMode,
   type Git,
   type MergeCommand,
+  MergeOperation,
   MergeStatus,
 } from "../src/index.js";
 import { normalizeState, openOurs, snapshot } from "./merge-native-helpers.js";
@@ -395,8 +396,6 @@ describeGit("merge messages, --log and --signoff against native git", () => {
             .setCommit(false)
             .setFastForwardMode(FastForwardMode.NO_FF)
             .setLog(true),
-        // git's MERGE_HEAD names the tag object, ours the commit (not this ticket's)
-        skipState: ["MERGE_HEAD"],
       });
       await twins({
         build: annotated,
@@ -414,8 +413,126 @@ describeGit("merge messages, --log and --signoff against native git", () => {
             .setCommit(false)
             .setFastForwardMode(FastForwardMode.NO_FF)
             .setLog(true),
-        skipState: ["MERGE_HEAD"],
       });
+    });
+  });
+
+  describe("an annotated tag's MERGE_HEAD (statewalker/webrun-vcs#272)", () => {
+    /** sideHistory with `annotate` an annotated tag of side; `conflict`: main also changes s */
+    const tagged = (conflict: boolean) => (d: string) =>
+      sideHistory(d, (b) => {
+        b.run("tag", "-a", "-m", "An annotated one", "annotate", "side");
+        if (conflict) b.commit("main changes s", { s: "main\n" });
+      });
+    const tagId = (dir: string) => gitOk(dir, ["rev-parse", "annotate"]).trim();
+    const mergeHead = (dir: string) => readFileSync(join(dir, ".git/MERGE_HEAD"), "utf8");
+    const resolve = (dir: string) => {
+      writeFileSync(join(dir, "s"), "resolved\n");
+      gitOk(dir, ["add", "s"]);
+    };
+    /** Both twins finished: native by `git <finish>`, ours by `ourFinish`; then compared. */
+    const finish = async (
+      t: { native: string; mine: string },
+      nativeArgs: string[],
+      ourFinish: (g: Git) => Promise<unknown>,
+    ) => {
+      gitOk(t.native, nativeArgs);
+      await ourFinish(await ours(t.mine));
+      const commit = (dir: string) => gitOk(dir, ["cat-file", "commit", "HEAD"]);
+      expect(commit(t.mine)).toBe(commit(t.native));
+      // the merge's second parent is the tagged commit, not the tag
+      expect(gitOk(t.mine, ["rev-parse", "HEAD^2"]).trim()).toBe(
+        gitOk(t.mine, ["rev-parse", "annotate^{commit}"]).trim(),
+      );
+      expect(snapshot(root, t.mine, normalizeState)).toEqual(
+        snapshot(root, t.native, normalizeState),
+      );
+    };
+    const noCommit = (g: Git) =>
+      g.merge().include("annotate").setCommit(false).setFastForwardMode(FastForwardMode.NO_FF);
+    const ourCommit = (g: Git) => g.commit().call();
+    const ourContinue = (g: Git) => g.merge().setOperation(MergeOperation.CONTINUE).call();
+
+    it("--no-commit writes the tag object's id; commit peels it", async () => {
+      const t = await twins({
+        build: tagged(false),
+        args: ["--no-commit", "--no-ff", "annotate"],
+        merge: noCommit,
+      });
+      expect(mergeHead(t.mine)).toBe(`${tagId(t.mine)}\n`);
+      await finish(t, ["commit", "--no-edit", "--cleanup=strip"], ourCommit);
+    });
+
+    it("--no-commit, then merge --continue peels it", async () => {
+      const t = await twins({
+        build: tagged(false),
+        args: ["--no-commit", "--no-ff", "annotate"],
+        merge: noCommit,
+      });
+      await finish(t, ["merge", "--continue"], ourContinue);
+    });
+
+    it("a conflict writes the tag object's id; commit after the resolution peels it", async () => {
+      const t = await twins({
+        build: tagged(true),
+        args: ["annotate"],
+        merge: (g) => g.merge().include("annotate"),
+      });
+      expect(mergeHead(t.mine)).toBe(`${tagId(t.mine)}\n`);
+      for (const dir of [t.native, t.mine]) resolve(dir);
+      await finish(t, ["commit", "--no-edit", "--cleanup=strip"], ourCommit);
+    });
+
+    it("a conflict, then merge --continue after the resolution", async () => {
+      const t = await twins({
+        build: tagged(true),
+        args: ["annotate"],
+        merge: (g) => g.merge().include("annotate"),
+      });
+      for (const dir of [t.native, t.mine]) resolve(dir);
+      await finish(t, ["merge", "--continue"], ourContinue);
+    });
+
+    it("the tag named by its id, and an octopus with a tag, write the tag's id", async () => {
+      const byId = await twins({
+        build: tagged(true),
+        args: [gitOk(join(root, `native-${counter - 1}`), ["rev-parse", "annotate"]).trim()],
+        merge: (g) => g.merge().include(tagId(join(root, `ours-${counter - 1}`))),
+      });
+      expect(mergeHead(byId.mine)).toBe(`${tagId(byId.mine)}\n`);
+      const octopus = await twins({
+        build: (d) =>
+          sideHistory(d, (b) => {
+            b.run("tag", "-a", "-m", "An annotated one", "annotate", "side");
+            b.run("checkout", "-q", "-b", "other", "main~1");
+            b.commit("other one", { o: "1\n" });
+            b.run("checkout", "-q", "main");
+          }),
+        args: ["--no-commit", "other", "annotate"],
+        merge: (g) => g.merge().include("other").include("annotate").setCommit(false),
+      });
+      expect(mergeHead(octopus.mine).split("\n")).toContain(tagId(octopus.mine));
+      gitOk(octopus.native, ["commit", "--no-edit", "--cleanup=strip"]);
+      await ourCommit(await ours(octopus.mine));
+      const commit = (dir: string) => gitOk(dir, ["cat-file", "commit", "HEAD"]);
+      expect(commit(octopus.mine)).toBe(commit(octopus.native));
+    });
+
+    it("each tool finishes the tag merge the other stopped", async () => {
+      const t = await twins({
+        build: tagged(true),
+        args: ["annotate"],
+        merge: (g) => g.merge().include("annotate"),
+      });
+      for (const dir of [t.native, t.mine]) resolve(dir);
+      // native's stopped merge finished by ours, ours' by native git
+      await ourCommit(await ours(t.native));
+      gitOk(t.mine, ["commit", "--no-edit", "--cleanup=strip"]);
+      const commit = (dir: string) => gitOk(dir, ["cat-file", "commit", "HEAD"]);
+      expect(commit(t.native)).toBe(commit(t.mine));
+      expect(gitOk(t.native, ["rev-parse", "HEAD^2"]).trim()).toBe(
+        gitOk(t.native, ["rev-parse", "annotate^{commit}"]).trim(),
+      );
     });
   });
 

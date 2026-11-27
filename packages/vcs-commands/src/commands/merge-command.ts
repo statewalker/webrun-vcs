@@ -51,6 +51,7 @@ import {
   indexChanges,
   indexChangesFromTree,
   OperationState,
+  peelMergeHeads,
   readIndex,
   rewriteIndex,
   storeFlatTree,
@@ -148,6 +149,11 @@ export const UNMERGED_FILES_MESSAGE = (action: "Merging" | "Committing") =>
  */
 export class MergeCommand extends GitCommand<MergeResult> {
   private includes: string[] = [];
+  /**
+   * The object each merged commit was named by (git's `merge_remote_desc.obj`, the first
+   * name's): an annotated tag's own id, which `write_merge_heads` puts in MERGE_HEAD.
+   */
+  private readonly mergeObjects = new Map<ObjectId, ObjectId>();
   private fastForwardMode = FastForwardMode.FF;
   private strategy = MergeStrategy.RECURSIVE;
   /** Whether `-s` was given (`-s recursive` names itself in git's messages) */
@@ -1514,7 +1520,10 @@ export class MergeCommand extends GitCommand<MergeResult> {
       return giveUp([refused.message], stop ? output.slice(0, stop.output) : output);
     }
     const writeState = async (text: string) => {
-      await state.write("MERGE_HEAD", remoteIds.map((id) => `${id}\n`).join(""));
+      await state.write(
+        "MERGE_HEAD",
+        remoteIds.map((id) => `${this.mergeObjectOf(id)}\n`).join(""),
+      );
       await state.write("MERGE_MSG", text);
       await state.write("MERGE_MODE", this.ffMode() === FastForwardMode.NO_FF ? "no-ff" : "");
     };
@@ -1590,13 +1599,23 @@ export class MergeCommand extends GitCommand<MergeResult> {
     return { status: MergeStatus.MERGED, newHead: newCommitId, mergedCommits, output };
   }
 
-  /** The heads MERGE_HEAD names (one per line: several for an octopus). */
+  /**
+   * The commits MERGE_HEAD names (one per line: several for an octopus), each peeled as
+   * git's `read_merge_heads` → `lookup_commit_reference` (a merged tag is named by its own id).
+   */
   private async mergeHeads(state: OperationState): Promise<ObjectId[]> {
     const text = await state.read("MERGE_HEAD");
-    const lines = (text ?? "").split("\n").filter((l) => /^[0-9a-f]{40,64}$/.test(l));
-    if (lines.length > 0) return lines;
-    const single = await state.ref("MERGE_HEAD");
-    return single ? [single] : [];
+    let lines = (text ?? "").split("\n").filter((l) => /^[0-9a-f]{40,64}$/.test(l));
+    if (lines.length === 0) {
+      const single = await state.ref("MERGE_HEAD");
+      lines = single ? [single] : [];
+    }
+    return peelMergeHeads(this.revisionResolver(), lines);
+  }
+
+  /** The object a merged commit was named by (the commit itself unless a tag named it). */
+  private mergeObjectOf(commitId: ObjectId): ObjectId {
+    return this.mergeObjects.get(commitId) ?? commitId;
   }
 
   /** `git merge --continue`: commits the resolved merge with MERGE_MSG. */
@@ -2052,7 +2071,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
     srcId: ObjectId,
     message: string,
   ): Promise<void> {
-    await state.setRef("MERGE_HEAD", srcId);
+    await state.setRef("MERGE_HEAD", this.mergeObjectOf(srcId));
     await state.write("MERGE_MSG", message);
     await state.write("MERGE_MODE", this.ffMode() === FastForwardMode.NO_FF ? "no-ff" : "");
   }
@@ -2185,7 +2204,12 @@ export class MergeCommand extends GitCommand<MergeResult> {
    */
   private async mergeHeadOf(name: string): Promise<ObjectId> {
     try {
-      return await this.resolveRef(name);
+      const commitId = await this.resolveRef(name);
+      if (!this.mergeObjects.has(commitId)) {
+        const objectId = await this.resolveRevision(name, { hint: "committish" });
+        this.mergeObjects.set(commitId, objectId);
+      }
+      return commitId;
     } catch (error) {
       if (!(error instanceof NotACommitError)) throw error;
       const lines = error.objectType

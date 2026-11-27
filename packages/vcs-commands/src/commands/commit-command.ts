@@ -66,6 +66,7 @@ import { reencodedCommitParts } from "./log-output.js";
 import {
   flatTree,
   OperationState,
+  peelMergeHeads,
   rewriteIndex,
   updateIndexCacheTree,
   writeIndexAsTree,
@@ -2426,17 +2427,21 @@ export class CommitCommand extends GitCommand<CommitResult> {
     return ran;
   }
 
-  /** The commits MERGE_HEAD names (one per line), none without a merge in progress. */
+  /**
+   * The commits MERGE_HEAD names (one per line, a merged tag peeled as git's
+   * `lookup_commit_reference`), none without a merge in progress.
+   */
   private async mergeHeads(state: OperationState): Promise<ObjectId[]> {
     const text = await state.read("MERGE_HEAD");
     if (text !== undefined) {
-      return text
+      const ids = text
         .split("\n")
         .map((l) => l.trim())
         .filter((l) => /^[0-9a-f]{40,64}$/.test(l));
+      return peelMergeHeads(this.revisionResolver(), ids);
     }
     const id = await state.ref("MERGE_HEAD");
-    return id ? [id] : [];
+    return id ? peelMergeHeads(this.revisionResolver(), [id]) : [];
   }
 
   /** The heads none of the others reaches (git's reduce_heads), in their order. */
