@@ -187,24 +187,23 @@ describeGit("JGit QuotedString*Test against native git", () => {
   for (const [source, texts] of DEQUOTED) {
     it(`JGit ${source}: check-attr --stdin unquotes as git`, async () => {
       const dir = repository();
-      for (const text of texts) {
-        for (const value of ["true", "false"]) {
-          const env = quotePathEnv(value);
-          const args = ["check-attr", "--stdin", "test"];
-          const native = nativeRun(dir, args, `${text}\n`, env);
-          const g = await openOurs(
-            dir,
-            createNodeGitHostEnvironment({ env: plumbingEnv(root, env) }),
-          );
-          const cmd = g
-            .checkAttr()
-            .setCompatibility(nativeCompatibility())
-            .addAttribute("test")
-            .setStdin(Buffer.from(`${text}\n`, "latin1"));
-          expect(outcomeOf(await cmd.call()), `${JSON.stringify(text)} quotePath=${value}`).toEqual(
-            native,
-          );
-        }
+      // one --stdin run of every text (a line git cannot unquote stops both at the same line)
+      const input = texts.map((t) => `${t}\n`).join("");
+      for (const value of ["true", "false"]) {
+        const env = quotePathEnv(value);
+        const native = nativeRun(dir, ["check-attr", "--stdin", "test"], input, env);
+        const g = await openOurs(
+          dir,
+          createNodeGitHostEnvironment({ env: plumbingEnv(root, env) }),
+        );
+        const cmd = g
+          .checkAttr()
+          .setCompatibility(nativeCompatibility())
+          .addAttribute("test")
+          .setStdin(Buffer.from(input, "latin1"));
+        expect(outcomeOf(await cmd.call()), `${JSON.stringify(texts)} quotePath=${value}`).toEqual(
+          native,
+        );
       }
     });
   }
