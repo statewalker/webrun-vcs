@@ -140,14 +140,18 @@ export async function adjustSharedPerm(
 
 /**
  * The files git creates read-only (mode 0444) in a repository's object directory: loose
- * objects, packs and their indexes, bitmaps, reverse indexes and mtimes, multi-pack-indexes
- * and commit-graphs. A shared repository's are created so here too, then adjusted.
+ * objects, packs and their indexes, bitmaps, reverse indexes and mtimes (a multi-pack-index's
+ * `multi-pack-index-<hash>.bitmap`/`.rev` too: `odb_mkstemp`), incremental multi-pack-index
+ * layers and commit-graphs. Not the plain `multi-pack-index` nor `multi-pack-index-chain`,
+ * which git writes through a lock file under the umask (midx-write.c). A shared repository's are created so here too, then adjusted.
  */
 export function isReadOnlyObjectFile(path: string): boolean {
   return (
     /\/objects\/[0-9a-f]{2}\/[0-9a-f]{38,62}$/.test(path) ||
-    /\/objects\/pack\/([^/]+\.(pack|idx|rev|bitmap|mtimes)|multi-pack-index[^/]*)$/.test(path) ||
-    /\/objects\/pack\/multi-pack-index\.d\/[^/]+$/.test(path) ||
+    /\/objects\/pack\/[^/]+\.(pack|idx|rev|bitmap|mtimes)$/.test(path) ||
+    /\/objects\/pack\/multi-pack-index\.d\/multi-pack-index-[0-9a-f]+\.(midx|bitmap|rev)$/.test(
+      path,
+    ) ||
     /\/objects\/info\/(commit-graph|commit-graphs\/[^/]+)$/.test(path)
   );
 }
@@ -274,8 +278,8 @@ export function withSharedPerm(files: FilesApi, shared: () => number, scope = "/
 export function isReadOnlyObjectPath(relative: string): boolean {
   return (
     /^[0-9a-f]{2}\/[0-9a-f]{38,62}$/.test(relative) ||
-    /^pack\/([^/]+\.(pack|idx|rev|bitmap|mtimes)|multi-pack-index[^/]*)$/.test(relative) ||
-    /^pack\/multi-pack-index\.d\/[^/]+$/.test(relative) ||
+    /^pack\/[^/]+\.(pack|idx|rev|bitmap|mtimes)$/.test(relative) ||
+    /^pack\/multi-pack-index\.d\/multi-pack-index-[0-9a-f]+\.(midx|bitmap|rev)$/.test(relative) ||
     /^info\/(commit-graph|commit-graphs\/[^/]+)$/.test(relative)
   );
 }

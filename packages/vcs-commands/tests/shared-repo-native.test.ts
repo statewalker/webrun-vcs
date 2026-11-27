@@ -424,7 +424,7 @@ describeGit("core.sharedRepository, as native git (t1301-shared-repo)", () => {
   // unshared repositories: git creates loose objects and pack-family files read-only
   // (odb_write_loose_object, finish_tmp_packfile, commit-graph and midx: 0444 under the umask)
   for (const umask of [0o077, 0o022]) {
-    it(`t1301-shared-repo.sh: "loose object is read-only" (unshared): a commit and a fetch under umask ${umask.toString(8).padStart(3, "0")}`, async () => {
+    it(`unshared: an add and a fetch under umask ${umask.toString(8).padStart(3, "0")}`, async () => {
       const [n, o] = await sharedAndFetched("umask", umask);
       writeFileSync(join(root, n, "a.txt"), "a\n");
       writeFileSync(join(root, o, "a.txt"), "a\n");
@@ -459,6 +459,39 @@ describeGit("core.sharedRepository, as native git (t1301-shared-repo)", () => {
       expect(ours).toEqual(fetchedModes(n));
       expect(ours[".git/objects/info/commit-graph"]).toBe(readOnly(umask));
       expect(objectFileModes(o)).toEqual(new Set([readOnly(umask)]));
+    });
+  }
+  /** The modes of `dir`'s `objects/pack`, every hex name (pack, midx checksum) as `X`. */
+  function packDirModes(dir: string): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const [path, mode] of Object.entries(modes(dir))) {
+      if (!path.startsWith(".git/objects/pack/")) continue;
+      out[path.replace(/[0-9a-f]{40}/g, "X")] = mode;
+    }
+    return out;
+  }
+
+  for (const umask of [0o077, 0o022]) {
+    it(`unshared: repack -a -d -b --write-midx under umask ${umask.toString(8).padStart(3, "0")}: bitmaps and the midx's .rev read-only, the midx itself not`, async () => {
+      const [n, o] = await sharedAndFetched("umask", umask);
+      const args = ["repack", "-q", "-a", "-d", "-b", "--write-midx"];
+      const theirs = native(join(root, n), args, umask);
+      expect(theirs.status, theirs.stderr).toBe(0);
+      await underUmask(umask, async () => {
+        const git = await openOurs(root, environment(), undefined, o);
+        await git
+          .repack()
+          .setAll(true)
+          .setDeleteRedundant(true)
+          .setWriteBitmaps(true)
+          .setWriteMidx(true)
+          .setQuiet(true)
+          .call();
+      });
+      const ours = packDirModes(o);
+      expect(ours).toEqual(packDirModes(n));
+      expect(ours[".git/objects/pack/multi-pack-index-X.bitmap"]).toBe(readOnly(umask));
+      expect(ours[".git/objects/pack/multi-pack-index"]).toBe(`f ${(0o666 & ~umask).toString(8)}`);
     });
   }
 });
