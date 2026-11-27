@@ -401,4 +401,15 @@ describe("approxidateCareful across summer time (git keeps now's tm_isdst)", () 
     const now = at(2026, 0, 1, 20);
     expect(approxidateCareful("6/1/2026", now).timestamp).toBe(at(2026, 0, 6, 20));
   });
+
+  it("a time in the hour a spring-forward change skipped is read in now's offset", async () => {
+    process.env.TZ = "America/Los_Angeles";
+    const { approxidateCareful } = await import("../src/commands/git-date.js");
+    // 2026-03-09 02:30 PDT: a year back is 2025-03-09 02:30, which the clocks skipped; glibc's
+    // mktime with tm_isdst 1 reads it as PDT (01:30 PST), as native git 2.43 and 2.55 answer
+    const now = Date.UTC(2026, 2, 9, 9, 30) / 1000;
+    expect(approxidateCareful("1.year.ago", now).timestamp).toBe(
+      Date.UTC(2025, 2, 9, 9, 30) / 1000,
+    );
+  });
 });
