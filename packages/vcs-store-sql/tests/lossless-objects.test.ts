@@ -156,6 +156,27 @@ describe("SQL native stores keep commits and tags byte for byte (#399)", () => {
     expect(rows[0].n).toBe(COMMITS.length);
   });
 
+  it("keeps a NUL in a name or message, which a TEXT column would cut short", async () => {
+    const commit = latin1(
+      "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n" +
+        "author A\0B <a@example.com> 1 +0000\n" +
+        "committer C <c@example.com> 1 +0000\n" +
+        "\na\0b\n",
+    );
+    const tag = latin1(
+      "object 4b825dc642cb6eb9a060e54bf8d69288fbee4904\ntype tree\ntag t\n" +
+        "tagger T\0U <t@example.com> 1 +0000\n\nm\0n\n",
+    );
+    for (const [type, bytes] of [
+      ["commit", commit],
+      ["tag", tag],
+    ] as const) {
+      const id = await history.serialization.importObject(type, once(bytes), bytes.length);
+      expect(id).toBe(idOf(type, bytes));
+      expect(sameBytes((await exported(history, id)).bytes, bytes)).toBe(true);
+    }
+  });
+
   it("commits.storeRaw refuses bytes that are not a commit", async () => {
     await expect(history.commits.storeRaw?.(latin1("not a commit\n"))).rejects.toThrow();
   });

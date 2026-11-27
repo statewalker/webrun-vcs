@@ -108,7 +108,11 @@ export class SqlNativeCommitStoreImpl implements SqlNativeCommitStore {
     sha1.update(content);
     const commitId = bytesToHex(sha1.digest());
     const rebuilt = await collectCommitBytes(commit);
-    return this.insert(commitId, commit, sameBytes(rebuilt, content) ? null : content);
+    return this.insert(
+      commitId,
+      commit,
+      sameBytes(rebuilt, content) && !content.includes(0) ? null : content,
+    );
   }
 
   /**

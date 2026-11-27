@@ -98,7 +98,11 @@ export class SqlNativeTagStoreImpl implements SqlNativeTagStore {
     sha1.update(content);
     const tagId = bytesToHex(sha1.digest());
     const rebuilt = await collectTagBytes(tag);
-    return this.insert(tagId, tag, sameBytes(rebuilt, content) ? null : content);
+    return this.insert(
+      tagId,
+      tag,
+      sameBytes(rebuilt, content) && !content.includes(0) ? null : content,
+    );
   }
 
   /** The tag's content as stored (see `Tags.raw`): the kept bytes, else rebuilt. */
