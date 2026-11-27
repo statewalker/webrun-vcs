@@ -923,19 +923,27 @@ describeGit("repack twins", () => {
       expect(midxKinds(twins.ours)).toEqual(["cruft", "pack", "pack"]);
     });
 
-    it("t7704-repack-cruft 'repack --write-midx includes cruft when already geometric'", async () => {
-      const caseDir = newCase(root, "follow-noop");
+    /**
+     * t7704's "repack --write-midx includes cruft when already geometric", every commit at
+     * `date`: the commits' ids decide whether the pack the follow walk writes holds C's objects
+     * in the cruft pack's order, so it is the cruft pack byte for byte and takes its name (git's
+     * install_generated_packs then unlinks the stale `.mtimes`); a clock date made it flaky
+     */
+    async function alreadyGeometric(name: string, date: number) {
+      const caseDir = newCase(root, name);
       const r = initRepo(root, caseDir);
       r.git(["config", "repack.midxMustContainCruft", "false"]);
-      r.commit("A", { "A.t": "A\n" });
-      r.commit("B", { "B.t": "B\n" });
+      r.commit("A", { "A.t": "A\n" }, date);
+      r.commit("B", { "B.t": "B\n" }, date);
       r.git(["checkout", "-q", "-B", "side"]);
-      const c = r.commit("C", { "C.t": "C\n" });
+      const c = r.commit("C", { "C.t": "C\n" }, date);
       r.git(["checkout", "-q", "main"]);
       r.git(["branch", "-D", "side"]);
       r.git(["reflog", "expire", "--all", "--expire=all"]);
       r.git(["repack", "-q", "--cruft", "-d"]);
-      r.git(["merge", "-q", "--no-ff", "-m", "merge", c]);
+      r.git(["merge", "-q", "--no-ff", "-m", "merge", c], {
+        env: { GIT_AUTHOR_DATE: `${date} +0000`, GIT_COMMITTER_DATE: `${date} +0000` },
+      });
       r.git(["repack", "-q", "-d"]);
       const { result, twins } = await repackTwins(
         caseDir,
@@ -944,12 +952,42 @@ describeGit("repack twins", () => {
         {},
         withoutInfoPacks,
       );
+      const packDir = (twin: string) => join(twin, "repo/.git/objects/pack");
+      const packCount = (twin: string) =>
+        readdirSync(packDir(twin)).filter((n) => n.endsWith(".pack")).length;
+      const cruftCount = (twin: string) =>
+        readdirSync(packDir(twin)).filter((n) => n.endsWith(".mtimes")).length;
+      return { result, twins, packCount, cruftCount };
+    }
+
+    it("t7704-repack-cruft 'repack --write-midx includes cruft when already geometric'", async () => {
+      const { result, twins, packCount, cruftCount } = await alreadyGeometric(
+        "follow-noop",
+        1700000000,
+      );
       // 2.5x's follow walk rescues C's objects from the cruft pack through the merge (a `!`
       // pack: no midx names it), so a pack is written and the midx can leave the cruft pack
       // out; 2.43 writes nothing and keeps it
       expect(result.output).toEqual(nativeIs25x ? [] : ["Nothing new to pack."]);
       expect(midxKinds(twins.ours)).toEqual(
         nativeIs25x ? ["pack", "pack", "pack"] : ["cruft", "pack", "pack"],
+      );
+      expect([packCount(twins.ours), cruftCount(twins.ours)]).toEqual(
+        nativeIs25x ? [4, 1] : [3, 1],
+      );
+    });
+
+    it("t7704-repack-cruft 'repack --write-midx includes cruft when already geometric' (the rescued pack is the cruft pack byte for byte: generated_pack_install unlinks its stale .mtimes)", async () => {
+      const { result, twins, packCount, cruftCount } = await alreadyGeometric(
+        "follow-noop-same-name",
+        1700000001,
+      );
+      expect(result.output).toEqual(nativeIs25x ? [] : ["Nothing new to pack."]);
+      expect(midxKinds(twins.ours)).toEqual(
+        nativeIs25x ? ["pack", "pack", "pack"] : ["cruft", "pack", "pack"],
+      );
+      expect([packCount(twins.ours), cruftCount(twins.ours)]).toEqual(
+        nativeIs25x ? [3, 0] : [3, 1],
       );
     });
 
