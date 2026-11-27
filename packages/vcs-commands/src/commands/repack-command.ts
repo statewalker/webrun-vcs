@@ -401,7 +401,7 @@ export class RepackCommand extends GitCommand<RepackCommandResult> {
       });
     const result = noDelta && worktree?.batch ? await worktree.batch(run) : await run();
     const output: string[] = [];
-    if (!result && !this._quiet) output.push("Nothing new to pack.");
+    if ((!result || result.nothingNew) && !this._quiet) output.push("Nothing new to pack.");
     return {
       repack: result,
       output,

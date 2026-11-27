@@ -240,6 +240,13 @@ export interface RepackOptions extends RepackTarget {
    */
   geometric?: number;
   /**
+   * `repack.midxMustContainCruft` (git 2.5x, default true, else read from the config; ignored
+   * under 2.43 compatibility): false makes a `geometric` repack run pack-objects'
+   * `--stdin-packs=follow` and leave the cruft packs out of its midx where it can (see
+   * `geometricRepack`).
+   */
+  midxMustContainCruft?: boolean;
+  /**
    * `git repack -i` (`--delta-islands`): `pack.island` and `pack.islandCore` (read from the
    * config) restrict the deltas (see `computeDeltaIslands`).
    */
@@ -273,6 +280,8 @@ export interface BitmapSettings {
   packKeptObjects?: boolean;
   /** The `bitmapPseudoMerge.*` entries in reading order (read only when a bitmap is written) */
   pseudoMergeConfig?: PseudoMergeConfigEntry[];
+  /** `repack.midxMustContainCruft` (2.5x), undefined when unset (git's default: true) */
+  midxMustContainCruft?: boolean;
 }
 
 /** git's warning when a bitmap cannot cover every object. */
@@ -338,8 +347,10 @@ export async function readBitmapSettings(
     writeBitmaps = parseGitBool(entry.value) ?? writeBitmaps;
   }
   const packKeptObjects = bool("repack.packKeptObjects");
+  const midxMustContainCruft = bool("repack.midxMustContainCruft");
   return {
     ...(writeBitmaps !== undefined ? { writeBitmaps } : {}),
+    ...(midxMustContainCruft !== undefined ? { midxMustContainCruft } : {}),
     ...(packKeptObjects !== undefined ? { packKeptObjects } : {}),
     bare: bool("core.bare") ?? false,
     hashCache: bool("pack.writeBitmapHashCache") ?? true,
@@ -437,6 +448,11 @@ export interface RepackResult {
   promisorPack?: { packName: string; objectCount: number };
   /** `filter`: the pack of the objects the filter left out (`pack-<id>`), when any was */
   filteredPack?: string;
+  /**
+   * No pack but `filteredPack` was written: git prints `Nothing new to pack.` before it writes
+   * the filtered pack
+   */
+  nothingNew?: boolean;
   /** `cruft`: the cruft packs written (`pack-<id>`), when any was */
   cruftPacks?: string[];
   /** `cruft`: the objects written to them */
@@ -619,8 +635,9 @@ export async function repackListed(
     options.packKeptObjects ??
     bitmaps.settings?.packKeptObjects ??
     (bitmaps.explicit === true && !options.writeMidx);
-  // --write-midx: a bitmap asked for is the midx's (pack-objects writes none)
-  const midxBitmap = options.writeMidx === true && bitmaps.mode !== "off";
+  // --write-midx: a bitmap asked for is the midx's (pack-objects writes none), only when
+  // write_bitmaps > 0 (-b or repack.writeBitmaps)
+  const midxBitmap = options.writeMidx === true && bitmaps.mode === "loud";
   if (options.writeMidx) bitmaps.mode = "off";
 
   // -a: everything reachable but what .keep packs hold (all of it with --pack-kept-objects);
@@ -696,7 +713,10 @@ export async function repackListed(
   const seen = reachable.length + unreachable.length;
   if (seen > 0) enumerating.update(seen);
   enumerating.stop();
-  if (ids.length === 0 && promised.length === 0 && unreachable.length === 0) return null;
+  // nothing new: --filter's write_filtered_pack still runs over the existing packs (git's
+  // `names` then holds only the filtered pack, so no "Nothing new to pack.")
+  const nothingNew = ids.length === 0 && promised.length === 0 && unreachable.length === 0;
+  if (nothingNew && (!options.filter || dryRun)) return null;
   if ((exclusions || options.filter) && bitmaps.mode !== "off") {
     // the promisor objects are not packed with the rest: no closure for a bitmap
     if (bitmaps.mode === "loud") warnings.push(NO_CLOSURE_BITMAP_WARNING);
@@ -757,7 +777,7 @@ export async function repackListed(
   }
   if (ids.length === 0 && unreachable.length === 0) {
     await packs.refresh();
-    return finishRepack(promisorPack as string, promised.length, false);
+    return finishRepack(promisorPack, promised.length, false);
   }
   // One stream: objects are read one at a time, the pack goes straight into its temporary file
   const stream = writePack(objects, unreachable.length ? [...ids, ...unreachable] : ids, {
@@ -785,14 +805,19 @@ export async function repackListed(
 
   /** Removes what the new packs replace (`-d`), then the loose objects now packed. */
   async function finishRepack(
-    packId: string,
-    count: number,
+    /** the main pack, none when only --filter's pack is written */
+    mainPack: string | undefined,
+    mainCount: number,
     bitmapWritten: boolean,
-  ): Promise<RepackResult> {
-    const newPacks = new Set([packId, ...(promisorPack ? [promisorPack] : [])]);
+  ): Promise<RepackResult | null> {
+    const newPacks = new Set([
+      ...(mainPack ? [mainPack] : []),
+      ...(promisorPack ? [promisorPack] : []),
+    ]);
     // --filter (write_filtered_pack, -a or not): what the existing packs hold and the new packs
     // do not, in a pack of its own
     let filteredPack: string | undefined;
+    let filteredCount = 0;
     if (options.filter) {
       const fresh = (await packs.packs()).filter((p) => newPacks.has(p.packId));
       const sources = packKeptObjects ? replaced.concat(kept) : replaced;
@@ -811,10 +836,14 @@ export async function repackListed(
       if (left.length > 0) {
         filteredPack = (await packs.install(writePack(objects, left, packOptions), installOptions))
           .packId;
+        filteredCount = left.length;
         newPacks.add(filteredPack);
         await packs.refresh();
       }
     }
+    if (!mainPack && !filteredPack) return null;
+    const packId = (mainPack ?? filteredPack) as string;
+    const count = mainPack ? mainCount : filteredCount;
     // Only packs of the snapshot, and none modified since the walk started (defence in depth)
     const replacedPacks: { pack: Pack; modified?: number }[] = [];
     if (all && (deleteRedundant || options.cruft)) {
@@ -957,6 +986,7 @@ export async function repackListed(
         ? { promisorPack: { packName: `pack-${promisorPack}`, objectCount: promised.length } }
         : {}),
       ...(filteredPack ? { filteredPack: `pack-${filteredPack}` } : {}),
+      ...(mainPack ? {} : { nothingNew: true }),
       ...(cruft ? { cruftPacks: cruft.packNames, cruftObjects: cruft.objectCount } : {}),
       ...(warnings.length > 0 ? { warnings } : {}),
       ...(midxWritten ? { midx: midxWritten } : {}),
@@ -994,16 +1024,17 @@ async function bitmapPlan(
     ...(options.compatibility ? { compatibility: options.compatibility } : {}),
   };
   if (options.writeBitmaps === false || options.dryRun) return { ...base, mode: "off" };
+  // git's write_bitmaps: -1 (true, "quiet") stays with --write-midx, or -a in a bare repository
   let mode: BitmapPlan["mode"] =
     explicit === true
       ? "loud"
       : explicit === false
         ? "off"
-        : all && settings.bare
+        : (all && settings.bare) || options.writeMidx
           ? "quiet"
           : "off";
   if (mode === "off") return { ...base, mode };
-  if (!all) throw new IncrementalBitmapError();
+  if (!all && !options.writeMidx) throw new IncrementalBitmapError();
   if (options.local && hasAlternates) {
     // git warns even for its default (write_bitmaps = -1 is true there)
     warnings.push(NO_CLOSURE_BITMAP_WARNING);
