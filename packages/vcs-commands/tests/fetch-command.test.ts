@@ -273,7 +273,8 @@ describe.each(backends)("FetchCommand ($name backend)", ({ factory }) => {
         const result = await git
           .fetch()
           .setRemote(remoteUrl)
-          .setRefSpecs("refs/heads/main:refs/remotes/origin/main")
+          // a wildcard: an exact source the empty remote lacks dies, as in git (#280)
+          .setRefSpecs("refs/heads/*:refs/remotes/origin/*")
           .call();
 
         expect(result.isEmpty).toBe(true);
