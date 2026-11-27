@@ -297,6 +297,14 @@ export interface FetchClientOptions {
    * `promisor.acceptFromServer=None`.
    */
   promisorRemote?: PromisorRemoteReply;
+  /**
+   * What `filter: "auto"` (git 2.54's `--filter=auto`) becomes on a v2 connection, asked
+   * after the `promisor-remote` answer before the `fetch` command (fetch-pack's
+   * `promisor_remote_construct_filter`): the filter the accepted promisor remotes advertised,
+   * or undefined for none (the fetch is then not filtered). Over v0 `auto` is sent as it is,
+   * as git sends it.
+   */
+  autoFilter?: () => string | undefined | Promise<string | undefined>;
 }
 
 /** A shallow remote refused under `rejectShallow` (git's "source repository is shallow"). */
@@ -556,7 +564,16 @@ export async function fetchFromConnection(
   // (`--check-self-contained-and-connected`); never for a partial clone's packs
   // the filter the server takes (fetch-pack drops one it does not, with a warning): its
   // objects are promised, so the checks below cannot walk them
-  const filter = options.filter && serverSupportsFilter(connection) ? options.filter : undefined;
+  let filterSpec = options.filter;
+  // do_fetch_pack_v2: promisor_remote_reply, then an `auto` filter resolved from the remotes
+  // it accepted; the first round's reply is this one
+  let promisorAsked = false;
+  if (filterSpec === "auto" && connection.version === 2 && !connection.dumb) {
+    await askPromisorRemote(connection, options.promisorRemote);
+    promisorAsked = true;
+    filterSpec = (await options.autoFilter?.()) ?? undefined;
+  }
+  const filter = filterSpec && serverSupportsFilter(connection) ? filterSpec : undefined;
   // a filtered bundle's pack: a promisor pack of its own kind (`--promisor=from-bundle`)
   const bundleFilter = options.bundle?.filter;
   const strictLinks =
@@ -640,7 +657,8 @@ export async function fetchFromConnection(
         deepen: deepening,
       });
     }
-    await askPromisorRemote(connection, options.promisorRemote);
+    if (promisorAsked) promisorAsked = false;
+    else await askPromisorRemote(connection, options.promisorRemote);
     const fetched = await fetchPack(connection, source, {
       wants,
       ...(repository.objectFormat ? { objectFormat: repository.objectFormat } : {}),
@@ -651,7 +669,7 @@ export async function fetchFromConnection(
         : {}),
       ...(parsedCommits ? { parsedCommits } : {}),
       shallow,
-      filter: options.filter,
+      filter: filterSpec,
       ...(options.onWarning ? { onWarning: options.onWarning } : {}),
       ...(options.serverOptions?.length ? { serverOptions: options.serverOptions } : {}),
       ...(options.sessionId !== undefined ? { sessionId: options.sessionId } : {}),
