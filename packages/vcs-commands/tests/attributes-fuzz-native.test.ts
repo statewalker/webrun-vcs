@@ -12,7 +12,17 @@
  * mismatches as JSON.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -224,6 +234,17 @@ const fatalOf = (stderr: string) =>
     .find((l) => l.startsWith("fatal: "))
     ?.slice("fatal: ".length);
 
+/**
+ * Dates `.git/index` whole seconds away from the tracked files' mtimes (never the files: their
+ * entries keep matching their stat): before the oldest makes every entry racily clean (git's
+ * `is_racy_timestamp`: the index's second no later than the entry's), after the newest none.
+ */
+function dateIndex(dir: string, tracked: string[], racy: boolean) {
+  const seconds = tracked.map((path) => Math.floor(statSync(join(dir, path)).mtimeMs / 1000));
+  const at = racy ? Math.min(...seconds) - 60 : Math.max(...seconds) + 3600;
+  utimesSync(join(dir, ".git", "index"), at, at);
+}
+
 async function one(root: string, seed: number) {
   const L = genLayout(seed);
   const native = join(root, `n${seed}`);
@@ -306,12 +327,24 @@ async function one(root: string, seed: number) {
       if (a !== b)
         diffs.push(`checkout ${path}: ours=${JSON.stringify(b)} git=${JSON.stringify(a)}`);
     }
-    const st2N = run(native, "status", "--porcelain=v1", "-uall");
-    const st2O = formatStatusPorcelain(
-      await (await open(ours)).git.status().setUntrackedFiles("all").call(),
-      1,
-    );
-    if (st2N !== st2O) diffs.push(`status after checkout:\ngit:\n${st2N}ours:\n${st2O}`);
+    // Whether an entry is racily clean depends on the second each twin wrote its files and
+    // its index in (statewalker/webrun-vcs#255), so the index is dated: an hour after every
+    // file (entries stat-clean), then before every file (all racily clean: compared by
+    // content through the conversions, which a checkout's bytes do not always survive)
+    const tracked = [...paths, ...[...L.attributes.keys()].map((d) => join(d, ".gitattributes"))];
+    // a failed checkout leaves files missing: already reported above, nothing to date
+    const missing = [native, ours].some((dir) => tracked.some((p) => !existsSync(join(dir, p))));
+    for (const view of missing ? [] : (["stat-clean", "racily clean"] as const)) {
+      for (const dir of [native, ours]) dateIndex(dir, tracked, view === "racily clean");
+      const st2N = run(native, "status", "--porcelain=v1", "-uall");
+      const st2O = formatStatusPorcelain(
+        await (await open(ours)).git.status().setUntrackedFiles("all").call(),
+        1,
+      );
+      if (st2N !== st2O) {
+        diffs.push(`status after checkout (${view}):\ngit:\n${st2N}ours:\n${st2O}`);
+      }
+    }
   }
   rmSync(native, { recursive: true, force: true });
   rmSync(ours, { recursive: true, force: true });
@@ -344,4 +377,69 @@ describeGit("attributes and line endings against native git (differential fuzz)"
     if (OUT) writeFileSync(OUT, JSON.stringify({ n: seeds.length, bad }, null, 1));
     expect(bad).toEqual([]);
   }, 3_600_000);
+});
+
+/**
+ * statewalker/webrun-vcs#255: seed 31018's layout once failed on CI, where the checkout and
+ * the index landed in one mtime second. A racily clean entry is checked by content, and git
+ * hashes the file through `convert_to_git` (`ie_match_stat` → `ce_modified_check_fs` →
+ * `ce_compare_data`): this file's `a\r\n` becomes `a\n`, so git reports it modified.
+ * `core.trustctime=false` keeps ctime out (utimes never sets it). Ours agrees in every case
+ * (2.43 and 2.55): the CI failure was each twin racing its own clock, which the fuzz now
+ * rules out by dating the index (`dateIndex`).
+ */
+describeGit("racily clean entries through conversions (statewalker/webrun-vcs#255)", () => {
+  const layout = (): Layout => ({
+    files: new Map([["a/b/a b.txt", "\t\r\n\nb c\x01a\r\r\n"]]),
+    attributes: new Map([
+      ["", ["[attr]mac text eol=crlf", "* crlf=input", "* ident eol=weird text", "**/b/* -mac"]],
+      ["a/b", ["*.txt eol=weird", "w eol=crlf"]],
+    ]),
+    config: [["core.trustctime", "false"]],
+  });
+
+  // seconds the index is written after the file: the same second (racy), a fraction of one
+  // later within that second (git compares whole seconds: still racy), an hour later
+  const cases = [
+    { name: "racily clean entry", after: 0, racy: true },
+    { name: "racily clean entry, index later in the same second", after: "fraction", racy: true },
+    { name: "stat-clean entry", after: 3600, racy: false },
+  ] as const;
+  for (const { name, after, racy } of cases) {
+    it(`status after checkout, ${name}`, async () => {
+      const root = mkdtempSync(join(tmpdir(), "attr-racy-"));
+      home = join(root, "home");
+      mkdirSync(home);
+      try {
+        const native = join(root, "native");
+        const ours = join(root, "ours");
+        for (const dir of [native, ours]) {
+          build(dir, layout());
+          run(dir, "-c", "core.safecrlf=false", "add", "-f", ".");
+          run(dir, "commit", "-q", "-m", "c1");
+          unlinkSync(join(dir, "a/b/a b.txt"));
+          if (dir === native) run(dir, "reset", "-q", "--hard");
+          else await (await open(dir)).git.reset().setMode(ResetMode.HARD).setRef("HEAD").call();
+          // the file keeps the stat its entry recorded; only the index is dated
+          const { mtimeNs } = statSync(join(dir, "a/b/a b.txt"), { bigint: true });
+          const second = Number(mtimeNs / 1_000_000_000n);
+          const fraction = Number(mtimeNs % 1_000_000_000n) / 1e9;
+          const at =
+            after === "fraction"
+              ? second + (fraction + 1) / 2 // later, still within the file's second
+              : second + fraction + after;
+          utimesSync(join(dir, ".git", "index"), at, at);
+        }
+        const stN = run(native, "status", "--porcelain=v1", "-uall");
+        const stO = formatStatusPorcelain(
+          await (await open(ours)).git.status().setUntrackedFiles("all").call(),
+          1,
+        );
+        expect(stO).toBe(stN);
+        expect(stN).toBe(racy ? ' M "a/b/a b.txt"\n' : "");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
 });
