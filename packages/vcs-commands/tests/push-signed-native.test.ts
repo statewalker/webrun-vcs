@@ -55,13 +55,19 @@ import { gitOut, putFile, testEnv } from "./status-native-support.js";
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 const itSsh =
   spawnSync("ssh-keygen", ["-?"], { stdio: "ignore" }).error === undefined ? it : it.skip;
+const itSshAgent =
+  itSsh === it && spawnSync("ssh-agent", ["-h"], { stdio: "ignore" }).error === undefined
+    ? it
+    : it.skip;
 
 let root: string;
 let counter = 0;
 let daemon: { port: number; close(): Promise<void> };
 const compatibility = nativeIs25x ? "2.56" : "2.43";
 
-const env = () => testEnv(root);
+/** Variables both pushers get besides the test environment's (an ssh agent's socket) */
+let extraEnv: Record<string, string> = {};
+const env = () => testEnv(root, extraEnv);
 const git = (cwd: string, ...args: string[]) => gitOut(root, cwd, args).trim();
 
 /** Our host environment: hooks, the signer and the verifier run the programs native git runs. */
@@ -278,16 +284,17 @@ async function oursPush(f: Fixture, way: Way, url: string, args: string[], trans
 
 /** `git push <args>` the four ways; every outcome must match native git's to a local path. */
 async function pushFourWays(f: Fixture, args: string[]): Promise<Record<Way, Outcome>> {
-  const native = await gitAsync(root, join(f.dirs.n, "src"), ["push", "../dst", ...args]);
+  const native = await gitAsync(root, join(f.dirs.n, "src"), ["push", "../dst", ...args], extraEnv);
   const out = {} as Record<Way, Outcome>;
   out.n = leftBy(f, "n", native.status ?? 1, stderrOf(native.stderr));
   const o = await oursPush(f, "o", "../dst", args);
   out.o = leftBy(f, "o", o.status, o.stderr);
-  const d = await gitAsync(root, join(f.dirs.d, "src"), [
-    "push",
-    `git://127.0.0.1:${daemon.port}/${f.k}/d/dst`,
-    ...args,
-  ]);
+  const d = await gitAsync(
+    root,
+    join(f.dirs.d, "src"),
+    ["push", `git://127.0.0.1:${daemon.port}/${f.k}/d/dst`, ...args],
+    extraEnv,
+  );
   out.d = leftBy(f, "d", d.status ?? 1, stderrOf(d.stderr));
   const e = await oursPush(f, "e", `git://127.0.0.1:9418/${f.k}/e/dst`, args, true);
   out.e = leftBy(f, "e", e.status, e.stderr);
@@ -455,7 +462,99 @@ describeGit("signed pushes (t5534-push-signed.sh)", () => {
     expect(out.n.log).toContain("GIT_PUSH_CERT_STATUS=G");
     expect(out.n.log).toContain("GIT_PUSH_CERT_SIGNER=committer@example.com");
     expect(out.n.log).toMatch(/GIT_PUSH_CERT_KEY=SHA256:/);
-    expect(out.n.log).toMatch(/pusher SHA256:\S+ <date>/);
+    expect(out.n.log).toMatch(/pusher SHA256:\S+ {1,2}<date>/);
+  });
+
+  /** An Ed25519 key `<root>/<name>` (and `.pub`), signers allowed by `allowed-signers`. */
+  function sshKey(name: string): { key: string; pub: string } {
+    const key = join(root, name);
+    if (!existsSync(key)) {
+      spawnSync("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-C", name, "-f", key]);
+      const pub = readFileSync(`${key}.pub`, "latin1").trim().split(" ");
+      writeFileSync(join(root, "allowed-signers"), `committer@example.com ${pub[0]} ${pub[1]}\n`, {
+        flag: "a",
+      });
+    }
+    return { key, pub: readFileSync(`${key}.pub`, "latin1").trim() };
+  }
+
+  const sshReceiver = () => ({
+    "receive.certNonceSeed": "sekrit",
+    "gpg.format": "ssh",
+    "gpg.ssh.allowedSignersFile": join(root, "allowed-signers"),
+  });
+
+  // not ported from t5534 (t7528-signed-commit-ssh.sh: "create signed commits with keys
+  // having defaultKeyCommand"): send-pack's get_signing_key_id runs gpg.ssh.defaultKeyCommand
+  // (get_default_ssh_signing_key) and the pusher is the fingerprint of the key it prints
+  itSshAgent("an ssh-signed push with gpg.ssh.defaultKeyCommand names its key", async () => {
+    const { key } = sshKey("agent-key");
+    const sock = join(root, "agent.sock");
+    const agent = spawnSync("ssh-agent", ["-a", sock, "-s"], { encoding: "latin1" });
+    const pid = /SSH_AGENT_PID=(\d+)/.exec(agent.stdout)?.[1];
+    try {
+      spawnSync("ssh-add", ["-q", key], { env: { ...process.env, SSH_AUTH_SOCK: sock } });
+      extraEnv = { SSH_AUTH_SOCK: sock };
+      const f = fixture(sshReceiver(), {
+        "gpg.format": "ssh",
+        "gpg.ssh.defaultKeyCommand": "ssh-add -L",
+      });
+      const out = await pushFourWays(f, ["--signed", "ff", "+noff"]);
+      expect(out.n.status).toBe(0);
+      expect(out.n.log).toContain("GIT_PUSH_CERT_STATUS=G");
+      const fingerprint = spawnSync("ssh-keygen", ["-lf", `${key}.pub`], {
+        encoding: "latin1",
+      }).stdout.split(" ")[1];
+      // 2.43 (to 2.51) keeps the space after the fingerprint
+      expect(out.n.log).toContain(`pusher ${fingerprint}${nativeIs25x ? "" : " "} <date>`);
+    } finally {
+      extraEnv = {};
+      if (pid) process.kill(Number(pid));
+    }
+  });
+
+  // not ported from t5534: a relative user.signingKey is the path ssh-keygen -lf reads in the
+  // directory git runs in (the worktree top), and `~/` is not expanded there
+  // (get_ssh_key_fingerprint passes configured_signing_key as it is)
+  itSsh("an ssh-signed push with a relative user.signingKey", async () => {
+    const { key } = sshKey("ssh-key");
+    for (const signingKey of ["../relative-key", "~/relative-key"]) {
+      const f = fixture(sshReceiver(), { "gpg.format": "ssh", "user.signingKey": signingKey });
+      for (const way of WAYS) cpSync(key, join(f.dirs[way], "relative-key"));
+      const out = await pushFourWays(f, ["--signed", "ff"]);
+      if (signingKey.startsWith("~")) {
+        expect(out.n.status).toBe(128);
+        expect(out.n.stderr).toContain(
+          "fatal: failed to get the ssh fingerprint for key '~/relative-key': Success",
+        );
+      } else {
+        expect(out.n.status).toBe(0);
+        expect(out.n.log).toMatch(/pusher SHA256:\S+ {1,2}<date>/);
+      }
+    }
+  });
+
+  // not ported from t5534: a gpg.ssh.defaultKeyCommand that gives no key leaves
+  // get_ssh_key_id a NULL key, and git crashes (SIGSEGV) after the warning
+  itSsh("an ssh-signed push whose gpg.ssh.defaultKeyCommand gives no key", async () => {
+    for (const command of ["false", "echo nokey"]) {
+      const f = fixture(sshReceiver(), {
+        "gpg.format": "ssh",
+        "gpg.ssh.defaultKeyCommand": command,
+      });
+      const native = spawnSync("git", ["push", "--signed", "../dst", "ff"], {
+        cwd: join(f.dirs.n, "src"),
+        env: env(),
+        encoding: "latin1",
+      });
+      expect(native.signal, native.stderr).toBe("SIGSEGV");
+      const ours = await oursPush(f, "o", "../dst", ["--signed", "ff"]);
+      expect(ours.status).toBe(139);
+      expect(ours.stderr).toEqual(stderrOf(native.stderr));
+      expect(git(join(f.dirs.o, "dst"), "for-each-ref", "--format=%(objectname) %(refname)")).toBe(
+        git(join(f.dirs.n, "dst"), "for-each-ref", "--format=%(objectname) %(refname)"),
+      );
+    }
   });
 });
 
