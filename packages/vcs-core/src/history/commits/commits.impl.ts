@@ -13,6 +13,7 @@ import type { CommitGraphProvider } from "../commit-graph/commit-graph-provider.
 import { type GitObject, type GitObjects, objectFormatOf } from "../objects/git-objects.js";
 import {
   hasObjectOfType,
+  loadTypedBytes,
   objectHeader,
   removeObject,
   storeObject,
@@ -298,6 +299,17 @@ class GitCommitStore implements Commits {
     } finally {
       await it.return?.();
     }
+  }
+
+  /** The stored content (see `Commits.raw`). */
+  raw(id: ObjectId): Promise<Uint8Array | undefined> {
+    return loadTypedBytes(this.objects, id, "commit");
+  }
+
+  /** Stores the content as it is (see `Commits.storeRaw`), once it parses as a commit. */
+  async storeRaw(content: Uint8Array): Promise<ObjectId> {
+    commitFromBytes(content, this.signatureHeader);
+    return storeObject(this.objects, "commit", [content]);
   }
 
   /**

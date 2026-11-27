@@ -96,6 +96,19 @@ export interface Tags extends ObjectStorage<Tag> {
    * @returns Target object ID if tag exists, undefined otherwise
    */
   getTarget(tagId: ObjectId, peel?: boolean): Promise<ObjectId | undefined>;
+
+  /**
+   * The tag's content as stored (git's tag format, without the object header), byte for byte:
+   * extra headers and bytes that are not UTF-8 included, which `load`'s `Tag` does not carry.
+   * Undefined if it is absent or not a tag. Optional, as `Commits.raw`.
+   */
+  raw?(id: ObjectId): Promise<Uint8Array | undefined>;
+
+  /**
+   * Stores a tag given as its content (without the object header) byte for byte, and returns
+   * its id. Refuses content that does not parse as a tag. Optional, as `Commits.storeRaw`.
+   */
+  storeRaw?(content: Uint8Array): Promise<ObjectId>;
 }
 
 /**
