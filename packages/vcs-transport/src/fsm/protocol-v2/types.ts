@@ -14,6 +14,8 @@ export interface FetchV2Request {
   wants: string[];
   /** Ref-based wants ("want-ref <refname>") */
   wantRefs: string[];
+  /** The `want` and `want-ref` lines in request order (git refuses the first bad one) */
+  wantOrder?: ({ want: string } | { wantRef: string })[];
   /** Client's have objects ("have <oid>") */
   haves: string[];
   /** Client has sent "done" */
@@ -220,6 +222,7 @@ export function createEmptyFetchRequest(): FetchV2Request {
   return {
     wants: [],
     wantRefs: [],
+    wantOrder: [],
     haves: [],
     done: false,
     shallow: [],

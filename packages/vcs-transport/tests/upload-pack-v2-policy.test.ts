@@ -384,7 +384,10 @@ describe("protocol v2 upload-pack: capabilities", () => {
     const { repo, c4 } = await linearRepo();
     const res = await fetchRaw(repo, [`want ${c4}`, "filter blob:none", "done"]);
     expect(res.capabilities.some((c) => c.includes("filter"))).toBe(false);
-    expect(res.lines).toContain("ERR unexpected line: 'filter blob:none'");
+    // git's process_args dies on the unexpected line without an ERR packet (native
+    // `git upload-pack` writes nothing: server-parity-real-git's ProtocolV2ParserTest twins)
+    expect(res.lines.some((l) => l.startsWith("ERR"))).toBe(false);
+    expect(res.lines).not.toContain("packfile");
   });
 });
 

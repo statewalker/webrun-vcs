@@ -349,8 +349,9 @@ describe("Server V2 FSM", () => {
 
   describe("PARSE_FETCH state", () => {
     it("parses fetch arguments", async () => {
-      // want-ref lines need git's uploadpack.allowRefInWant
+      // want-ref lines need git's uploadpack.allowRefInWant, filter lines uploadpack.allowFilter
       context.config.allowRefInWant = true;
+      context.config.uploadPackFilter = { allowFilter: true };
       const oid1 = "a".repeat(40);
       const oid2 = "b".repeat(40);
 

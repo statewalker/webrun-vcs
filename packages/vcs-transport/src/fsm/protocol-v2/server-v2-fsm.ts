@@ -235,8 +235,12 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
                 ...accepted.filter((n) => known.includes(n)),
               ]),
             ];
+          } else if (!isClientCapability(ctx, line)) {
+            // serve.c's receive_client_capability: a key that is no capability, a command's
+            // name, or a capability not advertised dies (no ERR packet)
+            ctx.output.error = `unknown capability '${line}'`;
+            return "ERROR";
           }
-          // other capability lines (agent, server-option, ...) are accepted
           seen = true;
         }
 
@@ -394,6 +398,8 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
 
           if (line.startsWith("want ")) {
             req.wants.push(line.slice(5));
+            req.wantOrder ??= [];
+            req.wantOrder.push({ want: line.slice(5) });
           } else if (line.startsWith("want-ref ")) {
             // only with uploadpack.allowRefInWant (process_args): else git dies on an
             // unexpected line, with no ERR packet
@@ -402,6 +408,8 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
               return "ERROR";
             }
             req.wantRefs.push(line.slice(9));
+            req.wantOrder ??= [];
+            req.wantOrder.push({ wantRef: line.slice(9) });
           } else if (line.startsWith("have ")) {
             req.haves.push(line.slice(5));
           } else if (line === "done") {
@@ -431,6 +439,12 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           } else if (line === "deepen-relative") {
             req.deepenRelative = true;
           } else if (line.startsWith("filter ")) {
+            // only with uploadpack.allowFilter (process_args): else git dies on an unexpected
+            // line, with no ERR packet
+            if (!advertisesFetchFeature(ctx, "filter")) {
+              ctx.output.error = `unexpected line: '${line}'`;
+              return "ERROR";
+            }
             // git dies at a second one (list_objects_filter_die_if_populated)
             if (req.filter !== null) req.filterRepeated = true;
             else req.filter = line.slice(7);
@@ -490,15 +504,25 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
         ctx.state.wants = new Set();
         ctx.state.wantedRefs = new Map();
 
+        // process_args refuses wants and want-refs line by line (parse_want: a missing
+        // object; parse_want_ref: an unknown ref), so the first refusal in request order
+        // is the one git reports
+        const policyFirst = ctx.config.requestPolicy ?? "ANY";
+        for (const item of req.wantOrder ?? []) {
+          if ("want" in item) {
+            if (policyFirst === "ANY" && !(await ctx.repository.has(item.want))) {
+              ctx.output.error = notOurRef(item.want);
+              ctx.output.invalidWant = item.want;
+              return "INVALID_WANT";
+            }
+          } else if (!(await wantRefTarget(ctx, item.wantRef))) break;
+        }
+
         // Resolve want-refs to OIDs; a hidden ref is unknown (git's parse_want_ref)
         for (const refName of req.wantRefs) {
           // refs_read_ref reads only well-formed names: another spelling of a hidden ref
           // (`refs//hidden/x`, `refs/./hidden/x`) is an unknown ref, never read
-          const oid =
-            !isValidRefName(refName, { allowOneLevel: true }) ||
-            isRefHidden(refName, ctx.config.hiddenRefs, ctx.config.namespace)
-              ? undefined
-              : await ctx.refStore.get(refName);
+          const oid = await wantRefTarget(ctx, refName);
           if (!oid) {
             ctx.output.error = `unknown ref ${refName}`;
             ctx.output.invalidWant = refName;
@@ -512,14 +536,10 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           ctx.state.wantedRefs.set(refName, oid);
         }
 
-        // A filter is refused unless advertised (uploadpack.allowFilter); an advertised one
-        // must parse and pass the allow-list (process_args: git dies, an allow-list refusal
-        // sent as ERR first), then goes to exportPack as `filterSpec`
+        // An advertised filter (an unadvertised one died while parsing) must parse and pass
+        // the allow-list (process_args: git dies, an allow-list refusal sent as ERR first),
+        // then goes to exportPack as `filterSpec`
         if (req.filter !== null) {
-          if (!advertisesFetchFeature(ctx, "filter")) {
-            ctx.output.error = `unexpected line: 'filter ${req.filter}'`;
-            return "INVALID_WANT";
-          }
           const refused = req.filterRepeated
             ? { message: "multiple filter-specs cannot be combined", reported: false }
             : checkUploadPackFilter(req.filter, ctx.config.uploadPackFilter);
@@ -1220,6 +1240,39 @@ function advertisedPromisorNames(ctx: ProcessContext): string[] {
 
 function advertisesCapability(ctx: ProcessContext, name: string): boolean {
   return advertisedCapabilities(ctx).some((c) => c === name || c.startsWith(`${name}=`));
+}
+
+/** The capabilities a client may send before its command (serve.c's table, no commands). */
+const CLIENT_CAPABILITIES = [
+  "agent",
+  "server-option",
+  "object-format",
+  "session-id",
+  "promisor-remote",
+];
+
+/**
+ * serve.c's receive_client_capability: `line` names a capability of git's table that is no
+ * command (`<name>` or `<name>=<value>`), and the server advertises it.
+ */
+function isClientCapability(ctx: ProcessContext, line: string): boolean {
+  const eq = line.indexOf("=");
+  const name = eq < 0 ? line : line.slice(0, eq);
+  return CLIENT_CAPABILITIES.includes(name) && advertisesCapability(ctx, name);
+}
+
+/**
+ * The object a `want-ref` names, undefined for git's "unknown ref" (parse_want_ref): a name
+ * refs_read_ref cannot read (`refs//hidden/x`, `refs/./hidden/x`) or a hidden ref.
+ */
+async function wantRefTarget(ctx: ProcessContext, refName: string): Promise<string | undefined> {
+  if (
+    !isValidRefName(refName, { allowOneLevel: true }) ||
+    isRefHidden(refName, ctx.config.hiddenRefs, ctx.config.namespace)
+  ) {
+    return undefined;
+  }
+  return await ctx.refStore.get(refName);
 }
 
 /** Whether the advertised `<capability>=` lists `feature` (e.g. `fetch=shallow`). */

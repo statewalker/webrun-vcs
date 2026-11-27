@@ -218,11 +218,13 @@ describe("upload-pack serving filters", () => {
     });
     expect(refused.text).toContain("ERR filter 'tree' not supported");
     expect(refused.text).not.toContain("packfile");
-    // not advertised: an unexpected line
+    // not advertised: an unexpected line, git's death without an ERR packet
     const off = await serve(repo, v2Fetch([`want ${tip}`, "filter blob:none", "done"]), {
       version: "2",
     });
-    expect(off.text).toContain("ERR unexpected line: 'filter blob:none'");
+    expect(off.text).not.toContain("ERR");
+    expect(off.text).not.toContain("packfile");
+    expect(off.error).toContain("unexpected line: 'filter blob:none'");
     // unparsable, or two of them: git dies without a packet
     for (const args of [["filter tree:x"], ["filter blob:none", "filter tree:0"]]) {
       const died = await serve(repo, v2Fetch([`want ${tip}`, ...args, "done"]), {
