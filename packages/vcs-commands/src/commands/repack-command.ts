@@ -6,10 +6,13 @@ import {
   repack as storeRepack,
 } from "@statewalker/vcs-store-files";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
+import { AttributesMemo, attributesSourceSetting } from "@statewalker/vcs-working-tree";
 import { GitApiError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
+import { bareAttributesResolver } from "./attributes-source.js";
 import { hostEnvironmentOf } from "./git-ident.js";
+import { configValue } from "./merge-config.js";
 
 /** What `git repack` did. */
 export interface RepackCommandResult {
@@ -89,7 +92,7 @@ export class RepackCommand extends GitCommand<RepackCommandResult> {
     return this;
   }
 
-  /** `--cruft`: unreachable objects into a cruft pack (needs `-d` here). */
+  /** `--cruft`: unreachable objects into a cruft pack (without `-d` the old packs stay). */
   setCruft(cruft: boolean): this {
     this.checkCallable();
     this._cruft = cruft;
@@ -169,7 +172,11 @@ export class RepackCommand extends GitCommand<RepackCommandResult> {
     return this;
   }
 
-  /** `--filter=<spec>` (with `-a`): filtered-out objects go into a pack of their own. */
+  /**
+   * `--filter=<spec>`: the new pack leaves out what the filter omits, and the objects of the
+   * existing packs the new ones lack go into a pack of their own (git's `write_filtered_pack`,
+   * with or without `-a`).
+   */
   setFilter(spec: string): this {
     this.checkCallable();
     this._filter = spec;
@@ -242,8 +249,13 @@ export class RepackCommand extends GitCommand<RepackCommandResult> {
     return value === undefined ? fallback : (parseGitBool(value) ?? fallback);
   }
 
-  /** The `delta` attribute's check (git's `no_try_delta`), when the repository has a worktree. */
-  private noDeltaCheck(): ((path: string) => Promise<boolean>) | undefined {
+  /**
+   * The `delta` attribute's check (git's `no_try_delta`): through the worktree's attributes, or
+   * in a bare repository builtin, system, global and `info/attributes` plus an attribute source
+   * (`$GIT_ATTR_SOURCE`, `attr.tree`); 2.43 reads HEAD's tree as the source when none is set
+   * (attr.c's `compute_default_attr_source` for a bare repository).
+   */
+  private async noDeltaCheck(): Promise<((path: string) => Promise<boolean>) | undefined> {
     const worktree = "worktree" in this.workingCopy ? this.worktreeAccess : undefined;
     const filter = worktree?.contentFilter as
       | {
@@ -255,8 +267,30 @@ export class RepackCommand extends GitCommand<RepackCommandResult> {
         }
       | undefined;
     const attributes = filter?.attributes?.bind(filter);
-    if (!attributes) return undefined;
-    return async (path) => (await attributes(path, ["delta"], "checkin")).get("delta") === false;
+    if (attributes)
+      return async (path) => (await attributes(path, ["delta"], "checkin")).get("delta") === false;
+    if (worktree) return undefined;
+    const { history } = this.workingCopy;
+    let sourceTree: string | undefined;
+    if (
+      this.hooks.compatibility === "2.43" &&
+      !attributesSourceSetting(
+        hostEnvironmentOf(this.workingCopy)?.attrSource,
+        configValue(this.workingCopy, "attr.tree"),
+      )
+    )
+      sourceTree = await this.revisionResolver()
+        .resolve("HEAD^{tree}")
+        .catch(() => undefined);
+    const resolver = bareAttributesResolver({
+      workingCopy: this.workingCopy,
+      trees: history.trees,
+      blobs: history.blobs,
+      revisions: () => this.revisionResolver(),
+      ...(sourceTree !== undefined ? { sourceTree } : {}),
+    });
+    const memo = new AttributesMemo();
+    return async (path) => (await resolver.get(path, ["delta"], { memo })).get("delta") === false;
   }
 
   /**
@@ -295,10 +329,6 @@ export class RepackCommand extends GitCommand<RepackCommandResult> {
     const geometric = this._geometric ? this._geometric : undefined;
     if (geometric !== undefined && all)
       throw new GitApiError("fatal: options '--geometric' and '-A/-a' cannot be used together");
-    if (this._filter !== undefined && !all)
-      throw new GitApiError("repack --filter without -a is not supported");
-    if (this._cruft && !this._delete)
-      throw new GitApiError("repack --cruft without -d is not supported");
 
     const repository = await this.filesRepository();
     if (!repository) throw new GitApiError("repack needs a files repository");
@@ -312,7 +342,8 @@ export class RepackCommand extends GitCommand<RepackCommandResult> {
             ...(this._depth !== undefined ? { depth: this._depth } : {}),
           }
         : undefined;
-    const noDelta = this.noDeltaCheck();
+    const noDelta = await this.noDeltaCheck();
+    const geometricWarnings: string[] = [];
     const unpackExpireMs = (() => {
       if (this._unpackUnreachable === undefined) return Number.POSITIVE_INFINITY;
       const cutoff = parseExpiryDate(this._unpackUnreachable, nowSeconds, "--unpack-unreachable");
@@ -366,6 +397,7 @@ export class RepackCommand extends GitCommand<RepackCommandResult> {
           this._updateServerInfo ?? this.configBool("repack.updateServerInfo", true),
         deltaIslands: this._deltaIslands ?? this.configBool("repack.useDeltaIslands", false),
         ...(noDelta ? { noDelta } : {}),
+        onWarning: (line) => geometricWarnings.push(line),
       });
     const result = noDelta && worktree?.batch ? await worktree.batch(run) : await run();
     const output: string[] = [];
@@ -375,6 +407,7 @@ export class RepackCommand extends GitCommand<RepackCommandResult> {
       output,
       warnings: [
         ...this.alternatesErrors(),
+        ...geometricWarnings,
         ...(result?.warnings ?? []),
         ...(result?.errors ?? []).filter((l) => !this.alternatesErrors().includes(l)),
       ],
