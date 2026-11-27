@@ -403,4 +403,62 @@ describeGit("core.sharedRepository, as native git (t1301-shared-repo)", () => {
       expect(ours[".git/objects/info/commit-graph"]).toBe("f 440");
     });
   }
+  /** git's 0444 under `umask`, as {@link modes} prints it. */
+  const readOnly = (umask: number) => `f ${(0o444 & ~umask).toString(8)}`;
+
+  /** The modes of every loose object and pack-family file below `dir`'s objects. */
+  function objectFileModes(dir: string): Set<string> {
+    const out = new Set<string>();
+    for (const [path, mode] of Object.entries(modes(dir))) {
+      if (
+        /^\.git\/objects\/([0-9a-f]{2}\/[0-9a-f]+|pack\/.+\.(pack|idx|rev|bitmap|mtimes))$/.test(
+          path,
+        )
+      ) {
+        out.add(mode);
+      }
+    }
+    return out;
+  }
+
+  // unshared repositories: git creates loose objects and pack-family files read-only
+  // (odb_write_loose_object, finish_tmp_packfile, commit-graph and midx: 0444 under the umask)
+  for (const umask of [0o077, 0o022]) {
+    it(`t1301-shared-repo.sh: "loose object is read-only" (unshared): a commit and a fetch under umask ${umask.toString(8).padStart(3, "0")}`, async () => {
+      const [n, o] = await sharedAndFetched("umask", umask);
+      writeFileSync(join(root, n, "a.txt"), "a\n");
+      writeFileSync(join(root, o, "a.txt"), "a\n");
+      expect(native(join(root, n), ["add", "a.txt"], umask).status).toBe(0);
+      await underUmask(umask, async () => {
+        const git = await openOurs(root, environment(), undefined, o);
+        await git.add().addFilepattern("a.txt").call();
+      });
+      const ours = fetchedModes(o);
+      expect(ours).toEqual(fetchedModes(n));
+      expect(objectFileModes(o)).toEqual(new Set([readOnly(umask)]));
+      expect(objectFileModes(n)).toEqual(new Set([readOnly(umask)]));
+    });
+
+    it(`unshared: gc --prune=now under umask ${umask.toString(8).padStart(3, "0")} writes git's read-only packs and commit-graph`, async () => {
+      const [n, o] = await sharedAndFetched("umask", umask);
+      const gc = [
+        "-c",
+        "gc.reflogExpire=90.days.ago",
+        "-c",
+        "gc.reflogExpireUnreachable=30.days.ago",
+        "gc",
+        "-q",
+        "--prune=now",
+      ];
+      expect(native(join(root, n), gc, umask).status).toBe(0);
+      await underUmask(umask, async () => {
+        const git = await openOurs(root, environment(), undefined, o);
+        await git.gc().setPrune("now").setQuiet(true).call();
+      });
+      const ours = fetchedModes(o);
+      expect(ours).toEqual(fetchedModes(n));
+      expect(ours[".git/objects/info/commit-graph"]).toBe(readOnly(umask));
+      expect(objectFileModes(o)).toEqual(new Set([readOnly(umask)]));
+    });
+  }
 });

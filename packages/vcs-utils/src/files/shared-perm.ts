@@ -266,3 +266,85 @@ export function withSharedPerm(files: FilesApi, shared: () => number, scope = "/
     },
   });
 }
+
+/**
+ * {@link isReadOnlyObjectFile} for a path relative to an objects directory (`ab/cdef...`,
+ * `pack/pack-<id>.idx`, `info/commit-graph`), whatever that directory is named.
+ */
+export function isReadOnlyObjectPath(relative: string): boolean {
+  return (
+    /^[0-9a-f]{2}\/[0-9a-f]{38,62}$/.test(relative) ||
+    /^pack\/([^/]+\.(pack|idx|rev|bitmap|mtimes)|multi-pack-index[^/]*)$/.test(relative) ||
+    /^pack\/multi-pack-index\.d\/[^/]+$/.test(relative) ||
+    /^info\/(commit-graph|commit-graphs\/[^/]+)$/.test(relative)
+  );
+}
+
+/**
+ * `files` creating the object files git keeps read-only ({@link isReadOnlyObjectPath} below
+ * `objectsDir`) as git creates them in a repository that is not shared: mode 0444 under the
+ * umask (`odb_write_loose_object`'s `create_tmpfile`, `finish_tmp_packfile`'s
+ * `chmod(..., 0444)`). Each such file a `write`, `createExclusive` or `append` creates, or a
+ * `move` puts into place, loses its write bits; a file replaced in place keeps its mode (the
+ * Node FilesApi passes it on). Everything else passes through; where the FilesApi keeps no
+ * modes (no `lstat` mode or no `chmod`: memory, browser storage) `files` is returned as it is.
+ */
+export function withReadOnlyObjectFiles(files: FilesApi, objectsDir: string): FilesApi {
+  const posix = files as ModeFilesApi;
+  if (!posix.lstat || !posix.chmod) return files;
+  const root = normalizePath(objectsDir);
+  const readOnly = (path: string) => {
+    const p = normalizePath(path);
+    return p.startsWith(`${root}/`) && isReadOnlyObjectPath(p.slice(root.length + 1));
+  };
+  const dropWriteBits = async (path: string) => {
+    const stats = await posix.lstat?.(path);
+    if (stats?.kind === "file" && stats.mode !== undefined && stats.mode & 0o222) {
+      await posix.chmod?.(path, stats.mode & 0o7555);
+    }
+  };
+  type Content = Parameters<FilesApi["write"]>[1];
+  return new Proxy(files, {
+    get(target, prop) {
+      switch (prop) {
+        case "write":
+          return async (path: string, content: Content) => {
+            if (!readOnly(path)) return target.write(path, content);
+            const existed = await target.stats(path);
+            await target.write(path, content);
+            if (!existed) await dropWriteBits(path);
+          };
+        case "createExclusive":
+          if (!target.createExclusive) return undefined;
+          return async (path: string, content: Content) => {
+            const created = await target.createExclusive?.(path, content);
+            if (created && readOnly(path)) await dropWriteBits(path);
+            return created;
+          };
+        case "append":
+          if (!target.append) return undefined;
+          return async (path: string, content: Content) => {
+            if (!readOnly(path)) return target.append?.(path, content);
+            const existed = await target.stats(path);
+            await target.append?.(path, content);
+            if (!existed) await dropWriteBits(path);
+          };
+        case "move":
+          return async (source: string, to: string) => {
+            const moved = await target.move(source, to);
+            // a temporary renamed into place: git made it read-only before the rename
+            if (moved && readOnly(to)) await dropWriteBits(to);
+            return moved;
+          };
+        case "withLstatCache":
+          if (!posix.withLstatCache) return undefined;
+          return (options?: { maxAgeMs?: number }) =>
+            withReadOnlyObjectFiles(posix.withLstatCache?.(options) ?? target, objectsDir);
+        default: {
+          const value = Reflect.get(target, prop, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+      }
+    },
+  });
+}
