@@ -30,6 +30,7 @@ import { FsckMessageTypes } from "./fsck/fsck-msg-ids.js";
 import { fsckCommit, fsckTag, fsckTree } from "./fsck/fsck-object-checks.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { PlumbingCommand, PlumbingError } from "./plumbing-command.js";
+import { CorruptTreeError } from "./plumbing-shared.js";
 
 /** git replace's command modes (OPT_CMDMODE); unset: list without arguments, else replace. */
 export type ReplaceMode = "list" | "delete" | "edit" | "graft" | "convert-graft-file" | "replace";
@@ -249,7 +250,11 @@ export class ReplaceCommand extends PlumbingCommand {
   private async getOid(name: string): Promise<ObjectId | undefined> {
     return this.revisionResolver()
       .resolve(name)
-      .catch(() => undefined);
+      .catch((e) => {
+        // get_oid dies on a corrupt tree on the way (`<rev>:<path>`)
+        if (e instanceof CorruptTreeError) throw e;
+        return undefined;
+      });
   }
 
   /** odb_read_object_info: the object's type, undefined when it is missing. */
@@ -428,9 +433,16 @@ export class ReplaceCommand extends PlumbingCommand {
       const entries = await this.listedTreeEntries(id);
       if (!entries) this.fail("cat-file reported failure");
       let out = "";
-      for (const entry of entries) {
-        const mode = entry.mode.toString(8).padStart(6, "0");
-        out += `${mode} ${modeType(entry.mode)} ${entry.id}\t${quotePath(entry.name, quoteFully)}\n`;
+      try {
+        for (const entry of entries) {
+          const mode = entry.mode.toString(8).padStart(6, "0");
+          out += `${mode} ${modeType(entry.mode)} ${entry.id}\t${quotePath(entry.name, quoteFully)}\n`;
+        }
+      } catch (e) {
+        // the child cat-file's death on a corrupt tree, then export_object's failure
+        if (!(e instanceof CorruptTreeError)) throw e;
+        this.warn(e.message);
+        this.fail("cat-file reported failure");
       }
       return encodeGitPath(out);
     }

@@ -14,6 +14,42 @@ export interface FilterDriverContext {
    * runs it (its `%f` the path, quoted), others ignore it
    */
   command?: string;
+  /**
+   * git's checkout metadata (`struct checkout_metadata`), which it sends to a long-running
+   * process filter (`filter.<driver>.process`) as `ref=`, `treeish=` and `blob=`: the ref the
+   * content comes from, the commit (or tree) and the blob; given where git has them
+   * (`git archive`)
+   */
+  metadata?: CheckoutMetadata;
+}
+
+/** git's `struct checkout_metadata`: where smudged content comes from. */
+export interface CheckoutMetadata {
+  /** The ref named (`refs/heads/main`), when the tree-ish was given through one */
+  ref?: string;
+  /** The commit, else the tree, the content belongs to */
+  treeish?: string;
+  /** The blob converted */
+  blob?: string;
+}
+
+/**
+ * Thrown by a driver that fails as git's external filter command does, with the lines git
+ * prints for that failure (`external filter '<cmd>' failed <status>`, or `cannot run
+ * <cmd>: ...` and `cannot fork to run external filter '<cmd>'`). A driver that is not
+ * required then has them reported as `error:` lines, followed by convert.c's own
+ * `external filter '<cmd>' failed`, and the content passes through unfiltered.
+ *
+ * @example
+ * ```typescript
+ * throw new FilterDriverRunError([`external filter '${command}' failed ${status}`]);
+ * ```
+ */
+export class FilterDriverRunError extends Error {
+  constructor(readonly lines: string[]) {
+    super(lines.join("\n"));
+    this.name = "FilterDriverRunError";
+  }
 }
 
 /**

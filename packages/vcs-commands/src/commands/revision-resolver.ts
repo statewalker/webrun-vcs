@@ -33,7 +33,6 @@
 
 import type { Commit, GitObjects, ObjectId, PersonIdent, Refs } from "@statewalker/vcs-core";
 import {
-  decodeTreeBytes,
   isSymbolicRef,
   isValidRefName,
   listObjectsWithPrefix,
@@ -41,6 +40,7 @@ import {
   objectFormatOf,
 } from "@statewalker/vcs-core";
 import { compilePosixRegex, isNullObjectId, parseGitBool } from "@statewalker/vcs-utils";
+import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import type { Staging, WorkingCopy } from "@statewalker/vcs-working-tree";
 
 import { RevisionError } from "../errors/index.js";
@@ -49,6 +49,7 @@ import { applyRefspecs } from "./branch-tracking.js";
 import { configLoadError } from "./core-config.js";
 import { approxidateCareful, formatRfc2822Date } from "./git-date.js";
 import { loadLegacyRemote } from "./legacy-remotes.js";
+import { findTreeDescEntry } from "./plumbing-shared.js";
 
 /** The stores a revision is read from. */
 export interface RevisionSources {
@@ -931,40 +932,48 @@ export class RevisionResolver {
   }
 
   /**
-   * git's `get_tree_entry` / `find_tree_entry`: the object at `path` in a tree (the tree
-   * itself for ""). Components are matched exactly: an empty one (`/a`, `d//b`) names
-   * nothing, and a trailing `/` only follows a directory (`d/` is d, `a.txt/` nothing).
+   * git's `get_tree_entry`: the object at `path` in a tree (the tree itself for ""), found
+   * as `find_tree_entry` walks the tree's stored bytes (names unchecked, so an entry named
+   * `..` is found; a corrupt tree git's death, {@link CorruptTreeError}). A store without
+   * stored bytes answers from its decoded entries, component by component.
    */
-  private async findTreeEntry(
-    tree: ObjectId,
-    name: string,
-  ): Promise<{ id: ObjectId; mode: number } | undefined> {
+  private async treeEntry(tree: ObjectId, path: string): Promise<ObjectId | undefined> {
+    if (path === "") return tree;
     const trees = this.sources.trees;
-    try {
-      return await trees.getEntry(tree, name);
-    } catch (e) {
-      if ((e as Error)?.name !== "InvalidTreeEntryNameError" || !trees.raw) return undefined;
-      const raw = await safe(() => trees.raw?.(tree) ?? Promise.resolve(undefined));
+    if (!trees.raw) return this.treeEntryDecoded(tree, path);
+    const rawLength = objectFormatOf(this.sources.objects).rawLength;
+    let current = tree;
+    let rest = encodeGitPath(path);
+    for (;;) {
+      const id = current;
+      const raw = await safe(() => trees.raw?.(id) ?? Promise.resolve(undefined));
+      // an empty tree holds nothing (get_tree_entry's `!size`)
       if (!raw) return undefined;
-      const entries = decodeTreeBytes(raw, {
-        canonicalModes: true,
-        idLength: objectFormatOf(this.sources.objects).rawLength,
-        checkNames: false,
-      });
-      const found = entries.find((e) => e.name === name);
-      return found ? { id: found.id, mode: found.mode } : undefined;
+      const found = findTreeDescEntry(raw, rawLength, rest, current);
+      if (!found) return undefined;
+      if (!found.rest) {
+        this.lastMode = found.mode;
+        return found.id;
+      }
+      current = found.id;
+      rest = found.rest;
     }
   }
 
-  private async treeEntry(tree: ObjectId, path: string): Promise<ObjectId | undefined> {
-    if (path === "") return tree;
+  /**
+   * {@link treeEntry} over a store's decoded entries: components matched exactly, an empty
+   * one (`/a`, `d//b`) names nothing, a trailing `/` only follows a directory.
+   */
+  private async treeEntryDecoded(tree: ObjectId, path: string): Promise<ObjectId | undefined> {
+    const trees = this.sources.trees;
     let current = tree;
     let rest = path;
     for (;;) {
       const slash = rest.indexOf("/");
       const name = slash < 0 ? rest : rest.slice(0, slash);
       if (name === "") return undefined;
-      const entry = await this.findTreeEntry(current, name);
+      const at = current;
+      const entry = await safe(() => trees.getEntry(at, name));
       if (!entry) return undefined;
       if (slash < 0) {
         this.lastMode = entry.mode;

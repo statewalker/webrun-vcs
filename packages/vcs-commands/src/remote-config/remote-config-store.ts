@@ -735,15 +735,23 @@ export class RemoteConfigStore {
   /**
    * Every variable whose canonical key starts with `prefix` (lower case), in the
    * configuration's order with its text (undefined for a variable without `=`), as git's
-   * config callbacks see them; undefined when the config cannot list its variables.
+   * config callbacks see them, and where each was read (file and line; none for the command
+   * line); undefined when the config cannot list its variables.
    */
-  entriesWithPrefix(prefix: string): { key: string; value: string | undefined }[] | undefined {
+  entriesWithPrefix(
+    prefix: string,
+  ): { key: string; value: string | undefined; file?: string; line?: number }[] | undefined {
     if (!this.config.listWithOrigin) return undefined;
     const lower = prefix.toLowerCase();
     return this.config
       .listWithOrigin()
       .filter((e) => e.key.startsWith(lower))
-      .map((e) => ({ key: e.key, value: e.text }));
+      .map((e) => ({
+        key: e.key,
+        value: e.text,
+        ...(e.file !== undefined ? { file: e.file } : {}),
+        ...(e.line !== undefined ? { line: e.line } : {}),
+      }));
   }
 
   /**

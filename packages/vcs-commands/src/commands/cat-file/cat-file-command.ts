@@ -12,18 +12,14 @@
  * ```
  */
 
-import {
-  type CompatObjects,
-  decodeTreeBytes,
-  type GitObjects,
-  type ObjectId,
-} from "@statewalker/vcs-core";
+import type { CompatObjects, GitObjects, ObjectId } from "@statewalker/vcs-core";
 import { ObjectInfoError } from "@statewalker/vcs-transport";
 import { parseGitBool } from "@statewalker/vcs-utils";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { RemoteConfigStore } from "../../remote-config/index.js";
 import { quotePath } from "../../results/quote-path.js";
 import { PlumbingCommand, PlumbingError } from "../plumbing-command.js";
+import { concatBytes, objectTypeOfMode } from "../plumbing-shared.js";
 import {
   RemoteObjectInfoCommand,
   type RemoteObjectInfoResult,
@@ -278,7 +274,7 @@ export class CatFileCommand extends PlumbingCommand {
     }
     const chunks: Uint8Array[] = [];
     for await (const c of object.content) chunks.push(c.slice());
-    return { type: object.type, bytes: concat(chunks) };
+    return { type: object.type, bytes: concatBytes(chunks) };
   }
 
   /** `stream_blob`: the blob's content written chunk by chunk. */
@@ -376,19 +372,8 @@ export class CatFileCommand extends PlumbingCommand {
         return 0;
       case "pretty":
         if (object.type === "tree") {
-          const config = RemoteConfigStore.from(this._workingCopy);
-          const quoteFully = parseGitBool(config.value("core.quotePath")) ?? true;
-          let out = "";
-          for (const entry of decodeTreeBytes(object.content, {
-            idLength: compat.compat.rawLength,
-            checkNames: false,
-          })) {
-            const kind = entry.mode & S_IFMT;
-            const type = kind === 0o040000 ? "tree" : kind === S_IFGITLINK ? "commit" : "blob";
-            const mode = entry.mode.toString(8).padStart(6, "0");
-            out += `${mode} ${type} ${entry.id}\t${quotePath(entry.name, quoteFully)}\n`;
-          }
-          await this.write(out);
+          // cmd_ls_tree of the compatibility id: its entries at that format's width
+          await this.listTree(name);
           return 0;
         }
         await this.write(
@@ -445,17 +430,19 @@ export class CatFileCommand extends PlumbingCommand {
     const entries = await this.listedTreeEntries(id);
     if (!entries) throw new PlumbingError(`fatal: Cannot read object ${id}`);
     let out = "";
-    for (const entry of entries) {
-      const kind = entry.mode & S_IFMT;
-      const type = kind === 0o040000 ? "tree" : kind === S_IFGITLINK ? "commit" : "blob";
-      const mode = entry.mode.toString(8).padStart(6, "0");
-      out += `${mode} ${type} ${entry.id}\t${quotePath(entry.name, quoteFully)}\n`;
-      if (out.length >= 1 << 16) {
-        await this.write(out);
-        out = "";
+    try {
+      for (const entry of entries) {
+        const mode = entry.mode.toString(8).padStart(6, "0");
+        out += `${mode} ${objectTypeOfMode(entry.mode)} ${entry.id}\t${quotePath(entry.name, quoteFully)}\n`;
+        if (out.length >= 1 << 16) {
+          await this.write(out);
+          out = "";
+        }
       }
+    } finally {
+      // what was listed before a corrupt entry is printed, as git's stdout is at its death
+      await this.write(out);
     }
-    await this.write(out);
   }
 
   /** `<type> <object>` */
@@ -845,19 +832,6 @@ function modeLetter(mode: CatFileMode): string {
   return mode === "type" ? "t" : mode === "size" ? "s" : mode === "exists" ? "e" : "p";
 }
 
-function concat(chunks: Uint8Array[]): Uint8Array {
-  if (chunks.length === 1) return chunks[0] as Uint8Array;
-  let size = 0;
-  for (const c of chunks) size += c.length;
-  const out = new Uint8Array(size);
-  let at = 0;
-  for (const c of chunks) {
-    out.set(c, at);
-    at += c.length;
-  }
-  return out;
-}
-
 /**
  * `strbuf_getline` (`strbuf_getdelim_strip_crlf`) over the input as it arrives: each record
  * without its delimiter, and for newline-terminated input without a CR before it (`-z`'s
@@ -884,12 +858,12 @@ async function* readLines(input: CatFileInput, delimiter: number): AsyncGenerato
       const at = chunk.indexOf(delimiter, start);
       if (at < 0) break;
       const piece = chunk.subarray(start, at);
-      const line = pending.length > 0 ? concat([...pending, piece]) : piece;
+      const line = pending.length > 0 ? concatBytes([...pending, piece]) : piece;
       pending = [];
       yield emit(line);
       start = at + 1;
     }
     if (start < chunk.length) pending.push(chunk.slice(start));
   }
-  if (pending.length > 0) yield emit(concat(pending));
+  if (pending.length > 0) yield emit(concatBytes(pending));
 }
