@@ -11,6 +11,8 @@
  * heuristic, and give git's warnings in order.
  */
 
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
+
 import { parseBundleHeader } from "./bundle-format.js";
 import { BundleList, parseBundleListConfig, type RemoteBundleInfo } from "./bundle-list.js";
 
@@ -37,14 +39,19 @@ export interface BundleUriHost {
    * `<objects>/bundles/tmp_uri_XXXXXX`)
    */
   tempFileName?(): string;
+  /**
+   * The hash a bundle header without `@object-format=` is read in (git's `the_hash_algo`, the
+   * repository's; default SHA-1)
+   */
+  objectFormat?: ObjectFormat;
 }
 
 /** bundle-uri.c's `max_bundle_uri_depth`. */
 const MAX_BUNDLE_URI_DEPTH = 4;
 
 /** Whether the bytes read as a bundle (`is_bundle`: the whole header parses). */
-export function isBundle(bytes: Uint8Array): boolean {
-  return parseBundleHeader(bytes).ok;
+export function isBundle(bytes: Uint8Array, objectFormat?: ObjectFormat): boolean {
+  return parseBundleHeader(bytes, undefined, objectFormat).ok;
 }
 
 /**
@@ -72,7 +79,7 @@ async function fetchBundleUriInternal(
     return false;
   }
   bundle.file = bytes;
-  if (!isBundle(bytes)) {
+  if (!isBundle(bytes, host.objectFormat)) {
     const ok = await fetchBundleListInConfigFormat(host, global, bundle, bytes, depth);
     if (!ok) {
       bundle.file = null;
@@ -160,7 +167,7 @@ async function fetchBundlesByToken(host: BundleUriHost, list: BundleList): Promi
         bundle.unbundled = true;
         direction = 1;
         skipUnbundle = true;
-      } else if (!bundle.file || !isBundle(bundle.file)) {
+      } else if (!bundle.file || !isBundle(bundle.file, host.objectFormat)) {
         host.message(`warning: file downloaded from '${bundle.uri}' is not a bundle`);
         break;
       }
