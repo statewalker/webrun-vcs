@@ -13,6 +13,7 @@
  */
 import { execFileSync, spawnSync } from "node:child_process";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -331,7 +332,9 @@ async function one(root: string, seed: number) {
     // file (entries stat-clean), then before every file (all racily clean: compared by
     // content through the conversions, which a checkout's bytes do not always survive)
     const tracked = [...paths, ...[...L.attributes.keys()].map((d) => join(d, ".gitattributes"))];
-    for (const view of ["stat-clean", "racily clean"] as const) {
+    // a failed checkout leaves files missing: already reported above, nothing to date
+    const missing = [native, ours].some((dir) => tracked.some((p) => !existsSync(join(dir, p))));
+    for (const view of missing ? [] : (["stat-clean", "racily clean"] as const)) {
       for (const dir of [native, ours]) dateIndex(dir, tracked, view === "racily clean");
       const st2N = run(native, "status", "--porcelain=v1", "-uall");
       const st2O = formatStatusPorcelain(
