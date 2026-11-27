@@ -210,6 +210,13 @@ export interface ServeOverDuplexOptions {
    * an unexpected line
    */
   allowSidebandAll?: boolean;
+  /**
+   * Protocol v2 upload-pack acknowledges every have it holds, repeats and parents of an
+   * earlier have included, as git before 2.45 (`process_haves`' `common`). Default false:
+   * git 2.45+ acknowledges a have only when no child of it (and no copy) came first in the
+   * request (`do_got_oid`'s `THEY_HAVE`, `send_acks` over `have_obj`)
+   */
+  acknowledgeEveryHave?: boolean;
   /** Protocol v2 `packfile-uris` (git's `uploadpack.blobPackfileUri` values) */
   blobPackfileUris?: readonly string[];
   /**
@@ -359,6 +366,7 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
       (useV2 || service === "git-receive-pack" ? undefined : options.uploadPackRequestPolicy),
     ...(options.allowRefInWant ? { allowRefInWant: true } : {}),
     ...(options.allowSidebandAll ? { allowSidebandAll: true } : {}),
+    ...(options.acknowledgeEveryHave ? { acknowledgeEveryHave: true } : {}),
     ...(options.blobPackfileUris?.length ? { blobPackfileUris: options.blobPackfileUris } : {}),
     ...(options.bundleUris !== undefined && service !== "git-receive-pack"
       ? { bundleUris: options.bundleUris }
