@@ -100,7 +100,7 @@ function parseResponse(bytes: Uint8Array): V2Response {
 async function fetchRaw(
   repo: TransportRepo,
   args: string[],
-  options: { requestPolicy?: UploadPackRequestPolicy } = {},
+  options: { requestPolicy?: UploadPackRequestPolicy; acknowledgeEveryHave?: boolean } = {},
 ): Promise<V2Response> {
   const request = concat([
     encodePacketLine("command=fetch\n"),
@@ -124,6 +124,7 @@ async function fetchRaw(
     service: "git-upload-pack",
     protocolVersion: "2",
     requestPolicy: options.requestPolicy,
+    acknowledgeEveryHave: options.acknowledgeEveryHave,
   });
   return parseResponse(concat(out));
 }
@@ -221,6 +222,30 @@ describe("protocol v2 upload-pack: negotiation", () => {
     const { repo, c2, c4 } = await linearRepo();
     const res = await fetchRaw(repo, [`want ${c4}`, `have ${c2}`, "wait-for-done"]);
     expect(res.lines).toEqual(["acknowledgments", `ACK ${c2}`, "FLUSH"]);
+  });
+
+  // statewalker/webrun-vcs#396: do_got_oid marks a commit's parents THEY_HAVE first
+  it("acknowledges no have whose child came first, nor a repeat (git 2.45+)", async () => {
+    const { repo, c1, c2, c3 } = await linearRepo();
+    const tree = await repo.history.commits.getTree(c1);
+    const haves = [c3, c2, c1, tree, tree, c3];
+    const res = await fetchRaw(repo, ["wait-for-done", ...haves.map((h) => `have ${h}`)]);
+    expect(res.lines).toEqual(["acknowledgments", `ACK ${c3}`, `ACK ${tree}`, "FLUSH"]);
+    const oldestFirst = await fetchRaw(repo, ["wait-for-done", `have ${c1}`, `have ${c2}`]);
+    expect(oldestFirst.lines).toEqual(["acknowledgments", `ACK ${c1}`, `ACK ${c2}`, "FLUSH"]);
+  });
+
+  it("acknowledges every have it holds with acknowledgeEveryHave (git before 2.45)", async () => {
+    const { repo, c1, c2, c3 } = await linearRepo();
+    const haves = [c3, c2, "2".repeat(40), c1, c3];
+    const res = await fetchRaw(repo, ["wait-for-done", ...haves.map((h) => `have ${h}`)], {
+      acknowledgeEveryHave: true,
+    });
+    expect(res.lines).toEqual([
+      "acknowledgments",
+      ...[c3, c2, c1, c3].map((h) => `ACK ${h}`),
+      "FLUSH",
+    ]);
   });
 
   it("our v2 client ends negotiation with done when the server is never ready", async () => {
