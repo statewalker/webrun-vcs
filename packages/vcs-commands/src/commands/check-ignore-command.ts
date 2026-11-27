@@ -16,8 +16,10 @@ import { GitCommand } from "../git-command.js";
 import { quotePath } from "../results/quote-path.js";
 import type { PlumbingTextOutput } from "./check-ref-format-command.js";
 import { hostEnvironmentOf } from "./git-ident.js";
+import { parseElementMagic, unsupportedPathspecMagic } from "./ls-tree-command.js";
 import { configBool, configValue } from "./merge-config.js";
 import { DO_MATCH_DIRECTORY, matchPathspec, parsePathspecItem } from "./pathspec.js";
+import { PlumbingError } from "./plumbing-command.js";
 import { directoryPrefix, inputRecords, prefixPath } from "./plumbing-input.js";
 import { worktreeHostPath } from "./submodule-model.js";
 
@@ -133,28 +135,56 @@ export class CheckIgnoreCommand extends GitCommand<PlumbingTextOutput> {
     let ignored = 0;
 
     const top = await worktreeHostPath(this._workingCopy);
-    const checkOne = async (original: string): Promise<string | undefined> => {
-      const full = prefixPath(this.prefix, original, top);
-      if (full === undefined) {
-        return `${original}: '${original}' is outside repository at '${top ?? ""}'`;
+    const EMPTY =
+      "empty string is not a valid pathspec. please use . instead if you meant to match all paths";
+    /**
+     * parse_pathspec of one element with check-ignore's mask (every magic but `:/`
+     * refused), PATHSPEC_SYMLINK_LEADING_PATH, then die_path_inside_submodule: the path
+     * from the top, or git's death.
+     */
+    const parse = async (original: string): Promise<{ path: string } | { death: string }> => {
+      if (original === "") return { death: EMPTY };
+      let parsed: { magic: Set<string>; rest: string };
+      try {
+        parsed = parseElementMagic(original);
+      } catch (error) {
+        if (error instanceof PlumbingError) return { death: error.message.replace(/^fatal: /, "") };
+        throw error;
       }
+      const { magic, rest } = parsed;
+      if (magic.has("literal") && magic.has("glob")) {
+        return { death: `${original}: 'literal' and 'glob' are incompatible` };
+      }
+      const full = prefixPath(magic.has("top") ? "" : this.prefix, rest, top);
+      if (full === undefined) {
+        return { death: `${original}: '${rest}' is outside repository at '${top ?? ""}'` };
+      }
+      const unsupported = unsupportedPathspecMagic(original, magic, ["top"]);
+      if (unsupported) return { death: unsupported };
       const path = full.replace(/\/+$/, "");
       // PATHSPEC_SYMLINK_LEADING_PATH
       const parts = path.split("/");
       for (let k = 1; k < parts.length; k++) {
         const entry = await worktree.getEntry(parts.slice(0, k).join("/")).catch(() => undefined);
         if (entry && (entry.mode & S_IFMT) === S_IFLNK) {
-          return `pathspec '${original}' is beyond a symbolic link`;
+          return { death: `pathspec '${original}' is beyond a symbolic link` };
         }
       }
-      if (staging) {
-        // die_path_inside_submodule
-        for (const e of index) {
-          if ((e.mode & S_IFMT) === S_IFGITLINK && path.startsWith(`${e.path}/`)) {
-            return `Pathspec '${original}' is in submodule '${e.path}'`;
-          }
+      return { path: full };
+    };
+    const insideSubmodule = (original: string, full: string): string | undefined => {
+      if (!staging) return undefined;
+      // die_path_inside_submodule
+      const path = full.replace(/\/+$/, "");
+      for (const e of index) {
+        if ((e.mode & S_IFMT) === S_IFGITLINK && path.startsWith(`${e.path}/`)) {
+          return `Pathspec '${original}' is in submodule '${e.path}'`;
         }
       }
+      return undefined;
+    };
+    const checkOne = async (original: string, full: string): Promise<void> => {
+      const path = full.replace(/\/+$/, "");
       let match: IgnoreMatch | undefined;
       if (!staging || !this.seenInIndex(full, index)) {
         match = await worktree.ignoreMatch?.(path);
@@ -163,19 +193,34 @@ export class CheckIgnoreCommand extends GitCommand<PlumbingTextOutput> {
       if (!this.quiet && (match || this.nonMatching))
         stdout += this.line(original, match, sources, quoteFully);
       if (match) ignored++;
+    };
+    /** check_ignore of the paths of one call: every element parsed before any output. */
+    const checkAll = async (originals: string[]): Promise<string | undefined> => {
+      if (originals.includes("")) return EMPTY;
+      const paths: string[] = [];
+      for (const original of originals) {
+        const parsed = await parse(original);
+        if ("death" in parsed) return parsed.death;
+        paths.push(parsed.path);
+      }
+      for (let i = 0; i < originals.length; i++) {
+        const death = insideSubmodule(originals[i] as string, paths[i] as string);
+        if (death) return death;
+      }
+      for (let i = 0; i < originals.length; i++)
+        await checkOne(originals[i] as string, paths[i] as string);
       return undefined;
     };
 
     const run = async () => {
       if (this.stdin === undefined) {
-        for (const path of this.paths) {
-          const death = await checkOne(path);
-          if (death) return die(death);
-        }
+        const death = await checkAll(this.paths);
+        if (death) return die(death);
       } else {
+        // one check_ignore per record: what came before a death stays on stdout
         const { records, badlyQuoted } = inputRecords(this.stdin, this.nul);
         for (const path of records) {
-          const death = await checkOne(path);
+          const death = await checkAll([path]);
           if (death) return die(death);
         }
         if (badlyQuoted) return die("line is badly quoted");

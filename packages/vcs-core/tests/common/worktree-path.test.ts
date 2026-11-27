@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   assertValidWorktreePath,
+  isDotGitComponent,
   isGitWorktreeFile,
   isValidWorktreePath,
   protectHFSDefault,
@@ -206,5 +207,19 @@ describe("isValidWorktreePath with protections off", () => {
     expect(protectHFSDefault("Linux")).toBe(false);
     // no environment (a browser, a library user without one): the storage may be HFS+
     expect(protectHFSDefault(undefined)).toBe(true);
+  });
+});
+
+describe("is_hfs_dotgit over bytes outside UTF-8", () => {
+  // JGit ObjectCheckerTest#testInvalidTreeNameIsMacHFSGitCorruptUTF8AtEnd(2), decided by
+  // native `git fsck` (`hasDotgit`): next_hfs_char reads a malformed sequence as the end
+  it("takes `.git` followed by a truncated sequence as `.git`", () => {
+    expect(isDotGitComponent(".git\udcef")).toBe(true);
+    expect(isDotGitComponent(".git\udce2\udcab")).toBe(true);
+    expect(isDotGitComponent(".gi\udcef")).toBe(false);
+    expect(isDotGitComponent("‌.g‍it\udcef")).toBe(true);
+    expect(isDotGitComponent(".git�")).toBe(false);
+    expect(isDotGitComponent(".git￾")).toBe(true);
+    expect(isGitWorktreeFile(".gitmodules\udcc0", "gitmodules")).toBe(true);
   });
 });
