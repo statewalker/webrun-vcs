@@ -899,6 +899,22 @@ export async function fetchFromConnection(
       }
     }
   }
+  // fetch-pack's filter_refs keeps the sought refs in the order the remote listed them (HEAD
+  // first, then by name; a clone seeks the remote HEAD too) and the wants go out in that
+  // order, ids a refspec names without a listed ref after them. upload-pack walks its wants
+  // in that order (get_shallow_commits: a shallow server's shallow-info follows it)
+  {
+    const soughtNames = new Set([...planned.map((p) => p.remoteRef), ...tagsOfTips]);
+    if (options.cloning) soughtNames.add("HEAD");
+    const position = new Map<string, number>();
+    remoteRefs.forEach((ref, i) => {
+      if (ref.oid && soughtNames.has(ref.name) && !position.has(ref.oid)) {
+        position.set(ref.oid, i);
+      }
+    });
+    const at = (oid: string) => position.get(oid) ?? Number.POSITIVE_INFINITY;
+    wants.sort((a, b) => at(a) - at(b));
+  }
   // the refs fetch-pack was asked for (transport_fetch_refs: those not up to date here)
   const sought: PlannedRef[] = [];
   for (const p of planned) {
@@ -933,7 +949,11 @@ export async function fetchFromConnection(
         sought,
       });
       if (recorded.shallow !== shallow) {
-        await refStore.setShallow?.(recorded.shallow, shallow);
+        await refStore.setShallow?.(
+          recorded.shallow,
+          shallow,
+          recorded.verbatim ? { verbatim: true } : undefined,
+        );
         shallow = recorded.shallow;
       }
       for (const p of recorded.rejected) shallowRejected.add(p);
@@ -1551,7 +1571,7 @@ async function updateServerShallow(
     updateShallow: boolean;
     sought: readonly PlannedRef[];
   },
-): Promise<{ shallow: string[]; rejected: PlannedRef[] }> {
+): Promise<{ shallow: string[]; rejected: PlannedRef[]; verbatim?: boolean }> {
   const { repository, refStore } = context;
   const unchanged = { shallow: context.shallow, rejected: [] as PlannedRef[] };
   const record = (extra: readonly string[]) => {
@@ -1563,10 +1583,16 @@ async function updateServerShallow(
   };
   if (info.list.length === 0) return unchanged;
   if (context.cloning) {
-    // a clone: any shallow commit the pack brought (nothing was here before)
+    // a clone: any shallow commit the pack brought (nothing was here before), written as
+    // setup_alternate_shallow writes the `extra` array: in the order sent, a commit sent twice
+    // (get_shallow_commits names one per want reaching it) on two lines
     const extra: string[] = [];
     for (const oid of info.list) if (await repository.has(oid)) extra.push(oid);
-    return extra.length > 0 ? record(extra) : unchanged;
+    if (extra.length === 0) return unchanged;
+    if (!refStore.setShallow) {
+      throw new Error("The server sent shallow commits this ref store cannot record");
+    }
+    return { shallow: extra, rejected: [], verbatim: true };
   }
   if (info.ours.length === 0 && info.theirs.length === 0) return unchanged;
   const theirs: string[] = [];
