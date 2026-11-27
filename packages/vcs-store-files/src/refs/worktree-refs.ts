@@ -46,6 +46,7 @@ import type {
   RefTransactionHook,
   RefTransactionUpdate,
   RefUpdateResult,
+  ShallowWriteOptions,
   SymbolicRef,
   SymbolicRefLogOptions,
 } from "@statewalker/vcs-core";
@@ -343,9 +344,13 @@ class WorktreeRefs implements Refs {
     return this.common.removeGrafts?.() ?? Promise.resolve(false);
   }
 
-  async setShallow(commits: Iterable<ObjectId>, expected?: Iterable<ObjectId>): Promise<void> {
+  async setShallow(
+    commits: Iterable<ObjectId>,
+    expected?: Iterable<ObjectId>,
+    options?: ShallowWriteOptions,
+  ): Promise<void> {
     if (!this.common.setShallow) throw new Error("this repository cannot be shallow");
-    await this.common.setShallow(commits, expected);
+    await this.common.setShallow(commits, expected, options);
   }
 
   async optimize(): Promise<void> {
