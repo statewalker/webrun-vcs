@@ -1,5 +1,12 @@
 # @statewalker/vcs-core
 
+## 0.12.1
+
+### Patch Changes
+
+- 2bd8d77: Packed blobs above the pack reader's `maxObjectSize` (1 GiB) are read again: a whole entry's size comes from its header and its content streams, as git's `open_istream` streams a blob above `core.bigFileThreshold`. The limit still guards what a read must hold in memory: delta instructions, delta results and delta bases (statewalker/webrun-vcs#477).
+- 55072b7: `git repack --geometric` follows `repack.midxMustContainCruft=false` as git 2.5x: pack-objects' `--stdin-packs=follow` walk rescues once-cruft objects (packs above the split that no midx names are excluded-open), and the midx leaves cruft packs out where git does. `repack -l -m` with alternates warns as git, the midx gets a bitmap only for `-b`/`repack.writeBitmaps`, `--filter` with nothing new still writes its filtered pack after `Nothing new to pack.`, loose objects are listed in git's fan-out/readdir order, and `listObjects` takes `ignoreMissingLinks` (the `--stdin-packs` hint walk goes on past a partial clone's missing links).
+
 ## 0.12.0
 
 ### Minor Changes

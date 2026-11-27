@@ -1,5 +1,24 @@
 # @statewalker/vcs-commands
 
+## 0.13.0
+
+### Minor Changes
+
+- Release of the changes since the last published version:
+  
+  - @statewalker/vcs-transport crosses a breaking line
+
+### Patch Changes
+
+- b4d6c72: Smart-HTTP POSTs follow remote-curl's `post_rpc` by size: a request within `http.postBuffer` (now read, `HttpClientSettings.postBuffer`) is held whole and sent again after a 401 the credential helper answers; a larger one first authenticates `probe_rpc`'s `0000` POST and is then sent once, streamed, so a push never builds or uploads its pack twice. `SmartHttpClient.postRpc` and `PushOptions.http` are new.
+- 55072b7: `git repack --geometric` follows `repack.midxMustContainCruft=false` as git 2.5x: pack-objects' `--stdin-packs=follow` walk rescues once-cruft objects (packs above the split that no midx names are excluded-open), and the midx leaves cruft packs out where git does. `repack -l -m` with alternates warns as git, the midx gets a bitmap only for `-b`/`repack.writeBitmaps`, `--filter` with nothing new still writes its filtered pack after `Nothing new to pack.`, loose objects are listed in git's fan-out/readdir order, and `listObjects` takes `ignoreMissingLinks` (the `--stdin-packs` hint walk goes on past a partial clone's missing links).
+- Updated dependencies [b4d6c72]
+- Updated dependencies [2bd8d77]
+- Updated dependencies [55072b7]
+  - @statewalker/vcs-transport@0.13.0
+  - @statewalker/vcs-core@0.12.1
+  - @statewalker/vcs-store-files@0.12.1
+
 ## 0.12.0
 
 ### Minor Changes

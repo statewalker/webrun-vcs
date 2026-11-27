@@ -1,5 +1,21 @@
 # @statewalker/vcs-transport-adapters
 
+## 0.13.0
+
+### Minor Changes
+
+- Release of the changes since the last published version:
+  
+  - @statewalker/vcs-transport crosses a breaking line
+
+### Patch Changes
+
+- Updated dependencies [b4d6c72]
+- Updated dependencies [2bd8d77]
+- Updated dependencies [55072b7]
+  - @statewalker/vcs-transport@0.13.0
+  - @statewalker/vcs-core@0.12.1
+
 ## 0.12.0
 
 ### Minor Changes
