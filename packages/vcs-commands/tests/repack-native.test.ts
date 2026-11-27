@@ -56,7 +56,13 @@ function idxIds(idx: string): string[] {
     .sort();
 }
 
-/** The packs a multi-pack-index names (its PNAM chunk), each as its sorted object ids. */
+/**
+ * The packs a multi-pack-index names (its PNAM chunk), each as its sorted object ids, ordered
+ * by those ids. PNAM lists the packs by name, and a pack's name is its checksum: ours and
+ * native's differ wherever the pack bytes do, so the order must come from the content alone,
+ * every id of it (two packs may hold the same objects first: a pack rescuing objects from a
+ * cruft pack, statewalker/webrun-vcs#514).
+ */
 function midxPacks(gitDir: string): string[][] | null {
   const packDir = join(gitDir, "objects", "pack");
   const path = join(packDir, "multi-pack-index");
@@ -72,16 +78,27 @@ function midxPacks(gitDir: string): string[][] | null {
       .toString("latin1", start, end)
       .split("\0")
       .filter((n) => n.length > 0);
-    return names
-      .map((n) => idxIds(join(packDir, n)))
-      .sort((a, b) => `${a[0]}`.localeCompare(`${b[0]}`));
+    return names.map((n) => idxIds(join(packDir, n))).sort((a, b) => compareIdLists(a, b));
   }
   return [];
 }
 
+/** Orders sorted id lists element by element, a list before its extensions. */
+function compareIdLists(a: string[], b: string[]): number {
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    const x = a[i] as string;
+    const y = b[i] as string;
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  return a.length - b.length;
+}
+
+/** A twin's snapshot with its multi-pack-index's packs (`midxPacks`). */
+type RepackSnapshot = GcSnapshot & { midx: string[][] | null };
+
 interface RepackTwinResult {
-  native: GcSnapshot;
-  ours: GcSnapshot;
+  native: RepackSnapshot;
+  ours: RepackSnapshot;
   result: RepackCommandResult;
   twins: { native: string; ours: string };
   /** native git's stderr */
@@ -866,20 +883,23 @@ describeGit("repack twins", () => {
       return [];
     }
 
-    /** t7704's setup_cruft_exclude_tests: `two` is cruft, then reachable again under `four`. */
-    function cruftExcludeRepo(name: string, mustContainCruft = false) {
+    /**
+     * t7704's setup_cruft_exclude_tests: `two` is cruft, then reachable again under `four`.
+     * Every commit is at `date` when given (the clock's otherwise).
+     */
+    function cruftExcludeRepo(name: string, mustContainCruft = false, date?: number) {
       const caseDir = newCase(root, name);
       const r = initRepo(root, caseDir);
       r.git(["config", "repack.midxMustContainCruft", String(mustContainCruft)]);
-      r.commit("one", { "one.t": "one\n" });
+      r.commit("one", { "one.t": "one\n" }, date);
       r.git(["tag", "one"]);
-      const two = r.commit("two", { "two.t": "two\n" });
-      r.commit("three", { "three.t": "three\n" });
+      const two = r.commit("two", { "two.t": "two\n" }, date);
+      r.commit("three", { "three.t": "three\n" }, date);
       r.git(["reset", "-q", "--hard", "one"]);
       r.git(["reflog", "expire", "--all", "--expire=all"]);
       r.git(["repack", "-q", "--cruft", "-d"]);
       r.git(["merge", "-q", two]);
-      r.commit("four", { "four.t": "four\n" });
+      r.commit("four", { "four.t": "four\n" }, date);
       return { caseDir, r };
     }
 
@@ -898,29 +918,71 @@ describeGit("repack twins", () => {
       expect(midxKinds(twins.ours)).toEqual(["cruft", "pack", "pack"]);
     });
 
-    it("t7704-repack-cruft 'repack --write-midx includes cruft when necessary'", async () => {
-      const { caseDir, r } = cruftExcludeRepo("follow-necessary");
+    /**
+     * t7704's "repack --write-midx includes cruft when necessary": a midx written over every
+     * pack (`oldMidx: "all"`, the cruft pack too) or, `"plain"`, over the non-cruft packs only,
+     * then `five`; every commit at `date` when given
+     */
+    async function includesCruftWhenNecessary(
+      name: string,
+      oldMidx: "all" | "plain",
+      date?: number,
+    ) {
+      const { caseDir, r } = cruftExcludeRepo(name, false, date);
       const packDir = join(r.gitDir, "objects/pack");
-      const all = readdirSync(packDir).filter((n) => /^pack-.*\.idx$/.test(n));
-      r.git(["multi-pack-index", "write", "--stdin-packs", "--bitmap"], {
-        input: `${all.sort().join("\n")}\n`,
-      });
-      r.commit("five", { "five.t": "five\n" });
-      const { twins } = await repackTwins(caseDir, bitmapMidx, ourBitmapMidx, {}, withoutInfoPacks);
+      if (oldMidx === "all") {
+        const all = readdirSync(packDir).filter((n) => /^pack-.*\.idx$/.test(n));
+        r.git(["multi-pack-index", "write", "--stdin-packs", "--bitmap"], {
+          input: `${all.sort().join("\n")}\n`,
+        });
+      } else {
+        const plain = readdirSync(packDir).filter(
+          (n) =>
+            /^pack-.*\.idx$/.test(n) && !existsSync(join(packDir, n.replace(/idx$/, "mtimes"))),
+        );
+        r.git(["multi-pack-index", "write", "--stdin-packs"], { input: `${plain.join("\n")}\n` });
+      }
+      r.commit("five", { "five.t": "five\n" }, date);
+      const twins = await repackTwins(caseDir, bitmapMidx, ourBitmapMidx, {}, withoutInfoPacks);
+      expect(midxKinds(twins.twins.ours)).toEqual(["cruft", "pack", "pack"]);
+      return twins;
+    }
+
+    it("t7704-repack-cruft 'repack --write-midx includes cruft when necessary'", async () => {
       // the old midx named the cruft pack: an unknown pack keeps it in the new one
-      expect(midxKinds(twins.ours)).toEqual(["cruft", "pack", "pack"]);
+      await includesCruftWhenNecessary("follow-necessary", "all");
     });
 
     it("t7704-repack-cruft 'repack --write-midx includes cruft when necessary' (an old midx without the cruft pack: git's midx_has_unknown_packs matches no name, so the cruft pack comes in)", async () => {
-      const { caseDir, r } = cruftExcludeRepo("follow-old-midx");
-      const packDir = join(r.gitDir, "objects/pack");
-      const plain = readdirSync(packDir).filter(
-        (n) => /^pack-.*\.idx$/.test(n) && !existsSync(join(packDir, n.replace(/idx$/, "mtimes"))),
+      await includesCruftWhenNecessary("follow-old-midx", "plain");
+    });
+
+    /**
+     * At this date commit `two`, which the follow walk rescues from the cruft pack into the new
+     * pack, has the smallest id of both packs (2.5x): the comparison must not order the two by
+     * their names, which are their checksums (pack bytes differ: statewalker/webrun-vcs#514)
+     */
+    const SHARED_SMALLEST = 1700000017;
+    /** How many packs of a midx share their smallest object id with another pack. */
+    const smallestShared = (midx: string[][] | null) =>
+      (midx ?? []).filter((ids) => (midx ?? []).some((o) => o !== ids && o[0] === ids[0])).length;
+
+    it("t7704-repack-cruft 'repack --write-midx includes cruft when necessary' (the rescued and the cruft pack share their smallest object)", async () => {
+      const { native } = await includesCruftWhenNecessary(
+        "follow-necessary-shared",
+        "all",
+        SHARED_SMALLEST,
       );
-      r.git(["multi-pack-index", "write", "--stdin-packs"], { input: `${plain.join("\n")}\n` });
-      r.commit("five", { "five.t": "five\n" });
-      const { twins } = await repackTwins(caseDir, bitmapMidx, ourBitmapMidx, {}, withoutInfoPacks);
-      expect(midxKinds(twins.ours)).toEqual(["cruft", "pack", "pack"]);
+      expect(smallestShared(native.midx)).toBe(nativeIs25x ? 2 : 0);
+    });
+
+    it("t7704-repack-cruft 'repack --write-midx includes cruft when necessary' (an old midx without the cruft pack; the rescued and the cruft pack share their smallest object)", async () => {
+      const { native } = await includesCruftWhenNecessary(
+        "follow-old-midx-shared",
+        "plain",
+        SHARED_SMALLEST,
+      );
+      expect(smallestShared(native.midx)).toBe(nativeIs25x ? 2 : 0);
     });
 
     /**
