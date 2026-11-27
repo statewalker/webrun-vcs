@@ -923,26 +923,73 @@ describeGit("repack twins", () => {
       expect(midxKinds(twins.ours)).toEqual(["cruft", "pack", "pack"]);
     });
 
-    it("t7704-repack-cruft 'repack --write-midx includes cruft when already geometric'", async () => {
-      const caseDir = newCase(root, "follow-noop");
+    /**
+     * t7704's "repack --write-midx includes cruft when already geometric", every commit at
+     * `date`: the commits' ids decide whether the pack the follow walk writes holds C's objects
+     * in the cruft pack's order, so it is the cruft pack byte for byte and takes its name (git's
+     * install_generated_packs then unlinks the stale `.mtimes`); a clock date made it flaky
+     */
+    function geometricFixture(name: string, date: number) {
+      const caseDir = newCase(root, name);
       const r = initRepo(root, caseDir);
       r.git(["config", "repack.midxMustContainCruft", "false"]);
-      r.commit("A", { "A.t": "A\n" });
-      r.commit("B", { "B.t": "B\n" });
+      r.commit("A", { "A.t": "A\n" }, date);
+      r.commit("B", { "B.t": "B\n" }, date);
       r.git(["checkout", "-q", "-B", "side"]);
-      const c = r.commit("C", { "C.t": "C\n" });
+      const c = r.commit("C", { "C.t": "C\n" }, date);
       r.git(["checkout", "-q", "main"]);
       r.git(["branch", "-D", "side"]);
       r.git(["reflog", "expire", "--all", "--expire=all"]);
       r.git(["repack", "-q", "--cruft", "-d"]);
-      r.git(["merge", "-q", "--no-ff", "-m", "merge", c]);
+      r.git(["merge", "-q", "--no-ff", "-m", "merge", c], {
+        env: { GIT_AUTHOR_DATE: `${date} +0000`, GIT_COMMITTER_DATE: `${date} +0000` },
+      });
       r.git(["repack", "-q", "-d"]);
+      return { caseDir, r };
+    }
+    const geometricArgs = ["--geometric=2", "--write-midx", "--write-bitmap-index"];
+    const packDirOf = (gitDir: string) => join(gitDir, "objects/pack");
+    /** The `.pack` and `.mtimes` files of a pack directory. */
+    const packFiles = (packDir: string) => {
+      const names = readdirSync(packDir);
+      return {
+        packs: names.filter((n) => n.endsWith(".pack")).length,
+        crufts: names.filter((n) => n.endsWith(".mtimes")).length,
+      };
+    };
+    /**
+     * The first fixture date at which native git's repack gives `wanted` pack files: whether the
+     * rescued pack takes the cruft pack's name depends on the ids and on the native build's pack
+     * bytes, so each case asks the git it compares with (deterministic for one build)
+     */
+    function dateWhereNative(name: string, wanted: { packs: number; crufts: number }): number {
+      for (let date = 1700000000; date < 1700000064; date++) {
+        const { r } = geometricFixture(`${name}-probe-${date}`, date);
+        r.git(["repack", "-q", ...geometricArgs]);
+        const got = packFiles(packDirOf(r.gitDir));
+        if (got.packs === wanted.packs && got.crufts === wanted.crufts) return date;
+      }
+      throw new Error(`no fixture date gives native git ${JSON.stringify(wanted)}`);
+    }
+
+    async function alreadyGeometric(name: string, date: number) {
+      const { caseDir } = geometricFixture(name, date);
       const { result, twins } = await repackTwins(
         caseDir,
-        ["--geometric=2", "--write-midx", "--write-bitmap-index"],
+        geometricArgs,
         (c) => c.setGeometric(2).setWriteMidx(true).setWriteBitmaps(true),
         {},
         withoutInfoPacks,
+      );
+      return { result, twins, ours: packFiles(packDirOf(join(twins.ours, "repo/.git"))) };
+    }
+
+    it("t7704-repack-cruft 'repack --write-midx includes cruft when already geometric'", async () => {
+      // 2.5x writes a fourth pack, 2.43 nothing
+      const wanted = nativeIs25x ? { packs: 4, crufts: 1 } : { packs: 3, crufts: 1 };
+      const { result, twins, ours } = await alreadyGeometric(
+        "follow-noop",
+        dateWhereNative("follow-noop", wanted),
       );
       // 2.5x's follow walk rescues C's objects from the cruft pack through the merge (a `!`
       // pack: no midx names it), so a pack is written and the midx can leave the cruft pack
@@ -951,6 +998,21 @@ describeGit("repack twins", () => {
       expect(midxKinds(twins.ours)).toEqual(
         nativeIs25x ? ["pack", "pack", "pack"] : ["cruft", "pack", "pack"],
       );
+      expect(ours).toEqual(wanted);
+    });
+
+    it("t7704-repack-cruft 'repack --write-midx includes cruft when already geometric' (the rescued pack is the cruft pack byte for byte: generated_pack_install unlinks its stale .mtimes)", async () => {
+      // 2.5x's new pack takes the cruft pack's name and loses its .mtimes; 2.43 writes nothing
+      const wanted = nativeIs25x ? { packs: 3, crufts: 0 } : { packs: 3, crufts: 1 };
+      const { result, twins, ours } = await alreadyGeometric(
+        "follow-noop-same-name",
+        dateWhereNative("follow-noop-same-name", wanted),
+      );
+      expect(result.output).toEqual(nativeIs25x ? [] : ["Nothing new to pack."]);
+      expect(midxKinds(twins.ours)).toEqual(
+        nativeIs25x ? ["pack", "pack", "pack"] : ["cruft", "pack", "pack"],
+      );
+      expect(ours).toEqual(wanted);
     });
 
     it("t7704-repack-cruft 'repack rescues once-cruft objects above geometric split'", async () => {
