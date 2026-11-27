@@ -14,8 +14,8 @@ import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import type { Checkout, Staging } from "@statewalker/vcs-working-tree";
 import { createMemoryGitStaging } from "@statewalker/vcs-working-tree";
 import { afterEach, describe, expect, it } from "vitest";
-import { checkoutConformanceTests } from "./checkout.conformance.test.js";
 import { CLEANUP_TIMEOUT, removeTempDir } from "../../temp-dir-support.js";
+import { checkoutConformanceTests } from "./checkout.conformance.test.js";
 
 let checkout: GitCheckout;
 let staging: Staging;

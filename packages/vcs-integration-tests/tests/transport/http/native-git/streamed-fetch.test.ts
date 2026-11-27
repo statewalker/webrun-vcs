@@ -16,12 +16,12 @@ import {
   fetch as transportFetch,
 } from "@statewalker/vcs-transport";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../../../temp-dir-support.js";
 import {
   type GitHttpBackendServer,
   gitHttpBackendAvailable,
   startGitHttpBackendServer,
 } from "./helpers/git-http-backend-server.js";
-import { CLEANUP_TIMEOUT, removeTempDir } from "../../../temp-dir-support.js";
 
 const GIT_ENV = {
   ...process.env,

@@ -16,6 +16,7 @@ import { ResetMode } from "../src/index.js";
 import { gitOk, openOurs, put, snapshot } from "./merge-native-helpers.js";
 import type { MockWorktree } from "./mock-worktree-store.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 import {
   backends,
   createCommit,
@@ -23,7 +24,6 @@ import {
   testAuthor,
   toArray,
 } from "./test-helper.js";
-import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 describe.each(backends)("ResetCommand ($name backend)", ({ factory }) => {
   let cleanup: (() => Promise<void>) | undefined;

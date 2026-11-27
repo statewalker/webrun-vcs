@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { push } from "@statewalker/vcs-transport";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../../../temp-dir-support.js";
 import {
   createInitializedTestRepository,
   createRepositoryFacade,
@@ -29,7 +30,6 @@ import {
   startGitHttpBackendServer,
 } from "./helpers/git-http-backend-server.js";
 import { startVcsHttpServer, type VcsHttpServer } from "./helpers/vcs-http-server.js";
-import { CLEANUP_TIMEOUT, removeTempDir } from "../../../temp-dir-support.js";
 
 const run = promisify(execFile);
 const GIT_ENV = {
