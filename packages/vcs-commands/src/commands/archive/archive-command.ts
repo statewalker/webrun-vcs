@@ -334,9 +334,13 @@ export class ArchiveCommand extends GitCommand<Uint8Array> {
     return this;
   }
 
-  /** What git printed on stderr (`-v`'s paths, warnings). */
-  getMessages(): string[] {
-    return [...this.messages];
+  /**
+   * What git printed on stderr (`-v`'s paths, warnings), from the `from`th message on: read
+   * while {@link callStream} runs, the messages so far (upload-archive sends them on as they
+   * come).
+   */
+  getMessages(from = 0): string[] {
+    return this.messages.slice(from);
   }
 
   /** `git archive --list`: the formats, as git lists them. */
