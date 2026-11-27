@@ -56,9 +56,11 @@ import {
   textEolIsCrlf,
 } from "./eol.js";
 import {
+  type CheckoutMetadata,
   type FilterDriver,
   FilterDriverError,
   type FilterDriverRegistry,
+  FilterDriverRunError,
   lookupFilterDriver,
 } from "./filter-driver.js";
 import { expandUserPath, type GitHostEnvironment, xdgConfigPath } from "./host-environment.js";
@@ -142,6 +144,20 @@ export function configValue(config: WorkingCopyConfig | undefined, key: string):
   return config[key];
 }
 
+/**
+ * The text of a configuration value as written (the last one), undefined for a key without
+ * one: commands such as `filter.<driver>.smudge = false` are strings, whatever a typed
+ * configuration reads them as.
+ */
+function configText(config: WorkingCopyConfig | undefined, key: string): string | undefined {
+  const withOrigin = (config as { getAllWithOrigin?: unknown } | undefined)?.getAllWithOrigin;
+  if (typeof withOrigin === "function") {
+    const all = (withOrigin as (k: string) => { text?: string }[]).call(config, key);
+    if (all.length > 0) return all[all.length - 1]?.text;
+  }
+  return str(configValue(config, key));
+}
+
 /** Every key of the configuration that starts with `prefix`. */
 function configKeys(config: WorkingCopyConfig | undefined, prefix: string): string[] {
   if (!config) return [];
@@ -191,9 +207,10 @@ export function readConversionSettings(
     if (!name) continue;
     const driver = drivers.get(name) ?? { name, required: false };
     const value = configValue(config, key);
-    if (prop === "clean") driver.clean = str(value);
-    else if (prop === "smudge") driver.smudge = str(value);
-    else if (prop === "process") driver.process = str(value);
+    // commands as written: a typed config reads `smudge = false` (the command) as a boolean
+    if (prop === "clean") driver.clean = configText(config, key);
+    else if (prop === "smudge") driver.smudge = configText(config, key);
+    else if (prop === "process") driver.process = configText(config, key);
     else if (prop === "required") driver.required = gitBool(value) ?? false;
     drivers.set(name, driver);
   }
@@ -739,6 +756,7 @@ export class GitContentFilter implements WorktreeContentFilter {
     direction: "clean" | "smudge",
     path: string,
     content: Uint8Array,
+    options: { onWarning?: (m: string) => void; metadata?: CheckoutMetadata } = {},
   ): Promise<Uint8Array | undefined> {
     if (!driver) return undefined;
     const command = driver[direction];
@@ -750,8 +768,14 @@ export class GitContentFilter implements WorktreeContentFilter {
       return await run.call(driver.host, content, {
         path,
         ...(command !== undefined ? { command } : {}),
+        ...(options.metadata ? { metadata: options.metadata } : {}),
       });
-    } catch {
+    } catch (error) {
+      // apply_single_file_filter: the command's own lines, then its failure, content kept
+      if (command !== undefined && !driver.required) {
+        const warn = options.onWarning ?? this.options.onWarning;
+        for (const line of filterFailureLines(error, command)) warn?.(`error: ${line}`);
+      }
       return undefined;
     }
   }
@@ -779,7 +803,9 @@ export class GitContentFilter implements WorktreeContentFilter {
         direction: "checkin",
       }));
     let out = src;
-    const filtered = await this.applyDriver(ca.driver, "clean", path, out);
+    const filtered = await this.applyDriver(ca.driver, "clean", path, out, {
+      onWarning: (message) => this.warn(options, message),
+    });
     if (filtered === undefined && ca.driver?.required) {
       throw new FilterDriverError(`${path}: clean filter '${ca.driver.name}' failed`);
     }
@@ -836,6 +862,7 @@ export class GitContentFilter implements WorktreeContentFilter {
       settings?: ConversionSettings;
       context?: ContentAttributesContext;
       onWarning?: (m: string) => void;
+      metadata?: CheckoutMetadata;
     } = {},
   ): Promise<Uint8Array> {
     const scope = options.attrs && options.settings ? undefined : await this.currentScope();
@@ -855,10 +882,15 @@ export class GitContentFilter implements WorktreeContentFilter {
     if (enc && out.length > 0) {
       const converted = reencode(out, enc, "UTF-8");
       if (!converted) {
-        this.options.onWarning?.(`error: failed to encode '${path}' from UTF-8 to ${enc}`);
+        (options.onWarning ?? this.options.onWarning)?.(
+          `error: failed to encode '${path}' from UTF-8 to ${enc}`,
+        );
       } else out = converted;
     }
-    const filtered = await this.applyDriver(ca.driver, "smudge", path, out);
+    const filtered = await this.applyDriver(ca.driver, "smudge", path, out, {
+      ...(options.onWarning ? { onWarning: options.onWarning } : {}),
+      ...(options.metadata ? { metadata: options.metadata } : {}),
+    });
     if (filtered === undefined && ca.driver?.required) {
       throw new FilterDriverError(`${path}: smudge filter ${ca.driver.name} failed`);
     }
@@ -907,6 +939,7 @@ export class GitContentFilter implements WorktreeContentFilter {
           attrs: ca,
           settings,
           ...(options?.onWarning ? { onWarning: options.onWarning } : {}),
+          ...(options?.metadata ? { metadata: options.metadata } : {}),
         }),
     };
   }
@@ -914,6 +947,15 @@ export class GitContentFilter implements WorktreeContentFilter {
   static supportsEncoding(encoding: string): boolean {
     return isSupportedEncoding(encoding);
   }
+}
+
+/**
+ * What convert.c prints for a filter command that failed: the driver's own lines
+ * ({@link FilterDriverRunError}), then `external filter '<cmd>' failed`.
+ */
+function filterFailureLines(error: unknown, command: string): string[] {
+  const own = error instanceof FilterDriverRunError ? error.lines : [];
+  return [...own, `external filter '${command}' failed`];
 }
 
 /** Options of {@link createGitContentFilter}. */

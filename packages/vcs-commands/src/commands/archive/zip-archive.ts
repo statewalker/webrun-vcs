@@ -5,12 +5,13 @@
  * the commit id as the archive's comment.
  */
 
-import { deflateSync } from "@statewalker/vcs-utils/compression";
-import { crc32 } from "@statewalker/vcs-utils/hash/crc32";
+import { createDeflater, deflateSync } from "@statewalker/vcs-utils/compression";
+import { CRC32, crc32 } from "@statewalker/vcs-utils/hash/crc32";
 import { bufferIsBinary } from "../grep/index.js";
 import {
   type ArchiveEntry,
   type ArchiveSettings,
+  ArchiveSink,
   type ArchiveWriter,
   asciiBytes,
   ByteBuffer,
@@ -27,6 +28,8 @@ const METHOD_DEFLATE = 8;
 const EXTRA_MTIME_SIZE = 9;
 const ZIP64_EXTRA_SIZE = 20;
 const MAX32 = 0xffffffff;
+/** archive-zip.c's `STREAM_BUFFER_SIZE`: a streamed blob's reads. */
+const STREAM_BUFFER_SIZE = 16384;
 
 /** Options of {@link ZipArchiveWriter}. */
 export interface ZipArchiveOptions extends ArchiveSettings {
@@ -95,9 +98,10 @@ export function dosTime(
 
 /** Writes git's zip archive (`git archive --format=zip`). */
 export class ZipArchiveWriter implements ArchiveWriter {
-  private readonly out = new ByteBuffer(65536);
+  private readonly sink: ArchiveSink;
+  private readonly out: ByteBuffer;
   private readonly dir = new ByteBuffer(4096);
-  private readonly le = new LeWriter(this.out);
+  private readonly le: LeWriter;
   private readonly dirLe = new LeWriter(this.dir);
   private entries = 0;
   private maxCreatorVersion = 0;
@@ -105,15 +109,18 @@ export class ZipArchiveWriter implements ArchiveWriter {
   private readonly dosTimeOfDay: number;
 
   constructor(private readonly settings: ZipArchiveOptions) {
+    this.sink = new ArchiveSink(settings.output, 65536);
+    this.out = this.sink.buffer;
+    this.le = new LeWriter(this.out);
     const dos = dosTime(settings.time, settings.localTzOffset);
     this.dosDate = dos.date;
     this.dosTimeOfDay = dos.time;
   }
 
   /** `write_zip_entry`. */
-  entry(entry: ArchiveEntry): string | undefined {
+  async entry(entry: ArchiveEntry): Promise<string | undefined> {
     const { path, mode, id } = entry;
-    const offset = this.out.length;
+    const offset = this.sink.position;
     let flags = 0;
     let crc = 0;
     let isBinary: boolean | undefined;
@@ -123,8 +130,8 @@ export class ZipArchiveWriter implements ArchiveWriter {
     let attr2: number;
     let out: Uint8Array | undefined;
     let compressedSize: number;
-    const size = entry.content.length;
     const streamed = entry.streamed === true && isRegMode(mode);
+    const size = streamed && entry.stream ? (entry.size ?? 0) : entry.content.length;
 
     if (!onlyAscii(path)) {
       if (isUtf8(path)) flags |= ZIP_UTF8;
@@ -207,16 +214,11 @@ export class ZipArchiveWriter implements ArchiveWriter {
     }
 
     if (streamed) {
-      crc = crc32(entry.content);
-      isBinary = entry.binary ?? bufferIsBinary(entry.content.subarray(0, 16384));
-      if (method === METHOD_STORE) {
-        this.out.push(entry.content);
-        compressedSize = size;
-      } else {
-        const deflated = deflateSync([entry.content], { format: "raw", level });
-        this.out.push(deflated);
-        compressedSize = deflated.length;
-      }
+      const streamedOut = await this.writeStreamed(entry, size, method === METHOD_STORE, level);
+      if (!streamedOut) return `cannot stream blob ${id}`;
+      crc = streamedOut.crc;
+      isBinary = streamedOut.isBinary;
+      compressedSize = streamedOut.compressedSize;
       // write_zip_data_desc
       le.u32(0x08074b50);
       le.u32(crc);
@@ -228,7 +230,7 @@ export class ZipArchiveWriter implements ArchiveWriter {
         le.u32(size);
       }
     } else if (compressedSize > 0 && out) {
-      this.out.push(out);
+      await this.sink.write(out);
     }
 
     let zip64DirPayload = 0;
@@ -268,12 +270,61 @@ export class ZipArchiveWriter implements ArchiveWriter {
       if (offset >= MAX32) d.u64(offset);
     }
     this.entries++;
+    await this.sink.flush();
     return undefined;
   }
 
+  /**
+   * A streamed blob's data (archive-zip.c's `stream` loops): the CRC-32 and the deflate
+   * computed as it is read, `entry_is_binary` asked of its first read (16 KiB); undefined
+   * when it cannot be read whole.
+   */
+  private async writeStreamed(
+    entry: ArchiveEntry,
+    size: number,
+    store: boolean,
+    level: number,
+  ): Promise<{ crc: number; isBinary: boolean; compressedSize: number } | undefined> {
+    const crc = new CRC32();
+    const deflater = store ? undefined : createDeflater({ format: "raw", level });
+    const head = new ByteBuffer(STREAM_BUFFER_SIZE);
+    let total = 0;
+    let compressedSize = 0;
+    const emit = async (chunks: Uint8Array[]) => {
+      for (const c of chunks) {
+        compressedSize += c.length;
+        await this.sink.write(c);
+      }
+    };
+    try {
+      for await (const chunk of entry.stream ?? [entry.content]) {
+        if (total + chunk.length > size) return undefined;
+        total += chunk.length;
+        crc.update(chunk);
+        if (head.length < STREAM_BUFFER_SIZE) {
+          head.push(chunk.subarray(0, STREAM_BUFFER_SIZE - head.length));
+        }
+        if (deflater) await emit(deflater.push(chunk));
+        else {
+          compressedSize += chunk.length;
+          await this.sink.write(chunk);
+        }
+      }
+    } catch {
+      return undefined;
+    }
+    if (total !== size) return undefined;
+    if (deflater) await emit(deflater.finish());
+    return {
+      crc: crc.getValue(),
+      isBinary: entry.binary ?? bufferIsBinary(head.bytes()),
+      compressedSize,
+    };
+  }
+
   /** `write_zip_trailer`. */
-  finish(): Uint8Array {
-    const zipOffset = this.out.length;
+  async finish(): Promise<Uint8Array> {
+    const zipOffset = this.sink.position;
     const dirBytes = this.dir.bytes();
     const clamped = this.entries > 0xffff || zipOffset > MAX32;
     this.out.push(dirBytes);
@@ -305,7 +356,7 @@ export class ZipArchiveWriter implements ArchiveWriter {
     le.u32(clamp32(zipOffset));
     le.u16(commitId ? (this.settings.hexLength ?? commitId.length) : 0);
     if (commitId) this.out.push(asciiBytes(commitId));
-    return this.out.bytes();
+    return this.sink.finish();
   }
 }
 
