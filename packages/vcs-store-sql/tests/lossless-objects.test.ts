@@ -3,12 +3,10 @@
  * object the parsed columns cannot rebuild (a `mergetag` header, an unknown `change-id` header,
  * a Latin-1 author name, a tag with an extra header and a non-UTF-8 message) keeps its bytes in
  * the row's `raw` column, so `importObject` and `importPack` give back the object's own id and
- * `exportObject` its own bytes. The three commits are git.git's (fixtures/git-git-commits/,
- * `git cat-file commit <id>`), found by the census over git.git.
+ * `exportObject` its own bytes. The three commits are git.git's (fixtures/git-git-commits.ts,
+ * `git cat-file commit <id>`, base64), found by the census over git.git.
  */
 
-import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
 import {
   type HistoryWithOperations,
   ObjectIdMismatchError,
@@ -22,11 +20,11 @@ import type { DatabaseClient } from "../src/database-client.js";
 import { getSchemaVersion, initializeSchema, rollbackMigration } from "../src/migrations/index.js";
 import { createSqlObjectStores } from "../src/object-storage/index.js";
 import { SQLHistoryFactory } from "../src/sql-storage-backend.js";
+import { GIT_GIT_COMMITS } from "./fixtures/git-git-commits.js";
 
-const FIXTURES = join(import.meta.dirname, "fixtures", "git-git-commits");
-const COMMITS = readdirSync(FIXTURES).map((id) => ({
+const COMMITS = Object.entries(GIT_GIT_COMMITS).map(([id, base64]) => ({
   id,
-  bytes: new Uint8Array(readFileSync(join(FIXTURES, id))),
+  bytes: Uint8Array.from(atob(base64), (c) => c.charCodeAt(0)),
 }));
 
 const latin1 = (s: string) => Uint8Array.from(s, (c) => c.charCodeAt(0));
@@ -91,7 +89,7 @@ describe("SQL native stores keep commits and tags byte for byte (#399)", () => {
       );
       const out = await exported(history, id);
       expect(out.type).toBe("commit");
-      expect(Buffer.from(out.bytes).equals(Buffer.from(bytes))).toBe(true);
+      expect(sameBytes(out.bytes, bytes)).toBe(true);
       // the parsed view still answers
       const commit = await history.commits.load(id);
       expect(commit?.parents.length).toBeGreaterThan(0);
@@ -104,7 +102,7 @@ describe("SQL native stores keep commits and tags byte for byte (#399)", () => {
     expect(await history.serialization.importObject("tag", once(TAG), TAG.length)).toBe(id);
     const out = await exported(history, id);
     expect(out.type).toBe("tag");
-    expect(Buffer.from(out.bytes).equals(Buffer.from(TAG))).toBe(true);
+    expect(sameBytes(out.bytes, TAG)).toBe(true);
     expect((await history.tags.load(id))?.tag).toBe("v-latin1");
     expect(await history.tags.getTarget(id)).toBe("7eb93c89651c47c8095d476251f2e4314656b292");
   });
@@ -125,13 +123,9 @@ describe("SQL native stores keep commits and tags byte for byte (#399)", () => {
     );
     expect(result.objectsImported).toBe(ids.length);
     for (const { id, bytes } of COMMITS) {
-      expect(Buffer.from((await exported(history, id)).bytes).equals(Buffer.from(bytes))).toBe(
-        true,
-      );
+      expect(sameBytes((await exported(history, id)).bytes, bytes)).toBe(true);
     }
-    expect(Buffer.from((await exported(history, ids[3])).bytes).equals(Buffer.from(TAG))).toBe(
-      true,
-    );
+    expect(sameBytes((await exported(history, ids[3])).bytes, TAG)).toBe(true);
 
     // exported through the SQL stores and imported elsewhere: the same ids
     const back = await collect(history.serialization.createPack(list(ids)));
@@ -216,7 +210,7 @@ describe("migration 10 (raw commit and tag bytes)", () => {
     await initializeSchema(db);
     expect(await getSchemaVersion(db)).toBe(10);
     const out = await exported(history, idOf("commit", plain));
-    expect(Buffer.from(out.bytes).equals(Buffer.from(plain))).toBe(true);
+    expect(sameBytes(out.bytes, plain)).toBe(true);
 
     // nothing raw yet: the rollback goes through and the column goes
     await rollbackMigration(db, 9);
@@ -235,6 +229,10 @@ async function initialized() {
   const db = await SqlJsAdapter.create();
   await initializeSchema(db);
   return db;
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  return a.length === b.length && a.every((v, i) => v === b[i]);
 }
 
 async function* once(bytes: Uint8Array) {
