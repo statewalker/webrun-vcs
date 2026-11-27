@@ -1,5 +1,13 @@
 # @statewalker/vcs-transport-xet
 
+## 0.10.1
+
+### Patch Changes
+
+- Release of the changes since the last published version:
+  
+  - @statewalker/vcs-transport-lfs ^0.10.0 -> ^0.10.1
+
 ## 0.10.0
 
 ### Minor Changes
