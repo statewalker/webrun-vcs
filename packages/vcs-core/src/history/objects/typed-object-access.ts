@@ -2,6 +2,7 @@
  * How the typed stores (blobs, trees, commits, tags) use `GitObjects`:
  * store content of unknown size, read a header, load content of one type.
  */
+import { collect } from "@statewalker/vcs-utils/streams";
 import type { ObjectId } from "../../common/id/index.js";
 import { CorruptObjectError, type GitObjects, InvalidObjectIdError } from "./git-objects.js";
 import { PromisorFetchError } from "./object-promisor.js";
@@ -99,6 +100,30 @@ export async function loadTypedObject(
     throw new Error(`Object ${id} is not a ${type} (found type: ${obj.type})`);
   }
   return { content: { [Symbol.asyncIterator]: () => it }, size: obj.size, release };
+}
+
+/**
+ * The whole content of an object of `type` (no header), or undefined when it is absent or of
+ * another type (`Commits.raw`, `Tags.raw`).
+ */
+export async function loadTypedBytes(
+  objects: GitObjects,
+  id: ObjectId,
+  type: ObjectTypeString,
+): Promise<Uint8Array | undefined> {
+  let obj: Awaited<ReturnType<GitObjects["get"]>>;
+  try {
+    obj = await objects.get(id);
+  } catch (e) {
+    if (e instanceof InvalidObjectIdError) return undefined;
+    throw e;
+  }
+  if (!obj) return undefined;
+  if (obj.type !== type) {
+    await obj.content[Symbol.asyncIterator]().return?.();
+    return undefined;
+  }
+  return obj.bytes ?? (await collect(obj.content));
 }
 
 /** Remove an object; false if it is absent or `id` is not an object id. */

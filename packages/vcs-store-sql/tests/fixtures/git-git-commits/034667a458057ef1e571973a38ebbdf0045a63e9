@@ -1,0 +1,30 @@
+tree db6473879e0ee571eda48e64ba378cf0a63bb793
+parent ea5b2dd28f7dc6e0f331af2aad13e281e7a9a408
+parent 8f9aeb0d36c6cbfb849946bb272fa0d3c4611547
+author Junio C Hamano <gitster@pobox.com> 1490387461 -0700
+committer Junio C Hamano <gitster@pobox.com> 1490387461 -0700
+mergetag object 8f9aeb0d36c6cbfb849946bb272fa0d3c4611547
+ type commit
+ tag v2.12.2
+ tagger Junio C Hamano <gitster@pobox.com> 1490385564 -0700
+ 
+ Git 2.12.2
+ -----BEGIN PGP SIGNATURE-----
+ Version: GnuPG v1
+ 
+ iQIcBAABAgAGBQJY1XqcAAoJELC16IaWr+bL0/EQAMFyPd8Rzjpt+yWs/gSllSSB
+ KuBKpBssfBVhqEjHz7o1y3NseOzQj6mbJR3WIrGpUOhlzDU/ARFYL//3EkHEbDzd
+ Cw9BXfU5B/zfkP9zPI8ecmjmjFfRwrCGA+DOTXYAA5RZz0Done+VsZwQYsBShEd8
+ 7cQNFNoThic4ww3Lba+VM6rh+6D89PcG21pQQy+DgwEWWTYPQXmebIYAnCgpLGcv
+ JLIPgefEBGwDlQ08rGZaiuKU3cqSSXIovNz7Oslntr6OlH3tox4lHtGVV3w/i2uY
+ /488+yiKqO7MP85/0Qg8xmv1sVnGOk9UilS18OsJsHGd1uByjWq6abfbdGqEmYJR
+ JhY5L3OBX8hlCsP3//JESqMWoXFZTzaCL2FQAh59FdNTk0BxvQFw3OVRz2CP6Y6y
+ Ghn4ywU3HSgZDYzPjE7sHsn+xTUAm3BZcHZ0VWM0we3QRibTewVkBmAh8nukZxfb
+ MutOGVRTHBoPKlQ+THz6eyBHV4N431Wko+Zq7bl4KttJk/WXl1nCzyLVi0TizsoO
+ NfeI1dtrOnMiBMR+dAIWoNd9cyDMU6j1wzvnWoCZs8YUrtegB9cM6XbI+gJ5NK6v
+ TVvYcqoZf4JFteYqVAXN7NtHApPcoPDOtV4vsB/qNoY2xiX7YZRGshuijlst6jOC
+ WfuyDe+wnrMb4Q4LVknC
+ =jgnW
+ -----END PGP SIGNATURE-----
+
+Sync with 2.12.2

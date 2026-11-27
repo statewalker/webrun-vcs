@@ -8,12 +8,14 @@
 
 import {
   type AnnotatedTag,
+  collectTagBytes,
   computeTagSize,
   encodeObjectHeader,
   encodeTagEntries,
   type ObjectId,
   ObjectType,
   type ObjectTypeCode,
+  parseTagFromBytes,
   tagToEntries,
 } from "@statewalker/vcs-core";
 import { bytesToHex, createSha1 } from "@statewalker/vcs-utils";
@@ -41,6 +43,8 @@ interface TagRow {
   message: string;
   encoding: string | null;
   gpg_signature: string | null;
+  /** The content when the columns cannot rebuild it byte for byte (migration 10), else null */
+  raw: Uint8Array | null;
 }
 
 /**
@@ -60,6 +64,13 @@ async function computeGitTagId(tag: AnnotatedTag): Promise<ObjectId> {
   return bytesToHex(sha1.digest());
 }
 
+/** True when both hold the same bytes. */
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
 /**
  * Native SQL TagStore implementation
  *
@@ -73,8 +84,38 @@ export class SqlNativeTagStoreImpl implements SqlNativeTagStore {
    * Store an annotated tag object with Git-compatible ID
    */
   async store(tag: AnnotatedTag): Promise<ObjectId> {
-    const tagId = await computeGitTagId(tag);
+    return this.insert(await computeGitTagId(tag), tag, null);
+  }
 
+  /**
+   * Store a tag given as its content, byte for byte (see `Tags.storeRaw`): parsed into the
+   * columns, the content kept in `raw` when the columns would rebuild other bytes.
+   */
+  async storeRaw(content: Uint8Array): Promise<ObjectId> {
+    const tag = await parseTagFromBytes(content);
+    const sha1 = createSha1();
+    sha1.update(encodeObjectHeader("tag", content.length));
+    sha1.update(content);
+    const tagId = bytesToHex(sha1.digest());
+    const rebuilt = await collectTagBytes(tag);
+    return this.insert(tagId, tag, sameBytes(rebuilt, content) ? null : content);
+  }
+
+  /** The tag's content as stored (see `Tags.raw`): the kept bytes, else rebuilt. */
+  async raw(id: ObjectId): Promise<Uint8Array | undefined> {
+    const rows = await this.db.query<{ raw: Uint8Array | null }>(
+      "SELECT * FROM vcs_tag WHERE tag_id = ?",
+      [id],
+    );
+    if (rows.length === 0) return undefined;
+    // `*`, not `raw`: a database before migration 10 has no such column and reads as before
+    const kept = rows[0].raw;
+    if (kept) return new Uint8Array(kept);
+    const tag = await this.load(id);
+    return tag ? collectTagBytes(tag) : undefined;
+  }
+
+  private async insert(tagId: ObjectId, tag: AnnotatedTag, raw: Uint8Array | null) {
     // Check if tag already exists (deduplication)
     const existing = await this.db.query<{ id: number }>(
       "SELECT id FROM vcs_tag WHERE tag_id = ?",
@@ -91,8 +132,8 @@ export class SqlNativeTagStoreImpl implements SqlNativeTagStore {
       `INSERT INTO vcs_tag (
         tag_id, object_id, object_type, tag_name,
         tagger_name, tagger_email, tagger_timestamp, tagger_tz,
-        message, encoding, gpg_signature, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        message, encoding, gpg_signature, created_at${raw ? ", raw" : ""}
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${raw ? ", ?" : ""})`,
       [
         tagId,
         tag.object,
@@ -106,6 +147,8 @@ export class SqlNativeTagStoreImpl implements SqlNativeTagStore {
         tag.encoding || null,
         tag.gpgSignature || null,
         now,
+        // only when needed: a row the columns rebuild needs no migration 10
+        ...(raw ? [raw] : []),
       ],
     );
 
@@ -124,6 +167,9 @@ export class SqlNativeTagStoreImpl implements SqlNativeTagStore {
     }
 
     const row = tags[0];
+
+    // kept bytes: parsed as the object stores parse them
+    if (row.raw) return parseTagFromBytes(new Uint8Array(row.raw));
 
     const tag: AnnotatedTag = {
       object: row.object_id,

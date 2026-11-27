@@ -9,6 +9,8 @@
 import {
   type AncestryOptions,
   type Commit,
+  collectCommitBytes,
+  commitFromBytes,
   commitToEntries,
   computeCommitSize,
   encodeCommitEntries,
@@ -42,6 +44,8 @@ interface CommitRow {
   message: string;
   encoding: string | null;
   gpg_signature: string | null;
+  /** The content when the columns cannot rebuild it byte for byte (migration 10), else null */
+  raw: Uint8Array | null;
 }
 
 /**
@@ -64,6 +68,13 @@ async function computeGitCommitId(commit: Commit): Promise<ObjectId> {
   return bytesToHex(sha1.digest());
 }
 
+/** True when both hold the same bytes. */
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
 /**
  * Native SQL CommitStore implementation
  *
@@ -81,7 +92,43 @@ export class SqlNativeCommitStoreImpl implements SqlNativeCommitStore {
    */
   async store(commit: Commit): Promise<ObjectId> {
     const commitId = await computeGitCommitId(commit);
+    return this.insert(commitId, commit, null);
+  }
 
+  /**
+   * Store a commit given as its content, byte for byte (see `Commits.storeRaw`): the columns
+   * hold it parsed (for queries; text that is not UTF-8 decoded leniently), and the content
+   * itself is kept in `raw` when the columns would rebuild other bytes (an extra header such as
+   * `mergetag` or `change-id`, a name or message that is not UTF-8).
+   */
+  async storeRaw(content: Uint8Array): Promise<ObjectId> {
+    const commit = commitFromBytes(content);
+    const sha1 = createSha1();
+    sha1.update(encodeObjectHeader("commit", content.length));
+    sha1.update(content);
+    const commitId = bytesToHex(sha1.digest());
+    const rebuilt = await collectCommitBytes(commit);
+    return this.insert(commitId, commit, sameBytes(rebuilt, content) ? null : content);
+  }
+
+  /**
+   * The commit's content as stored (see `Commits.raw`): the kept bytes, else rebuilt from the
+   * columns.
+   */
+  async raw(id: ObjectId): Promise<Uint8Array | undefined> {
+    const rows = await this.db.query<{ raw: Uint8Array | null }>(
+      "SELECT * FROM vcs_commit WHERE commit_id = ?",
+      [id],
+    );
+    if (rows.length === 0) return undefined;
+    // `*`, not `raw`: a database before migration 10 has no such column and reads as before
+    const kept = rows[0].raw;
+    if (kept) return new Uint8Array(kept);
+    const commit = await this.load(id);
+    return commit ? collectCommitBytes(commit) : undefined;
+  }
+
+  private async insert(commitId: ObjectId, commit: Commit, raw: Uint8Array | null) {
     // Check if commit already exists (deduplication)
     const existing = await this.db.query<{ id: number }>(
       "SELECT id FROM vcs_commit WHERE commit_id = ?",
@@ -100,8 +147,8 @@ export class SqlNativeCommitStoreImpl implements SqlNativeCommitStore {
           commit_id, tree_id,
           author_name, author_email, author_timestamp, author_tz,
           committer_name, committer_email, committer_timestamp, committer_tz,
-          message, encoding, gpg_signature, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          message, encoding, gpg_signature, created_at${raw ? ", raw" : ""}
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${raw ? ", ?" : ""})`,
         [
           commitId,
           commit.tree,
@@ -117,6 +164,8 @@ export class SqlNativeCommitStoreImpl implements SqlNativeCommitStore {
           commit.encoding || null,
           commit.gpgSignature || null,
           now,
+          // only when needed: a row the columns rebuild needs no migration 10
+          ...(raw ? [raw] : []),
         ],
       );
 
@@ -148,6 +197,9 @@ export class SqlNativeCommitStoreImpl implements SqlNativeCommitStore {
     }
 
     const row = commits[0];
+
+    // kept bytes: parsed as the object stores parse them (the columns hold the same, leniently)
+    if (row.raw) return commitFromBytes(new Uint8Array(row.raw));
 
     // Load parents
     const parents = await this.db.query<{ parent_id: string }>(
