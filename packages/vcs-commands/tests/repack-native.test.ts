@@ -790,6 +790,160 @@ describeGit("repack twins", () => {
     });
   });
 
+  describe("repack.midxMustContainCruft (--stdin-packs=follow)", () => {
+    const bitmapMidx = ["-d", "--geometric=2", "--write-midx", "--write-bitmap-index"];
+    const ourBitmapMidx = (c: RepackCommand) =>
+      c.setDeleteRedundant(true).setGeometric(2).setWriteMidx(true).setWriteBitmaps(true);
+    /** The kinds of the packs a twin's midx names (`cruft` or `pack`), sorted. */
+    function midxKinds(twin: string): string[] {
+      const packDir = join(twin, "repo/.git/objects/pack");
+      const bytes = readFileSync(join(packDir, "multi-pack-index"));
+      const chunks = bytes[6] as number;
+      for (let i = 0; i < chunks; i++) {
+        const at = 12 + i * 12;
+        if (bytes.toString("latin1", at, at + 4) !== "PNAM") continue;
+        const start = Number(bytes.readBigUInt64BE(at + 4));
+        const end = Number(bytes.readBigUInt64BE(at + 16));
+        return bytes
+          .toString("latin1", start, end)
+          .split("\0")
+          .filter(Boolean)
+          .map((n) => (existsSync(join(packDir, n.replace(/idx$/, "mtimes"))) ? "cruft" : "pack"))
+          .sort();
+      }
+      return [];
+    }
+
+    /** t7704's setup_cruft_exclude_tests: `two` is cruft, then reachable again under `four`. */
+    function cruftExcludeRepo(name: string, mustContainCruft = false) {
+      const caseDir = newCase(root, name);
+      const r = initRepo(root, caseDir);
+      r.git(["config", "repack.midxMustContainCruft", String(mustContainCruft)]);
+      r.commit("one", { "one.t": "one\n" });
+      r.git(["tag", "one"]);
+      const two = r.commit("two", { "two.t": "two\n" });
+      r.commit("three", { "three.t": "three\n" });
+      r.git(["reset", "-q", "--hard", "one"]);
+      r.git(["reflog", "expire", "--all", "--expire=all"]);
+      r.git(["repack", "-q", "--cruft", "-d"]);
+      r.git(["merge", "-q", two]);
+      r.commit("four", { "four.t": "four\n" });
+      return { caseDir, r };
+    }
+
+    it("t7704-repack-cruft 'repack --write-midx excludes cruft where possible'", async () => {
+      const { caseDir } = cruftExcludeRepo("follow-exclude");
+      const { twins } = await repackTwins(caseDir, bitmapMidx, ourBitmapMidx, {}, withoutInfoPacks);
+      // 2.43 has no repack.midxMustContainCruft: the cruft pack stays in its midx
+      expect(midxKinds(twins.ours)).toEqual(
+        nativeIs25x ? ["pack", "pack"] : ["cruft", "pack", "pack"],
+      );
+    });
+
+    it("t7704-repack-cruft 'repack --write-midx includes cruft when instructed'", async () => {
+      const { caseDir } = cruftExcludeRepo("follow-instructed", true);
+      const { twins } = await repackTwins(caseDir, bitmapMidx, ourBitmapMidx, {}, withoutInfoPacks);
+      expect(midxKinds(twins.ours)).toEqual(["cruft", "pack", "pack"]);
+    });
+
+    it("t7704-repack-cruft 'repack --write-midx includes cruft when necessary'", async () => {
+      const { caseDir, r } = cruftExcludeRepo("follow-necessary");
+      const packDir = join(r.gitDir, "objects/pack");
+      const all = readdirSync(packDir).filter((n) => /^pack-.*\.idx$/.test(n));
+      r.git(["multi-pack-index", "write", "--stdin-packs", "--bitmap"], {
+        input: `${all.sort().join("\n")}\n`,
+      });
+      r.commit("five", { "five.t": "five\n" });
+      const { twins } = await repackTwins(caseDir, bitmapMidx, ourBitmapMidx, {}, withoutInfoPacks);
+      // the old midx named the cruft pack: an unknown pack keeps it in the new one
+      expect(midxKinds(twins.ours)).toEqual(["cruft", "pack", "pack"]);
+    });
+
+    it("t7704-repack-cruft 'repack --write-midx includes cruft when already geometric'", async () => {
+      const caseDir = newCase(root, "follow-noop");
+      const r = initRepo(root, caseDir);
+      r.git(["config", "repack.midxMustContainCruft", "false"]);
+      r.commit("A", { "A.t": "A\n" });
+      r.commit("B", { "B.t": "B\n" });
+      r.git(["checkout", "-q", "-B", "side"]);
+      const c = r.commit("C", { "C.t": "C\n" });
+      r.git(["checkout", "-q", "main"]);
+      r.git(["branch", "-D", "side"]);
+      r.git(["reflog", "expire", "--all", "--expire=all"]);
+      r.git(["repack", "-q", "--cruft", "-d"]);
+      r.git(["merge", "-q", "--no-ff", "-m", "merge", c]);
+      r.git(["repack", "-q", "-d"]);
+      const { result, twins } = await repackTwins(
+        caseDir,
+        ["--geometric=2", "--write-midx", "--write-bitmap-index"],
+        (c) => c.setGeometric(2).setWriteMidx(true).setWriteBitmaps(true),
+        {},
+        withoutInfoPacks,
+      );
+      // 2.5x's follow walk rescues C's objects from the cruft pack through the merge (a `!`
+      // pack: no midx names it), so a pack is written and the midx can leave the cruft pack
+      // out; 2.43 writes nothing and keeps it
+      expect(result.output).toEqual(nativeIs25x ? [] : ["Nothing new to pack."]);
+      expect(midxKinds(twins.ours)).toEqual(
+        nativeIs25x ? ["pack", "pack", "pack"] : ["cruft", "pack", "pack"],
+      );
+    });
+
+    it("t7704-repack-cruft 'repack rescues once-cruft objects above geometric split'", async () => {
+      const caseDir = newCase(root, "follow-rescue");
+      const r = initRepo(root, caseDir);
+      r.git(["config", "repack.midxMustContainCruft", "false"]);
+      r.commit("reachable", { "reachable.t": "reachable\n" });
+      const unreachable = r.commit("unreachable", { "unreachable.t": "unreachable\n" });
+      r.git(["reset", "-q", "--hard", "HEAD^"]);
+      r.git(["reflog", "expire", "--all", "--expire=all"]);
+      r.git(["repack", "-q", "--cruft", "-d"]);
+      r.git(["pack-objects", "-q", join(r.gitDir, "objects/pack/pack")], {
+        input: `${unreachable}\n`,
+      });
+      r.commit("new", { "new.t": "new\n" });
+      r.git(["update-ref", "refs/heads/other", unreachable]);
+      const { twins } = await repackTwins(caseDir, bitmapMidx, ourBitmapMidx, {}, withoutInfoPacks);
+      expect(midxKinds(twins.ours)).toEqual(
+        nativeIs25x ? ["pack", "pack", "pack"] : ["cruft", "pack", "pack", "pack"],
+      );
+    });
+  });
+
+  describe("#347's divergences", () => {
+    it("t7700-repack '--local disables writing bitmaps when connected to alternate ODB' (-d -l -m without -b: git's write_bitmaps is -1, true, with --write-midx)", async () => {
+      const caseDir = newCase(root, "local-midx-alternate");
+      const shared = initRepo(root, caseDir, false, "shared");
+      shared.commit("one", { "one.t": "one\n" });
+      shared.git(["repack", "-q", "-a", "-d"]);
+      shared.git(["clone", "-q", "--shared", "shared", "repo"], { cwd: join(caseDir, "src") });
+      const r = new NativeRepo(root, join(caseDir, "src", "repo"));
+      r.commit("two", { "two.t": "two\n" });
+      const { result, stderr } = await repackTwins(
+        caseDir,
+        ["-d", "-l", "-m"],
+        (c) => c.setDeleteRedundant(true).setLocal(true).setWriteMidx(true),
+        {},
+        withoutInfoPacks,
+      );
+      const warning = "warning: disabling bitmap writing, as some objects are not being packed";
+      expect(stderr.split("\n").filter(Boolean)).toEqual([warning]);
+      expect(result.warnings).toEqual([warning]);
+    });
+
+    it("t7700-repack 'repacking with a filter works' (without -a and nothing new: \"Nothing new to pack.\", then write_filtered_pack still runs)", async () => {
+      const { caseDir, r } = history("filter-nothing-new");
+      r.git(["repack", "-q", "-a", "-d"]);
+      r.commit("four", { "d.txt": "d\n" });
+      r.git(["repack", "-q", "-d"]);
+      const { ours, result } = await repackTwins(caseDir, ["-d", "--filter=blob:none"], (c) =>
+        c.setDeleteRedundant(true).setFilter("blob:none"),
+      );
+      expect(result.output).toEqual(["Nothing new to pack."]);
+      expect(ours.packs).toHaveLength(3);
+    });
+  });
+
   describe("delta islands and the delta attribute", () => {
     /** 10 KiB of pseudo-random bytes of `seed`, then `suffix` (test-tool genrandom's role). */
     function random(seed: string, suffix: string): string {

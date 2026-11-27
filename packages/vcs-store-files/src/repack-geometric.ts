@@ -14,19 +14,30 @@
  * loads delta islands only for a reachability walk, never for `--stdin-packs`. The `delta`
  * attribute and the name hashes come from pack-objects' best-effort hint walk
  * (`show_object_pack_hint`) from the commits of the rolled-up packs and the loose ones.
+ *
+ * `repack.midxMustContainCruft=false` (2.5x; 2.43 has no such setting) runs pack-objects with
+ * `--stdin-packs=follow`: the packs above the split that the existing midx does not name are
+ * `!` (excluded-open: not known closed under reachability), their commits start the walk too,
+ * and every object the walk reaches that no excluded pack holds goes into the new pack, so
+ * once-cruft objects made reachable again are rescued from the cruft packs. The midx then
+ * leaves the cruft packs out unless the old midx named a pack the new one would lose
+ * (`midx_has_unknown_packs`), or nothing was written and there was no midx.
  */
 
 import type { ObjectId, ObjectTypeString, Pack, PackObjectRef } from "@statewalker/vcs-core";
 import {
   clearMultiPackIndexNaming,
+  decodeTreeBytes,
   joinPath,
   listObjects,
+  loadMultiPackIndex,
   objectFormatOf,
   packNameOf,
+  parseCommitHeader,
   writePack,
 } from "@statewalker/vcs-core";
 import { multiPackIndexWrite } from "./multi-pack-index.js";
-import { keepPackNames, objectIdPattern } from "./object-names.js";
+import { keepPackNames, looseObjectIdsInGitOrder, objectIdPattern } from "./object-names.js";
 import { packDeltaSearch, readPackWriteSettings } from "./pack/pack-write-settings.js";
 import {
   IncrementalBitmapError,
@@ -83,8 +94,8 @@ export const GEOMETRIC_PROMISOR_REMOTE_2_43 =
  * The paths of pack-objects' `--stdin-packs` hint walk (`read_stdin_packs`): a revision walk
  * from `tips` that never enters the objects of `excluded` (`no_kept_objects` over the packs
  * kept in core), giving each object of `ids` it meets the path it was met at
- * (`show_object_pack_hint`), the shallow commits' parents cut. Another missing link ends it
- * early (git's `ignore_missing_links` goes on: best effort either way).
+ * (`show_object_pack_hint`), the shallow commits' parents cut. A missing link (a partial
+ * clone's absent tree) is passed over and the walk goes on (git's `ignore_missing_links`).
  */
 async function stdinPacksHints(
   objects: Parameters<typeof listObjects>[0],
@@ -102,6 +113,7 @@ async function stdinPacksHints(
     for await (const o of listObjects(objects, {
       wants: tips,
       excludeObjects: exclude,
+      ignoreMissingLinks: true,
       ...(shallow.length ? { shallow } : {}),
     })) {
       if (o.path === undefined || !ids.has(o.id) || hints.has(o.id)) continue;
@@ -111,6 +123,118 @@ async function stdinPacksHints(
     // a best-effort walk: the hints found so far stay
   }
   return hints;
+}
+
+/** An object `followWalk` reached, with the path git's walk names it by. */
+interface FollowedObject {
+  id: ObjectId;
+  type: ObjectTypeString;
+  path: string;
+}
+
+/**
+ * pack-objects' `--stdin-packs=follow` walk (`read_stdin_packs` over `traverse_commit_list`,
+ * `ignore_missing_links`): from `tips` (newest first), every commit not in a closed pack
+ * (`^`, `--keep-pack`: `no_kept_objects` over the packs kept in core) is shown with its tree;
+ * with open packs (`!`) present, the walk neither goes past a closed commit's parents nor
+ * enters a closed tree (`include_check`). A missing object ends its own branch only.
+ */
+async function followWalk(
+  objects: Parameters<typeof listObjects>[0],
+  tips: readonly ObjectId[],
+  closed: (id: ObjectId) => boolean,
+  hasOpen: boolean,
+  shallow: ReadonlySet<ObjectId>,
+  idLength: number,
+): Promise<FollowedObject[]> {
+  const out: FollowedObject[] = [];
+  const read = async (
+    id: ObjectId,
+  ): Promise<{ type: ObjectTypeString; data: Uint8Array } | undefined> => {
+    try {
+      const o = await objects.get(id);
+      if (!o) return undefined;
+      if (o.bytes) return { type: o.type, data: o.bytes };
+      const parts: Uint8Array[] = [];
+      let n = 0;
+      for await (const c of o.content) {
+        parts.push(c);
+        n += c.length;
+      }
+      const data = new Uint8Array(n);
+      let at = 0;
+      for (const c of parts) {
+        data.set(c, at);
+        at += c.length;
+      }
+      return { type: o.type, data };
+    } catch {
+      return undefined;
+    }
+  };
+  const seen = new Set<ObjectId>();
+  // commits by committer time, newest first (the revision walk's queue)
+  const queue: { id: ObjectId; time: number; at: number }[] = [];
+  let order = 0;
+  const trees: ObjectId[] = [];
+  const push = async (id: ObjectId) => {
+    if (seen.has(id)) return;
+    seen.add(id);
+    const o = await read(id);
+    if (o?.type !== "commit") return;
+    let info: ReturnType<typeof parseCommitHeader>;
+    try {
+      info = parseCommitHeader(id, o.data);
+    } catch {
+      return;
+    }
+    queue.push({ id, time: info.time, at: order++ });
+    infos.set(id, info);
+  };
+  const infos = new Map<ObjectId, ReturnType<typeof parseCommitHeader>>();
+  for (const tip of tips) await push(tip);
+  while (queue.length > 0) {
+    let best = 0;
+    for (let i = 1; i < queue.length; i++) {
+      const q = queue[i] as (typeof queue)[number];
+      const b = queue[best] as (typeof queue)[number];
+      if (q.time > b.time || (q.time === b.time && q.at < b.at)) best = i;
+    }
+    const { id } = queue.splice(best, 1)[0] as (typeof queue)[number];
+    const info = infos.get(id) as ReturnType<typeof parseCommitHeader>;
+    const isClosed = closed(id);
+    // process_parents: include_check stops at a closed commit when open packs are present
+    if (!(hasOpen && isClosed) && !shallow.has(id)) for (const p of info.parents) await push(p);
+    // get_commit_action: a commit in a pack kept in core is not shown
+    if (isClosed) continue;
+    out.push({ id, type: "commit", path: "" });
+    trees.push(info.tree);
+  }
+  const walkTree = async (id: ObjectId, path: string) => {
+    if (seen.has(id)) return;
+    seen.add(id);
+    if (hasOpen && closed(id)) return;
+    const o = await read(id);
+    if (o?.type !== "tree") return;
+    out.push({ id, type: "tree", path });
+    let entries: ReturnType<typeof decodeTreeBytes>;
+    try {
+      entries = decodeTreeBytes(o.data, { idLength, checkNames: false });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const kind = Number(e.mode) & 0o170000;
+      const child = path ? `${path}/${e.name}` : e.name;
+      if (kind === 0o040000) await walkTree(e.id, child);
+      else if (kind !== 0o160000 && !seen.has(e.id)) {
+        seen.add(e.id);
+        out.push({ id: e.id, type: "blob", path: child });
+      }
+    }
+  };
+  for (const t of trees) await walkTree(t, "");
+  return out;
 }
 
 /**
@@ -153,6 +277,10 @@ export async function geometricRepack(options: RepackOptions): Promise<RepackRes
     writeBitmaps = false;
   }
   const packKeptObjects = options.packKeptObjects ?? bitmapSettings.packKeptObjects ?? false;
+  // repack.midxMustContainCruft=false: pack-objects --stdin-packs=follow (2.5x only)
+  let midxMustContainCruft =
+    legacy || (options.midxMustContainCruft ?? bitmapSettings.midxMustContainCruft ?? true);
+  const follow = !midxMustContainCruft;
   // 2.43's pack-objects refuses --exclude-promisor-objects (repo_has_promisor_remote) with
   // --stdin-packs
   if (legacy && (await readRepositoryFormat(files, gitDir)).partialClone !== undefined)
@@ -197,6 +325,18 @@ export async function geometricRepack(options: RepackOptions): Promise<RepackRes
   );
   const rolled = geometry.slice(0, split);
   const above = geometry.slice(split);
+  // the packs the existing midx names (git's existing.midx_packs: `p->multi_pack_index`)
+  const existingMidx = (
+    await loadMultiPackIndex(files, packDir, {
+      objectFormat: format,
+      ...(legacy ? { compatibility: "2.43" as const } : {}),
+    }).catch(() => undefined)
+  )?.midx;
+  const midxPacks = new Set<string>();
+  for (let m = existingMidx; m; m = m.base)
+    for (const n of m.packNames) midxPacks.add(n.replace(/\.idx$/, ""));
+  // follow: the packs above the split no midx names are `!` (not known closed), the rest `^`
+  const openAbove = follow ? above.filter((g) => !midxPacks.has(packNameOf(g.pack))) : [];
   const promisorRolled = promisorGeometry.slice(0, promisorSplit);
   const promisorAbove = promisorGeometry.slice(promisorSplit);
   // --honor-pack-keep (without --pack-kept-objects) and --keep-pack (always: repack passes it
@@ -220,6 +360,21 @@ export async function geometricRepack(options: RepackOptions): Promise<RepackRes
   };
 
   /**
+   * The loose objects in git's order (fan-out directories in order, each in readdir order:
+   * their list position breaks ties of the delta search), those the FilesApi does not list
+   * after them.
+   */
+  const looseIds = async (): Promise<ObjectId[]> => {
+    const keys: ObjectId[] = [];
+    for await (const key of looseStorage.keys()) if (idPattern.test(key)) keys.push(key);
+    const present = new Set(keys);
+    const ordered = (
+      await looseObjectIdsInGitOrder(files, joinPath(gitDir, "objects"), format)
+    ).filter((id) => present.delete(id));
+    return [...ordered, ...keys.filter((id) => present.has(id))];
+  };
+
+  /**
    * One `pack-objects --stdin-packs` run: the objects of `include` (newest pack first, pack
    * order), then (`unpacked`) every loose object, each once, none an `excluded` pack holds (or,
    * with -l, an alternate). The hint walk never enters `walkExcluded` (the packs kept in core:
@@ -230,10 +385,13 @@ export async function geometricRepack(options: RepackOptions): Promise<RepackRes
     excluded: readonly Pack[],
     walkExcluded: readonly Pack[],
     unpacked: boolean,
+    /** --stdin-packs=follow: the `!` packs (their commits start the walk) */
+    open?: readonly PackInfo[],
   ): Promise<PackObjectRef[]> => {
     const ids: ObjectId[] = [];
     const seen = new Set<ObjectId>();
     const tips: ObjectId[] = [];
+    const noDelta = new Map<string, boolean>();
     // the objects the hint walk may name: 2.43 walks before adding the loose objects
     // (read_packs_list_from_stdin), so they keep the empty name; 2.5x walks after
     // (read_stdin_packs), from the loose commits too
@@ -249,12 +407,45 @@ export async function geometricRepack(options: RepackOptions): Promise<RepackRes
       ids.push(id);
       if (walks) hinted.add(id);
     };
-    const byMtime = [...include].sort((a, b) => b.mtime - a.mtime);
+    const byMtime = [...include, ...(open ?? [])].sort((a, b) => b.mtime - a.mtime);
     for (const g of byMtime) for (const id of g.pack.ids()) await add(id, false);
-    if (unpacked)
-      for await (const key of looseStorage.keys()) if (idPattern.test(key)) await add(key, true);
+    if (unpacked) for (const key of await looseIds()) await add(key, true);
+    if (open) {
+      // follow: what the walk reaches is packed too (with its name); the objects listed so far
+      // are duplicates to it, so they get no name (add_object_entry's have_duplicate_entry)
+      const closedIds = new Set<ObjectId>();
+      for (const p of walkExcluded) for (const id of p.ids()) closedIds.add(id);
+      const refs: PackObjectRef[] = [...ids];
+      const reached = await followWalk(
+        objects,
+        tips,
+        (id) => closedIds.has(id),
+        open.length > 0,
+        new Set(shallow),
+        format.rawLength,
+      );
+      for (const o of reached) {
+        if (seen.has(o.id)) continue;
+        seen.add(o.id);
+        if (excluded.some((p) => p.has(o.id))) continue;
+        if (options.local) {
+          let borrowed = false;
+          for (const alt of alternates) if (await alt.objects.has(o.id)) borrowed = true;
+          if (borrowed) continue;
+        }
+        // a blob the repository lacks (a partial clone's) is skipped
+        if (o.type === "blob" && !(await objects.has(o.id))) continue;
+        let off = false;
+        if (options.noDelta && o.path) {
+          const known = noDelta.get(o.path);
+          off = known ?? (await options.noDelta(o.path));
+          if (known === undefined) noDelta.set(o.path, off);
+        }
+        refs.push({ id: o.id, type: o.type, path: o.path, ...(off ? { noDelta: true } : {}) });
+      }
+      return refs;
+    }
     const hints = await stdinPacksHints(objects, tips, walkExcluded, hinted, shallow);
-    const noDelta = new Map<string, boolean>();
     const refs: PackObjectRef[] = [];
     for (const id of ids) {
       const hint = hints.get(id);
@@ -309,8 +500,12 @@ export async function geometricRepack(options: RepackOptions): Promise<RepackRes
   const listed = await list(
     rolled,
     [...above.map((g) => g.pack), ...keptOut.map((i) => i.pack)],
-    [...above.map((g) => g.pack), ...info.filter((i) => i.keptInCore).map((i) => i.pack)],
+    [
+      ...above.filter((g) => !openAbove.includes(g)).map((g) => g.pack),
+      ...info.filter((i) => i.keptInCore).map((i) => i.pack),
+    ],
     true,
+    follow ? openAbove : undefined,
   );
 
   const keptPacks = info.filter((i) => i.keep).map((i) => packNameOf(i.pack));
@@ -347,10 +542,20 @@ export async function geometricRepack(options: RepackOptions): Promise<RepackRes
   // --write-midx: kept packs, the new ones, the (non-promisor) packs above the split, cruft packs
   let midxWritten: string | undefined;
   if (options.writeMidx) {
+    // midx_included_packs: kept packs, the new ones, the packs above the split, then the cruft
+    // packs when the midx must contain them or the old midx names a pack this one would lose
     const include = new Set<string>();
-    for (const i of info) if (i.keep || i.cruft) include.add(`${packNameOf(i.pack)}.idx`);
+    for (const i of info) if (i.keep) include.add(`${packNameOf(i.pack)}.idx`);
     for (const id of newIds) include.add(`pack-${id}.idx`);
     for (const g of above) include.add(`${packNameOf(g.pack)}.idx`);
+    // nothing written and no midx before: non-cruft packs may refer to once-cruft objects
+    if (newIds.size === 0 && !existingMidx) midxMustContainCruft = true;
+    const rolledNames = new Set(rolled.map((g) => packNameOf(g.pack)));
+    const unknownPacks = [...midxPacks].some(
+      (n) => !include.has(`${n}.idx`) && !rolledNames.has(n),
+    );
+    if (midxMustContainCruft || unknownPacks)
+      for (const i of info) if (i.cruft && !i.keep) include.add(`${packNameOf(i.pack)}.idx`);
     const preferred = above.length
       ? packNameOf((above[above.length - 1] as (typeof above)[number]).pack)
       : installed && `pack-${installed.packId}`;

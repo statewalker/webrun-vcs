@@ -240,4 +240,22 @@ describe("listObjects: includeTags reads only tag objects", () => {
     const trees = new Set(out.filter((o) => o.type === "tree").map((o) => o.id));
     expect(reads.filter((id) => !trees.has(id)).sort()).toEqual([onC3, onBlob, onOld].sort());
   });
+  it("passes over missing parents and trees with ignoreMissingLinks (revision.c's ignore_missing_links)", async () => {
+    const objects = memObjects();
+    const h = await linear(objects);
+    // a partial store: c1 and the shared subtree of c2 are absent
+    const absent = new Set([h.c1, h.lib]);
+    const partial = {
+      ...objects,
+      get: (id: string) => (absent.has(id) ? Promise.resolve(undefined) : objects.get(id)),
+      getNow: undefined,
+      has: async (id: string) => !absent.has(id) && (await objects.has(id)),
+    } as unknown as GitObjects;
+    await expect(list(partial, { wants: [h.c3] })).rejects.toThrow(/missing/);
+    const out = await list(partial, { wants: [h.c3], ignoreMissingLinks: true });
+    const ids = new Set(out.map((o) => o.id));
+    for (const id of [h.c3, h.c2, h.t3, h.t2, h.lib3, h.v3, h.v2, h.shared, h.extra])
+      expect(ids.has(id)).toBe(true);
+    expect(ids.has(h.c1) || ids.has(h.lib)).toBe(false);
+  });
 });

@@ -122,6 +122,12 @@ export interface ListObjectsOptions {
    * them is skipped unread, a commit among them is not walked, a tree among them is not read.
    */
   excludeObjects?: Iterable<ObjectId>;
+  /**
+   * revision.c's `ignore_missing_links`: a missing parent or tree is passed over (the walk goes
+   * on elsewhere) instead of throwing `MissingObjectError`; a missing want still throws. For
+   * best-effort walks, as pack-objects' `--stdin-packs` hint walk.
+   */
+  ignoreMissingLinks?: boolean;
 }
 
 /** git's default `core.maxTreeDepth` (`DEFAULT_MAX_ALLOWED_TREE_DEPTH`, outside MSVC builds). */
@@ -309,7 +315,7 @@ export async function* listObjects(
   const enqueue = async (id: ObjectId, uninteresting: boolean) => {
     if (uninteresting) markUninteresting(id);
     if (has(id, SEEN)) return;
-    const c = await parseCommit(id, !uninteresting);
+    const c = await parseCommit(id, !uninteresting && !options.ignoreMissingLinks);
     if (!c) return; // an uninteresting parent missing (a shallow or partial store)
     set(id, SEEN);
     push(id, c.time);
@@ -505,7 +511,8 @@ export async function* listObjects(
     ): Promise<{ shown?: ListedObject; frame?: FilterFrame }> {
       if (has(id, UNINTERESTING | FILTER_SEEN)) return {};
       if (depth > maxTreeDepth) throw new TreeDepthError();
-      const o = await read(id);
+      const o = options.ignoreMissingLinks ? await tryRead(id) : await read(id);
+      if (!o) return {};
       if (o.type !== "tree") throw new Error(`object ${id} is a ${o.type}, not a tree`);
       const path = base + name;
       const r = await ask("begin-tree", id, path, name);
@@ -590,7 +597,8 @@ export async function* listObjects(
         // process_tree's core.maxTreeDepth (the root at depth 0)
         if (depth > maxTreeDepth) throw new TreeDepthError();
         set(id, ADDED);
-        const o = await read(id);
+        const o = options.ignoreMissingLinks ? await tryRead(id) : await read(id);
+        if (!o) continue;
         if (o.type !== "tree") throw new Error(`object ${id} is a ${o.type}, not a tree`);
         yield { id, type: "tree", path };
         const subtrees: { id: ObjectId; path: string; depth: number }[] = [];
