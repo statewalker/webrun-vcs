@@ -1,5 +1,13 @@
 # @statewalker/vcs-working-tree
 
+## 0.12.1
+
+### Patch Changes
+
+- Release of the changes since the last published version:
+  
+  - @statewalker/vcs-core ^0.12.0 -> ^0.12.1
+
 ## 0.12.0
 
 ### Minor Changes
