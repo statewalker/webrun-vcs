@@ -5,7 +5,8 @@
  * zlib builds (pako here, the system's in git), so compressed archives are compared with
  * their compressed streams inflated (see {@link normalizeZip}, {@link normalizeTgz}).
  */
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { gunzipSync, inflateRawSync } from "node:zlib";
@@ -83,7 +84,29 @@ async function shellFilter(command: string, input: Uint8Array): Promise<Uint8Arr
   return new Uint8Array(r.stdout);
 }
 
-/** `git archive <args>` through ours, git's command line mapped onto `ArchiveCommand`. */
+/** Runs a tar filter command through the shell as a pipe, as git's start_command does. */
+async function* shellStreamFilter(
+  command: string,
+  input: AsyncIterable<Uint8Array>,
+): AsyncGenerator<Uint8Array> {
+  const child = spawn("sh", ["-c", command], { stdio: ["pipe", "pipe", "ignore"] });
+  const exit = new Promise<number>((resolve) => child.on("close", (code) => resolve(code ?? 1)));
+  child.stdin.on("error", () => {});
+  const feed = (async () => {
+    for await (const chunk of input) {
+      if (!child.stdin.write(chunk)) await once(child.stdin, "drain");
+    }
+    child.stdin.end();
+  })().catch(() => child.stdin.destroy());
+  for await (const chunk of child.stdout) yield new Uint8Array(chunk as Buffer);
+  await feed;
+  if ((await exit) !== 0) throw new Error(`${command} failed`);
+}
+
+/**
+ * `git archive <args>` through ours, git's command line mapped onto `ArchiveCommand`;
+ * `stream` reads it through `callStream` (tar filters as pipes) instead of `call`.
+ */
 export async function oursArchive(
   home: string,
   dir: string,
@@ -92,14 +115,17 @@ export async function oursArchive(
     cwd?: string;
     env?: Record<string, string>;
     filterDrivers?: Parameters<ReturnType<Git["archive"]>["setFilterDrivers"]>[0];
+    stream?: boolean;
+    /** Changes our repository before the run (a content filter installed) */
+    prepare?: (git: Git) => void | Promise<void>;
   } = {},
 ): Promise<ArchiveOutcome> {
   const git = await openArchiveRepo(home, dir, options.env);
-  const cmd = git
-    .archive()
-    .setFilterRunner(shellFilter)
-    .setLocalTimezone(() => 0)
-    .setCompatibility(nativeCompatibility());
+  await options.prepare?.(git);
+  const cmd = git.archive();
+  if (options.stream) cmd.setStreamFilterRunner(shellStreamFilter);
+  else cmd.setFilterRunner(shellFilter);
+  cmd.setLocalTimezone(() => 0).setCompatibility(nativeCompatibility());
   if (options.cwd) cmd.setCurrentDirectory(options.cwd);
   if (options.filterDrivers) cmd.setFilterDrivers(options.filterDrivers);
   let list = false;
@@ -132,7 +158,12 @@ export async function oursArchive(
       const names = cmd.listFormats();
       return { status: 0, out: Buffer.from(names.map((n) => `${n}\n`).join("")), err: "" };
     }
-    const out = await cmd.call();
+    let out: Uint8Array;
+    if (options.stream) {
+      const chunks: Buffer[] = [];
+      for await (const chunk of cmd.callStream()) chunks.push(Buffer.from(chunk));
+      out = Buffer.concat(chunks);
+    } else out = await cmd.call();
     return { status: 0, out: Buffer.from(out), err: messages(cmd.getMessages()) };
   } catch (e) {
     if (!(e instanceof GitApiError)) throw e;

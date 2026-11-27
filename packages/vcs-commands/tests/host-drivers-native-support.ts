@@ -8,7 +8,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
-import type { FilterDriver } from "@statewalker/vcs-working-tree";
+import { type FilterDriver, FilterDriverRunError } from "@statewalker/vcs-working-tree";
 
 import { createMergeDriver, type MergeDriver, type TextconvRunner } from "../src/index.js";
 
@@ -43,7 +43,8 @@ export function shellFilterDriver(top: string, env: Record<string, string>): Fil
     );
     const res = spawnSync("sh", ["-c", expanded], { cwd: top, input: content, env });
     const status = statusOf(res);
-    if (status !== 0) throw new Error(`external filter '${command}' failed ${status}`);
+    if (status !== 0)
+      throw new FilterDriverRunError([`external filter '${command}' failed ${status}`]);
     return new Uint8Array(res.stdout);
   };
   return { clean: run, smudge: run };

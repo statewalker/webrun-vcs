@@ -7,6 +7,7 @@
 import {
   type ArchiveEntry,
   type ArchiveSettings,
+  ArchiveSink,
   type ArchiveWriter,
   asciiBytes,
   ByteBuffer,
@@ -84,11 +85,14 @@ function pathPrefix(path: Uint8Array, maxlen: number): number {
 
 /** Writes git's tar archive (`git archive --format=tar`). */
 export class TarArchiveWriter implements ArchiveWriter {
-  private readonly out = new ByteBuffer(BLOCKSIZE);
+  private readonly sink: ArchiveSink;
+  private readonly out: ByteBuffer;
   private readonly umask: number;
   private time: number;
 
   constructor(private readonly settings: TarArchiveOptions) {
+    this.sink = new ArchiveSink(settings.output, BLOCKSIZE);
+    this.out = this.sink.buffer;
     this.umask = settings.umask ?? 0o002;
     this.time = settings.time;
     this.writeGlobalExtendedHeader();
@@ -99,6 +103,24 @@ export class TarArchiveWriter implements ArchiveWriter {
     this.out.push(data);
     const tail = data.length % RECORDSIZE;
     if (tail) this.out.zeros(RECORDSIZE - tail);
+  }
+
+  /** `stream_blocked`: a streamed blob's bytes, padded to a whole record; false when short. */
+  private async streamBlocked(stream: AsyncIterable<Uint8Array>, size: number): Promise<boolean> {
+    let total = 0;
+    try {
+      for await (const chunk of stream) {
+        if (total + chunk.length > size) return false;
+        total += chunk.length;
+        await this.sink.write(chunk);
+      }
+    } catch {
+      return false;
+    }
+    if (total !== size) return false;
+    const tail = size % RECORDSIZE;
+    if (tail) this.out.zeros(RECORDSIZE - tail);
+    return true;
   }
 
   /** `prepare_header`: the numeric fields, owner, magic and checksum. */
@@ -148,8 +170,10 @@ export class TarArchiveWriter implements ArchiveWriter {
   }
 
   /** `write_tar_entry`. */
-  entry(entry: ArchiveEntry): string | undefined {
+  async entry(entry: ArchiveEntry): Promise<string | undefined> {
     const { path, id, content } = entry;
+    const stream = isRegMode(entry.mode) ? entry.stream : undefined;
+    const size = stream ? (entry.size ?? 0) : content.length;
     let mode = entry.mode;
     const header = new Uint8Array(RECORDSIZE);
     const ext = new ByteBuffer(256);
@@ -184,24 +208,31 @@ export class TarArchiveWriter implements ArchiveWriter {
       } else header.set(content, LINKNAME);
     }
 
-    let sizeInHeader = content.length;
-    if (isRegMode(mode) && content.length > USTAR_MAX) {
+    let sizeInHeader = size;
+    if (isRegMode(mode) && size > USTAR_MAX) {
       sizeInHeader = 0;
-      extRecord(ext, "size", asciiBytes(String(content.length)));
+      extRecord(ext, "size", asciiBytes(String(size)));
     }
     this.prepareHeader(header, mode, sizeInHeader);
     if (ext.length > 0) this.writeExtendedHeader(id, ext.bytes());
     this.writeBlocked(header);
-    if (isRegMode(mode) && content.length > 0) this.writeBlocked(content);
+    if (stream) {
+      if (!(await this.streamBlocked(stream, size))) return `cannot stream blob ${id}`;
+    } else if (isRegMode(mode) && content.length > 0) {
+      await this.sink.write(content);
+      const tail = content.length % RECORDSIZE;
+      if (tail) this.out.zeros(RECORDSIZE - tail);
+    }
+    await this.sink.flush();
     return undefined;
   }
 
   /** `write_trailer`: the last block filled, another one when fewer than two records remain. */
-  finish(): Uint8Array {
-    const offset = this.out.length % BLOCKSIZE;
+  async finish(): Promise<Uint8Array> {
+    const offset = this.sink.position % BLOCKSIZE;
     const tail = BLOCKSIZE - offset;
     this.out.zeros(tail);
     if (tail < 2 * RECORDSIZE) this.out.zeros(BLOCKSIZE);
-    return this.out.bytes();
+    return this.sink.finish();
   }
 }

@@ -61,6 +61,11 @@ export function bareAttributesResolver(o: {
    * check-attr --source`); the index tree still wins
    */
   sourceTree?: string;
+  /**
+   * The attribute source when none is set (git 2.43 reads a bare repository's from `HEAD`:
+   * attr.c's `compute_default_attr_source`); one that does not resolve gives none
+   */
+  defaultSource?: string;
 }): AttributesResolver {
   const { workingCopy } = o;
   const environment = hostEnvironmentOf(workingCopy);
@@ -88,7 +93,14 @@ export function bareAttributesResolver(o: {
               environment?.attrSource,
               configValue(workingCopy, "attr.tree"),
             );
-            if (!setting) return undefined;
+            if (!setting) {
+              if (!o.defaultSource) return undefined;
+              // fromConfig: a default that names nothing is ignored, as a bad attr.tree
+              return resolveAttributesSource(
+                { name: o.defaultSource, fromConfig: true },
+                attributesSourceResolver(o.revisions),
+              );
+            }
             return resolveAttributesSource(setting, attributesSourceResolver(o.revisions));
           })();
         }

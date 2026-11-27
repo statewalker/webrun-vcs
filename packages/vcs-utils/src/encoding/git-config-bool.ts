@@ -95,3 +95,34 @@ export function parseGitInt(value: unknown): number | undefined {
   if (magnitude > (negative ? -BigInt(INT_MIN) : BigInt(INT_MAX))) return undefined; // ERANGE
   return Number(negative ? -magnitude : magnitude);
 }
+
+/** git's `unsigned long` limit on 64-bit hosts. */
+const ULONG_MAX = (1n << 64n) - 1n;
+
+/**
+ * A git `unsigned long` config value (`git_config_ulong`, through `git_parse_ulong`): as
+ * {@link parseGitInt}, but up to 2^64 - 1 and without a sign (a `-` anywhere is refused).
+ * Gives git's reason for a value it refuses, `bad numeric config value '<v>' for '<key>':
+ * <reason>`: `invalid unit` (not such a number, a key without `=` included, given as
+ * undefined) or `out of range`. Values past 2^53 lose precision.
+ *
+ * @example
+ * ```typescript
+ * parseGitUlong("4g"); // 4294967296
+ * parseGitUlong("-1"); // "invalid unit"
+ * parseGitUlong("99999999999g"); // "out of range"
+ * ```
+ */
+export function parseGitUlong(value: string | undefined): number | "invalid unit" | "out of range" {
+  if (value === undefined || value.includes("-")) return "invalid unit";
+  const m = INTEGER.exec(value);
+  if (!m) return "invalid unit";
+  const digits = (m[1] ?? m[2]) as string;
+  const octal = m[1] === undefined && digits.length > 1 && digits[0] === "0";
+  if (octal && /[89]/.test(digits)) return "invalid unit";
+  const magnitude =
+    BigInt(m[1] !== undefined ? `0x${digits}` : octal ? `0o${digits.slice(1)}` : digits) *
+    (UNIT_FACTOR[(m[3] as string).toLowerCase()] as bigint);
+  if (magnitude > ULONG_MAX) return "out of range";
+  return Number(magnitude);
+}
