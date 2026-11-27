@@ -932,36 +932,48 @@ export class RevisionResolver {
   }
 
   /**
-   * git's `find_tree_entry` for one path component: from the tree's stored bytes as git walks
-   * them (names unchecked, so an entry named `..` is found; a corrupt tree git's death,
-   * {@link CorruptTreeError}); a store without them answers from its decoded entries.
-   */
-  private async findTreeEntry(
-    tree: ObjectId,
-    name: string,
-  ): Promise<{ id: ObjectId; mode: number } | undefined> {
-    const trees = this.sources.trees;
-    if (!trees.raw) return safe(() => trees.getEntry(tree, name));
-    const raw = await safe(() => trees.raw?.(tree) ?? Promise.resolve(undefined));
-    if (!raw) return undefined;
-    const rawLength = objectFormatOf(this.sources.objects).rawLength;
-    return findTreeDescEntry(raw, rawLength, encodeGitPath(name), tree);
-  }
-
-  /**
-   * git's `get_tree_entry`: the object at `path` in a tree (the tree itself for "").
-   * Components are matched exactly: an empty one (`/a`, `d//b`) names nothing, and a
-   * trailing `/` only follows a directory (`d/` is d, `a.txt/` nothing).
+   * git's `get_tree_entry`: the object at `path` in a tree (the tree itself for ""), found
+   * as `find_tree_entry` walks the tree's stored bytes (names unchecked, so an entry named
+   * `..` is found; a corrupt tree git's death, {@link CorruptTreeError}). A store without
+   * stored bytes answers from its decoded entries, component by component.
    */
   private async treeEntry(tree: ObjectId, path: string): Promise<ObjectId | undefined> {
     if (path === "") return tree;
+    const trees = this.sources.trees;
+    if (!trees.raw) return this.treeEntryDecoded(tree, path);
+    const rawLength = objectFormatOf(this.sources.objects).rawLength;
+    let current = tree;
+    let rest = encodeGitPath(path);
+    for (;;) {
+      const id = current;
+      const raw = await safe(() => trees.raw?.(id) ?? Promise.resolve(undefined));
+      // an empty tree holds nothing (get_tree_entry's `!size`)
+      if (!raw) return undefined;
+      const found = findTreeDescEntry(raw, rawLength, rest, current);
+      if (!found) return undefined;
+      if (!found.rest) {
+        this.lastMode = found.mode;
+        return found.id;
+      }
+      current = found.id;
+      rest = found.rest;
+    }
+  }
+
+  /**
+   * {@link treeEntry} over a store's decoded entries: components matched exactly, an empty
+   * one (`/a`, `d//b`) names nothing, a trailing `/` only follows a directory.
+   */
+  private async treeEntryDecoded(tree: ObjectId, path: string): Promise<ObjectId | undefined> {
+    const trees = this.sources.trees;
     let current = tree;
     let rest = path;
     for (;;) {
       const slash = rest.indexOf("/");
       const name = slash < 0 ? rest : rest.slice(0, slash);
       if (name === "") return undefined;
-      const entry = await this.findTreeEntry(current, name);
+      const at = current;
+      const entry = await safe(() => trees.getEntry(at, name));
       if (!entry) return undefined;
       if (slash < 0) {
         this.lastMode = entry.mode;

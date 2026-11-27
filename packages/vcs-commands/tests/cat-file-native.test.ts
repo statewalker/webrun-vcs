@@ -532,6 +532,11 @@ describeGit("git cat-file, corrupt trees (statewalker/webrun-vcs#351)", () => {
     trees.empty = tree(["100644", "", blob]);
     trees.nested = tree(["100644", "a", blob], ["40000", "sub", trees.short]);
     trees.odd = tree(["100644", "..", blob], "100644 f\0abc");
+    // stored unsorted: find_tree_entry compares the whole path, so `abc` (after `ab/`) ends
+    // the walk before `ab`
+    const sub = tree(["100644", "c", blob]);
+    trees.unsorted = tree(["100644", "abc", blob], ["40000", "ab", sub]);
+    trees.unsortedBad = tree(["100644", "abc", blob], ["40000", "ab", sub], ["10x644", "z", blob]);
     trees.third = tree(["100644", "a", blob], ["100644", "b", blob], ["10x644", "c", blob]);
   });
   afterAll(() => {
@@ -555,6 +560,14 @@ describeGit("git cat-file, corrupt trees (statewalker/webrun-vcs#351)", () => {
     await checkHere(["-t", `${trees.third}:a`]);
     await checkHere(["-t", `${trees.third}:b`]);
     await checkHere(["-t", `${trees.third}:0`]);
+    for (const t of [trees.unsorted, trees.unsortedBad]) {
+      await checkHere(["-t", `${t}:ab/c`]);
+      await checkHere(["-t", `${t}:ab`]);
+      await checkHere(["-t", `${t}:ab/`]);
+      await checkHere(["-t", `${t}:abc/`]);
+    }
+    await checkHere(["-t", `${trees.nested}:sub//f`]);
+    await checkHere(["-t", `${trees.nested}:/a`]);
   });
 
   it("scenario from t1006: --batch reads a corrupt tree raw, dies resolving a path through it", async () => {

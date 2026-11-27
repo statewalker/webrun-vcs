@@ -102,14 +102,16 @@ export function* walkTreeDesc(
 }
 
 /**
- * tree-walk.c's `find_tree_entry` for one path component: the entry named `name` (bytes)
- * in a tree's stored bytes, walking in stored order and stopping at the first name sorting
- * after it, each entry looked at once the next one decoded (a corrupt entry after the one
- * found is still git's death).
+ * tree-walk.c's `find_tree_entry`: the entry a path (bytes, not empty) names in a tree's
+ * stored bytes, each entry compared with the whole path as git compares it (an entry that
+ * matches a leading part followed by `/` is entered, one sorting after the path ends the
+ * walk), each looked at once the next one decoded (a corrupt entry right after the one
+ * found is still git's death). `rest` is the path left to look up in the subtree `id`
+ * (`get_tree_entry`'s recursion); none when the entry itself was found (`d/` names `d`).
  *
  * @example
  * ```typescript
- * findTreeDescEntry(raw, 20, encodeGitPath("README")); // { id, mode } or undefined
+ * findTreeDescEntry(raw, 20, encodeGitPath("src/main.ts")); // { id, mode, rest: "main.ts" }
  * ```
  *
  * @throws CorruptTreeError where git dies
@@ -119,7 +121,7 @@ export function findTreeDescEntry(
   rawLength: number,
   name: Uint8Array,
   treeId?: ObjectId,
-): { id: ObjectId; mode: number } | undefined {
+): { id: ObjectId; mode: number; rest?: Uint8Array } | undefined {
   const namelen = name.length;
   for (const e of treeDesc(raw, rawLength, treeId)) {
     const entrylen = e.nameEnd - e.nameStart;
@@ -130,12 +132,12 @@ export function findTreeDescEntry(
     }
     if (cmp > 0) continue;
     if (cmp < 0) break;
-    if (entrylen === namelen) {
-      return {
-        id: bytesToHex(raw.subarray(e.nameEnd + 1, e.nameEnd + 1 + rawLength)),
-        mode: e.mode,
-      };
-    }
+    const id = () => bytesToHex(raw.subarray(e.nameEnd + 1, e.nameEnd + 1 + rawLength));
+    if (entrylen === namelen) return { id: id(), mode: e.mode };
+    if (name[entrylen] !== 0x2f) continue;
+    if ((e.mode & 0o170000) !== 0o040000) break;
+    if (entrylen + 1 === namelen) return { id: id(), mode: e.mode };
+    return { id: id(), mode: e.mode, rest: name.subarray(entrylen + 1) };
   }
   return undefined;
 }
