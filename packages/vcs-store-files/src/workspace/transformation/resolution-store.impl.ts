@@ -4,7 +4,10 @@
  * Provides conflict tracking and resolution management using:
  * - Staging area entries (stages 1-3) for conflict detection
  * - Working tree for resolved content
- * - .git/rr-cache/ for recorded resolutions (rerere)
+ * - .git/rr-cache/ for recorded resolutions (rerere): git reads it as its own records, so
+ *   only a {@link RerereEngine} (vcs-commands' rerere.c port, `git.rerere().engine()`)
+ *   records or replays there; without one nothing is recorded. Listing, reading and
+ *   deleting a record's directory work on git's format as it lies.
  *
  * Worktree files are read and written through a Worktree (a FileWorktree over the
  * FilesApi by default), never with raw FilesApi calls: a symbolic link is read as its
@@ -12,7 +15,6 @@
  */
 
 import { type Blobs, FileMode, type ObjectId, type Trees } from "@statewalker/vcs-core";
-import { sha1 } from "@statewalker/vcs-utils";
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import { dirname, joinPath, tryReadFile } from "@statewalker/vcs-utils/files";
 import type { IndexEntry, Staging, Worktree } from "@statewalker/vcs-working-tree";
@@ -23,6 +25,7 @@ import type {
   ConflictStats,
   ConflictType,
   RecordedResolution,
+  RerereEngine,
   Resolution,
   ResolutionStore,
 } from "@statewalker/vcs-working-tree/transformation";
@@ -45,6 +48,8 @@ export class GitResolutionStore implements ResolutionStore {
     readonly gitDir: string,
     worktreePath?: string,
     worktree?: Worktree,
+    /** git's rerere over the same index and worktree (`git.rerere().engine()`) */
+    private readonly rerere?: RerereEngine,
   ) {
     this.rerereDir = joinPath(gitDir, "rr-cache");
     // Worktree is typically the parent of .git directory
@@ -242,59 +247,19 @@ export class GitResolutionStore implements ResolutionStore {
   // ========== Resolution Recording (rerere) ==========
 
   async recordResolution(path: string): Promise<string | undefined> {
-    const conflict = await this.getConflict(path);
-    if (!conflict) return undefined;
-
-    // Compute conflict signature
-    const signature = await this.computeConflictSignature(conflict);
-
-    // Get resolved content from working tree
-    const resolvedContent = await this.readWorktreeFile(path);
-    if (!resolvedContent) return undefined;
-
-    // Ensure rr-cache directory exists
-    try {
-      await this.files.mkdir(this.rerereDir);
-    } catch {
-      // Directory may already exist
-    }
-
-    const cacheDir = joinPath(this.rerereDir, signature);
-    try {
-      await this.files.mkdir(cacheDir);
-    } catch {
-      // Directory may already exist
-    }
-
-    // Write postimage (resolved content)
-    await this.files.write(joinPath(cacheDir, "postimage"), [resolvedContent]);
-
-    // Write preimage (conflict content) for reference
-    const conflictContent = await this.generateConflictMarkers(conflict);
-    if (conflictContent) {
-      await this.files.write(joinPath(cacheDir, "preimage"), [conflictContent]);
-    }
-
-    return signature;
+    if (!this.rerere || !(await this.getConflict(path))) return undefined;
+    return this.rerere.record(path);
   }
 
   async getSuggestedResolution(path: string): Promise<RecordedResolution | undefined> {
-    const conflict = await this.getConflict(path);
-    if (!conflict) return undefined;
-
-    const signature = await this.computeConflictSignature(conflict);
-    return this.getRecordedResolution(signature);
+    if (!this.rerere || !(await this.getConflict(path))) return undefined;
+    const replay = await this.rerere.replay(path);
+    return replay && this.replayed(replay);
   }
 
   async applyRecordedResolution(path: string): Promise<boolean> {
-    const recorded = await this.getSuggestedResolution(path);
-    if (!recorded?.resolvedContent) return false;
-
-    // Write resolved content to working tree (a link there is replaced, never followed)
-    // the resolution as it was recorded from the worktree (already in its form)
-    await this.worktree.writeContent(path, recorded.resolvedContent, { raw: true });
-
-    return true;
+    if (!this.rerere || !(await this.getConflict(path))) return false;
+    return (await this.rerere.replay(path, { apply: true })) !== undefined;
   }
 
   async autoResolve(): Promise<string[]> {
@@ -380,6 +345,20 @@ export class GitResolutionStore implements ResolutionStore {
 
   // ========== Private Helpers ==========
 
+  private replayed(replay: {
+    signature: string;
+    preimage: Uint8Array;
+    content: Uint8Array;
+  }): RecordedResolution {
+    return {
+      signature: replay.signature,
+      resolution: { strategy: "manual" },
+      recordedAt: new Date(),
+      conflictContent: replay.preimage,
+      resolvedContent: replay.content,
+    };
+  }
+
   /**
    * Determine conflict type from staging entries
    */
@@ -443,89 +422,6 @@ export class GitResolutionStore implements ResolutionStore {
   }
 
   /**
-   * Compute unique signature for a conflict based on content
-   */
-  private async computeConflictSignature(conflict: ConflictInfo): Promise<string> {
-    // Signature based on base/ours/theirs object IDs
-    const parts = [
-      conflict.base?.objectId ?? "none",
-      conflict.ours?.objectId ?? "none",
-      conflict.theirs?.objectId ?? "none",
-    ];
-    const input = new TextEncoder().encode(parts.join(":"));
-    const hash = await sha1(input);
-    return this.toHexString(hash);
-  }
-
-  /**
-   * Generate conflict markers for preimage
-   */
-  private async generateConflictMarkers(conflict: ConflictInfo): Promise<Uint8Array | undefined> {
-    const parts: string[] = [];
-
-    if (conflict.ours) {
-      const content = await this.loadBlobContent(conflict.ours.objectId);
-      if (content) {
-        parts.push("<<<<<<< ours");
-        parts.push(new TextDecoder().decode(content));
-      }
-    }
-
-    if (conflict.base) {
-      const content = await this.loadBlobContent(conflict.base.objectId);
-      if (content) {
-        parts.push("||||||| base");
-        parts.push(new TextDecoder().decode(content));
-      }
-    }
-
-    parts.push("=======");
-
-    if (conflict.theirs) {
-      const content = await this.loadBlobContent(conflict.theirs.objectId);
-      if (content) {
-        parts.push(new TextDecoder().decode(content));
-        parts.push(">>>>>>> theirs");
-      }
-    }
-
-    if (parts.length > 1) {
-      return new TextEncoder().encode(parts.join("\n"));
-    }
-
-    return undefined;
-  }
-
-  /**
-   * Load blob content as Uint8Array
-   */
-  private async loadBlobContent(objectId: ObjectId): Promise<Uint8Array | undefined> {
-    const stream = await this.blobs.load(objectId);
-    if (!stream) return undefined;
-
-    const chunks: Uint8Array[] = [];
-    for await (const chunk of stream) {
-      chunks.push(chunk);
-    }
-    return this.concat(chunks);
-  }
-
-  /**
-   * Read file from working tree
-   */
-  private async readWorktreeFile(path: string): Promise<Uint8Array | undefined> {
-    try {
-      const entry = await this.worktree.getEntry(path);
-      if (!entry || entry.isDirectory) return undefined;
-      const chunks: Uint8Array[] = [];
-      for await (const chunk of this.worktree.readContent(path)) chunks.push(chunk);
-      return this.concat(chunks);
-    } catch {
-      return undefined;
-    }
-  }
-
-  /**
    * Write content to working tree
    */
   private async writeWorktreeFile(path: string, objectId: ObjectId, mode?: number): Promise<void> {
@@ -584,29 +480,6 @@ export class GitResolutionStore implements ResolutionStore {
       // Ignore errors during cleanup
     }
   }
-
-  /**
-   * Concatenate Uint8Array chunks
-   */
-  private concat(chunks: Uint8Array[]): Uint8Array {
-    const total = chunks.reduce((sum, c) => sum + c.length, 0);
-    const result = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      result.set(chunk, offset);
-      offset += chunk.length;
-    }
-    return result;
-  }
-
-  /**
-   * Convert Uint8Array to hex string
-   */
-  private toHexString(bytes: Uint8Array): string {
-    return Array.from(bytes)
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-  }
 }
 
 /**
@@ -617,6 +490,7 @@ export class GitResolutionStore implements ResolutionStore {
  * @param blobs Blobs interface for content storage
  * @param gitDir Path to .git directory
  * @param worktreePath Path to working tree (defaults to parent of gitDir)
+ * @param rerere git's rerere over the same index and worktree; without it nothing is recorded
  */
 export function createResolutionStore(
   files: FilesApi,
@@ -624,6 +498,7 @@ export function createResolutionStore(
   blobs: Blobs,
   gitDir: string,
   worktreePath?: string,
+  rerere?: RerereEngine,
 ): ResolutionStore {
-  return new GitResolutionStore(files, staging, blobs, gitDir, worktreePath);
+  return new GitResolutionStore(files, staging, blobs, gitDir, worktreePath, undefined, rerere);
 }

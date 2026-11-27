@@ -157,34 +157,34 @@ export interface ResolutionStore {
   // ========== Resolution Recording (rerere) ==========
 
   /**
-   * Record a resolution for future reuse.
+   * Record a resolution for future reuse, as `git rerere` records it.
    *
-   * Stores the current resolution in .git/rr-cache/ indexed by
-   * a signature computed from the conflict (base/ours/theirs).
-   *
-   * This enables automatic resolution of identical conflicts
-   * in future merge operations.
+   * The path is resolved in the worktree while its stages are still in the index: the
+   * store's `RerereEngine` recreates the conflict from the stages (`handle_cache`),
+   * names it by git's conflict id and writes `rr-cache/<id>/preimage` and `postimage` in
+   * git's format. Without an engine nothing is recorded.
    *
    * @param path Path of resolved file
-   * @returns Signature of recorded resolution, or undefined if not recorded
+   * @returns The conflict id, or undefined where git records nothing (rerere off, no
+   *   three-staged conflict, markers left, no engine)
    */
   recordResolution(path: string): Promise<string | undefined>;
 
   /**
-   * Get suggested resolution based on recorded resolutions.
+   * The recorded resolution that applies to the conflicted worktree file at `path`.
    *
-   * Computes the conflict signature and looks up in rr-cache.
+   * As git's replay: the file's conflict id, then each recorded variant merged onto the
+   * file (`try_merge`); the first that merges cleanly. Without an engine, undefined.
    *
-   * @param path Path with conflict
-   * @returns Recorded resolution if signature matches, undefined otherwise
+   * @param path Path with conflict (the conflicted file in the worktree)
+   * @returns `conflictContent` the recorded preimage, `resolvedContent` the resolution as
+   *   replayed onto the file now
    */
   getSuggestedResolution(path: string): Promise<RecordedResolution | undefined>;
 
   /**
-   * Apply a recorded resolution to a conflict.
-   *
-   * If a matching recorded resolution exists, writes the resolved
-   * content to the working tree.
+   * Apply a recorded resolution to a conflict, as git replays one (the worktree file
+   * written, the postimage freshened, `MERGE_RR` updated; nothing staged).
    *
    * @param path Path with conflict
    * @returns True if resolution was applied

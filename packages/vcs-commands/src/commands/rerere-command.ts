@@ -13,6 +13,7 @@
 import { rerereGc } from "@statewalker/vcs-store-files";
 import { unifiedDiff } from "@statewalker/vcs-utils";
 import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
+import type { RerereEngine } from "@statewalker/vcs-working-tree/transformation";
 
 import { GitCommand } from "../git-command.js";
 import type { PlumbingTextOutput } from "./check-ref-format-command.js";
@@ -23,6 +24,7 @@ import {
   type RerereHost,
   rerereClear,
   rerereDiff,
+  rerereEngineOf,
   rerereForget,
   rerereGcLocation,
   rerereRemaining,
@@ -73,6 +75,21 @@ export class RerereCommand extends GitCommand<PlumbingTextOutput> {
     this.checkCallable();
     this.autoUpdate = value;
     return this;
+  }
+
+  /**
+   * git's rerere for a resolution store (vcs-store-files `GitResolutionStore`): its records
+   * written and replayed as `git rerere` does ({@link rerereEngineOf}); undefined without a
+   * worktree. Give the store the index this command reads (`workingCopy.checkout.staging`).
+   *
+   * @example
+   * ```typescript
+   * const store = createResolutionStore(files, staging, blobs, ".git", "", git.rerere().engine());
+   * ```
+   */
+  engine(): RerereEngine | undefined {
+    const host = this.rerereHost();
+    return host && rerereEngineOf(host);
   }
 
   async call(): Promise<PlumbingTextOutput> {

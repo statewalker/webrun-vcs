@@ -5,6 +5,8 @@
  * File-based implementations moved to @statewalker/vcs-store-files.
  */
 
+// rerere, as resolution stores use it
+export type { RerereEngine, RerereReplay } from "./rerere-engine.js";
 // Resolution store interface
 export type { ResolutionStore } from "./resolution-store.js";
 // Resolution types

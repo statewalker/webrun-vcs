@@ -24,6 +24,7 @@ import { decodeGitPath, encodeGitPath, parseGitBool } from "@statewalker/vcs-uti
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import { joinPath } from "@statewalker/vcs-utils/files";
 import type { Staging, WorkingCopy, Worktree } from "@statewalker/vcs-working-tree";
+import type { RerereEngine, RerereReplay } from "@statewalker/vcs-working-tree/transformation";
 
 import { conflictMarkerSizeOf } from "../results/diff-check.js";
 import { worktreeModeTrust } from "./core-config.js";
@@ -412,6 +413,12 @@ class RerereRun {
     if (!current) return false;
     const result = await this.tryMerge(id, path, current);
     if (!result) return false;
+    await this.writeReplayed(id, path, result);
+    return true;
+  }
+
+  /** The end of `merge`: a replayed resolution written to the worktree. */
+  async writeReplayed(id: RerereId, path: string, result: Uint8Array): Promise<void> {
     // the resolution was used: its mtime tells rerere gc
     const postimage = this.path(id, "postimage");
     if (!(await this.files.touch?.(postimage))) {
@@ -423,7 +430,6 @@ class RerereRun {
       raw: true,
       ...(entry && !entry.isDirectory ? { mode: entry.mode } : {}),
     });
-    return true;
   }
 
   /** `remove_variant`. */
@@ -826,7 +832,7 @@ async function handleCache(
   path: string,
   stages: Stages,
   output?: string,
-): Promise<{ status: number; id?: string }> {
+): Promise<{ status: number; id?: string; output?: Uint8Array }> {
   if (stages.some((s) => s.stage === 0)) return { status: -1 };
   const read = async (stage: number): Promise<Uint8Array> => {
     const entry = stages.find((s) => s.stage === stage);
@@ -863,7 +869,7 @@ async function handleCache(
     run.host.objectFormat,
   );
   if (output) await run.writeFile(output, parsed.output);
-  return { status: parsed.status, ...(parsed.id ? { id: parsed.id } : {}) };
+  return { status: parsed.status, output: parsed.output, ...(parsed.id ? { id: parsed.id } : {}) };
 }
 
 /** `rerere_forget_one_path`. */
@@ -922,4 +928,139 @@ export async function rerereGcLocation(
   const location = await commonGitFileOf(workingCopy, "rr-cache");
   if (!location) return undefined;
   return { files: location.files, gitDir: location.path.replace(/\/?rr-cache$/, "") || "." };
+}
+
+/** `check_one_conflict`'s three-staged conflict: no stage 0, ours and theirs regular files. */
+function threeStaged(stages: Stages): boolean {
+  if (stages.length === 0 || stages.some((s) => s.stage === 0)) return false;
+  const isRegular = (mode: number | undefined) =>
+    mode !== undefined && (mode & 0o170000) === 0o100000;
+  return (
+    isRegular(stages.find((s) => s.stage === 2)?.mode) &&
+    isRegular(stages.find((s) => s.stage === 3)?.mode)
+  );
+}
+
+async function stagesOf(staging: Staging, path: string): Promise<Stages> {
+  return (await staging.getEntries(path)).map((e) => ({
+    stage: e.stage,
+    mode: e.mode,
+    objectId: e.objectId,
+  }));
+}
+
+/**
+ * rerere for a resolution store (`ResolutionStore` of vcs-store-files): its records are
+ * git's, written by rerere.c's steps only.
+ *
+ * `record(path)` is what two `git rerere` runs record for a path, one while it was
+ * conflicted and one once resolved: the variant `MERGE_RR` names for the path; else the
+ * preimage recreated from the stages as `rerere forget` recreates it (`handle_cache`),
+ * nothing recorded when a recorded variant replays cleanly onto it (git's first run would
+ * have replayed it; its id is returned), else a new variant (`assign_variant`); then the
+ * worktree file as the postimage (`copy_file`: an existing one stays) and the path dropped
+ * from `MERGE_RR`.
+ * `replay(path)` is `do_rerere_one_path`'s replay over the conflicted worktree file.
+ * Nothing is written where rerere is off (`setup_rerere`).
+ *
+ * @example
+ * ```typescript
+ * const engine = rerereEngineOf(rerereHostOf(workingCopy, staging, worktree, blobs, format));
+ * await engine.record("f"); // "<conflict id>"
+ * ```
+ */
+export function rerereEngineOf(host: RerereHost): RerereEngine {
+  return {
+    record: (path) => recordOnePath(host, path),
+    replay: (path, options) => replayOnePath(host, path, options?.apply === true),
+  };
+}
+
+async function recordOnePath(host: RerereHost, path: string): Promise<string | undefined> {
+  const run = await setupRerere(host);
+  if (!run) return undefined;
+  // resolved in the worktree: no conflict hunk left (handle_file's 0)
+  if ((await run.handleFile(path, false)).status !== 0) return undefined;
+  const rr = await run.readRr();
+  const waiting = rr.get(path);
+  let id: RerereId;
+  if (waiting && waiting.variant >= 0) {
+    // the id and variant `git rerere` gave the conflict (do_rerere_one_path's first step)
+    id = waiting;
+  } else {
+    const stages = await stagesOf(host.staging, path);
+    if (!threeStaged(stages)) return undefined;
+    const { status, id: hex, output } = await handleCache(run, path, stages);
+    if (status < 1 || !hex || !output) return undefined;
+    id = await run.newId(hex);
+    // the first run: a recorded resolution that applies cleanly would have been replayed,
+    // and nothing recorded (do_rerere_one_path)
+    for (let variant = 0; variant < id.dir.status.length; variant++) {
+      if (((id.dir.status[variant] ?? 0) & BOTH) !== BOTH) continue;
+      if (await run.tryMerge({ dir: id.dir, variant }, path, output)) return hex;
+    }
+    run.assignVariant(id);
+    await run.mkdir(run.path(id));
+    if (!((id.dir.status[id.variant] ?? 0) & RR_HAS_PREIMAGE)) {
+      await run.writeFile(run.path(id, "preimage"), output);
+    }
+  }
+  fit(id.dir, id.variant);
+  const bits = id.dir.status[id.variant] ?? 0;
+  // copy_file: O_EXCL, an existing postimage stays
+  const postimage = run.path(id, "postimage");
+  if ((await run.files.stats(postimage)) === undefined) {
+    const content = await run.readWorktree(path);
+    if (!content) return undefined;
+    await run.mkdir(run.path(id));
+    await run.writeFile(postimage, content);
+  }
+  id.dir.status[id.variant] = bits | RR_HAS_POSTIMAGE | RR_HAS_PREIMAGE;
+  if (rr.has(path)) {
+    rr.delete(path);
+    await run.writeRr(rr);
+  }
+  return id.dir.hex;
+}
+
+async function replayOnePath(
+  host: RerereHost,
+  path: string,
+  apply: boolean,
+): Promise<RerereReplay | undefined> {
+  const run = await setupRerere(host);
+  if (!run) return undefined;
+  if (!threeStaged(await stagesOf(host.staging, path))) return undefined;
+  const content = await run.readWorktree(path);
+  if (!content) return undefined;
+  // thisimage: the file normalised (handle_file), kept in memory
+  const parsed = normalizeConflicts(content, await run.markerSize(path), host.objectFormat);
+  if (parsed.status < 1 || !parsed.id) return undefined;
+  const dir = await run.dir(parsed.id);
+  for (let variant = 0; variant < dir.status.length; variant++) {
+    if (((dir.status[variant] ?? 0) & BOTH) !== BOTH) continue;
+    const id = { dir, variant };
+    // git's `merge` writes the normalised file as the variant's thisimage before it tries
+    if (apply) await run.writeFile(run.path(id, "thisimage"), parsed.output);
+    const merged = await run.tryMerge(id, path, parsed.output);
+    if (!merged) continue;
+    const preimage = await run.readFile(run.path(id, "preimage"));
+    const postimage = await run.readFile(run.path(id, "postimage"));
+    if (!preimage || !postimage) continue;
+    if (apply) {
+      await run.writeReplayed(id, path, merged);
+      const rr = await run.readRr();
+      const waiting = rr.get(path);
+      if (waiting !== undefined) {
+        // a different variant applies cleanly: no point keeping the path's own
+        if (waiting && waiting.dir === dir && waiting.variant >= 0 && waiting.variant !== variant) {
+          await run.removeVariant(waiting);
+        }
+        rr.delete(path);
+        await run.writeRr(rr);
+      }
+    }
+    return { signature: dir.hex, variant, preimage, postimage, content: merged };
+  }
+  return undefined;
 }
