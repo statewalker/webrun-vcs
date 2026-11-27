@@ -491,3 +491,76 @@ describeGit("git cat-file, bytes and odd trees", () => {
     await checkHere(["-t"]);
   });
 });
+
+describeGit("git cat-file, corrupt trees (statewalker/webrun-vcs#351)", () => {
+  let base: string;
+  let dir: string;
+  const trees: Record<string, string> = {};
+
+  async function checkHere(argv: string[], input?: string | Uint8Array): Promise<void> {
+    const twin = await catFileTwin(shell, dir, argv, input);
+    expect({ ...twin.ours, stdout: twin.ours.stdout.toString("latin1") }).toEqual({
+      ...twin.native,
+      stdout: twin.native.stdout.toString("latin1"),
+    });
+  }
+
+  beforeAll(() => {
+    base = mkdtempSync(join(tmpdir(), "cat-file-corrupt-"));
+    shell = new Shell(base);
+    dir = join(base, "corrupt");
+    shell.ok(base, "init", "-q", "-b", "main", dir);
+    writeFileSync(join(dir, "f"), "x\n");
+    shell.ok(dir, "add", "f");
+    shell.tick();
+    shell.ok(dir, "commit", "-q", "-m", "m");
+    const blob = shell.ok(dir, "rev-parse", "HEAD:f").trim();
+    const tree = (...parts: (string | [string, string, string])[]): string =>
+      shell
+        .git(dir, ["hash-object", "-t", "tree", "--literally", "--stdin", "-w"], {
+          input: Buffer.concat(
+            parts.map((p) =>
+              typeof p === "string"
+                ? Buffer.from(p, "latin1")
+                : Buffer.concat([Buffer.from(`${p[0]} ${p[1]}\0`), Buffer.from(p[2], "hex")]),
+            ),
+          ),
+        })
+        .stdout.trim();
+    trees.short = tree("100644 f\0abc");
+    trees.mode = tree(["10x644", "f", blob]);
+    trees.empty = tree(["100644", "", blob]);
+    trees.nested = tree(["100644", "a", blob], ["40000", "sub", trees.short]);
+    trees.odd = tree(["100644", "..", blob], "100644 f\0abc");
+    trees.third = tree(["100644", "a", blob], ["100644", "b", blob], ["10x644", "c", blob]);
+  });
+  afterAll(() => {
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  it("t1006-cat-file.sh: -p of a corrupt tree dies as tree-walk.c's decode_tree_entry", async () => {
+    await checkHere(["-p", trees.short as string]);
+    await checkHere(["-p", trees.mode as string]);
+    await checkHere(["-p", trees.empty as string]);
+    await checkHere(["-t", trees.short as string]);
+    await checkHere(["-s", trees.mode as string]);
+    await checkHere(["-p", trees.third as string]);
+  });
+
+  it("t1006-cat-file.sh: a path through a corrupt tree dies (get_tree_entry)", async () => {
+    await checkHere(["-p", `${trees.nested}:sub/f`]);
+    await checkHere(["-p", `${trees.nested}:a`]);
+    await checkHere(["-p", `${trees.odd}:..`]);
+    await checkHere(["-e", `${trees.odd}:f`]);
+    await checkHere(["-t", `${trees.third}:a`]);
+    await checkHere(["-t", `${trees.third}:b`]);
+    await checkHere(["-t", `${trees.third}:0`]);
+  });
+
+  it("t1006-cat-file.sh: --batch reads a corrupt tree raw, dies resolving a path through it", async () => {
+    await checkHere(["--batch-check"], lines(trees.short as string, trees.mode as string));
+    await checkHere(["--batch"], lines(trees.short as string));
+    await checkHere(["--batch-check"], lines(`${trees.nested}:a`, `${trees.nested}:sub/f`, "HEAD"));
+    await checkHere(["--batch-check"], lines(`${trees.odd}:ok`));
+  });
+});

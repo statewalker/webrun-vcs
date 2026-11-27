@@ -23,7 +23,6 @@ import {
   createReplacedCommits,
   createReplacedTags,
   createReplacedTrees,
-  decodeTreeBytes,
   type GraftFileBase,
   graftFileBaseDir,
   graftFileReader,
@@ -79,6 +78,7 @@ import { loadLegacyRemote } from "./commands/legacy-remotes.js";
 import { type Mailmap, readRepositoryMailmap } from "./commands/mailmap.js";
 import type { MergeBaseGraph } from "./commands/merge-bases.js";
 import type { NotesContext } from "./commands/notes-support.js";
+import { walkTreeDesc } from "./commands/plumbing-shared.js";
 import { postIndexChangeHookOf } from "./commands/post-index-change.js";
 import { createPromisorFetcher, promisorOf } from "./commands/promisor-remote.js";
 import { reflogLine } from "./commands/reflog-messages.js";
@@ -1721,38 +1721,35 @@ export abstract class GitCommand<T> {
   }
 
   /**
-   * A tree's entries for a listing (`ls-tree`, `cat-file -p`), as git's readers list them: a
-   * tree holding a name fsck refuses (`..`, `a/b`), which the store will not decode, is read
-   * from its stored bytes without the name check. Undefined when the tree cannot be read.
+   * A tree's entries for a listing (`ls-tree`, `cat-file -p`, `ls-files --with-tree`), as
+   * git's readers walk them (tree-walk.c's `tree_desc`, {@link walkTreeDesc}): from the stored
+   * bytes, names not checked (a tree holding `..` lists), each entry yielded once the next one
+   * decoded, a corrupt entry git's death ({@link CorruptTreeError}) when the walk reaches it.
+   * Undefined when the tree cannot be read (missing, or not a tree).
    */
-  protected async listedTreeEntries(id: ObjectId): Promise<readonly TreeEntry[] | undefined> {
+  protected async listedTreeEntries(id: ObjectId): Promise<Iterable<TreeEntry> | undefined> {
     const compat = this.compatObjects;
     if (compat && id.length !== this.objectFormat.hexLength) {
       // a tree named by its compatibility id (GET_OID_HASH_ANY): read converted, its entries
       // the compatibility format's ids, as git's parse_tree of such an id lists them
       const tree = await compat.readAsCompat(id).catch(() => undefined);
       if (tree?.type !== "tree") return undefined;
-      return decodeTreeBytes(tree.content, {
-        canonicalModes: true,
-        idLength: compat.compat.rawLength,
-        checkNames: false,
-      });
+      return walkTreeDesc(tree.content, compat.compat.rawLength, id);
     }
+    const trees = this.trees;
+    if (trees.raw) {
+      const raw = await trees.raw(id).catch(() => undefined);
+      return raw ? walkTreeDesc(raw, this.objectFormat.rawLength, id) : undefined;
+    }
+    // a store without stored bytes: its decoded entries
     try {
-      const loaded = await this.trees.load(id);
+      const loaded = await trees.load(id);
       if (!loaded) return undefined;
       const entries: TreeEntry[] = [];
       for await (const e of loaded) entries.push(e);
       return entries;
-    } catch (e) {
-      if ((e as Error)?.name !== "InvalidTreeEntryNameError") return undefined;
-      const raw = await this.trees.raw?.(id).catch(() => undefined);
-      if (!raw) return undefined;
-      return decodeTreeBytes(raw, {
-        canonicalModes: true,
-        idLength: this.objectFormat.rawLength,
-        checkNames: false,
-      });
+    } catch {
+      return undefined;
     }
   }
 
