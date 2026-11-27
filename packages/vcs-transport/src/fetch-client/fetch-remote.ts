@@ -3,7 +3,7 @@
  * negotiate and import the pack, keep the shallow file, follow tags, update the refs.
  */
 
-import { outgoingLinks } from "@statewalker/vcs-core";
+import { compareRefNames, outgoingLinks } from "@statewalker/vcs-core";
 import type { ProgressMonitor } from "@statewalker/vcs-utils";
 import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import type { PackImportResult, RepositoryFacade } from "../api/repository-facade.js";
@@ -899,21 +899,27 @@ export async function fetchFromConnection(
       }
     }
   }
-  // fetch-pack's filter_refs keeps the sought refs in the order the remote listed them (HEAD
-  // first, then by name; a clone seeks the remote HEAD too) and the wants go out in that
-  // order, ids a refspec names without a listed ref after them. upload-pack walks its wants
-  // in that order (get_shallow_commits: a shallow server's shallow-info follows it)
+  // do_fetch_pack sorts the remote's refs by name (HEAD first; a clone seeks the remote HEAD
+  // too) and filter_refs keeps the sought ones in that order: the wants go out so, ids a
+  // refspec names without a listed ref after them. upload-pack walks its wants in that order
+  // (get_shallow_commits: a shallow server's shallow-info follows it)
   {
     const soughtNames = new Set([...planned.map((p) => p.remoteRef), ...tagsOfTips]);
     if (options.cloning) soughtNames.add("HEAD");
-    const position = new Map<string, number>();
-    remoteRefs.forEach((ref, i) => {
-      if (ref.oid && soughtNames.has(ref.name) && !position.has(ref.oid)) {
-        position.set(ref.oid, i);
+    const firstName = new Map<string, string>();
+    for (const ref of remoteRefs) {
+      if (!ref.oid || !soughtNames.has(ref.name)) continue;
+      const known = firstName.get(ref.oid);
+      if (known === undefined || compareRefNames(ref.name, known) < 0) {
+        firstName.set(ref.oid, ref.name);
       }
+    }
+    wants.sort((a, b) => {
+      const x = firstName.get(a);
+      const y = firstName.get(b);
+      if (x === undefined || y === undefined) return x === y ? 0 : x === undefined ? 1 : -1;
+      return compareRefNames(x, y);
     });
-    const at = (oid: string) => position.get(oid) ?? Number.POSITIVE_INFINITY;
-    wants.sort((a, b) => at(a) - at(b));
   }
   // the refs fetch-pack was asked for (transport_fetch_refs: those not up to date here)
   const sought: PlannedRef[] = [];
@@ -954,7 +960,8 @@ export async function fetchFromConnection(
           shallow,
           recorded.verbatim ? { verbatim: true } : undefined,
         );
-        shallow = recorded.shallow;
+        // a clone's file may name a commit twice; later rounds send each one once (grafts)
+        shallow = recorded.verbatim ? [...new Set(recorded.shallow)].sort() : recorded.shallow;
       }
       for (const p of recorded.rejected) shallowRejected.add(p);
     }
