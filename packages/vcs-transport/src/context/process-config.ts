@@ -270,6 +270,14 @@ export class ProcessConfiguration {
   allowSidebandAll?: boolean;
 
   /**
+   * Protocol v2 upload-pack acknowledges every have it holds, repeats and parents of an
+   * earlier have included, as git before 2.45 (`process_haves`' `common`). Default false:
+   * git 2.45+ acknowledges a have only when no child of it (and no copy) came first in the
+   * request (`do_got_oid`'s `THEY_HAVE`, `send_acks` over `have_obj`)
+   */
+  acknowledgeEveryHave?: boolean;
+
+  /**
    * Protocol v2: git's `uploadpack.blobPackfileUri` values, `<object-hash> <pack-hash> <uri>`.
    * Any value advertises `fetch=... packfile-uris` and takes a `packfile-uris <protocols>`
    * argument; with `sideband-all`, each listed object the pack would hold whose URI is of one
