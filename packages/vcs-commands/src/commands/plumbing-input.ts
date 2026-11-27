@@ -31,7 +31,9 @@ export function inputRecords(
     if (!nul && line[0] === 0x22) {
       const unquoted = unquoteGitPath(line, 0);
       if (!unquoted) return { records, badlyQuoted: true };
-      records.push(unquoted.path);
+      // the caller reads the strbuf as a C string: an unquoted `\000` ends the path
+      const nul = unquoted.path.indexOf("\0");
+      records.push(nul < 0 ? unquoted.path : unquoted.path.slice(0, nul));
     } else records.push(decodeGitPath(line));
   }
   return { records, badlyQuoted: false };
