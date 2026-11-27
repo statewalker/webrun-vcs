@@ -14,7 +14,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-
+import { type HttpServerOptions, handleUploadPackV2 } from "../../src/adapters/http/http-server.js";
 import {
   createFetchHandler,
   createHttpHandler,
@@ -850,5 +850,233 @@ describeGit("Interop · server parity with native git", { timeout: TIMEOUT }, ()
         }
       });
     }
+  });
+
+  // JGit's ProtocolV2ParserTest (org.eclipse.jgit.test, transport/) as native twins
+  // (statewalker/webrun-vcs#218): each request JGit's parser reads, sent whole to native
+  // `git upload-pack --stateless-rpc` (protocol v2) and to ours. Only JGit's inputs are
+  // taken; native git decides the answer (ls-refs byte for byte, fetch by its lines before
+  // the pack and whether a pack follows: pack bytes differ by writer).
+  describe("JGit ProtocolV2ParserTest requests", () => {
+    const JGIT = {
+      want1: "4624442d68ee402a94364191085b77137618633e",
+      want2: "f900c8326a43303685c46b279b9f70411bff1a4b",
+      have1: "554f6e41067b9e3e565b6988a8294fac1cb78f4b",
+      have2: "abc760ab9ad72f08209943251b36cb886a578f87",
+      shallow1: "28274d02c489f4c7e68153056e9061a46f62d7a0",
+      shallow2: "145e683b229dcab9d0e2ccb01b386f9ecc17d29d",
+      deepenNot: "a08595f76159b09d57553e37a5123f1091bb13e7",
+      wantRefCase: "e4980cdc48cfa1301493ca94eb70523f6788b819",
+    };
+    // createHttpHandler has no filter policy: those requests go to handleUploadPackV2 itself
+    const FILTER: HttpServerOptions = { uploadPackFilter: { allowFilter: true } };
+    const FILTER_CONFIG = [["uploadpack.allowFilter", "true"]];
+    const REF_IN_WANT = { allowRefInWant: true } as Partial<HttpHandlerOptions>;
+    const REF_IN_WANT_CONFIG = [["uploadpack.allowRefInWant", "true"]];
+
+    /** A v2 request: the command, capability lines, then the arguments. */
+    function request(command: string, args: string[], capabilities: string[] = []): string {
+      return (
+        pkt(`command=${command}\n`) +
+        [...capabilities, "object-format=sha1"].map((c) => pkt(`${c}\n`)).join("") +
+        "0001" +
+        args.map((a) => pkt(`${a}\n`)).join("") +
+        "0000"
+      );
+    }
+
+    /** What a fetch answered: its lines before the pack, and whether a pack came. */
+    function fetchAnswer(body: Buffer): { lines: string[]; pack: boolean } {
+      const { lines, pack } = parseResponse(body);
+      return { lines, pack: pack.length > 0 };
+    }
+
+    async function fetchTwin(
+      label: string,
+      args: string[],
+      options: Partial<HttpHandlerOptions> = {},
+      config: string[][] = [],
+      capabilities: string[] = [],
+    ) {
+      const [native, our] = await bothUploadPack(
+        request("fetch", args, capabilities),
+        true,
+        options,
+        config,
+      );
+      expect(fetchAnswer(our), label).toEqual(fetchAnswer(native));
+    }
+
+    /** A filter request: native git with `config`, ours through handleUploadPackV2. */
+    async function filterTwin(label: string, args: string[], config: string[][]) {
+      const body = request("fetch", args);
+      const native = run(root, ["upload-pack", "--stateless-rpc", bare], {
+        input: Buffer.from(body, "latin1"),
+        env: { GIT_PROTOCOL: "version=2" },
+        config,
+      }).stdout;
+      const response = await handleUploadPackV2(post(body, true), ours.facade, ours.refStore, {
+        ...(config.length ? FILTER : {}),
+      });
+      expect(fetchAnswer(await bodyBytes(response)), label).toEqual(fetchAnswer(native));
+    }
+
+    async function lsRefsTwin(label: string, args: string[], capabilities: string[] = []) {
+      const [native, our] = await bothUploadPack(request("ls-refs", args, capabilities), true);
+      expect(our.toString("latin1"), label).toBe(native.toString("latin1"));
+    }
+
+    it("JGit ProtocolV2ParserTest#testFetchBasicArguments", async () => {
+      const options = ["thin-pack", "no-progress", "include-tag", "ofs-delta"];
+      await fetchTwin("JGit's ids", [
+        ...options,
+        `want ${JGIT.want1}`,
+        `want ${JGIT.want2}`,
+        `have ${JGIT.have1}`,
+        `have ${JGIT.have2}`,
+        "done",
+      ]);
+      // the same request over objects the repository has
+      await fetchTwin("the repository's ids", [
+        ...options,
+        `want ${ids.c4}`,
+        `want ${ids.v3}`,
+        `have ${ids.c1}`,
+        `have ${JGIT.have2}`,
+        "done",
+      ]);
+    });
+
+    it("JGit ProtocolV2ParserTest#testFetchWithShallow_deepen", async () => {
+      const args = ["deepen 15", "deepen-relative", `shallow ${JGIT.shallow1}`];
+      await fetchTwin("no want", [...args, `shallow ${JGIT.shallow2}`]);
+      await fetchTwin("a want", [`want ${ids.c4}`, ...args, `shallow ${ids.c2}`, "done"]);
+    });
+
+    it("JGit ProtocolV2ParserTest#testFetchWithShallow_deepenNot", async () => {
+      await fetchTwin("an id as deepen-not", [
+        `shallow ${JGIT.shallow1}`,
+        `shallow ${JGIT.shallow2}`,
+        `deepen-not ${JGIT.deepenNot}`,
+      ]);
+      await fetchTwin("a ref as deepen-not", [`want ${ids.c4}`, `deepen-not refs/tags/v1`, "done"]);
+    });
+
+    it("JGit ProtocolV2ParserTest#testFetchWithShallow_deepenSince", async () => {
+      await fetchTwin("no want", [
+        `shallow ${JGIT.shallow1}`,
+        `shallow ${JGIT.shallow2}`,
+        "deepen-since 123123123",
+      ]);
+      await fetchTwin("a want", [`want ${ids.c4}`, "deepen-since 123123123", "done"]);
+    });
+
+    it("JGit ProtocolV2ParserTest#testFetchWithNoneFilter, #testFetchWithBlobSizeFilter, #testFetchWithTreeDepthFilter", async () => {
+      for (const filter of ["blob:none", "blob:limit=15", "tree:3"]) {
+        await filterTwin(filter, [`filter ${filter}`], FILTER_CONFIG);
+        await filterTwin(
+          `${filter} with a want`,
+          [`want ${ids.c4}`, `filter ${filter}`, "done"],
+          FILTER_CONFIG,
+        );
+      }
+    });
+
+    it("JGit ProtocolV2ParserTest#testFetchMustNotHaveMultipleFilters", async () => {
+      await filterTwin(
+        "two filters",
+        [`want ${ids.c4}`, "filter blob:none", "filter blob:limit=12", "done"],
+        FILTER_CONFIG,
+      );
+    });
+
+    it("JGit ProtocolV2ParserTest#testFetchFilterWithoutAllowFilter", async () => {
+      await filterTwin(
+        "filter not allowed",
+        [`want ${ids.c4}`, "filter blob:limit=12", "done"],
+        [],
+      );
+    });
+
+    it("JGit ProtocolV2ParserTest#testFetchWithRefInWant, #testFetchWithRefInWantUnknownRef, #testFetchAllowsHeadWantRef, #testFetchRejectsTraversalWantRef", async () => {
+      for (const ref of [
+        "refs/heads/branchA",
+        "refs/heads/branchC",
+        "refs/heads/main",
+        "HEAD",
+        "refs/heads/../../../victim/refs/private/admin",
+      ]) {
+        await fetchTwin(
+          ref,
+          [`want ${JGIT.wantRefCase}`, `want-ref ${ref}`, "done"],
+          REF_IN_WANT,
+          REF_IN_WANT_CONFIG,
+        );
+        await fetchTwin(
+          `${ref} with a known want`,
+          [`want ${ids.c1}`, `want-ref ${ref}`, "done"],
+          REF_IN_WANT,
+          REF_IN_WANT_CONFIG,
+        );
+      }
+      // without uploadpack.allowRefInWant
+      await fetchTwin("ref-in-want not allowed", [`want-ref refs/heads/main`, "done"]);
+    });
+
+    it("JGit ProtocolV2ParserTest#testLsRefsMinimalReq, #testLsRefsSymrefs, #testLsRefsPeel, #testLsRefsRefPrefixes", async () => {
+      await lsRefsTwin("minimal", []);
+      await lsRefsTwin("symrefs", ["symrefs"]);
+      await lsRefsTwin("peel", ["peel"]);
+      await lsRefsTwin("prefixes", ["ref-prefix refs/for", "ref-prefix refs/heads"]);
+    });
+
+    it("JGit ProtocolV2ParserTest#testLsRefsAcceptsValidPartialRefPrefixes", async () => {
+      await lsRefsTwin("partial prefixes", [
+        "ref-prefix r",
+        "ref-prefix refs/heads/maste",
+        "ref-prefix refs/heads/",
+        "ref-prefix refs/heads/v1.0",
+      ]);
+    });
+
+    it("JGit ProtocolV2ParserTest#testLsRefsRejectsTraversalRefPrefix, #testLsRefsRejectsInvalidRefPrefixes", async () => {
+      // git takes any prefix: one that names no ref matches nothing
+      for (const prefix of [
+        "refs/heads/../../../victim/refs/private/",
+        "refs/heads/./x",
+        "refs/heads\\x",
+        "refs/heads/x:y",
+        "/refs/heads/x",
+        "refs//heads/x",
+      ]) {
+        await lsRefsTwin(prefix, [`ref-prefix ${prefix}`]);
+      }
+    });
+
+    it("JGit ProtocolV2ParserTest#testFetchWithSessionID, #testLsRefsWithSessionID", async () => {
+      const sid = ["session-id=the.client.sid"];
+      // not advertised (transfer.advertiseSID unset): git dies on the capability before
+      // writing (serve.c's "unknown capability"); our HTTP handler answers such a death as a
+      // 500 carrying the message (see streamUploadPack) where http-backend sends nothing
+      for (const command of ["fetch", "ls-refs"]) {
+        const args = command === "fetch" ? [`want ${ids.c4}`, "done"] : [];
+        const [native, our] = await bothUploadPack(request(command, args, sid), true);
+        expect(native.length, command).toBe(0);
+        expect(our.toString("latin1"), command).toBe(
+          "unknown capability 'session-id=the.client.sid'",
+        );
+      }
+      // advertised
+      const config = [["transfer.advertiseSID", "true"]];
+      const options = { advertiseSID: true } as Partial<HttpHandlerOptions>;
+      await fetchTwin("fetch, advertised", [`want ${ids.c4}`, "done"], options, config, sid);
+      const [native2, our2] = await bothUploadPack(
+        request("ls-refs", [], sid),
+        true,
+        options,
+        config,
+      );
+      expect(our2.toString("latin1")).toBe(native2.toString("latin1"));
+    });
   });
 });
