@@ -503,6 +503,8 @@ describeGit("git fetch --atomic: the reference-transaction hook, as native git",
     const fetch = (await oursIn(mine)).fetch().setRemote("origin");
     if (args.includes("--atomic")) fetch.setAtomic(true);
     if (args.includes("--tags")) fetch.setTagOpt(TagOption.FETCH_TAGS);
+    if (args.includes("--prune")) fetch.setRemoveDeletedRefs(true);
+    if (args.includes("--dry-run")) fetch.setDryRun(true);
     let result: FetchResult | undefined;
     let error: Error | undefined;
     try {
@@ -518,7 +520,10 @@ describeGit("git fetch --atomic: the reference-transaction hook, as native git",
         .filter((l) => followsRemoteHead || !/^refs\/remotes\/[^/]+\/HEAD /.test(l))
         .join("\n");
     expect(refsOf(mine.dir)).toBe(refsOf(theirs.dir));
-    const head = (d: string) => readFileSync(join(d, ".git/FETCH_HEAD"), "utf8");
+    const head = (d: string) => {
+      const path = join(d, ".git/FETCH_HEAD");
+      return existsSync(path) ? readFileSync(path, "utf8") : null;
+    };
     expect(head(mine.dir)).toBe(head(theirs.dir));
     if (error) {
       // the refusing hook: git dies
@@ -551,6 +556,21 @@ describeGit("git fetch --atomic: the reference-transaction hook, as native git",
     const dir = repository("plain", { branches: ["plain-1", "plain-2"], tags: ["plain-tag"] });
     await expectHookTwins(dir, ["--tags", "origin"]);
   });
+
+  // statewalker/webrun-vcs#340: a fetch with nothing to update still commits its transaction,
+  // empty (2.5x: always, the dry run too; 2.43: only --atomic's)
+  for (const args of [
+    ["origin"],
+    ["--atomic", "origin"],
+    ["--prune", "origin"],
+    ["--atomic", "--prune", "origin"],
+    ["--dry-run", "origin"],
+  ]) {
+    it(`a fetch updating no ref: fetch ${args.join(" ")}`, async () => {
+      const dir = repository(`noop-${args.join("").replace(/-/g, "")}`, {});
+      await expectHookTwins(dir, args);
+    });
+  }
 });
 
 // git 2.5x only: 2.43's set_head writes no symbolic ref in a transaction (and fetch has none)

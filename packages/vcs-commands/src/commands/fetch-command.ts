@@ -1070,6 +1070,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       atomic: this.atomic || undefined,
       // git 2.5x writes a fetch's refs in one transaction that refuses each on its own
       ...(compatibility !== "2.43" ? { batchNonAtomic: true } : {}),
+      // do_fetch commits its transaction even with no update: 2.5x always, 2.43 with --atomic
+      ...(compatibility !== "2.43" || this.atomic ? { emptyTransaction: true } : {}),
       dryRun: this.dryRun,
       onProgress: this.progressMessageCallback,
       // index-pack's "Receiving objects" and "Resolving deltas"
