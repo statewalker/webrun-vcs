@@ -1104,8 +1104,24 @@ export function createFilesRefOps(
         after.committed = true;
         return { ok: true, rejected: [] };
       }
-      if (deleting.length === updates.length) {
-        // only deletions, as git commits them: packed-refs rewritten when it names one of
+      if (deleting.length === updates.length || o.loose) {
+        if (deleting.length < updates.length) {
+          // `loose` with deletions, as git's files_transaction_finish: the updates first,
+          // each new value (and its log lines) written before any rename, then each lock
+          // renamed over its loose ref; the deletions follow
+          const writing = updates.filter((u) => u.newValue !== null);
+          await writeLogs(writing, at, o, true);
+          for (const u of writing) {
+            await files.write(`${u.name}.lock`, encodeGitPath(`${u.newValue}\n`));
+          }
+          for (const u of writing) {
+            if (!(await commit(u.name))) {
+              return fail([{ name: u.requested, reason: "df-conflict" }]);
+            }
+            held.splice(held.indexOf(u.name), 1);
+          }
+        }
+        // the deletions, as git commits them: packed-refs rewritten when it names one of
         // them, then the loose files removed, all before packed-refs.lock is released
         const fresh = await readPacked();
         let dropped = false;
