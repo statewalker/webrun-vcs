@@ -83,20 +83,27 @@ export const GEOMETRIC_PROMISOR_REMOTE_2_43 =
  * The paths of pack-objects' `--stdin-packs` hint walk (`read_stdin_packs`): a revision walk
  * from `tips` that never enters the objects of `excluded` (`no_kept_objects` over the packs
  * kept in core), giving each object of `ids` it meets the path it was met at
- * (`show_object_pack_hint`). Missing links end it early (`ignore_missing_links`, best effort).
+ * (`show_object_pack_hint`), the shallow commits' parents cut. Another missing link ends it
+ * early (git's `ignore_missing_links` goes on: best effort either way).
  */
 async function stdinPacksHints(
   objects: Parameters<typeof listObjects>[0],
   tips: readonly ObjectId[],
   excluded: readonly Pack[],
   ids: ReadonlySet<ObjectId>,
+  shallow: readonly ObjectId[],
 ): Promise<Map<ObjectId, { type: ObjectTypeString; path: string }>> {
   const hints = new Map<ObjectId, { type: ObjectTypeString; path: string }>();
   if (tips.length === 0) return hints;
   const exclude = new Set<ObjectId>();
   for (const p of excluded) for (const id of p.ids()) exclude.add(id);
   try {
-    for await (const o of listObjects(objects, { wants: tips, excludeObjects: exclude })) {
+    // the shallow commits' parents are cut, as git parses commits through its grafts
+    for await (const o of listObjects(objects, {
+      wants: tips,
+      excludeObjects: exclude,
+      ...(shallow.length ? { shallow } : {}),
+    })) {
       if (o.path === undefined || !ids.has(o.id) || hints.has(o.id)) continue;
       hints.set(o.id, { type: o.type, path: o.path });
     }
@@ -202,6 +209,7 @@ export async function geometricRepack(options: RepackOptions): Promise<RepackRes
       ...(options.environment ? { environment: options.environment } : {}),
     }));
   const idPattern = objectIdPattern(format);
+  const shallow = (await options.history.refs.getShallow?.().catch(() => [])) ?? [];
   // the type from the entry header, else from the object (its content left unread)
   const typeOf = async (id: ObjectId): Promise<ObjectTypeString | undefined> => {
     const known = (await objects.header?.(id))?.type ?? (await objects.objectType?.(id));
@@ -245,7 +253,7 @@ export async function geometricRepack(options: RepackOptions): Promise<RepackRes
     for (const g of byMtime) for (const id of g.pack.ids()) await add(id, false);
     if (unpacked)
       for await (const key of looseStorage.keys()) if (idPattern.test(key)) await add(key, true);
-    const hints = await stdinPacksHints(objects, tips, walkExcluded, hinted);
+    const hints = await stdinPacksHints(objects, tips, walkExcluded, hinted, shallow);
     const noDelta = new Map<string, boolean>();
     const refs: PackObjectRef[] = [];
     for (const id of ids) {

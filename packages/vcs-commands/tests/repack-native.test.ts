@@ -1052,6 +1052,35 @@ describeGit("repack twins", () => {
           expect(whole(ours).filter(Boolean).length).toBe(whole(native).filter(Boolean).length);
       });
 
+    it("t5300-pack-object: the delta attribute unset under --geometric in a shallow clone (the hint walk stops at the shallow commits)", async () => {
+      const caseDir = newCase(root, "delta-attribute-geometric-shallow");
+      const up = initRepo(root, caseDir, false, "up");
+      up.commit("one", {
+        ".gitattributes": "*.bin -delta\n",
+        "a.bin": big(1, "b"),
+        "a.txt": big(1, "t"),
+      });
+      up.commit("two", { "a.bin": big(2, "b"), "a.txt": big(2, "t") });
+      up.git(["clone", "-q", "--depth=1", `file://${up.dir}`, "repo"], {
+        cwd: join(caseDir, "src"),
+      });
+      const r = new NativeRepo(root, join(caseDir, "src", "repo"));
+      const dir = join(r.gitDir, "objects/pack");
+      for (const n of readdirSync(dir)) utimesSync(join(dir, n), 1700000000, 1700000000);
+      r.commit("three", { "a.bin": big(3, "b"), "a.txt": big(3, "t") });
+      r.git(["repack", "-q", "-d"]);
+      const ids = [2, 3].flatMap((n) => [r.blob(big(n, "b")), r.blob(big(n, "t"))]);
+      const { twins } = await repackTwins(caseDir, ["--geometric=2", "-d", "-f"], (c) =>
+        c.setGeometric(2).setDeleteRedundant(true).setReuseDeltas(false),
+      );
+      const ours = deltaBases(twins.ours, ids);
+      const native = deltaBases(twins.native, ids);
+      const binsWhole = (bases: string[]) =>
+        !!bases[0]?.endsWith(zero) && !!bases[2]?.endsWith(zero);
+      expect(binsWhole(native)).toBe(true);
+      expect(binsWhole(ours)).toBe(true);
+    });
+
     /** A bare repository whose two commits hold `a.bin` and `a.txt`, by fast-import. */
     function bareDeltaRepo(name: string, inTree: string) {
       const caseDir = newCase(root, name);
