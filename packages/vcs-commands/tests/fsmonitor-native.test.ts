@@ -16,8 +16,10 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -862,6 +864,12 @@ describeGit("fsmonitor against native git (t7519-status-fsmonitor.sh)", () => {
     checkFile?: string,
     /** a version 1 token (a failed hook's nanosecond time) compared as digits */
     zeroToken = false,
+    restore: {
+      /** runs once native git's result is read, before the worktree is checked out again */
+      afterNative?: () => void;
+      /** runs after the checkout and reset that put the worktree back for ours */
+      beforeOurs?: () => void;
+    } = {},
   ) {
     const saved = saveIndex();
     const savedFile = checkFile ? readFileSync(join(dir, checkFile)) : undefined;
@@ -873,6 +881,7 @@ describeGit("fsmonitor against native git (t7519-status-fsmonitor.sh)", () => {
     const nativeFile = checkFile ? readFileSync(join(dir, checkFile), "latin1") : undefined;
     const nativeHead = git(["rev-parse", "HEAD"]).trim();
     const nativeBranch = git(["symbolic-ref", "-q", "HEAD"]).trim();
+    restore.afterNative?.();
     // the worktree, refs and index put back for ours
     git(["-c", "core.fsmonitor=", "checkout", "-qf", branch.replace("refs/heads/", "")]);
     git(["update-ref", branch, head]);
@@ -881,6 +890,7 @@ describeGit("fsmonitor against native git (t7519-status-fsmonitor.sh)", () => {
       writeFileSync(join(dir, checkFile), savedFile);
       dateBack();
     }
+    restore.beforeOurs?.();
     restoreIndex(saved);
     await ours(await openOurs(dir, host()));
     const oursIndex = readFileSync(indexPath());
@@ -958,6 +968,190 @@ describeGit("fsmonitor against native git (t7519-status-fsmonitor.sh)", () => {
     report(["modified"]);
     await commandTwins(["rm", "-q", "--cached", "dir1/tracked"], ourRmCached("dir1/tracked"));
     expect(git(["ls-files", "-f"])).toContain("H modified\n");
+  });
+
+  describe("git mv (rename_index_entry_at's refresh_cache_entry)", () => {
+    const compat = () => (nativeIs25x ? "2.56" : "2.43");
+    /**
+     * Native `git mv <args>`, then ours from the same index and files: the files native git
+     * renamed are renamed back (inode and times kept) and the index refreshed for the checkout
+     * and reset that restore the worktree, so they rewrite none of them.
+     */
+    const mvTwins = (
+      args: string[],
+      ours: (mv: ReturnType<Awaited<ReturnType<typeof openOurs>>["mv"]>) => Promise<unknown>,
+      moved: [from: string, to: string][],
+      beforeOurs?: () => void,
+    ) => {
+      const before = saveIndex();
+      return commandTwins(
+        ["mv", ...args],
+        (g) => ours(g.mv().setCompatibility(compat())),
+        undefined,
+        false,
+        {
+          afterNative: () => {
+            for (const [from, to] of moved) {
+              rmSync(join(dir, from), { recursive: true, force: true });
+              renameSync(join(dir, to), join(dir, from));
+            }
+            restoreIndex(before);
+            spawnSync("git", ["-c", "core.fsmonitor=", "update-index", "-q", "--refresh"], {
+              cwd: dir,
+              env: env(),
+            });
+          },
+          ...(beforeOurs ? { beforeOurs } : {}),
+        },
+      );
+    };
+    /** Waits for the next second: a rename then changes the file's ctime second. */
+    const nextSecond = () => {
+      const now = Date.now();
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000 - (now % 1000) + 50);
+    };
+
+    it('t7001-mv.sh: "moving the file out of subdirectory": a dirty-bit clean file comes out valid', async () => {
+      hook(LISTED);
+      report([]);
+      git(["update-index", "--fsmonitor"]);
+      expect(git(["ls-files", "-f", "dir1/tracked"])).toBe("H dir1/tracked\n");
+      await mvTwins(
+        ["dir1/tracked", "moved"],
+        (mv) => mv.addSource("dir1/tracked").setDestination("moved").call(),
+        [["dir1/tracked", "moved"]],
+      );
+      expect(git(["ls-files", "-f", "moved"])).toBe("h moved\n");
+    });
+
+    it('t7519-status-fsmonitor.sh: "*only* files returned by the integration script get flagged as invalid": a changed file stays dirty after git mv', async () => {
+      hook(LISTED);
+      report([]);
+      git(["update-index", "--fsmonitor"]);
+      put("modified", "changed\n");
+      dateBack();
+      report(["modified"]);
+      await mvTwins(
+        ["modified", "moved"],
+        (mv) => mv.addSource("modified").setDestination("moved").call(),
+        [["modified", "moved"]],
+        // the reset put the committed content back
+        () => put("modified", "changed\n"),
+      );
+      expect(git(["ls-files", "-f", "moved"])).toBe("H moved\n");
+    });
+
+    it('t7519-status-fsmonitor.sh: "all unmodified files get marked valid": a valid entry keeps its bit, and a later reported change is still seen', async () => {
+      hook(LISTED);
+      report([]);
+      await statusTwins();
+      await statusTwins({ keep: "ours" });
+      expect(git(["ls-files", "-f", "tracked"])).toBe("h tracked\n");
+      await mvTwins(
+        ["tracked", "moved"],
+        (mv) => mv.addSource("tracked").setDestination("moved").call(),
+        [["tracked", "moved"]],
+      );
+      expect(git(["ls-files", "-f", "moved"])).toBe("h moved\n");
+      // the moved file changed: once the monitor reports it, both see the change
+      put("moved", "changed\n");
+      dateBack();
+      report(["moved"]);
+      const { nativeOut } = await statusTwins({ keep: "ours" });
+      expect(nativeOut).toContain("RM tracked -> moved\n");
+      expect(git(["ls-files", "-f", "moved"])).toBe("H moved\n");
+    });
+
+    it('t7001-mv.sh: "moving whole subdirectory": every entry of a moved directory comes out valid', async () => {
+      hook(LISTED);
+      report([]);
+      put("dir1/modified", "changed\n");
+      dateBack();
+      git(["update-index", "--fsmonitor"]);
+      await mvTwins(
+        ["dir1", "dir3"],
+        (mv) => mv.addSource("dir1").setDestination("dir3").call(),
+        [["dir1", "dir3"]],
+        () => put("dir1/modified", "changed\n"),
+      );
+      const bits = git(["ls-files", "-f", "dir3"]);
+      expect(bits).toBe("H dir3/modified\nh dir3/tracked\n");
+    });
+
+    it('t7001-mv.sh: "mv -f refreshes updated index entry": a replaced destination entry is dirty', async () => {
+      hook(LISTED);
+      report([]);
+      await statusTwins();
+      await statusTwins({ keep: "ours" });
+      expect(git(["ls-files", "-f", "modified", "tracked"])).toBe("h modified\nh tracked\n");
+      await mvTwins(
+        ["-f", "modified", "tracked"],
+        (mv) => mv.addSource("modified").setDestination("tracked").setForce(true).call(),
+        [["modified", "tracked"]],
+      );
+      expect(git(["ls-files", "-f", "tracked"])).toBe("H tracked\n");
+    });
+
+    it('t7001-mv.sh: "checking -k on non-existing file": the sources that move come out valid', async () => {
+      hook(LISTED);
+      report([]);
+      mkdirSync(join(dir, "dir3"));
+      git(["update-index", "--fsmonitor"]);
+      await mvTwins(
+        ["-k", "nosuch", "tracked", "dir3"],
+        (mv) =>
+          mv
+            .addSource("nosuch")
+            .addSource("tracked")
+            .setDestination("dir3")
+            .setSkipErrors(true)
+            .call(),
+        [["tracked", "dir3/tracked"]],
+      );
+      expect(git(["ls-files", "-f", "dir3"])).toBe("h dir3/tracked\n");
+    });
+
+    for (const trustCtime of [true, false]) {
+      it(`t7001-mv.sh: "check moved symlink": a symbolic link is valid only while its stat matches (core.trustctime=${trustCtime})`, async () => {
+        hook(LISTED);
+        report([]);
+        git(["config", "core.trustctime", String(trustCtime)]);
+        symlinkSync("tracked", join(dir, "link"));
+        git(["-c", "core.fsmonitor=", "add", "link"]);
+        git(["-c", "core.fsmonitor=", "commit", "-qm", "link"]);
+        git(["update-index", "--fsmonitor"]);
+        nextSecond();
+        await mvTwins(
+          ["link", "moved-link"],
+          (mv) => mv.addSource("link").setDestination("moved-link").call(),
+          [["link", "moved-link"]],
+        );
+        // a changed ctime refreshes the entry's stat data (fill_stat_cache_info), which marks
+        // only regular files valid
+        expect(git(["ls-files", "-f", "moved-link"])).toBe(
+          trustCtime ? "H moved-link\n" : "h moved-link\n",
+        );
+      });
+    }
+
+    it('t7001-mv.sh: "git mv should overwrite symlink to a file": a symbolic link checked out as a file (core.symlinks=false) is a regular file to fill_stat_cache_info', async () => {
+      hook(LISTED);
+      report([]);
+      git(["config", "core.symlinks", "false"]);
+      put("link", "tracked");
+      const blob = git(["hash-object", "-w", "link"]).trim();
+      git(["-c", "core.fsmonitor=", "update-index", "--add", "--cacheinfo", `120000,${blob},link`]);
+      git(["-c", "core.fsmonitor=", "commit", "-qm", "link"]);
+      git(["-c", "core.fsmonitor=", "update-index", "-q", "--refresh"]);
+      git(["update-index", "--fsmonitor"]);
+      nextSecond();
+      await mvTwins(
+        ["link", "moved-link"],
+        (mv) => mv.addSource("link").setDestination("moved-link").call(),
+        [["link", "moved-link"]],
+      );
+      expect(git(["ls-files", "-f", "moved-link"])).toBe("h moved-link\n");
+    });
   });
 
   for (const how of ["reset --hard", "checkout -f"] as const) {

@@ -7,9 +7,11 @@ import { FileMode, type ObjectId } from "@statewalker/vcs-core";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
   attributesIndexOf,
+  basicStatMatches,
   compareWithWorktree,
   entryStatOf,
   type IndexEntry,
+  isCleanByStat,
   type Worktree,
   type WorktreeModeTrust,
 } from "@statewalker/vcs-working-tree";
@@ -517,6 +519,10 @@ export class MvCommand extends GitCommand<MvResult> {
     });
     const current = new Map<string, IndexEntry>();
     for (const e of cache) if (e.stage === 0) current.set(e.path, e);
+    // the monitor as the index read asked it (core.fsmonitor): rename_index_entry_at's
+    // refresh_cache_entry marks the entries it finds up to date CE_FSMONITOR_VALID
+    const fsm = await this.fsmonitorRefresh(this.staging);
+    const validMoves: string[] = [];
     const dirtyPaths: string[] = [];
     let gitmodulesModified = false;
     let changed = false;
@@ -558,21 +564,37 @@ export class MvCommand extends GitCommand<MvResult> {
         const at = await lstat(src);
         if (at) sparseAndDirty = await entryModified(worktree, entry, trust, indexTime);
       }
-      // rename_index_entry_at: flags kept; refresh_cache_entry takes the new file's stat
-      // only while the content still matches (a gitlink's never: ie_match_stat compares its
-      // type and HEAD alone, so its stat data stays as it was)
+      // rename_index_entry_at: flags kept (CE_FSMONITOR_VALID too); refresh_cache_entry
+      // returns a skip-worktree, assume-valid or fsmonitor-valid entry as it is, keeps one whose
+      // stat still matches (marked fsmonitor-valid), and takes the new file's stat only while
+      // the content still matches (fill_stat_cache_info: only a regular file then marked
+      // valid). A gitlink's stat is never taken (ie_match_stat compares its type and HEAD
+      // alone) nor marked; an intent-to-add entry always differs.
       let moved: IndexEntry = { ...entry, path: dst };
+      let valid = !!fsm && fsm.state.isValid(entry);
       if (
         !entry.skipWorktree &&
         !entry.assumeValid &&
+        !valid &&
         !entry.intentToAdd &&
         entry.mode !== FileMode.GITLINK
       ) {
         const file = await lstat(dst);
-        if (file && !(await entryModified(worktree, moved, trust, indexTime, true))) {
-          moved = { ...moved, ...entryStatOf(file) };
+        if (file && isCleanByStat(moved, file, trust, indexTime)) valid = true;
+        else if (file && !(await entryModified(worktree, moved, trust, indexTime, true))) {
+          // a racily clean entry: ie_match_stat compared the content, the stat stays
+          if (basicStatMatches(moved, file, trust)) valid = true;
+          else {
+            moved = { ...moved, ...entryStatOf(file) };
+            // S_ISREG of the file: a symbolic link's entry checked out as a file
+            // (core.symlinks=false) is one
+            valid = !file.isDirectory && file.mode !== FileMode.SYMLINK;
+          }
         }
       }
+      // add_index_entry replaces a tracked destination (-f): replace_index_entry's
+      // mark_fsmonitor_invalid
+      if (current.has(dst)) valid = false;
       let checkout = false;
       if (this.sparse && sparseConfig.enabled && sparseConfig.cone) {
         if (mode & SPARSE && inSparse(dst)) {
@@ -603,6 +625,7 @@ export class MvCommand extends GitCommand<MvResult> {
         const { skipWorktree: _drop, ...rest } = moved;
         moved = rest;
       }
+      if (fsm && valid) validMoves.push(dst);
       current.delete(src);
       current.set(dst, moved);
       adder.remove(src);
@@ -643,7 +666,12 @@ export class MvCommand extends GitCommand<MvResult> {
       }
     }
     if (changed || gitmodulesModified) {
-      await this.writeMoves(adder, worktree, gitmodulesModified);
+      await this.writeMoves(adder, worktree, gitmodulesModified, async () => {
+        for (const path of validMoves) {
+          const entry = await this.staging.getEntry(path);
+          if (entry && entry.stage === 0) fsm?.state.markValid(entry);
+        }
+      });
     }
     return result;
   }
@@ -662,12 +690,15 @@ export class MvCommand extends GitCommand<MvResult> {
     adder: IndexAdder,
     worktree: Worktree,
     gitmodulesModified: boolean,
+    /** marks the moved entries fsmonitor-valid once they are in the index */
+    markValid: () => Promise<void>,
   ): Promise<void> {
     if (gitmodulesModified) {
       const entry = await worktree.getEntry(".gitmodules");
       if (entry && !entry.isDirectory) await adder.add(worktree, ".gitmodules", entry);
     }
     await adder.finish();
+    await markValid();
     await this.staging.write();
   }
 
