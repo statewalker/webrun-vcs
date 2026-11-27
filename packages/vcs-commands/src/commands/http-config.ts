@@ -7,8 +7,8 @@
  * an empty value clearing the list. `GIT_HTTP_USER_AGENT`, `GIT_HTTP_MAX_RETRIES`,
  * `GIT_HTTP_RETRY_AFTER` and `GIT_HTTP_MAX_RETRY_TIME` override the configuration.
  *
- * Read here: `extraHeader`, `userAgent`, `followRedirects`, `emptyAuth`, `maxRetries`,
- * `retryAfter`, `maxRetryTime`. TLS, proxy, cookie, version and speed keys are the host
+ * Read here: `extraHeader`, `userAgent`, `followRedirects`, `emptyAuth`, `proactiveAuth`
+ * (2.46+), `maxRetries`, `retryAfter`, `maxRetryTime`. TLS, proxy, cookie, version and speed keys are the host
  * `fetch`'s business and are not read.
  *
  * @example
@@ -31,6 +31,8 @@ import type { RemoteConfigStore } from "../remote-config/index.js";
 export interface HttpConfigOptions {
   /** As git 2.43: no retries on 429 (`http.maxRetries` came with 2.52) */
   compatibility?: "2.43" | "2.56";
+  /** git's `warning:` lines about the configuration (`Unknown value for http.proactiveauth`) */
+  onWarning?(line: string): void;
 }
 
 /**
@@ -75,6 +77,16 @@ export function httpClientSettingsOf(
         break;
       case "emptyauth":
         settings.emptyAuth = value === "auto" ? "auto" : bool(key, value);
+        break;
+      case "proactiveauth":
+        // git 2.46: an unknown value warns and leaves the setting as it was
+        if (options.compatibility === "2.43") break;
+        if (value === undefined) throw missingValue(key);
+        if (value === "auto" || value === "basic" || value === "none") {
+          settings.proactiveAuth = value;
+        } else {
+          options.onWarning?.("warning: Unknown value for http.proactiveauth");
+        }
         break;
       case "followredirects":
         settings.followRedirects =
