@@ -1,7 +1,0 @@
----
-"@statewalker/vcs-commands": minor
-"@statewalker/vcs-working-tree": minor
-"@statewalker/vcs-utils": minor
----
-
-`git archive` streams (statewalker/webrun-vcs#349): `ArchiveCommand.callStream()` yields the archive in chunks, the bytes `call()` returns, with blobs above `core.bigFileThreshold` read from the store chunk by chunk (incremental CRC-32 and deflate, zip64 and pax `size` headers) and tar filters run as pipes (`setStreamFilterRunner`, the builtin gzip incremental). `ArchiveWriter.entry`/`finish` are now asynchronous and take an `output`. `--add-file` reads through the host environment as git's `stat` does (absolute paths, files outside the repository, symbolic links followed), with git's `File not found`/`Not a regular file`. Valueless `tar.<format>.command`/`tar.umask` die as git does, `core.bigFileThreshold` is git's unsigned long (`4g`, `0`, git's deaths, 2.43 reading it at start and 2.5x at the first file), a bare repository's `--worktree-attributes` reads HEAD's attributes under 2.43, and filter drivers get git's checkout metadata (`FilterDriverContext.metadata`), report a failing command that is not required (`FilterDriverRunError`, `error: external filter '<cmd>' failed`) and the encoding warning with a worktree too. vcs-working-tree reads filter commands as written (`smudge = false` is the command `false`). vcs-utils adds `createDeflater` (incremental deflate, `deflateSync`'s bytes) and `parseGitUlong`.

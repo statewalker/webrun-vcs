@@ -1,5 +1,20 @@
 # @statewalker/vcs-utils-node
 
+## 0.12.0
+
+### Minor Changes
+
+- Release of the changes since the last published version:
+  
+  - files changed: dist/files-CZv0tDxO.js, dist/files-DrJ1CFBC.js, dist/files/index.js, dist/index.js
+  - @statewalker/vcs-utils crosses a breaking line
+
+### Patch Changes
+
+- Updated dependencies [d156c9c]
+- Updated dependencies [8029d7f]
+  - @statewalker/vcs-utils@0.11.0
+
 ## 0.11.0
 
 ### Minor Changes
