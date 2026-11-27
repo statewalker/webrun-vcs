@@ -1,5 +1,19 @@
 # @statewalker/vcs-transport
 
+## 0.12.0
+
+### Minor Changes
+
+- 8029d7f: HTTP authentication as native git: Digest (RFC 7616: MD5, SHA-256, SHA-512-256) answered as curl answers it, `http.proactiveAuth` (git 2.46+) asking the credential helper before the first request, and a POST answering 401 after an open `info/refs` asking the helper and sending the request again (remote-curl's `post_rpc`). vcs-utils gains a portable `md5`/`md5Hex` and synchronous `sha256Hex`/`sha512_256Hex` for Digest.
+
+### Patch Changes
+
+- Updated dependencies [d156c9c]
+- Updated dependencies [8029d7f]
+- Updated dependencies [d038d8e]
+  - @statewalker/vcs-utils@0.11.0
+  - @statewalker/vcs-core@0.12.0
+
 ## 0.11.0
 
 ### Minor Changes

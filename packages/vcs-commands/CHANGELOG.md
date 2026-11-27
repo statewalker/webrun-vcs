@@ -1,5 +1,30 @@
 # @statewalker/vcs-commands
 
+## 0.12.0
+
+### Minor Changes
+
+- d156c9c: `git archive` streams (statewalker/webrun-vcs#349): `ArchiveCommand.callStream()` yields the archive in chunks, the bytes `call()` returns, with blobs above `core.bigFileThreshold` read from the store chunk by chunk (incremental CRC-32 and deflate, zip64 and pax `size` headers) and tar filters run as pipes (`setStreamFilterRunner`, the builtin gzip incremental). `ArchiveWriter.entry`/`finish` are now asynchronous and take an `output`. `--add-file` reads through the host environment as git's `stat` does (absolute paths, files outside the repository, symbolic links followed), with git's `File not found`/`Not a regular file`. Valueless `tar.<format>.command`/`tar.umask` die as git does, `core.bigFileThreshold` is git's unsigned long (`4g`, `0`, git's deaths, 2.43 reading it at start and 2.5x at the first file), a bare repository's `--worktree-attributes` reads HEAD's attributes under 2.43, and filter drivers get git's checkout metadata (`FilterDriverContext.metadata`), report a failing command that is not required (`FilterDriverRunError`, `error: external filter '<cmd>' failed`) and the encoding warning with a worktree too. vcs-working-tree reads filter commands as written (`smudge = false` is the command `false`). vcs-utils adds `createDeflater` (incremental deflate, `deflateSync`'s bytes) and `parseGitUlong`.
+- 8029d7f: HTTP authentication as native git: Digest (RFC 7616: MD5, SHA-256, SHA-512-256) answered as curl answers it, `http.proactiveAuth` (git 2.46+) asking the credential helper before the first request, and a POST answering 401 after an open `info/refs` asking the helper and sending the request again (remote-curl's `post_rpc`). vcs-utils gains a portable `md5`/`md5Hex` and synchronous `sha256Hex`/`sha512_256Hex` for Digest.
+- d038d8e: `git.repack()` follows git in more cases (statewalker/webrun-vcs#347). `--geometric` rolls promisor packs up the way each git version does (2.5x: a geometry of their own and a new promisor pack; 2.43: with the rest, and git's death with a promisor remote), keeps `--keep-pack` objects out even with `--pack-kept-objects`, warns `disabling bitmap writing` for `-l` with alternates, and names objects through pack-objects' `--stdin-packs` hint walk, so the `delta` attribute applies there. Delta-island marks propagate through commits of `.keep` packs (`DeltaIslandOptions.walkedCommits`), and the `delta` attribute is read in bare repositories (`info/attributes`). `--cruft` without `-d` and `--filter` without `-a` now run as git runs them instead of being refused. `RepackOptions.onWarning` receives the warnings of a geometric repack that writes no pack.
+- b3cea1d: `GitResolutionStore` no longer writes `rr-cache/` entries of its own format, which native git read as rerere records (statewalker/webrun-vcs#359). It records and replays through a `RerereEngine` (new in `@statewalker/vcs-working-tree/transformation`), which vcs-commands gives as `rerereEngineOf` or `git.rerere().engine()`. Its records are git's own, byte for byte. Without an engine the store records and replays nothing. Pass the engine as the store's seventh constructor argument, the sixth of `createResolutionStore`, or `TransformationStoreConfig.rerere`.
+
+### Patch Changes
+
+- b64f762: `git mv` marks the moved entry fsmonitor-valid where git's `rename_index_entry_at` does (`refresh_cache_entry`): a valid source keeps its bit and stat, a stat-clean moved file comes out valid, a content-clean one takes the new stat and is valid only if a regular file, and a tracked destination replaced by `-f` stays dirty (statewalker/webrun-vcs#471).
+- fb59270: Plumbing reads walk trees as git's `tree_desc` does (statewalker/webrun-vcs#351): `ls-files --with-tree` lists an entry named `..` and dies on a missing subtree (`error: Could not read <id>`, `fatal: unable to read tree entries <tree>`, exit 128); a corrupt tree (`too-short tree object`, `malformed mode in tree entry`, `empty filename in tree entry`) is git's death, exit 128, in `ls-tree`, `cat-file -p`, `ls-files --with-tree`, `replace --edit` and any `<rev>:<path>` through it, after the entries git shows first. New export: `CorruptTreeError`.
+- Updated dependencies [d156c9c]
+- Updated dependencies
+- Updated dependencies [8029d7f]
+- Updated dependencies [d038d8e]
+- Updated dependencies [b3cea1d]
+  - @statewalker/vcs-working-tree@0.12.0
+  - @statewalker/vcs-utils@0.11.0
+  - @statewalker/vcs-store-mem@0.12.0
+  - @statewalker/vcs-transport@0.12.0
+  - @statewalker/vcs-core@0.12.0
+  - @statewalker/vcs-store-files@0.12.0
+
 ## 0.11.0
 
 ### Minor Changes

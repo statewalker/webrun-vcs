@@ -1,5 +1,22 @@
 # @statewalker/vcs-store-files
 
+## 0.12.0
+
+### Minor Changes
+
+- d038d8e: `git.repack()` follows git in more cases (statewalker/webrun-vcs#347). `--geometric` rolls promisor packs up the way each git version does (2.5x: a geometry of their own and a new promisor pack; 2.43: with the rest, and git's death with a promisor remote), keeps `--keep-pack` objects out even with `--pack-kept-objects`, warns `disabling bitmap writing` for `-l` with alternates, and names objects through pack-objects' `--stdin-packs` hint walk, so the `delta` attribute applies there. Delta-island marks propagate through commits of `.keep` packs (`DeltaIslandOptions.walkedCommits`), and the `delta` attribute is read in bare repositories (`info/attributes`). `--cruft` without `-d` and `--filter` without `-a` now run as git runs them instead of being refused. `RepackOptions.onWarning` receives the warnings of a geometric repack that writes no pack.
+- b3cea1d: `GitResolutionStore` no longer writes `rr-cache/` entries of its own format, which native git read as rerere records (statewalker/webrun-vcs#359). It records and replays through a `RerereEngine` (new in `@statewalker/vcs-working-tree/transformation`), which vcs-commands gives as `rerereEngineOf` or `git.rerere().engine()`. Its records are git's own, byte for byte. Without an engine the store records and replays nothing. Pass the engine as the store's seventh constructor argument, the sixth of `createResolutionStore`, or `TransformationStoreConfig.rerere`.
+
+### Patch Changes
+
+- Updated dependencies [d156c9c]
+- Updated dependencies [8029d7f]
+- Updated dependencies [d038d8e]
+- Updated dependencies [b3cea1d]
+  - @statewalker/vcs-working-tree@0.12.0
+  - @statewalker/vcs-utils@0.11.0
+  - @statewalker/vcs-core@0.12.0
+
 ## 0.11.0
 
 ### Minor Changes

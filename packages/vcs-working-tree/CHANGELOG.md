@@ -1,5 +1,20 @@
 # @statewalker/vcs-working-tree
 
+## 0.12.0
+
+### Minor Changes
+
+- d156c9c: `git archive` streams (statewalker/webrun-vcs#349): `ArchiveCommand.callStream()` yields the archive in chunks, the bytes `call()` returns, with blobs above `core.bigFileThreshold` read from the store chunk by chunk (incremental CRC-32 and deflate, zip64 and pax `size` headers) and tar filters run as pipes (`setStreamFilterRunner`, the builtin gzip incremental). `ArchiveWriter.entry`/`finish` are now asynchronous and take an `output`. `--add-file` reads through the host environment as git's `stat` does (absolute paths, files outside the repository, symbolic links followed), with git's `File not found`/`Not a regular file`. Valueless `tar.<format>.command`/`tar.umask` die as git does, `core.bigFileThreshold` is git's unsigned long (`4g`, `0`, git's deaths, 2.43 reading it at start and 2.5x at the first file), a bare repository's `--worktree-attributes` reads HEAD's attributes under 2.43, and filter drivers get git's checkout metadata (`FilterDriverContext.metadata`), report a failing command that is not required (`FilterDriverRunError`, `error: external filter '<cmd>' failed`) and the encoding warning with a worktree too. vcs-working-tree reads filter commands as written (`smudge = false` is the command `false`). vcs-utils adds `createDeflater` (incremental deflate, `deflateSync`'s bytes) and `parseGitUlong`.
+- b3cea1d: `GitResolutionStore` no longer writes `rr-cache/` entries of its own format, which native git read as rerere records (statewalker/webrun-vcs#359). It records and replays through a `RerereEngine` (new in `@statewalker/vcs-working-tree/transformation`), which vcs-commands gives as `rerereEngineOf` or `git.rerere().engine()`. Its records are git's own, byte for byte. Without an engine the store records and replays nothing. Pass the engine as the store's seventh constructor argument, the sixth of `createResolutionStore`, or `TransformationStoreConfig.rerere`.
+
+### Patch Changes
+
+- Updated dependencies [d156c9c]
+- Updated dependencies [8029d7f]
+- Updated dependencies [d038d8e]
+  - @statewalker/vcs-utils@0.11.0
+  - @statewalker/vcs-core@0.12.0
+
 ## 0.11.0
 
 ### Minor Changes
