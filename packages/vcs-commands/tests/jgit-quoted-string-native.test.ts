@@ -15,7 +15,7 @@
  * Paths and texts are bytes (latin1 strings here), as JGit's `ISO_8859_1` inputs are.
  */
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -32,6 +32,7 @@ import {
   outcomeOf,
   plumbingEnv,
 } from "./plumbing-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -155,7 +156,7 @@ describeGit("JGit QuotedString*Test against native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "jgit-quoted-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   for (const [source, names] of QUOTED_NAMES) {
     it(`JGit ${source}: ls-files quotes as git`, async () => {
