@@ -217,6 +217,11 @@ bad_commit=$(git hash-object --literally -t commit -w --stdin <data)
 git branch bad $bad_commit
 git bundle create -q bad-object.bundle bad
 git update-ref -d refs/heads/bad
+# a tag without a tagger line: fsck's missingTaggerEntry is a warning, the bundle applies
+printf 'object %s\ntype commit\ntag no-tagger\n\nno tagger\n' "$(git rev-parse B)" >tagdata
+git update-ref refs/tags/no-tagger "$(git hash-object --literally -t tag -w tagdata)"
+git bundle create -q no-tagger.bundle refs/tags/no-tagger
+git update-ref -d refs/tags/no-tagger
 `,
     );
     fromTags = join(home, "clone-from-tags");
@@ -280,6 +285,18 @@ git bundle create -q ALL.bundle --all
       expect(packsOf(t.oursDir)).toHaveLength(packsOf(t.nativeDir).length);
     }
     expect(hasAllObjects(from, t.oursDir)).toBe(true);
+  });
+
+  it("unbundling under fetch.fsckObjects prints fsck's warnings and applies the bundle", async () => {
+    const t = await cloneTwins(from, join(from, "no-tagger.bundle"), {
+      config: ["fetch.fsckObjects=true"],
+    });
+    expect(t.ours).toEqual(t.native);
+    // (2.43 checks nothing, and maps only refs/heads/ into refs/bundles/)
+    if (compatibility !== "2.43") {
+      expect(t.native.messages.join("\n")).toContain("missingTaggerEntry");
+      expect(t.ours.refs).toContain("refs/bundles/tags/no-tagger");
+    }
   });
 
   it('t5558-clone-bundle-uri.sh: "clone with path bundle and non-default hash"', async () => {

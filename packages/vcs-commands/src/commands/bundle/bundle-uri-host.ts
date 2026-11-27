@@ -125,13 +125,15 @@ export function createBundleUriHost(options: BundleUriHostOptions): BundleUriHos
           );
           let committed = false;
           try {
-            await checkReceivedPack(quarantine?.repository ?? facade, received, {
+            const checked = await checkReceivedPack(quarantine?.repository ?? facade, received, {
               fsck,
               links: false,
               shallow: new Set<string>(),
               kept: true,
               tail: null,
             });
+            // index-pack's fsck warnings (stderr; VERIFY_BUNDLE_QUIET quiets verify_bundle only)
+            for (const line of checked.messages) options.message(line);
             await quarantine?.commit();
             committed = true;
           } finally {
