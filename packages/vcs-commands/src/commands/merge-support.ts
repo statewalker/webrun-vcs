@@ -43,6 +43,7 @@ import type { CommandRefs, CommandTrees } from "../git-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import type { OrtConflict } from "./ort-merge.js";
 import { markIndexUpdate } from "./post-index-change.js";
+import type { RevisionResolver } from "./revision-resolver.js";
 import { pushSparseWarnings, SparseUnpack } from "./sparse-checkout-support.js";
 import type { SubmoduleUnpack } from "./submodule-unpack.js";
 import {
@@ -1333,4 +1334,21 @@ export function subjectOf(message: string): string {
   const subject: string[] = [];
   for (; i < lines.length && lines[i] !== ""; i++) subject.push(lines[i] as string);
   return subject.join(" ");
+}
+
+/**
+ * MERGE_HEAD's entries as commits (git's `read_merge_heads` → `lookup_commit_reference`): a
+ * merged annotated tag is written by its own id (`write_merge_heads`) and peeled when read;
+ * an entry that peels to no commit is kept as written.
+ */
+export async function peelMergeHeads(
+  resolver: Pick<RevisionResolver, "peelTags">,
+  ids: ObjectId[],
+): Promise<ObjectId[]> {
+  const out: ObjectId[] = [];
+  for (const id of ids) {
+    const peeled = await resolver.peelTags(id).catch(() => undefined);
+    out.push(peeled?.type === "commit" ? peeled.id : id);
+  }
+  return out;
 }
