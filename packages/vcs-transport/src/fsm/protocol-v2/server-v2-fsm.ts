@@ -600,14 +600,29 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
         }
 
         ctx.state.commonBase = new Set();
-        ctx.state.acks = [];
+        const acks: string[] = [];
+        ctx.state.acks = acks;
 
+        // upload-pack.c's process_haves over do_got_oid: a held commit marks its parents
+        // THEY_HAVE before its own flag is looked at, and since git 2.45 only an object not
+        // yet marked is acknowledged (`have_obj`), so a have whose child came first in the
+        // request, or a repeated one, gets no ACK. git before 2.45 acknowledged every have
+        // it held (`common`), repeats included. The pack and `ok_to_give_up` see every held
+        // have either way (a skipped one is reachable from one kept).
+        const everyHave = ctx.config.acknowledgeEveryHave === true;
+        const theyHave = new Set<string>();
         for (const oid of req.haves) {
-          if (await ctx.repository.has(oid)) {
-            ctx.state.commonBase.add(oid);
-            ctx.state.acks = ctx.state.acks ?? [];
-            ctx.state.acks.push(oid);
+          if (!(await ctx.repository.has(oid))) continue;
+          ctx.state.commonBase.add(oid);
+          if (everyHave) {
+            acks.push(oid);
+            continue;
           }
+          const commit = await ctx.repository.getCommitInfo?.(oid);
+          for (const parent of commit?.parents ?? []) theyHave.add(parent);
+          if (theyHave.has(oid)) continue;
+          theyHave.add(oid);
+          acks.push(oid);
         }
 
         return "COMPUTED";

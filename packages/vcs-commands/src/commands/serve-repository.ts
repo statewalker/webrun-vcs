@@ -40,9 +40,10 @@ export interface ServedRepositoryOptions {
    */
   hooks?: HookSession;
   /**
-   * Where receive-pack runs (`ReceivePackHost`): whose fsck messages to give (default the
-   * hooks' runner's compatibility). A served repository's `receive.fsck.skipList` is always
-   * read confined to its own git directories (`confineFiles`), never from the host
+   * Where receive-pack runs (`ReceivePackHost`): whose fsck messages to give and whose v2
+   * upload-pack ACKs (2.43: every have held), by default the hooks' runner's compatibility. A
+   * served repository's `receive.fsck.skipList` is always read confined to its own git
+   * directories (`confineFiles`), never from the host
    */
   host?: ReceivePackHost;
   /**
@@ -126,6 +127,10 @@ export async function servedRepositoryOf(
     settings.receivePackConfigError = fsckError;
   }
   const hooks = options.hooks;
+  // v2 upload-pack's ACKs: git before 2.45 acknowledges every have it holds
+  if ((options.host?.compatibility ?? hooks?.compatibility) === "2.43") {
+    settings.acknowledgeEveryHave = true;
+  }
   if (options.packObjectsHook !== false && hooks) {
     const hook = await packObjectsHookOf(hooks);
     if (hook) settings.packObjectsHook = hook;
