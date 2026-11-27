@@ -96,6 +96,14 @@ describe("packed objects above maxObjectSize (statewalker/webrun-vcs#477)", () =
     expect(equal(await bytesOf(r?.content as AsyncIterable<Uint8Array>), small)).toBe(true);
   });
 
+  it("a whole commit, tree or tag over the limit is still refused: their readers hold them", async () => {
+    const { files, packPath, idxPath } = await packOf([{ kind: 2, data: big }]);
+    const pack = await openPack(files, packPath, idxPath, { maxObjectSize: MiB });
+    const treeId = oidOf("tree", big);
+    await expect(pack.get(treeId)).rejects.toThrow(/over the limit of 1048576/);
+    await expect(pack.get(treeId)).rejects.toBeInstanceOf(PackError);
+  });
+
   it("a delta whose instructions or result exceed the limit is refused", async () => {
     // a delta copying the whole big blob: its result would be held
     const { files, packPath, idxPath } = await packOf([

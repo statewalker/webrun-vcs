@@ -63,7 +63,8 @@ export interface OpenPackSetOptions {
   baseCacheBytes?: number;
   /**
    * Largest object held in memory: delta instructions and results, delta bases (external ones
-   * too). A whole object read on its own streams and is not limited. Default 1 GiB.
+   * too), commits, trees and tags. A whole blob read on its own streams and is not limited.
+   * Default 1 GiB.
    */
   maxObjectSize?: number;
   /**
