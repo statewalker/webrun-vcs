@@ -46,6 +46,7 @@ import type {
   RefTransactionState,
   RefTransactionUpdate,
   RefUpdateResult,
+  ShallowWriteOptions,
   SymbolicRef,
   SymbolicRefLogOptions,
 } from "@statewalker/vcs-core";
@@ -426,8 +427,12 @@ export class ReftableRefStore implements Refs {
     return this.fileState.removeGrafts();
   }
 
-  setShallow(commits: Iterable<ObjectId>, expected?: Iterable<ObjectId>): Promise<void> {
-    return this.fileState.setShallow(commits, expected);
+  setShallow(
+    commits: Iterable<ObjectId>,
+    expected?: Iterable<ObjectId>,
+    options?: ShallowWriteOptions,
+  ): Promise<void> {
+    return this.fileState.setShallow(commits, expected, options);
   }
 
   // Writes: each one transaction, one table per stack it changes (git's reftable backend)

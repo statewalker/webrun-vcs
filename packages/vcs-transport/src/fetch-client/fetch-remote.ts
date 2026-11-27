@@ -3,7 +3,7 @@
  * negotiate and import the pack, keep the shallow file, follow tags, update the refs.
  */
 
-import { outgoingLinks } from "@statewalker/vcs-core";
+import { compareRefNames, outgoingLinks } from "@statewalker/vcs-core";
 import type { ProgressMonitor } from "@statewalker/vcs-utils";
 import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import type { PackImportResult, RepositoryFacade } from "../api/repository-facade.js";
@@ -899,6 +899,28 @@ export async function fetchFromConnection(
       }
     }
   }
+  // do_fetch_pack sorts the remote's refs by name (HEAD first; a clone seeks the remote HEAD
+  // too) and filter_refs keeps the sought ones in that order: the wants go out so, ids a
+  // refspec names without a listed ref after them. upload-pack walks its wants in that order
+  // (get_shallow_commits: a shallow server's shallow-info follows it)
+  {
+    const soughtNames = new Set([...planned.map((p) => p.remoteRef), ...tagsOfTips]);
+    if (options.cloning) soughtNames.add("HEAD");
+    const firstName = new Map<string, string>();
+    for (const ref of remoteRefs) {
+      if (!ref.oid || !soughtNames.has(ref.name)) continue;
+      const known = firstName.get(ref.oid);
+      if (known === undefined || compareRefNames(ref.name, known) < 0) {
+        firstName.set(ref.oid, ref.name);
+      }
+    }
+    wants.sort((a, b) => {
+      const x = firstName.get(a);
+      const y = firstName.get(b);
+      if (x === undefined || y === undefined) return x === y ? 0 : x === undefined ? 1 : -1;
+      return compareRefNames(x, y);
+    });
+  }
   // the refs fetch-pack was asked for (transport_fetch_refs: those not up to date here)
   const sought: PlannedRef[] = [];
   for (const p of planned) {
@@ -933,8 +955,13 @@ export async function fetchFromConnection(
         sought,
       });
       if (recorded.shallow !== shallow) {
-        await refStore.setShallow?.(recorded.shallow, shallow);
-        shallow = recorded.shallow;
+        await refStore.setShallow?.(
+          recorded.shallow,
+          shallow,
+          recorded.verbatim ? { verbatim: true } : undefined,
+        );
+        // a clone's file may name a commit twice; later rounds send each one once (grafts)
+        shallow = recorded.verbatim ? [...new Set(recorded.shallow)].sort() : recorded.shallow;
       }
       for (const p of recorded.rejected) shallowRejected.add(p);
     }
@@ -1551,7 +1578,7 @@ async function updateServerShallow(
     updateShallow: boolean;
     sought: readonly PlannedRef[];
   },
-): Promise<{ shallow: string[]; rejected: PlannedRef[] }> {
+): Promise<{ shallow: string[]; rejected: PlannedRef[]; verbatim?: boolean }> {
   const { repository, refStore } = context;
   const unchanged = { shallow: context.shallow, rejected: [] as PlannedRef[] };
   const record = (extra: readonly string[]) => {
@@ -1563,10 +1590,16 @@ async function updateServerShallow(
   };
   if (info.list.length === 0) return unchanged;
   if (context.cloning) {
-    // a clone: any shallow commit the pack brought (nothing was here before)
+    // a clone: any shallow commit the pack brought (nothing was here before), written as
+    // setup_alternate_shallow writes the `extra` array: in the order sent, a commit sent twice
+    // (get_shallow_commits names one per want reaching it) on two lines
     const extra: string[] = [];
     for (const oid of info.list) if (await repository.has(oid)) extra.push(oid);
-    return extra.length > 0 ? record(extra) : unchanged;
+    if (extra.length === 0) return unchanged;
+    if (!refStore.setShallow) {
+      throw new Error("The server sent shallow commits this ref store cannot record");
+    }
+    return { shallow: extra, rejected: [], verbatim: true };
   }
   if (info.ours.length === 0 && info.theirs.length === 0) return unchanged;
   const theirs: string[] = [];
