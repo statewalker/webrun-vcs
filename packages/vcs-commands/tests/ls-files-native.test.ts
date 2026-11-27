@@ -867,14 +867,14 @@ describeGit("git ls-files, native twins", () => {
       blob = shell.ok(dir, "rev-parse", "HEAD:f").trim();
     });
 
-    it("t3060-ls-files-with-tree.sh: a tree entry named '..' is listed (builtin/ls-files.c overlay_tree_on_index)", async () => {
+    it("scenario from t3060: a tree entry named '..' is listed (builtin/ls-files.c overlay_tree_on_index)", async () => {
       const odd = tree(["100644", "..", blob], ["100644", "ok", blob]);
       await check(dir, [`--with-tree=${odd}`]);
       await check(dir, [`--with-tree=${tree(["40000", "sub", odd])}`]);
       await check(dir, [`--with-tree=${tree(["40000", "sub", odd])}`, "-s"]);
     });
 
-    it("t3060-ls-files-with-tree.sh: a missing subtree dies (unable to read tree entries)", async () => {
+    it("scenario from t3060: a missing subtree dies (unable to read tree entries)", async () => {
       const missing = "1".repeat(40);
       const t = tree(["100644", "a", blob], ["40000", "sub", missing]);
       const commit = shell.ok(dir, "commit-tree", t, "-m", "missing").trim();
@@ -883,7 +883,7 @@ describeGit("git ls-files, native twins", () => {
       await check(dir, [`--with-tree=${t}`]);
     });
 
-    it("t3060-ls-files-with-tree.sh: a corrupt tree dies as tree-walk.c's decode_tree_entry", async () => {
+    it("scenario from t3060: a corrupt tree dies as tree-walk.c's decode_tree_entry", async () => {
       await check(dir, [`--with-tree=${tree("100644 f\0abc")}`]);
       await check(dir, [`--with-tree=${tree(["10x644", "f", blob])}`]);
       await check(dir, [`--with-tree=${tree(["40000", "sub", tree("100644 f")])}`]);

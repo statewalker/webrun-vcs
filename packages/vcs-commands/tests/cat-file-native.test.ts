@@ -538,7 +538,7 @@ describeGit("git cat-file, corrupt trees (statewalker/webrun-vcs#351)", () => {
     rmSync(base, { recursive: true, force: true });
   });
 
-  it("t1006-cat-file.sh: -p of a corrupt tree dies as tree-walk.c's decode_tree_entry", async () => {
+  it("scenario from t1006: -p of a corrupt tree dies as tree-walk.c's decode_tree_entry", async () => {
     await checkHere(["-p", trees.short as string]);
     await checkHere(["-p", trees.mode as string]);
     await checkHere(["-p", trees.empty as string]);
@@ -547,7 +547,7 @@ describeGit("git cat-file, corrupt trees (statewalker/webrun-vcs#351)", () => {
     await checkHere(["-p", trees.third as string]);
   });
 
-  it("t1006-cat-file.sh: a path through a corrupt tree dies (get_tree_entry)", async () => {
+  it("scenario from t1006: a path through a corrupt tree dies (get_tree_entry)", async () => {
     await checkHere(["-p", `${trees.nested}:sub/f`]);
     await checkHere(["-p", `${trees.nested}:a`]);
     await checkHere(["-p", `${trees.odd}:..`]);
@@ -557,7 +557,7 @@ describeGit("git cat-file, corrupt trees (statewalker/webrun-vcs#351)", () => {
     await checkHere(["-t", `${trees.third}:0`]);
   });
 
-  it("t1006-cat-file.sh: --batch reads a corrupt tree raw, dies resolving a path through it", async () => {
+  it("scenario from t1006: --batch reads a corrupt tree raw, dies resolving a path through it", async () => {
     await checkHere(["--batch-check"], lines(trees.short as string, trees.mode as string));
     await checkHere(["--batch"], lines(trees.short as string));
     await checkHere(["--batch-check"], lines(`${trees.nested}:a`, `${trees.nested}:sub/f`, "HEAD"));

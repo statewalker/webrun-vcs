@@ -500,7 +500,7 @@ describeGit("git replace, native twins (t6050-replace.sh)", () => {
     await step(t, ["-d", "HEAD^{tree}"]);
   });
 
-  it("t6050-replace.sh: --edit of a corrupt tree, a path through one (statewalker/webrun-vcs#351)", async () => {
+  it("scenario from t6050: --edit of a corrupt tree, a path through one (statewalker/webrun-vcs#351)", async () => {
     // cat-file -p of the tree dies in tree-walk.c (export_object's `cat-file reported
     // failure` after it); get_oid of a path through a corrupt tree dies the same way
     const t = twins(fixture);

@@ -603,7 +603,7 @@ describeGit("git ls-tree, native twins", () => {
   });
 
   describe("corrupt trees (statewalker/webrun-vcs#351)", () => {
-    it("t3103-ls-tree-misc.sh: corrupt trees die as tree-walk.c's decode_tree_entry", async () => {
+    it("scenario from t3103: corrupt trees die as tree-walk.c's decode_tree_entry", async () => {
       const dir = repository("corrupt");
       write(dir, "f", "x\n");
       shell.ok(dir, "add", "f");
