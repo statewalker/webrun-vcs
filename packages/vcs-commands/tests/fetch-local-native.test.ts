@@ -258,6 +258,102 @@ describeGit("fetch from a local repository: as native git", () => {
     });
   }
 
+  // statewalker/webrun-vcs#280: an empty remote (or one whose HEAD is unborn) is not special
+  // to git's get_fetch_map: an exact source it lacks dies, only wildcards and the configured
+  // refspecs (missing_ok) go through
+  describe("a remote with an unborn HEAD", () => {
+    /** `empty` (no refs) and `unborn` (refs, HEAD at a missing branch), each beside `src` */
+    beforeAll(() => {
+      git(root, "init", "-q", "--bare", "-b", "main", "empty");
+      git(root, "clone", "-q", "--bare", "src", "unborn");
+      git(join(root, "unborn"), "symbolic-ref", "HEAD", "refs/heads/trunk");
+    });
+
+    /** `git fetch <args>` in a new pair, `configure` run in each first: status, stderr, refs */
+    async function expectFetch(
+      args: string[],
+      configure: (dir: string) => void = () => {},
+    ): Promise<void> {
+      const [n, o] = twins();
+      configure(join(root, n));
+      configure(join(root, o));
+      const native = gitRun(root, join(root, n), ["fetch", ...args]);
+      let error: GitApiError | undefined;
+      try {
+        await (await ours(o))
+          .fetch()
+          .setRemote(args[0] as string)
+          .setRefSpecs(...args.slice(1))
+          .call();
+      } catch (e) {
+        error = e as GitApiError;
+      }
+      if (native.status === 0) {
+        expect(error, native.stderr).toBeUndefined();
+      } else {
+        expect(error?.message).toBe(native.stderr.trim());
+        expect(error?.exitCode).toBe(native.status);
+      }
+      expect(refs(o)).toBe(refs(n));
+    }
+
+    for (const remote of ["empty", "unborn"]) {
+      for (const url of [`../${remote}`, `file://${remote}`]) {
+        it(`fetch ${url} dies: couldn't find remote ref HEAD`, async () => {
+          await expectFetch([url.startsWith("file://") ? `file://${join(root, remote)}` : url]);
+        });
+        it(`fetch ${url} HEAD dies too`, async () => {
+          const u = url.startsWith("file://") ? `file://${join(root, remote)}` : url;
+          await expectFetch([u, "HEAD"]);
+        });
+      }
+    }
+
+    for (const spec of ["main", "refs/heads/main", "main:refs/heads/x"]) {
+      it(`fetch ../empty ${spec} dies: the source names no remote ref`, async () => {
+        await expectFetch(["../empty", spec]);
+      });
+    }
+
+    it("fetch ../empty with a wildcard refspec succeeds", async () => {
+      await expectFetch(["../empty", "refs/heads/*:refs/remotes/e/*"]);
+    });
+
+    it("fetch ../unborn <branch> fetches the branch", async () => {
+      await expectFetch(["../unborn", "feat:refs/heads/f"]);
+    });
+
+    for (const remote of ["empty", "unborn"]) {
+      it(`a configured remote at ${remote}: fetch succeeds, fetch <remote> HEAD dies`, async () => {
+        const configure = (dir: string) => git(dir, "remote", "add", "origin", `../${remote}`);
+        await expectFetch(["origin"], configure);
+        await expectFetch(["origin", "HEAD"], configure);
+      });
+    }
+
+    for (const single of [false, true]) {
+      it(`clone --single-branch=${single} of a repository whose HEAD is unborn`, async () => {
+        const n = `nclone${counter}`;
+        const o = `oclone${counter}`;
+        counter++;
+        const args = single ? ["--single-branch"] : ["--no-single-branch"];
+        const native = gitRun(root, root, ["clone", "-q", ...args, "unborn", n]);
+        expect(native.status, native.stderr).toBe(0);
+        mkdirSync(join(root, o));
+        git(join(root, o), "init", "-q", "-b", "main");
+        await (await ours(o)).clone().setURI(join(root, "unborn")).setSingleBranch(single).call();
+        const config = ["config", "--get-regexp", "^(remote|branch)\\."];
+        expect(git(join(root, o), ...config).replaceAll(o, "<d>")).toBe(
+          git(join(root, n), ...config).replaceAll(n, "<d>"),
+        );
+        expect(refs(o)).toBe(refs(n));
+        expect(git(join(root, o), "symbolic-ref", "HEAD")).toBe(
+          git(join(root, n), "symbolic-ref", "HEAD"),
+        );
+      });
+    }
+  });
+
   it("the source repository is left untouched", () => {
     expect(
       execFileSync("git", ["status", "--porcelain"], { cwd: join(root, "src") }).toString(),
