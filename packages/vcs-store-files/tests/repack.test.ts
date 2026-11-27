@@ -4,15 +4,18 @@ import { describe, expect, it } from "vitest";
 import { createGitFilesBackend, repack } from "../src/index.js";
 
 describe("repack", () => {
-  it("returns null when no loose objects exist", async () => {
+  it("reports nothing new when no loose objects exist", async () => {
     const files = createInMemoryFilesApi();
     const backend = await createGitFilesBackend({
       files,
       create: true,
     });
 
+    // git's "Nothing new to pack.": no pack, -d still runs (statewalker/webrun-vcs#389)
     const result = await repack(backend);
-    expect(result).toBeNull();
+    expect(result?.nothingNew).toBe(true);
+    expect(result?.packName).toBe("");
+    expect(result?.packsRemoved).toEqual([]);
   });
 
   it("packs loose objects into a pack file", async () => {
