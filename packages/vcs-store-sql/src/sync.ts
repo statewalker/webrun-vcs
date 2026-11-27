@@ -66,10 +66,7 @@ export async function importToNative(
         // Skip if already exists
         if (await nativeStores.commits.has(id)) continue;
 
-        // Load from Git store and convert to Commit object
-        const commit = await gitStores.commits.load(id);
-        if (!commit) throw new Error(`Commit not found: ${id}`);
-        await (nativeStores.commits as any).store(commit);
+        await copyCommitOrTag("Commit", id, gitStores.commits, nativeStores.commits);
         count++;
         break;
       }
@@ -106,10 +103,7 @@ export async function importToNative(
         // Skip if already exists
         if (await nativeStores.tags.has(id)) continue;
 
-        // Load from Git store and convert to AnnotatedTag object
-        const tag = await gitStores.tags.load(id);
-        if (!tag) throw new Error(`Tag not found: ${id}`);
-        await nativeStores.tags.store(tag);
+        await copyCommitOrTag("Tag", id, gitStores.tags, nativeStores.tags);
         count++;
         break;
       }
@@ -160,10 +154,7 @@ export async function exportToGit(
         // Skip if already exists in Git store
         if (await gitStores.commits.has(id)) continue;
 
-        // Load from native store and store to Git store
-        const commit = await (nativeStores.commits as any).load(id);
-        if (!commit) throw new Error(`Commit not found: ${id}`);
-        await gitStores.commits.store(commit);
+        await copyCommitOrTag("Commit", id, nativeStores.commits, gitStores.commits);
         count++;
         break;
       }
@@ -203,10 +194,7 @@ export async function exportToGit(
         // Skip if already exists in Git store
         if (await gitStores.tags.has(id)) continue;
 
-        // Load from native store and store to Git store
-        const tag = await (nativeStores.tags as any).load(id);
-        if (!tag) throw new Error(`Tag not found: ${id}`);
-        await (gitStores.tags as any).store(tag);
+        await copyCommitOrTag("Tag", id, nativeStores.tags, gitStores.tags);
         count++;
         break;
       }
@@ -214,6 +202,39 @@ export async function exportToGit(
   }
 
   return count;
+}
+
+/** The part of `Commits`/`Tags` a copy uses. */
+interface CopyableStore<T> {
+  load(id: ObjectId): Promise<T | undefined>;
+  store(value: T): Promise<ObjectId>;
+  raw?(id: ObjectId): Promise<Uint8Array | undefined>;
+  storeRaw?(content: Uint8Array): Promise<ObjectId>;
+}
+
+/**
+ * Copies a commit or tag byte for byte when the source gives its bytes and the target takes
+ * them (`raw`/`storeRaw`: extra headers and bytes that are not UTF-8 survive), else as the parsed
+ * object; refuses one that would be written under another id.
+ */
+async function copyCommitOrTag<T>(
+  kind: "Commit" | "Tag",
+  id: ObjectId,
+  from: CopyableStore<T>,
+  to: CopyableStore<T>,
+): Promise<void> {
+  const raw = to.storeRaw ? await from.raw?.(id) : undefined;
+  let stored: ObjectId;
+  if (raw && to.storeRaw) {
+    stored = await to.storeRaw(raw);
+  } else {
+    const value = await from.load(id);
+    if (!value) throw new Error(`${kind} not found: ${id}`);
+    stored = await to.store(value);
+  }
+  if (stored !== id) {
+    throw new Error(`${kind} ${id} cannot be copied as stored: it was written as ${stored}`);
+  }
 }
 
 /**

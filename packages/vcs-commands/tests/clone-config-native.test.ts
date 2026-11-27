@@ -60,8 +60,8 @@ describeGit("git clone -c, -o, --reject-shallow, --sparse, as native git", () =>
     git(src, "update-ref", "refs/grab/it", "refs/heads/main");
     git(src, "update-ref", "refs/leave/out", "refs/heads/main");
     shallow = join(root, "shallow-repo");
-    // (no tag: native git lists a shallow commit two refs reach twice in the clone's shallow
-    // file, ours once; not what these twins are about)
+    // (no tag: a shallow commit two refs reach is listed twice in the clone's shallow file,
+    // which clone-shallow-source-native.test.ts covers; not what these twins are about)
     git(root, "clone", "-q", "--depth=1", "--no-tags", "--no-local", src, shallow);
   });
   afterAll(() => rmSync(root, { recursive: true, force: true }));

@@ -501,8 +501,8 @@ export async function geometricRepack(options: RepackOptions): Promise<RepackRes
     return refs;
   };
 
-  const install = async (listed: PackObjectRef[]) =>
-    packs.install(
+  const install = async (listed: PackObjectRef[]) => {
+    const written = await packs.install(
       writePack(objects, listed, {
         packs,
         reuseObjects: options.reuseObjects ?? true,
@@ -515,6 +515,17 @@ export async function geometricRepack(options: RepackOptions): Promise<RepackRes
       }),
       { writeReverseIndex: settings.writeReverseIndex },
     );
+    // generated_pack_install: a pack named as one already there (the same objects in the same
+    // order, as a follow walk's rescue of a whole cruft pack) loses the optional files the new
+    // pack did not write, so a stale `.mtimes` no longer makes it a cruft pack
+    const base = joinPath(packDir, `pack-${written.packId}`);
+    const stale = ["mtimes", "bitmap", "promisor"];
+    if (settings.writeReverseIndex === false) stale.push("rev");
+    for (const ext of stale)
+      if ((await files.stats(`${base}.${ext}`))?.kind === "file")
+        await files.remove(`${base}.${ext}`);
+    return written;
+  };
 
   // pack_geometry_repack_promisors (2.5x): the promisor packs below their split, `^` those above,
   // into a new promisor pack with an empty `.promisor` file (no loose objects, no --keep-pack)

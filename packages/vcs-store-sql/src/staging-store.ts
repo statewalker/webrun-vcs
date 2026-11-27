@@ -386,15 +386,29 @@ export class SQLStaging implements Staging {
     treeId: ObjectId,
     prefix: string,
     stage: MergeStageValue,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const treeIter = await trees.load(treeId);
     if (!treeIter) throw new Error("Tree not found");
+    let added = false;
+    // the files of this tree: one a directory of its name replaces (add_index_entry's
+    // OK_TO_REPLACE, a crafted tree holding both; webrun-vcs#247)
+    const files = new Set<string>();
     for await (const entry of treeIter) {
       const path = prefix ? `${prefix}/${entry.name}` : entry.name;
 
       if (entry.mode === FileMode.TREE) {
-        await this.addTreeRecursive(trees, entry.id, path, stage);
+        if (await this.addTreeRecursive(trees, entry.id, path, stage)) {
+          added = true;
+          if (files.has(entry.name)) {
+            await this.db.execute("DELETE FROM staging_entry WHERE path = ? AND stage = ?", [
+              toSqlPath(path),
+              stage,
+            ]);
+          }
+        }
       } else {
+        added = true;
+        files.add(entry.name);
         await this.db.execute(
           `INSERT INTO staging_entry (path, stage, mode, object_id, size, mtime)
            VALUES (?, ?, ?, ?, 0, 0)`,
@@ -402,6 +416,7 @@ export class SQLStaging implements Staging {
         );
       }
     }
+    return added;
   }
 
   // ============ Persistence ============

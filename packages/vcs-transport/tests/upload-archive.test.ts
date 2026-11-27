@@ -38,9 +38,11 @@ describe("serveUploadArchive", () => {
       encodeFlush(),
     ]);
     let seen: string[] = [];
-    const result = await serveUploadArchive(duplex, async (args) => {
+    const result = await serveUploadArchive(duplex, async (args, sink) => {
       seen = args;
-      return { exitCode: 0, stdout: enc.encode("ARCHIVE"), stderr: "a\n" };
+      await sink.stdout(enc.encode("ARCHIVE"));
+      await sink.stderr("a\n");
+      return 0;
     });
     expect(result.success).toBe(true);
     expect(seen).toEqual(["--format=zip", "HEAD"]);
@@ -56,7 +58,7 @@ describe("serveUploadArchive", () => {
     let ran = false;
     const result = await serveUploadArchive(duplex, async () => {
       ran = true;
-      return { exitCode: 0, stdout: new Uint8Array(0), stderr: "" };
+      return 0;
     });
     expect(ran).toBe(false);
     expect(result.success).toBe(false);
@@ -78,23 +80,137 @@ describe("serveUploadArchive", () => {
     let seen: string[] = [];
     await serveUploadArchive(scripted([sent]), async (args) => {
       seen = args;
-      return { exitCode: 0, stdout: new Uint8Array(0), stderr: "" };
+      return 0;
     });
     expect(seen).toEqual(["caf\udce9"]);
   });
 
   it("dies on a line that is not an argument", async () => {
     const duplex = scripted([encodePacket("want x\n"), encodeFlush()]);
-    await serveUploadArchive(duplex, async () => ({
-      exitCode: 0,
-      stdout: new Uint8Array(0),
-      stderr: "",
-    }));
+    await serveUploadArchive(duplex, async () => 0);
     expect(text(duplex.written)).toContain("\x02fatal: 'argument' token or flush expected\n");
   });
 });
 
+describe("serveUploadArchive streams (statewalker/webrun-vcs#413)", () => {
+  const request = () => [encodePacket("argument HEAD\n"), encodeFlush()];
+
+  it("sends each chunk as it is written, stderr interleaved, 16 KiB per packet", async () => {
+    const duplex = scripted(request());
+    const big = new Uint8Array(40000).fill(0x61);
+    await serveUploadArchive(duplex, async (_args, sink) => {
+      await sink.stdout(enc.encode("A"));
+      // already on the wire before the writer goes on
+      expect(text(duplex.written)).toContain("\x01A");
+      await sink.stderr("x\n");
+      await sink.stdout(big);
+      await sink.stderr("y\n");
+      return 0;
+    });
+    const answer = text(duplex.written);
+    const sideband = (band: number, data: Uint8Array) =>
+      dec.decode(encodeSidebandPacket(band, data));
+    expect(answer).toBe(
+      "0008ACK\n0000" +
+        sideband(1, enc.encode("A")) +
+        sideband(2, enc.encode("x\n")) +
+        sideband(1, big.subarray(0, 16384)) +
+        sideband(1, big.subarray(16384, 32768)) +
+        sideband(1, big.subarray(32768)) +
+        sideband(2, enc.encode("y\n")) +
+        "0000",
+    );
+  });
+
+  it("waits for the stream: a writer never runs ahead of a slow client", async () => {
+    let release: () => void = () => {};
+    let written = 0;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const duplex: Duplex = {
+      async *[Symbol.asyncIterator]() {
+        yield* request();
+      },
+      async write(data: Uint8Array) {
+        written += data.length;
+        if (written > 1 << 16) await gate;
+      },
+    };
+    let produced = 0;
+    const serving = serveUploadArchive(duplex, async (_args, sink) => {
+      for (let i = 0; i < 1024; i++) {
+        await sink.stdout(new Uint8Array(1 << 16));
+        produced += 1 << 16;
+      }
+      return 0;
+    });
+    for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 1));
+    // blocked on the second chunk's write: nothing more produced, nothing buffered
+    expect(produced).toBeLessThanOrEqual(1 << 16);
+    release();
+    expect((await serving).success).toBe(true);
+    expect(produced).toBe(1 << 26);
+  });
+
+  it("a writer's failure after some output: stderr, then band 3", async () => {
+    const duplex = scripted(request());
+    const result = await serveUploadArchive(duplex, async (_args, sink) => {
+      await sink.stdout(enc.encode("PART"));
+      throw new Error("boom");
+    });
+    expect(result.success).toBe(false);
+    expect(text(duplex.written)).toBe(
+      `0008ACK\n0000${dec.decode(encodeSidebandPacket(1, enc.encode("PART")))}` +
+        `${dec.decode(encodeSidebandPacket(2, enc.encode("fatal: boom\n")))}` +
+        `${dec.decode(encodeSidebandPacket(3, enc.encode("git upload-archive: archiver died with error")))}`,
+    );
+  });
+
+  it("stops the writer once the client is gone", async () => {
+    let writes = 0;
+    const duplex: Duplex = {
+      async *[Symbol.asyncIterator]() {
+        yield* request();
+      },
+      write() {
+        if (++writes > 2) throw new Error("EPIPE");
+      },
+    };
+    let chunks = 0;
+    const result = await serveUploadArchive(duplex, async (_args, sink) => {
+      for (;;) {
+        await sink.stdout(enc.encode("x"));
+        chunks++;
+      }
+    });
+    expect(result.success).toBe(false);
+    expect(chunks).toBe(1);
+  });
+});
+
 describe("requestRemoteArchive", () => {
+  it("hands band 1 to the output as it arrives, collecting nothing", async () => {
+    const seen: string[] = [];
+    const duplex = scripted([
+      encodePacket("ACK\n"),
+      encodeFlush(),
+      encodeSidebandPacket(1, enc.encode("AR")),
+      encodeSidebandPacket(2, enc.encode("a\n")),
+      encodeSidebandPacket(1, enc.encode("CH")),
+      encodeFlush(),
+    ]);
+    const result = await requestRemoteArchive(duplex, ["HEAD"], {
+      output: async (chunk) => {
+        seen.push(dec.decode(chunk));
+      },
+    });
+    expect(seen).toEqual(["AR", "CH"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.archive.length).toBe(0);
+    expect(result.stderr).toBe("remote: a        \n");
+  });
+
   it("sends the format hint first, reads the archive and the remote's lines", async () => {
     const duplex = scripted([
       encodePacket("ACK\n"),

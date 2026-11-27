@@ -157,8 +157,11 @@ describe("repack -d (loose only)", () => {
     for (const id of [second.commit, second.tree, second.blob])
       expect(await b.looseStorage.has(id)).toBe(false);
     expect(await b.looseStorage.has(orphan)).toBe(true);
-    // nothing loose and reachable left: nothing to do
-    expect(await repack({ ...b, all: false })).toBeNull();
+    // nothing loose and reachable left: no pack written, none removed
+    const again = await repack({ ...b, all: false });
+    expect(again?.nothingNew).toBe(true);
+    expect(again?.packsRemoved).toEqual([]);
+    expect(await b.looseStorage.has(orphan)).toBe(true);
   });
 });
 

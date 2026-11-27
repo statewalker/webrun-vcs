@@ -22,7 +22,12 @@
 
 import type { RefTransactionHook } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils";
-import { type FilesApi, sharedRepositoryOf, withSharedPerm } from "@statewalker/vcs-utils/files";
+import {
+  type FilesApi,
+  sharedRepositoryOf,
+  withReadOnlyObjectFiles,
+  withSharedPerm,
+} from "@statewalker/vcs-utils/files";
 import {
   expandUserPath,
   type GitHostEnvironment,
@@ -989,9 +994,9 @@ export class HookSession {
   }
 
   /**
-   * The repository's FilesApi for writes in its git directories: under `core.sharedRepository`
-   * wrapped so what is created there gets git's modes (`adjust_shared_perm`), as the files
-   * backend's own FilesApi is.
+   * The repository's FilesApi for writes in its git directories, wrapped as the files
+   * backend's own FilesApi is: under `core.sharedRepository` what is created there gets git's
+   * modes (`adjust_shared_perm`), otherwise the object files git keeps read-only are 0444.
    */
   private async repositoryFiles(layout: HookLayout): Promise<FilesApi> {
     let shared = 0;
@@ -1000,8 +1005,9 @@ export class HookSession {
     } catch {
       shared = 0;
     }
-    if (!shared) return layout.files;
     const common = await commonDirOf(layout.files, layout.gitDir);
+    // unshared, git still creates loose objects and pack-family files 0444 (umask applied)
+    if (!shared) return withReadOnlyObjectFiles(layout.files, joinFilesPath(common, "objects"));
     return withSharedPerm(layout.files, () => shared, common);
   }
 

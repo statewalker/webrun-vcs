@@ -18,6 +18,7 @@
  */
 
 import {
+  chmodSync,
   closeSync,
   fchmodSync,
   constants as fsConstants,
@@ -72,6 +73,13 @@ const UNPLAIN_PATH = /(?:^|\/)\.{0,2}(?:\/|$)/;
 const O_NOFOLLOW = fsConstants.O_NOFOLLOW ?? 0;
 /** `open` flag that never blocks on a FIFO swapped in at the path. */
 const O_NONBLOCK = fsConstants.O_NONBLOCK ?? 0;
+
+/** `chmod` refuses to act through a symbolic link. */
+class ChmodThroughLinkError extends Error {
+  constructor(path: string) {
+    super(`PosixNodeFilesApi: will not chmod through a symbolic link: ${path}`);
+  }
+}
 
 /** Options of {@link PosixNodeFilesApi}. */
 export interface PosixNodeFilesApiOptions {
@@ -660,31 +668,36 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
    */
   async chmod(path: string, mode: number): Promise<void> {
     const real = await this.realNoLinks(path);
-    const before = await fs.lstat(fsPath(real));
-    if (before.isSymbolicLink()) {
-      throw new Error(`PosixNodeFilesApi: will not chmod through a symbolic link: ${path}`);
-    }
-    mode &= before.isDirectory() ? 0o2777 : 0o777;
-    let handle: fs.FileHandle;
+    // synchronous calls: short metadata calls, each round trip through libuv's thread pool
+    // costs more than the call (every loose object written gets one: git's 0444)
     try {
-      handle = await fs.open(fsPath(real), fsConstants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+      this.chmodSync(path, real, mode);
+    } catch (error) {
+      if (!(error instanceof ChmodThroughLinkError)) this.forgetOn(error);
+      throw error;
+    }
+  }
+
+  private chmodSync(path: string, real: string, mode: number): void {
+    const before = lstatSync(fsPath(real));
+    if (before.isSymbolicLink()) throw new ChmodThroughLinkError(path);
+    mode &= before.isDirectory() ? 0o2777 : 0o777;
+    let fd: number;
+    try {
+      fd = openSync(fsPath(real), fsConstants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      if (code === "ELOOP") {
-        throw new Error(`PosixNodeFilesApi: will not chmod through a symbolic link: ${path}`);
-      }
-      if (code !== "EACCES" && code !== "EPERM") this.forgetOn(error);
+      if (code === "ELOOP") throw new ChmodThroughLinkError(path);
+      if (code !== "EACCES" && code !== "EPERM") throw error;
       // no read permission (chmod needs none): lstat again just before a path chmod
-      if ((await fs.lstat(fsPath(real))).isSymbolicLink()) {
-        throw new Error(`PosixNodeFilesApi: will not chmod through a symbolic link: ${path}`);
-      }
-      await fs.chmod(fsPath(real), mode);
+      if (lstatSync(fsPath(real)).isSymbolicLink()) throw new ChmodThroughLinkError(path);
+      chmodSync(fsPath(real), mode);
       return;
     }
     try {
-      await handle.chmod(mode);
+      fchmodSync(fd, mode);
     } finally {
-      await handle.close();
+      closeSync(fd);
     }
   }
 

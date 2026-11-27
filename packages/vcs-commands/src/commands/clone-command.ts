@@ -58,7 +58,9 @@ import {
 } from "./bundle/index.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import {
+  type DefaultBranch,
   defaultInitialBranch,
+  type NewRepositoryConfig,
   UnsupportedObjectStorageError,
   unknownObjectStorageFormat,
 } from "./default-branch.js";
@@ -1233,6 +1235,9 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       repository: createRepositoryFacade({ history: historyWithoutLazyFetch(history) }),
       refStore: createTransportRefStore(history.refs),
       refspecs,
+      // clone maps what wanted_peer_refs finds: its own refspecs never die on a source the
+      // remote lacks (an unborn HEAD's branch); the configured ones are checked above
+      missingRefsOk: true,
       tags,
       depth,
       deepenSince: shallowSince,
@@ -1341,7 +1346,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
         (r) =>
           r.name.startsWith("refs/heads/") && cloned.has(r.name) && r.oid === remoteHeadRef.oid,
       );
-      const preferred = (await defaultInitialBranch(hostEnvironmentOf(this._workingCopy))).name;
+      const preferred = (await this.defaultInitialBranch()).name;
       advertisedDefaultBranch = (
         branches.find((r) => r.name === `refs/heads/${preferred}`) ??
         branches.find((r) => r.name === "refs/heads/master") ??
@@ -1349,15 +1354,18 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       )?.name;
     }
     let defaultBranch = branchToClone ?? toBranchName(advertisedDefaultBranch);
+    // the remote HEAD names a branch it does not have (ls-refs' `unborn`)
+    const unbornHead =
+      remoteHeadRef !== undefined &&
+      remoteHeadRef.oid === undefined &&
+      remoteHeadRef.symref !== undefined;
     let headCommit: ObjectId | undefined;
     let checkedOutBranch: string | undefined;
     // the commit to check out once refs and configuration are in place (git: last)
     let checkoutId: ObjectId | undefined;
     // an empty remote without unborn HEAD: git's default branch (the one init named)
     if (!detachedTag && !this.bare && defaultBranch === undefined && result.isEmpty) {
-      defaultBranch =
-        (await this.localHeadBranch()) ??
-        (await defaultInitialBranch(hostEnvironmentOf(this._workingCopy))).name;
+      defaultBranch = (await this.localHeadBranch()) ?? (await this.defaultInitialBranch()).name;
     }
 
     // git's update_remote_refs (before update_head): refs/remotes/<name>/HEAD names the tracking ref of the
@@ -1428,8 +1436,9 @@ export class CloneCommand extends TransportCommand<CloneResult> {
         headCommit = tip.objectId;
         if (!this.noCheckout) checkoutId = tip.objectId;
       }
-      // git's install_branch_config: the branch tracks its remote counterpart
-      if (tip?.objectId || result.isEmpty) checkedOutBranch = defaultBranch;
+      // git's install_branch_config: the branch tracks its remote counterpart, also when the
+      // remote's HEAD is unborn (v2's unborn_head_target), refs or not
+      if (tip?.objectId || result.isEmpty || unbornHead) checkedOutBranch = defaultBranch;
     } else if (this.bare || this.mirror) {
       // For bare/mirror repos, HEAD points to default branch
       if (defaultBranch) {
@@ -1445,7 +1454,9 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       detachedTag,
       remoteHead,
       checkedOutBranch,
-      isEmpty: result.isEmpty,
+      // a single-branch clone of an unborn HEAD maps no ref (wanted_peer_refs): git's empty
+      // clone, without a fetch refspec
+      isEmpty: result.isEmpty || (singleBranch && unbornHead && branchToClone === undefined),
       revision: this.revision !== undefined,
     });
 
@@ -1469,9 +1480,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       fetchResult,
       // as the empty-remote case above: the local HEAD's branch, else git's default
       defaultBranch:
-        defaultBranch ??
-        (await this.localHeadBranch()) ??
-        (await defaultInitialBranch(hostEnvironmentOf(this._workingCopy))).name,
+        defaultBranch ?? (await this.localHeadBranch()) ?? (await this.defaultInitialBranch()).name,
       remoteName: this.remoteName,
       bare: this.bare,
       headCommit,
@@ -1958,6 +1967,20 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     await store.save();
     // the promisor remote just recorded (partial_clone_register's reinit)
     if (this.filterSpec !== undefined) promisorOf(this._workingCopy)?.fetcher?.invalidate?.();
+  }
+
+  /**
+   * git's `repo_default_branch_name` in the new repository: its whole configuration
+   * (`includeIf "gitdir:"` matching its git directory), as the working copy's config reads it
+   * when that is the user's chain (it has the environment); else the protected configuration.
+   */
+  private defaultInitialBranch(): Promise<DefaultBranch> {
+    const config = this._workingCopy.config as Partial<NewRepositoryConfig> | undefined;
+    const environment = hostEnvironmentOf(this._workingCopy);
+    return defaultInitialBranch(
+      environment,
+      environment && config?.listWithOrigin ? (config as NewRepositoryConfig) : undefined,
+    );
   }
 
   /** The branch the local HEAD names (`init.defaultBranch` of the new repository), if any. */

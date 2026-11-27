@@ -16,22 +16,35 @@ import { PktStream } from "../fetch-client/pkt-stream.js";
 import { encodeFlush, encodePacket } from "../protocol/pkt-line-codec.js";
 import { encodeSidebandPacket } from "../protocol/sideband.js";
 
-/** What `git archive` in the served repository gave: git's `upload-archive--writer`. */
-export interface UploadArchiveOutput {
-  /** Its exit status (0 for an archive or a `--list`) */
-  exitCode: number;
-  /** Its standard output: the archive, or the `--list` lines */
-  stdout: Uint8Array;
-  /** Its standard error, as git prints it (`fatal: no such ref: x\n`) */
-  stderr: string;
+/**
+ * Where an {@link UploadArchiveWriter} writes: git's `upload-archive--writer` stdout and stderr
+ * pipes, which upload-archive reads as they fill and sends on as side-band packets.
+ */
+export interface UploadArchiveSink {
+  /**
+   * Sends a chunk of the archive (or of the `--list` lines) on side-band 1, in packets of at
+   * most 16 KiB. Resolves once the stream took it, so a writer awaiting each call holds no
+   * more than its own buffer; rejects once the client is gone (the writer should stop). The
+   * chunk is not kept after the promise settles.
+   */
+  stdout(chunk: Uint8Array): Promise<void>;
+  /**
+   * Sends text the writer prints on stderr (`-v`'s paths, its `fatal:` line) on side-band 2,
+   * interleaved with stdout in call order. Nothing is sent, and nothing thrown, once the
+   * client is gone.
+   */
+  stderr(text: string): Promise<void>;
 }
 
 /**
  * Runs `git archive` in the served repository with the arguments a client sent (git's
  * `upload-archive--writer`, `write_archive(..., remote = 1)`): only formats the server allows
- * remotely, only tree-ishes a ref names unless `uploadarchive.allowUnreachable`.
+ * remotely, only tree-ishes a ref names unless `uploadarchive.allowUnreachable`. Writes its
+ * output to `sink` as it is made and resolves with its exit status (0 for an archive or a
+ * `--list`); where git dies it writes the `fatal:` line to stderr and gives 128. A rejection
+ * is taken for a death with its message.
  */
-export type UploadArchiveWriter = (args: string[]) => Promise<UploadArchiveOutput>;
+export type UploadArchiveWriter = (args: string[], sink: UploadArchiveSink) => Promise<number>;
 
 /** git's `MAX_ARGS` of upload-archive.c. */
 const MAX_ARGS = 64;
@@ -70,65 +83,101 @@ export async function serveUploadArchive(
   await duplex.write(concat([encodePacket("ACK\n"), encodeFlush()]));
   const input = new PktStream(duplex);
   const args: string[] = [];
-  let output: UploadArchiveOutput | undefined;
+  /** The writer's death before it ran (`die()` in upload-archive--writer) */
+  let death: string | undefined;
   try {
     for (;;) {
       const packet = await input.read();
       if (!packet) {
-        output = died("the remote end hung up unexpectedly");
+        death = "the remote end hung up unexpectedly";
         break;
       }
       if (packet.type === "flush") break;
       if (args.length + 1 > MAX_ARGS) {
-        output = died(`Too many options (>${MAX_ARGS})`);
+        death = `Too many options (>${MAX_ARGS})`;
         break;
       }
       // git's bytes: a non-UTF-8 pathspec or prefix passes as decodeGitPath's escapes
       let line = packet.type === "data" ? decodeGitPath(packet.data) : "";
       if (line.endsWith("\n")) line = line.slice(0, -1);
       if (packet.type !== "data" || !line.startsWith("argument ")) {
-        output = died("'argument' token or flush expected");
+        death = "'argument' token or flush expected";
         break;
       }
       args.push(line.slice("argument ".length));
     }
   } catch {
-    output = died("protocol error: bad line length character");
+    death = "protocol error: bad line length character";
   }
-  output ??= await writer(args).catch(
-    (error: unknown): UploadArchiveOutput => died((error as Error).message ?? String(error)),
-  );
-  try {
+  let gone = false;
+  // one write at a time, in call order (a writer may print while its stdout is in flight)
+  let pending: Promise<void> = Promise.resolve();
+  const send = (packet: Uint8Array): Promise<void> => {
+    pending = pending.then(async () => {
+      if (gone) throw clientGone();
+      try {
+        await duplex.write(packet);
+      } catch {
+        gone = true;
+        throw clientGone();
+      }
+    });
+    return pending;
+  };
+  const sendBand = (band: number, data: Uint8Array): Promise<void> => {
+    if (data.length === 0) return pending;
+    if (data.length <= CHUNK) return send(encodeSidebandPacket(band, data));
+    // one write per chunk: its packets joined, never more than the chunk itself
     const packets: Uint8Array[] = [];
-    for (let at = 0; at < output.stdout.length; at += CHUNK) {
-      packets.push(encodeSidebandPacket(1, output.stdout.subarray(at, at + CHUNK)));
+    for (let at = 0; at < data.length; at += CHUNK) {
+      packets.push(encodeSidebandPacket(band, data.subarray(at, at + CHUNK)));
     }
-    const err = encoder.encode(output.stderr);
-    for (let at = 0; at < err.length; at += CHUNK) {
-      packets.push(encodeSidebandPacket(2, err.subarray(at, at + CHUNK)));
+    return send(concat(packets));
+  };
+  const sink: UploadArchiveSink = {
+    stdout: (chunk) => sendBand(1, chunk),
+    stderr: (text) => sendBand(2, encoder.encode(text)).catch(() => {}),
+  };
+
+  let exitCode: number;
+  if (death !== undefined) {
+    await sink.stderr(`fatal: ${death}\n`);
+    exitCode = 128;
+  } else {
+    try {
+      exitCode = await writer(args, sink);
+    } catch (error) {
+      if (!gone) await sink.stderr(`fatal: ${(error as Error).message ?? String(error)}\n`);
+      exitCode = 128;
     }
-    if (output.exitCode !== 0) packets.push(encodeSidebandPacket(3, encoder.encode(ARCHIVER_DIED)));
-    else packets.push(encodeFlush());
-    await duplex.write(concat(packets));
+  }
+  await pending.catch(() => {});
+  if (gone) return { success: false, args };
+  try {
+    if (exitCode !== 0) await send(encodeSidebandPacket(3, encoder.encode(ARCHIVER_DIED)));
+    else await send(encodeFlush());
   } catch {
     // the client is gone
   }
-  if (output.exitCode !== 0) {
+  if (exitCode !== 0) {
     return { success: false, args, error: `fatal: sent error to the client: ${ARCHIVER_DIED}` };
   }
   return { success: true, args };
 }
 
-/** The writer's death (`die()` in upload-archive--writer): stderr, exit 128. */
-function died(message: string): UploadArchiveOutput {
-  return { exitCode: 128, stdout: new Uint8Array(0), stderr: `fatal: ${message}\n` };
+/** The writer's stream failed: the client hung up. */
+function clientGone(): Error {
+  return new Error("the remote end hung up unexpectedly");
 }
 
 /** What `git archive --remote` gave: its stdout, stderr and exit status. */
 export interface RemoteArchiveOutput {
   /** 0, 1 when the server reported an error (band 3), 128 when the client died */
   exitCode: number;
-  /** The archive (the remote writer's stdout) */
+  /**
+   * The archive (the remote writer's stdout); empty when
+   * {@link RemoteArchiveOptions.output} took it
+   */
   archive: Uint8Array;
   /**
    * git's stderr: the server's messages as `remote: <line>        ` lines (side-band 2, the
@@ -145,6 +194,13 @@ export interface RemoteArchiveOptions {
    * first as `--format=<format>`, so an explicit `--format` overrides it
    */
   formatHint?: string;
+  /**
+   * Takes the archive as it arrives (git's stdout), one side-band packet's payload at a
+   * time, instead of collecting it into {@link RemoteArchiveOutput.archive}: the next packet
+   * is read once the returned promise settles. A rejection ends the exchange as the client's
+   * death (exit 128, its message as the `fatal:` line).
+   */
+  output?: (chunk: Uint8Array) => void | Promise<void>;
 }
 
 /**
@@ -211,8 +267,10 @@ export async function requestRemoteArchive(
       if (packet.data.length === 0) continue;
       const band = packet.data[0];
       const payload = packet.data.subarray(1);
-      if (band === 1) chunks.push(payload.slice());
-      else if (band === 2) {
+      if (band === 1) {
+        if (options.output) await options.output(payload.slice());
+        else chunks.push(payload.slice());
+      } else if (band === 2) {
         let text = decoder.decode(payload);
         for (;;) {
           const brk = text.search(/[\n\r]/);

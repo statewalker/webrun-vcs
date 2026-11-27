@@ -27,6 +27,7 @@ import {
 } from "../remote-object-info-command.js";
 import { applyMailmapToHeader } from "../rev-filter/index.js";
 import type { RevisionResolver } from "../revision-resolver.js";
+import { splitCmdline } from "../split-cmdline.js";
 import {
   type BatchFormat,
   type BatchObjectData,
@@ -794,39 +795,6 @@ const MAX_ALLOWED_OBJ_LIMIT = 10000;
 
 /** cat-file.c's MAX_REMOTE_OBJ_INFO_LINE: a URL of 8 KiB and the ids (GIT_MAX_HEXSZ + 1 each). */
 const MAX_REMOTE_OBJ_INFO_LINE = 8 * 1024 + MAX_ALLOWED_OBJ_LIMIT * (64 + 1);
-
-/**
- * alias.c's split_cmdline: words split on whitespace, quotes removed, a backslash escaping
- * the next character outside single quotes; split_cmdline_strerror's text on an error.
- */
-function splitCmdline(line: string): string[] | string {
-  // one word to begin with; every whitespace run ends one and starts the next (a trailing
-  // run leaves an empty last word, as git's)
-  const args: string[] = [];
-  let current = "";
-  let quoted = "";
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i] as string;
-    if (!quoted && /[ \t\n\r]/.test(c)) {
-      args.push(current);
-      current = "";
-      while (i + 1 < line.length && /[ \t\n\r]/.test(line[i + 1] as string)) i++;
-    } else if (!quoted && (c === "'" || c === '"')) {
-      quoted = c;
-    } else if (c === quoted) {
-      quoted = "";
-    } else {
-      if (c === "\\" && quoted !== "'") {
-        i++;
-        if (i >= line.length) return "cmdline ends with \\";
-      }
-      current += line[i];
-    }
-  }
-  if (quoted) return "unclosed quote";
-  args.push(current);
-  return args;
-}
 
 function modeLetter(mode: CatFileMode): string {
   return mode === "type" ? "t" : mode === "size" ? "s" : mode === "exists" ? "e" : "p";
