@@ -12,6 +12,7 @@ import type {
   StagingEntryOptions,
 } from "@statewalker/vcs-working-tree";
 import {
+  dropFileReplacedByDirectory,
   EntriesAsRead,
   keepMatchingEntries,
   keepMatchingMode,
@@ -302,7 +303,9 @@ export class MemoryStagingStore implements Staging {
       const path = prefix ? `${prefix}/${entry.name}` : entry.name;
 
       if (entry.mode === FileMode.TREE) {
+        const start = this._entries.length;
         await this.addTreeRecursive(trees, entry.id, path, stage);
+        dropFileReplacedByDirectory(this._entries, start, path, stage);
       } else {
         this._entries.push({
           path,
