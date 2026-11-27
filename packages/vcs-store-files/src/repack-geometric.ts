@@ -146,6 +146,8 @@ async function followWalk(
   hasOpen: boolean,
   shallow: ReadonlySet<ObjectId>,
   idLength: number,
+  /** `--exclude-promisor-objects`: never shown nor walked through (UNINTERESTING) */
+  uninteresting: (id: ObjectId) => boolean,
 ): Promise<FollowedObject[]> {
   const out: FollowedObject[] = [];
   const read = async (
@@ -177,9 +179,42 @@ async function followWalk(
   const queue: { id: ObjectId; time: number; at: number }[] = [];
   let order = 0;
   const trees: ObjectId[] = [];
+  // a max-heap on (time, then insertion order): git's prio_queue of the revision walk
+  const before = (a: (typeof queue)[number], b: (typeof queue)[number]) =>
+    a.time > b.time || (a.time === b.time && a.at < b.at);
+  const heapPush = (e: (typeof queue)[number]) => {
+    queue.push(e);
+    let i = queue.length - 1;
+    while (i > 0) {
+      const up = (i - 1) >> 1;
+      if (!before(queue[i] as typeof e, queue[up] as typeof e)) break;
+      [queue[i], queue[up]] = [queue[up] as typeof e, queue[i] as typeof e];
+      i = up;
+    }
+  };
+  const heapPop = (): (typeof queue)[number] => {
+    const top = queue[0] as (typeof queue)[number];
+    const last = queue.pop() as (typeof queue)[number];
+    if (queue.length > 0) {
+      queue[0] = last;
+      let i = 0;
+      for (;;) {
+        const l = 2 * i + 1;
+        const r = l + 1;
+        let m = i;
+        if (l < queue.length && before(queue[l] as typeof last, queue[m] as typeof last)) m = l;
+        if (r < queue.length && before(queue[r] as typeof last, queue[m] as typeof last)) m = r;
+        if (m === i) break;
+        [queue[m], queue[i]] = [queue[i] as typeof last, queue[m] as typeof last];
+        i = m;
+      }
+    }
+    return top;
+  };
   const push = async (id: ObjectId) => {
     if (seen.has(id)) return;
     seen.add(id);
+    if (uninteresting(id)) return;
     const o = await read(id);
     if (o?.type !== "commit") return;
     let info: ReturnType<typeof parseCommitHeader>;
@@ -188,19 +223,13 @@ async function followWalk(
     } catch {
       return;
     }
-    queue.push({ id, time: info.time, at: order++ });
+    heapPush({ id, time: info.time, at: order++ });
     infos.set(id, info);
   };
   const infos = new Map<ObjectId, ReturnType<typeof parseCommitHeader>>();
   for (const tip of tips) await push(tip);
   while (queue.length > 0) {
-    let best = 0;
-    for (let i = 1; i < queue.length; i++) {
-      const q = queue[i] as (typeof queue)[number];
-      const b = queue[best] as (typeof queue)[number];
-      if (q.time > b.time || (q.time === b.time && q.at < b.at)) best = i;
-    }
-    const { id } = queue.splice(best, 1)[0] as (typeof queue)[number];
+    const { id } = heapPop();
     const info = infos.get(id) as ReturnType<typeof parseCommitHeader>;
     const isClosed = closed(id);
     // process_parents: include_check stops at a closed commit when open packs are present
@@ -213,6 +242,7 @@ async function followWalk(
   const walkTree = async (id: ObjectId, path: string) => {
     if (seen.has(id)) return;
     seen.add(id);
+    if (uninteresting(id)) return;
     if (hasOpen && closed(id)) return;
     const o = await read(id);
     if (o?.type !== "tree") return;
@@ -229,6 +259,7 @@ async function followWalk(
       if (kind === 0o040000) await walkTree(e.id, child);
       else if (kind !== 0o160000 && !seen.has(e.id)) {
         seen.add(e.id);
+        if (uninteresting(e.id)) continue;
         out.push({ id: e.id, type: "blob", path: child });
       }
     }
@@ -283,8 +314,8 @@ export async function geometricRepack(options: RepackOptions): Promise<RepackRes
   const follow = !midxMustContainCruft;
   // 2.43's pack-objects refuses --exclude-promisor-objects (repo_has_promisor_remote) with
   // --stdin-packs
-  if (legacy && (await readRepositoryFormat(files, gitDir)).partialClone !== undefined)
-    throw new GeometricRepackError(GEOMETRIC_PROMISOR_REMOTE_2_43);
+  const hasPromisorRemote = (await readRepositoryFormat(files, gitDir)).partialClone !== undefined;
+  if (legacy && hasPromisorRemote) throw new GeometricRepackError(GEOMETRIC_PROMISOR_REMOTE_2_43);
 
   await packs.refresh();
   const all = await packs.packs();
@@ -337,6 +368,9 @@ export async function geometricRepack(options: RepackOptions): Promise<RepackRes
     for (const n of m.packNames) midxPacks.add(n.replace(/\.idx$/, ""));
   // follow: the packs above the split no midx names are `!` (not known closed), the rest `^`
   const openAbove = follow ? above.filter((g) => !midxPacks.has(packNameOf(g.pack))) : [];
+  const promisorIds = new Set<ObjectId>();
+  if (follow && hasPromisorRemote)
+    for (const i of info) if (i.promisor) for (const id of i.pack.ids()) promisorIds.add(id);
   const promisorRolled = promisorGeometry.slice(0, promisorSplit);
   const promisorAbove = promisorGeometry.slice(promisorSplit);
   // --honor-pack-keep (without --pack-kept-objects) and --keep-pack (always: repack passes it
@@ -423,6 +457,9 @@ export async function geometricRepack(options: RepackOptions): Promise<RepackRes
         open.length > 0,
         new Set(shallow),
         format.rawLength,
+        // --exclude-promisor-objects (a promisor remote): the promisor packs' objects are
+        // UNINTERESTING to the walk (revision.c's prepare_revision_walk)
+        (id) => promisorIds.has(id),
       );
       for (const o of reached) {
         if (seen.has(o.id)) continue;
@@ -550,10 +587,10 @@ export async function geometricRepack(options: RepackOptions): Promise<RepackRes
     for (const g of above) include.add(`${packNameOf(g.pack)}.idx`);
     // nothing written and no midx before: non-cruft packs may refer to once-cruft objects
     if (newIds.size === 0 && !existingMidx) midxMustContainCruft = true;
-    const rolledNames = new Set(rolled.map((g) => packNameOf(g.pack)));
-    const unknownPacks = [...midxPacks].some(
-      (n) => !include.has(`${n}.idx`) && !rolledNames.has(n),
-    );
+    // midx_has_unknown_packs: git compares the midx's packs by `pack_basename` (`.pack`)
+    // with the `.idx` names of the include list and of the rolled-up packs, so none ever
+    // matches: any pack an existing midx names counts as unknown (git 2.5x's behaviour)
+    const unknownPacks = midxPacks.size > 0;
     if (midxMustContainCruft || unknownPacks)
       for (const i of info) if (i.cruft && !i.keep) include.add(`${packNameOf(i.pack)}.idx`);
     const preferred = above.length

@@ -859,6 +859,18 @@ describeGit("repack twins", () => {
       expect(midxKinds(twins.ours)).toEqual(["cruft", "pack", "pack"]);
     });
 
+    it("t7704-repack-cruft 'repack --write-midx includes cruft when necessary' (an old midx without the cruft pack: git's midx_has_unknown_packs matches no name, so the cruft pack comes in)", async () => {
+      const { caseDir, r } = cruftExcludeRepo("follow-old-midx");
+      const packDir = join(r.gitDir, "objects/pack");
+      const plain = readdirSync(packDir).filter(
+        (n) => /^pack-.*\.idx$/.test(n) && !existsSync(join(packDir, n.replace(/idx$/, "mtimes"))),
+      );
+      r.git(["multi-pack-index", "write", "--stdin-packs"], { input: `${plain.join("\n")}\n` });
+      r.commit("five", { "five.t": "five\n" });
+      const { twins } = await repackTwins(caseDir, bitmapMidx, ourBitmapMidx, {}, withoutInfoPacks);
+      expect(midxKinds(twins.ours)).toEqual(["cruft", "pack", "pack"]);
+    });
+
     it("t7704-repack-cruft 'repack --write-midx includes cruft when already geometric'", async () => {
       const caseDir = newCase(root, "follow-noop");
       const r = initRepo(root, caseDir);
