@@ -601,4 +601,68 @@ describeGit("git ls-tree, native twins", () => {
       }
     });
   });
+
+  describe("corrupt trees (statewalker/webrun-vcs#351)", () => {
+    it("scenario from t3103: corrupt trees die as tree-walk.c's decode_tree_entry", async () => {
+      const dir = repository("corrupt");
+      write(dir, "f", "x\n");
+      shell.ok(dir, "add", "f");
+      shell.tick();
+      shell.ok(dir, "commit", "-q", "-m", "m");
+      const blob = shell.ok(dir, "rev-parse", "HEAD:f").trim();
+      const tree = (...parts: (string | [string, string, string])[]): string =>
+        spawnSync("git", ["hash-object", "-t", "tree", "-w", "--stdin", "--literally"], {
+          cwd: dir,
+          env: nativeGitEnv(root),
+          input: Buffer.concat(
+            parts.map((p) =>
+              typeof p === "string"
+                ? Buffer.from(p, "latin1")
+                : Buffer.concat([Buffer.from(`${p[0]} ${p[1]}\0`), Buffer.from(p[2], "hex")]),
+            ),
+          ),
+        })
+          .stdout.toString()
+          .trim();
+      const short = tree("100644 f\0abc");
+      const mode = tree(["10x644", "f", blob]);
+      const empty = tree(["100644", "", blob]);
+      const nested = tree(["100644", "a", blob], ["40000", "sub", short]);
+      const odd = tree(["100644", "..", blob], "100644 f\0abc");
+      const missing = tree(["100644", "a", blob], ["40000", "sub", "1".repeat(40)]);
+      // git shows an entry once the next one decoded: a b c(bad) shows a
+      const third = tree(["100644", "a", blob], ["100644", "b", blob], ["10x644", "c", blob]);
+      const pair = tree(["100644", "x", blob], ["100644", "y", blob]);
+      const late = tree(
+        ["100644", "a", blob],
+        ["40000", "s", pair],
+        ["100644", "t", blob],
+        ["10x644", "u", blob],
+      );
+      const deep = tree(["40000", "s", third], ["100644", "z", blob]);
+      for (const argv of [
+        [third],
+        [late],
+        ["-r", late],
+        ["-r", deep],
+        ["-r", deep, "z"],
+        [`${late}:s`],
+        [`${late}:t`],
+        [short],
+        [mode],
+        [empty],
+        ["-r", short],
+        [nested],
+        ["-r", nested],
+        ["-d", "-r", nested],
+        [nested, "sub/f"],
+        [`${nested}:sub`],
+        [odd],
+        ["-r", missing],
+        [missing],
+      ]) {
+        await check(dir, argv);
+      }
+    });
+  });
 });

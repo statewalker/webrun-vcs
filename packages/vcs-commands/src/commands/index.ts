@@ -113,6 +113,7 @@ export * from "./pack-refs-command.js";
 export { type PatchIdTextOptions, patchIdsOfPatchText } from "./patch-id.js";
 export * from "./patch-id-command.js";
 export * from "./plumbing-command.js";
+export { CorruptTreeError } from "./plumbing-shared.js";
 export * from "./pretty-format.js";
 export * from "./promisor-remote.js";
 export * from "./promisor-remote-reply.js";

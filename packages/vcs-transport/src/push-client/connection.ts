@@ -177,21 +177,24 @@ async function openHttp(
       // request to take it, and once the body is sent; a large pack is not bounded as a
       // whole, a server that stops reading or answering is
       const watched = () => idle.serverPaced(body());
-      const res = await wait(() =>
-        fetchWithRequestBody(
-          watched,
-          (init) =>
-            client.post(
-              "git-receive-pack",
-              {
-                ...headers,
-                "Content-Type": "application/x-git-receive-pack-request",
-                Accept: "application/x-git-receive-pack-result",
-              },
-              init,
-              (next) => next(),
-            ),
-          shouldStreamRequestBody(options.streamRequestBody),
+      // a 401 asks the helper and sends the pack again, produced anew (post_rpc's retry)
+      const res = await client.postAuthorized(() =>
+        wait(() =>
+          fetchWithRequestBody(
+            watched,
+            (init) =>
+              client.post(
+                "git-receive-pack",
+                {
+                  ...headers,
+                  "Content-Type": "application/x-git-receive-pack-request",
+                  Accept: "application/x-git-receive-pack-result",
+                },
+                init,
+                (next) => next(),
+              ),
+            shouldStreamRequestBody(options.streamRequestBody),
+          ),
         ),
       );
       await checkResponse(res, "Failed to receive-pack");

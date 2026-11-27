@@ -184,22 +184,24 @@ export async function openHttpConnection(
         options.gzipRequests === false
           ? { bytes: concat(body), gzip: false }
           : await gzipLargeBody(concat(body));
-      const res = await client.post(
-        "git-upload-pack",
-        {
-          "Content-Type": "application/x-git-upload-pack-request",
-          Accept: "application/x-git-upload-pack-result",
-          // the version spoken: v2 as answered, v1 as asked (git's remote-curl sends its
-          // protocol header with every request)
-          ...(greeting.version === 2
-            ? { "Git-Protocol": "version=2" }
-            : asked === 1
-              ? protocolHeader
-              : {}),
-          ...(payload.gzip ? { "Content-Encoding": "gzip" } : {}),
-        },
-        { body: payload.bytes },
-        wait,
+      const res = await client.postAuthorized(() =>
+        client.post(
+          "git-upload-pack",
+          {
+            "Content-Type": "application/x-git-upload-pack-request",
+            Accept: "application/x-git-upload-pack-result",
+            // the version spoken: v2 as answered, v1 as asked (git's remote-curl sends its
+            // protocol header with every request)
+            ...(greeting.version === 2
+              ? { "Git-Protocol": "version=2" }
+              : asked === 1
+                ? protocolHeader
+                : {}),
+            ...(payload.gzip ? { "Content-Encoding": "gzip" } : {}),
+          },
+          { body: payload.bytes },
+          wait,
+        ),
       );
       if (!res.ok) {
         await res.body?.cancel().catch(() => {});
