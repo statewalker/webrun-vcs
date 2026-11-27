@@ -4,10 +4,11 @@
  * The tests may run as root (which reads any directory), so readdir is made to fail for a
  * directory named `locked`, as it does for an unprivileged user over `chmod 000`.
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const denied = (path: unknown) =>
   Object.assign(new Error(`EACCES: permission denied, scandir '${String(path)}'`), {
@@ -42,7 +43,7 @@ describe("PosixNodeFilesApi over an unreadable directory", () => {
     writeFileSync(join(root, "d/locked/secret"), "s");
     writeFileSync(join(root, "d/free"), "f");
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const names = async (iterable: AsyncIterable<{ path: string }>) => {
     const out: string[] = [];

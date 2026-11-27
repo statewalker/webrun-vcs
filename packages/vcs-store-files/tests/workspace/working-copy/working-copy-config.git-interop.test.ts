@@ -18,6 +18,7 @@ import { type ConfigFilesApi, GitWorkingCopyConfig } from "@statewalker/vcs-stor
 import { parseGitBool } from "@statewalker/vcs-utils";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../../temp-dir-support.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -81,8 +82,8 @@ describe("GitWorkingCopyConfig <-> native git", () => {
   });
 
   afterEach(async () => {
-    await fs.rm(testDir, { recursive: true, force: true });
-  });
+    await await removeTempDir(testDir);
+  }, CLEANUP_TIMEOUT);
 
   function openConfig(): GitWorkingCopyConfig {
     return new GitWorkingCopyConfig(files, ".git/config");

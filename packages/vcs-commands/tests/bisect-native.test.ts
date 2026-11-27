@@ -37,6 +37,7 @@ import {
 } from "../src/index.js";
 import { gitOk, openOurs, put } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -47,9 +48,9 @@ beforeAll(() => {
   root = mkdtempSync(join(tmpdir(), "bisect-native-"));
 });
 
-afterAll(() => {
-  rmSync(root, { recursive: true, force: true });
-});
+afterAll(async () => {
+  await removeTempDir(root);
+}, CLEANUP_TIMEOUT);
 
 /** git 2.5x (quoted terms in the messages, no "We are not bisecting." without a start). */
 function modern(): boolean {

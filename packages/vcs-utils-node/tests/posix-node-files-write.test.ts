@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { BeyondSymlinkError } from "@statewalker/vcs-utils/files";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PosixNodeFilesApi } from "../src/files/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const enc = new TextEncoder();
 
@@ -28,7 +29,7 @@ describe("PosixNodeFilesApi writes (P4.36)", () => {
     root = mkdtempSync(join(tmpdir(), "posix-write-"));
     files = new PosixNodeFilesApi({ rootDir: root });
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("touch sets a file's mtime, keeps its content and inode", async () => {
     writeFileSync(join(root, "a"), "content");
@@ -135,10 +136,10 @@ describe("PosixNodeFilesApi batch view with maxAgeMs (review of P4.36)", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "posix-lstat-age-"));
   });
-  afterEach(() => {
+  afterEach(async () => {
     vi.restoreAllMocks();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("checks a verified directory again once it is older than maxAgeMs", async () => {
     const view = new PosixNodeFilesApi({ rootDir: root }).withLstatCache({ maxAgeMs: 1000 });

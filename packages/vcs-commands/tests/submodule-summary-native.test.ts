@@ -18,6 +18,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { DiffCommand, DiffOutputFormat, SubmoduleDiffFormat } from "../src/index.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, openRepo, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -186,7 +187,7 @@ describeGit("submodule summaries: as native git", () => {
     dir = join(root, "r");
     superproject(dir, up, ids);
   }, 120_000);
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("git diff --submodule=log, diff and short, of the worktree and the index", async () => {
     await expectDiffs(dir, "all states");
@@ -371,7 +372,7 @@ describeGit("submodules in diff-index against the worktree, as native git", () =
     git(base, ["add", "sub"]);
     git(base, ["commit", "-qm", "sub at c4"]);
   }, 120_000);
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   async function expectFormats(dir: string, rev: string, label: string, extra: string[] = []) {
     for (const [args, formats] of FORMATS) {
@@ -517,7 +518,7 @@ describeGit("committing and adding a submodule whose .git is a gitfile, as nativ
     moveTo(base, "sub", ids.c3 as string);
     putFile(base, "a.txt", "a2\n");
   }, 120_000);
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const date = "1800000000 +0000";
   const dated = { GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date };

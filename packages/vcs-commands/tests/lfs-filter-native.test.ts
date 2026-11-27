@@ -10,7 +10,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  rmSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -31,6 +30,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { formatStatusPorcelain, Git, ResetMode } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const hasGitLfs = nativeGitAvailable() && spawnSync("git", ["lfs", "version"]).status === 0;
 const describeLfs = hasGitLfs && process.platform !== "win32" ? describe : describe.skip;
@@ -97,7 +97,7 @@ describeLfs("git-lfs as a filter driver against native git-lfs", () => {
     home = join(root, "home");
     mkdirSync(home);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("stores the same pointers and objects, and checks the content out again", async () => {
     const big = new Uint8Array(70_000);

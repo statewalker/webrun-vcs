@@ -11,7 +11,7 @@
  * test per title, each going on from the state the previous ones left.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -26,6 +26,7 @@ import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitAtLeast } from "./native-git-working-copy.js";
 import { configurePush } from "./push-modes-native-support.js";
 import { testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 const versionLine = nativeGitAvailable() ? execFileSync("git", ["--version"]).toString() : "";
@@ -179,9 +180,9 @@ mkdir work; (cd work; git init -q; git config push.default matching; mkdir -p ga
     execFileSync("cp", ["-a", build, native]);
     execFileSync("cp", ["-a", build, ours]);
   });
-  afterAll(() => {
-    if (!process.env.KEEP_TWINS) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (!process.env.KEEP_TWINS) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it('t5531-deep-submodule-push.sh: "push works with recorded gitlink"', async () => {
     await push("work", ["push", "../pub.git", "main"]);

@@ -7,13 +7,14 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { gitOk, openOurs, put, snapshot } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -81,7 +82,7 @@ describeGit("git clean -e against native git (t7300-clean)", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "clean-exclude-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const cases: string[][] = [
     ["-d", "-x", "-e", "src"], // t7300-clean.sh: "git clean -d -x with ignored tracked directory"
@@ -130,7 +131,7 @@ describeGit("git clean -e with patterns git's add_pattern takes whole", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "clean-exclude-hash-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** t7300's setup plus untracked `#foo`, `#bar` and `x.o` (ignored by `*.o`). */
   function hashTwins(): { native: string; ours: string } {

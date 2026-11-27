@@ -45,6 +45,7 @@ import { formatStatusPorcelain, Git } from "../src/index.js";
 import { backends } from "./backend-factories.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 import { createSimpleHistory } from "./simple-history-store.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -160,7 +161,7 @@ describeGit("status against native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "status-native-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("a clean worktree is clean", async () => {
     const dir = join(root, "r");
@@ -439,7 +440,7 @@ describeGit("stash push against native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "stash-push-native-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** Staged, unstaged, deleted, added, untracked and ignored changes. */
   function changes(dir: string) {
@@ -774,7 +775,7 @@ describeGit("stash push twins against native git (review cases)", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "stash-twins-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("-u keeps an untracked nested repository next to stashed untracked files", async () => {
     const { ours } = await twinStash(
@@ -1132,7 +1133,7 @@ describeGit("a .git naming no repository, against native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "fake-gitdirs-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("stash -u stashes and removes the files of such directories, keeps the repository", async () => {
     const { native, ours } = await twinStash("fake-u", fakeGitDirs, { u: true });
@@ -1252,7 +1253,7 @@ describeGit("status against native git (review cases)", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "status-review-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const at = (name: string, setup: (d: string) => void) => {
     const d = join(root, name);
@@ -1359,7 +1360,7 @@ describeGit("status and stash refresh the index (review cases)", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "refresh-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("files proved clean by hashing get their stat: the next status reads none", async () => {
     const dir = join(root, "r");
@@ -1464,7 +1465,7 @@ describeGit("clean against native git (review cases)", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "clean-twins-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("-d: an untracked file next to tracked files goes, the tracked directory stays", async () => {
     const { ours } = await twinClean("tracked-dir", (d) => put(d, "d/u.txt", "u\n"), { d: true });
@@ -1543,7 +1544,7 @@ describeGit("index refresh is compare-and-set (review cases)", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "refresh-cas-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** A repository whose files' stats no longer match the index (status must hash them). */
   function staleRepo(dir: string) {
@@ -1665,7 +1666,7 @@ describeGit("submodules (review cases)", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "submodule-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("a submodule added by git (gitdir: ../.git/modules/sub) moved to another commit", async () => {
     const dir = join(root, "r");
@@ -1715,7 +1716,7 @@ describe("removing an empty directory never removes what is in it", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "rmdir-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("PosixFilesApi.rmdir and FileWorktree.removeEmptyDirectory refuse a non-empty one", async () => {
     mkdirSync(join(root, "d/e"), { recursive: true });
@@ -1744,7 +1745,7 @@ describeGit("clean, racy smudging and submodules against native git (review roun
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "round4-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("clean never enters a directory where the index has a file", async () => {
     const setup = (d: string) => {
@@ -1913,7 +1914,7 @@ describeTimes("stat time precision as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "status-times-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** Sets a file's mtime to exact seconds and nanoseconds. */
   const touchAt = (path: string, seconds: number, nanos: number) =>
@@ -2067,7 +2068,7 @@ describeGit("final review: stat as git's checkStat, smudged entries, gitdirs (ro
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "round5-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("a same-second edit survives native git rewriting our index (no lost edit)", async () => {
     for (let attempt = 0; attempt < 5; attempt++) {
@@ -2177,7 +2178,7 @@ describeGit("clean twins against native git (final review)", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "clean-final-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
   const base = (d: string) => {
     put(d, "top.txt", "t\n");
     put(d, "atop.md", "t\n");
@@ -2254,7 +2255,7 @@ describeGit("clean keeps repositories with a symlinked HEAD (native git)", () =>
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "clean-symlink-head-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** Native `git clean -d -f` in one build of the layout, ours in another; both listings. */
   async function bothClean(setup: (dir: string) => void) {

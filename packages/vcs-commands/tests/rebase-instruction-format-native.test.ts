@@ -6,7 +6,7 @@
  * compared byte for byte.
  */
 
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -17,6 +17,7 @@ import { RebaseOperation, RebaseStatus } from "../src/index.js";
 import { git, INTEROP_IDENT, openOurs } from "./merge-native-helpers.js";
 import { buildHistory, type History, text } from "./merge-native-scenarios.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -44,9 +45,9 @@ describeGit("rebase.instructionFormat, native twins", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "rebase-format-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   for (const format of [
     "%s",

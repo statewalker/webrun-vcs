@@ -11,6 +11,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { fetchOverDuplex } from "../../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 import {
   cleanupDir,
   createTransportRepo,
@@ -36,9 +37,9 @@ describeGit("Interop A · fetch ← real git upload-pack", () => {
   beforeAll(() => {
     fx = makeFixtureRepo();
   });
-  afterAll(() => {
-    cleanupDir(fx.root);
-  });
+  afterAll(async () => {
+    await removeTempDir(fx.root);
+  }, CLEANUP_TIMEOUT);
 
   it("clones every object real git has, with identical git oids", async () => {
     const client = await createTransportRepo();

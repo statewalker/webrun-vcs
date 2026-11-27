@@ -8,7 +8,7 @@
  * Each case runs native git in one copy of a pusher and its bare remote and ours (with the
  * Node hook runner) in the other.
  */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -30,6 +30,7 @@ import {
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -127,7 +128,7 @@ describeGit("push hooks: as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-push-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("pre-push, then pre-receive, update, post-receive and post-update on the remote", async () => {
     const dir = join(root, "r");
@@ -228,7 +229,7 @@ describeGit("push hooks: reference-transaction on the receive side (as native gi
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-push-reftx-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** `<dir>/src` (main, other, gone) cloned bare to `<dir>/bare.git` (refs packed), then moved on. */
   function reftxBase(dir: string): void {
@@ -520,7 +521,7 @@ describeGit("push hooks: configured hooks of the receiving repository (as native
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-push-config-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /**
    * A configured hook's command: logs its name, arguments, `GIT_DIR`, directory and stdin to
@@ -625,7 +626,7 @@ describeGit("push hooks: a broken hook configuration of the receiving repository
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-push-broken-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   async function pushTwins(dir: string, label: string) {
     const [theirs, mine] = hookTwins(root, dir);
@@ -691,7 +692,7 @@ describeGit(
     beforeEach(() => {
       root = mkdtempSync(join(tmpdir(), "hooks-push-include-"));
     });
-    afterEach(() => rmSync(root, { recursive: true, force: true }));
+    afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
     it("include.path=../inc: its configured pre-receive runs", async () => {
       const dir = join(root, "r");
@@ -726,7 +727,7 @@ describeGit("push hooks: a local push clears the pushing side's repository varia
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-push-local-env-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("GIT_ALTERNATE_OBJECT_DIRECTORIES=<x> git push ../bare.git: pre-receive gets <bare.git>/./objects only, update none", async () => {
     const dir = join(root, "r");

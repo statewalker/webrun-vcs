@@ -23,6 +23,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { Git, type LogCommand } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -160,7 +161,7 @@ describeGit("log -- <path> against native git", () => {
     git(["fast-import", "--quiet"], {}, history());
     git(["checkout", "-q", "main"]);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   async function open(): Promise<Git> {
     const files = createNodeFilesApi({ rootDir: dir });

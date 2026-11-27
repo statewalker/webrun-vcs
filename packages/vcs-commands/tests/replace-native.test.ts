@@ -7,7 +7,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -17,6 +17,7 @@ import { type Git, GitApiError, type ReplaceCommand, type ReplaceEditor } from "
 import { compatibilityOf, type Outcome, Shell } from "./describe-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -236,9 +237,9 @@ describeGit("git replace, native twins (t6050-replace.sh)", () => {
       chmodSync(path, 0o755);
     }
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it(`t6050-replace.sh: '"git replace" listing and deleting'`, async () => {
     const t = twins(fixture);

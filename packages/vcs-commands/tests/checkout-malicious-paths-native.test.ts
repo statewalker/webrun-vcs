@@ -35,6 +35,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { FastForwardMode, MergeStatus, ResetMode } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -680,7 +681,7 @@ describeGit("malicious tree paths against native git (verify_path)", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "malicious-paths-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   afterAll(() => {
     if (jgitDiffers.length > 0)
@@ -781,7 +782,7 @@ describeGit("git add of .git spellings, as core.protectNTFS/core.protectHFS say"
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "malicious-add-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const cases: Array<{ path: string; config?: Record<string, string> }> = [
     { path: "git~1/x" },

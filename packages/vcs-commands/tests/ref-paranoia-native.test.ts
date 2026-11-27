@@ -21,6 +21,7 @@ import {
   openOursGc,
 } from "./gc-native-twins-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -132,7 +133,7 @@ describeGit("GIT_REF_PARANOIA twins", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "ref-paranoia-twins-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t5312-prune-corruption.sh: "pruning does not drop bogus object"', async () => {
     const { caseDir, bogus } = bogusRefCase("prune-bogus", false);

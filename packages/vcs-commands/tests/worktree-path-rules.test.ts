@@ -5,7 +5,7 @@
  * (`capabilities.protects`) raises the rules again.
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isValidWorktreePath } from "@statewalker/vcs-core";
@@ -16,6 +16,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { worktreePathRules } from "../src/commands/worktree-path-rules.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() ? describe : describe.skip;
 const HFS_DOTGIT = "‌.git/hooks/post-checkout";
@@ -43,7 +44,7 @@ describeGit("worktreePathRules", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "path-rules-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("refuses HFS+ spellings of .git where the system is unknown", async () => {
     const rules = worktreePathRules(await workingCopyOf({}));

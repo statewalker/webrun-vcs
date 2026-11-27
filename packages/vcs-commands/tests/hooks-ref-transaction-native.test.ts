@@ -40,6 +40,7 @@ import {
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -95,7 +96,7 @@ describeGit("reference-transaction hook: as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-reftx-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("a branch and a tag created: prepared and committed (preparing in 2.5x)", async () => {
     const dir = join(root, "r");
@@ -157,7 +158,7 @@ describeGit("reference-transaction hook: after the locks, and deletions (as nati
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-reftx2-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("committed runs once the ref locks are released: no lock file, HEAD can be updated", async () => {
     const dir = join(root, "r");
@@ -226,7 +227,7 @@ describeGit("reference-transaction hook: a deletion failing on a held lock (as n
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-reftx-held-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   // git frees the failed transaction without ref_transaction_abort: the hook hears no
   // `aborted` for it, only for the packed store's transaction files_transaction_cleanup
@@ -308,7 +309,7 @@ describeGit("reference-transaction hook: installed only while the command runs",
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-reftx3-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("a ref written after the command ends runs no hook of that command", async () => {
     const dir = join(root, "r");
@@ -380,7 +381,7 @@ describeGit("reference-transaction hook: several refs deleted at once (as native
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-reftx-multi-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   type Run = (g: Git) => Promise<unknown>;
 
@@ -560,7 +561,7 @@ describeGit(
     beforeEach(() => {
       root = mkdtempSync(join(tmpdir(), "hooks-reftx-root-"));
     });
-    afterEach(() => rmSync(root, { recursive: true, force: true }));
+    afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
     /** main: base, m (a.txt "m"); side (off base): s (a.txt "s"): their picks conflict. */
     function conflicting(dir: string): void {
@@ -622,7 +623,7 @@ describeGit("branch -d and tag -d with several refusals: each reported (as nativ
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-reftx-refusals-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** main (checked out), merged and gone (in it), side (not merged), origin/x remote-tracking. */
   function repo(): string {
@@ -707,7 +708,7 @@ describeGit("reset: an ORIG_HEAD that cannot be written (as native git)", () => 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-reftx-orighead-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   function repo(): string {
     const dir = join(root, "r");
@@ -755,7 +756,7 @@ describeGit("reset: a symbolic ORIG_HEAD written through to its target (as nativ
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-reftx-orighead-sym-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** main at "second", tag t at "base". */
   function repo(): string {
@@ -812,7 +813,7 @@ describeGit("reference-transaction hook: symbolic refs written (as native git)",
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-reftx-symref-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   // git 2.5x writes a symbolic ref in a transaction of its own (refs_update_symref:
   // `<zero> ref:<target> <ref>`); git 2.43 writes it outside any, telling the hook nothing
@@ -898,7 +899,7 @@ describeGit("reference-transaction hook: ORIG_HEAD and the other root refs (as n
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-reftx-rootrefs-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** main and topic changing a.txt apart (conflicting unless `clean`), topic checked out. */
   function forked(clean = false): string {
@@ -1006,7 +1007,7 @@ describeGit("rebase: an ORIG_HEAD it cannot write reported, as native git", () =
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-reftx-rebase-orighead-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   // checkout_onto's reset_head writes ORIG_HEAD with UPDATE_REFS_MSG_ON_ERR: the error is
   // printed and the rebase goes on
@@ -1051,7 +1052,7 @@ describeGit("reference-transaction hook: pack-refs and gc (as native git)", () =
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-reftx-pack-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** A repository with loose branches and tags, some already packed, and a symbolic ref. */
   function packBase(dir: string): void {
@@ -1162,7 +1163,7 @@ describeGit("pack-refs: refs left loose, --auto (as native git)", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-reftx-pack2-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
   const it25x = nativeIs25x ? it : it.skip;
 
   /** Loose branches and tags, a symbolic ref; nothing packed yet. */
@@ -1300,7 +1301,7 @@ describeGit("reference-transaction hook: a commit refused in preparing (as nativ
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-reftx-asked-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("aborted tells HEAD as asked", async () => {
     const dir = join(root, "r");

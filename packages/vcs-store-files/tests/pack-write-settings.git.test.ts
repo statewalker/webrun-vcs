@@ -5,7 +5,7 @@
  * deflate level; native git's `verify-pack -v` reads what ours wrote under the same keys.
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
@@ -18,6 +18,7 @@ import {
   readPackWriteSettings,
   repack,
 } from "../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const GIT_ENV = {
   ...process.env,
@@ -39,9 +40,9 @@ const git = (cwd: string, args: string[]) =>
   execFileSync("git", args, { cwd, env: GIT_ENV, maxBuffer: 1 << 30 }).toString();
 
 const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 
 /** `n` commits each editing one line of three large files: long delta chains to find. */
 function repo(n: number): string {

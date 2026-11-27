@@ -8,7 +8,7 @@
  * runs on native git and on ours, comparing stdout byte for byte.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -16,6 +16,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { type DiffTextOptions, type LogOutputOptions, mergesMode } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -33,9 +34,9 @@ const versionOptions: DiffTextOptions = {
 };
 
 let root: string | undefined;
-afterAll(() => {
-  if (root) rmSync(root, { recursive: true, force: true });
-});
+afterAll(async () => {
+  if (root) await removeTempDir(root);
+}, CLEANUP_TIMEOUT);
 const tmp = () => {
   root ??= mkdtempSync(join(tmpdir(), "remerge-diff-native-"));
   return root;

@@ -42,6 +42,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { formatStatusPorcelain, Git } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -213,9 +214,9 @@ describeGit("pattern files and patches with bytes that are no UTF-8, against nat
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "non-utf8-patterns-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("latin-1 ignore rules: status --ignored agrees with git", async () => {
     const dir = buildIgnoreRepo();
@@ -499,9 +500,9 @@ describeGit("literal parts of patterns as bytes, and case folding as git folds i
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "non-utf8-literal-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /**
    * Rules whose literal parts end or start inside a UTF-8 sequence: `sub/caf\xc3*` (a path
@@ -596,9 +597,9 @@ describeGit("git directory pointers and configuration values that are no UTF-8",
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "non-utf8-gitdir-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("a submodule whose gitdir: names a latin-1 directory: status agrees with git", async () => {
     const source = join(root, `source-${counter++}`);

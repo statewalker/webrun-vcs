@@ -12,7 +12,7 @@
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -31,6 +31,7 @@ import {
 } from "../src/index.js";
 import { normalizeState, openOurs, snapshot } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -169,9 +170,9 @@ describeGit("merge messages, --log and --signoff against native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "merge-log-native-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   describe("titles (t7608-merge-messages)", () => {
     it("merge local branch", async () => {
@@ -749,9 +750,9 @@ describeGit("FmtMergeMsgCommand against git fmt-merge-msg (t6200-fmt-merge-msg)"
     remote = join(root, "remote");
     gitOk(root, ["clone", "-q", repo, remote]);
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** Native fmt-merge-msg over FETCH_HEAD and ours over the same text. */
   async function compare(

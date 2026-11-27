@@ -29,6 +29,7 @@ import {
   parseExpiryDate,
   wildmatch,
 } from "../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const DAY = 24 * 3600;
 const now = Math.floor(Date.now() / 1000);
@@ -57,9 +58,9 @@ const git = (cwd: string, args: string[], daysAgo = 0) => {
 };
 
 const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 const tmp = () => {
   const d = mkdtempSync(join(tmpdir(), "reflog-expire-"));
   dirs.push(d);

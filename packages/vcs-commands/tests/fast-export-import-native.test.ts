@@ -21,6 +21,7 @@ import {
 } from "../src/index.js";
 import { gitOk, openOurs, put } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -222,7 +223,7 @@ describeGit("git fast-export against native git", () => {
     g(repo, "merge", "-q", "-s", "ours", "main");
   });
 
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t9350-fast-export.sh: "fast-export | fast-import"', async () => {
     const { stdout } = await exportTwin(["--all"]);
@@ -506,7 +507,7 @@ describeGit("git fast-import against native git", () => {
     commitA = gitOk(root, base, "rev-parse", "HEAD").trim();
   });
 
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const C = "committer C O Mitter <committer@example.com> 1112912473 -0700";
   const A = "author A U Thor <author@example.com> 1112912473 -0700";

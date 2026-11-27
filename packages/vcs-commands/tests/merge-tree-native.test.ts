@@ -8,7 +8,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -18,6 +18,7 @@ import type { Git, MergeTreeCommand } from "../src/index.js";
 import { compatibilityOf, type Outcome, Shell } from "./describe-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -246,9 +247,9 @@ git commit -q -m first-commit
 `,
     );
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it('t4301: "Clean merge"', async () => {
     const out = await check(dir, ["--write-tree", "side1", "side3"]);
@@ -497,9 +498,9 @@ describeGit("git merge-tree -z conflict details, native twins (t4301)", () => {
     shell = new Shell(root);
     compatibility = compatibilityOf(shell);
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** A repository from `original` (on main), with branches O, A and B, A and B scripted. */
   function scenario(name: string, original: string, a: string, b: string): string {
@@ -665,9 +666,9 @@ describeGit("git merge-tree trivial merge, native twins (t4300)", () => {
     // t4300-merge-tree.sh: "setup"
     script(dir, 'test_commit "initial" "initial-file" "initial"');
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** Runs a t4300 step's setup (from `git reset --hard initial`), then the twins. */
   async function step(setup: string, ...argv: string[]): Promise<Outcome> {

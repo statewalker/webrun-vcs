@@ -7,7 +7,7 @@
  * same source and compares the repositories left (`cloneStateOf`).
  */
 
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -20,6 +20,7 @@ import {
 } from "./clone-options-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -64,7 +65,7 @@ describeGit("git clone -c, -o, --reject-shallow, --sparse, as native git", () =>
     // which clone-shallow-source-native.test.ts covers; not what these twins are about)
     git(root, "clone", "-q", "--depth=1", "--no-tags", "--no-local", src, shallow);
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it.each([
     ['"clone -c sets config in cloned repo"', ["core.foo=bar"]],

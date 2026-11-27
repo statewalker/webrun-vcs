@@ -22,13 +22,8 @@ import {
   type RefStore,
   type RepositoryFacade,
 } from "../../src/index.js";
-import {
-  cleanupDir,
-  createTransportRefStore,
-  gitAvailable,
-  loopbackEnv,
-  makeTmpDir,
-} from "./helpers.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
+import { createTransportRefStore, gitAvailable, loopbackEnv, makeTmpDir } from "./helpers.js";
 import { type LoopbackHttpServer, serveFetchHandler } from "./http-server.js";
 
 const describeGit = gitAvailable() ? describe : describe.skip;
@@ -131,8 +126,8 @@ describeGit("Interop · native git push → our receive-pack (files backend): qu
 
   afterAll(async () => {
     await server?.close();
-    cleanupDir(root);
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /**
    * A source repository (c1 ← c2 ← c3), a bare copy served through our receive-pack on the

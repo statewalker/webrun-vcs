@@ -4,13 +4,14 @@
  * sees the packed-refs.lock our packRefs holds. Needs native git.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { FilesApi } from "@statewalker/vcs-core";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import { FileRefStore } from "../../src/refs/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 
 /** A fixed identity, so git works on machines without user.name / user.email (CI). */
 const GIT_ENV = {
@@ -30,9 +31,9 @@ const gitTry = (cwd: string, args: string[]) =>
   spawnSync("git", args, { cwd, env: GIT_ENV, encoding: "utf8" });
 
 const roots: string[] = [];
-afterAll(() => {
-  for (const r of roots) rmSync(r, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const r of roots) await removeTempDir(r);
+}, CLEANUP_TIMEOUT);
 
 /** A repository with loose branches, a lightweight and an annotated tag, and one packed ref. */
 function newRepo(): string {

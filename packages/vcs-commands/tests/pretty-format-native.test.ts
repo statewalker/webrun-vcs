@@ -8,7 +8,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGitFilesBackend } from "@statewalker/vcs-store-files";
@@ -19,6 +19,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { formatCommitPretty, loadRefDecorations } from "../src/index.js";
 import { put } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -70,7 +71,7 @@ describeGit("formatCommitPretty against git log --format, native", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "pretty-format-native-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("every format, every commit: the same bytes", async () => {
     const dir = repo();
@@ -168,7 +169,7 @@ describeGit(
     beforeAll(() => {
       root = mkdtempSync(join(tmpdir(), "pretty-format-decorations-native-"));
     });
-    afterAll(() => rmSync(root, { recursive: true, force: true }));
+    afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
     it("decorates the refs git log decorates, with full names under log.decorate=full", async () => {
       const dir = join(root, "filters");
@@ -260,7 +261,7 @@ describeGit("padding, truncation and wrapping of combining and wide characters, 
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "pretty-format-width-native-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("combining marks stay attached where git keeps them; git's width tables", async () => {
     const dir = join(root, "widths");

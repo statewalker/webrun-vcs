@@ -14,7 +14,7 @@
  *   Ed25519 signatures are deterministic, so ssh tags equal native git's.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createNodeGitHostEnvironment, createNodeSigner } from "@statewalker/vcs-utils-node/files";
@@ -31,6 +31,7 @@ import {
 import { nativeIs25x } from "./hooks-native-support.js";
 import { openOurs, put } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const has = (program: string, ...args: string[]) =>
   spawnSync(program, args, { stdio: "ignore" }).error === undefined;
@@ -155,10 +156,10 @@ describeGit("signed tags against native git", () => {
       );
     }
   }, 60_000);
-  afterAll(() => {
+  afterAll(async () => {
     spawnSync("gpgconf", ["--kill", "all"], { env: env() });
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   describe("a deterministic gpg.program: the same signer output, the same tag", () => {
     it("t7004 'creating a signed tag with -m message should succeed', 'sign with a given key id', '-u implies signed tag', 'git tag --sign enable GPG sign', 'git tag configured tag.gpgsign enables GPG sign', 'git tag -s implied if configured with tag.forcesignannotated'", async () => {

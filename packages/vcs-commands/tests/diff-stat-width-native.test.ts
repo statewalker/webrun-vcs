@@ -10,12 +10,13 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { gitOk, openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 const version = spawnSync("git", ["--version"], { encoding: "utf8" }).stdout ?? "";
@@ -57,7 +58,7 @@ describeGit("git diff --stat widths against native git", () => {
     gitOk(root, dir, "add", "-A");
     gitOk(root, dir, "commit", "-q", "-m", "names");
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const native = (args: string[]) => {
     const r = spawnSync("git", args, { cwd: dir, env: nativeGitEnv(root) });

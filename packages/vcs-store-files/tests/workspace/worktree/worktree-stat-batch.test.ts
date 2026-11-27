@@ -3,7 +3,7 @@
  * over a Node FilesApi, `getEntry` per path over any other), and a walk with `skipFile`
  * passes the skipped files over without a stat, yielding the same entries otherwise.
  */
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -13,6 +13,7 @@ import { createSymlinkFilesApi } from "@statewalker/vcs-utils/files";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import type { Worktree, WorktreeEntry } from "@statewalker/vcs-working-tree";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../../temp-dir-support.js";
 
 const noStores = { blobs: {} as Blobs, trees: {} as Trees };
 
@@ -38,7 +39,7 @@ describe("FileWorktree getEntries and walk skipFile", () => {
     writeFileSync(join(root, ".gitignore"), "*.log\n");
     symlinkSync("d", join(root, "link"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   const paths = ["a.txt", "d/b.log", "d/sub/c.sh", "link", "link/b.log", "d", "missing"];
 

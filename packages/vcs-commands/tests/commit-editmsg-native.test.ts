@@ -26,6 +26,7 @@ import {
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, openRepo, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -102,7 +103,7 @@ describeGit("COMMIT_EDITMSG and the message checks: as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "commit-editmsg-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("-m: the message so far, whitespace cleaned unless verbatim, in every cleanup mode", async () => {
     const dir = join(root, "r");
@@ -236,7 +237,7 @@ describeGit(
     beforeEach(() => {
       root = mkdtempSync(join(tmpdir(), "commit-p451-"));
     });
-    afterEach(() => rmSync(root, { recursive: true, force: true }));
+    afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
     const headOf = (d: string) => gitRun(root, d, ["rev-parse", "-q", "--verify", "HEAD"]).stdout;
 
@@ -436,7 +437,7 @@ describeGit("COMMIT_EDITMSG of the commands that commit: as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "commit-editmsg-ops-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** A conflict of `side` with `main` on b.txt. */
   function conflicted(dir: string): void {
@@ -525,7 +526,7 @@ describeGit("commit -i / --include: as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "commit-include-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("stages the tracked paths named, commits the whole index", async () => {
     const dir = join(root, "r");
@@ -603,7 +604,7 @@ describeGit("diff.submodule without a value: as native git 2.5x", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "diff-submodule-nonbool-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("status, commit, log and merge die reading git_diff_ui_config (2.43 crashes)", async () => {
     const dir = join(root, "r");

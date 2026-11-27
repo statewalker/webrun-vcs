@@ -4,12 +4,13 @@
  * in a non-bare and in a bare repository. Needs native git.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import { createGitFilesBackend } from "../../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 
 /** A fixed identity, so git works on machines without user.name / user.email (CI). */
 const GIT_ENV = {
@@ -29,9 +30,9 @@ const reflogExists = (cwd: string, ref: string) =>
   spawnSync("git", ["reflog", "exists", ref], { cwd, env: GIT_ENV }).status === 0;
 
 const roots: string[] = [];
-afterAll(() => {
-  for (const r of roots) rmSync(r, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const r of roots) await removeTempDir(r);
+}, CLEANUP_TIMEOUT);
 
 /** A non-bare repository with one commit on main, and a bare clone of it. */
 function newRepos() {

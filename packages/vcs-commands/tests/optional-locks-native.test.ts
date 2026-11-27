@@ -5,12 +5,13 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, statSync, utimesSync } from "node:fs";
+import { mkdtempSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, openRepo, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() ? describe : describe.skip;
 
@@ -38,7 +39,7 @@ describeGit("GIT_OPTIONAL_LOCKS twins", () => {
   beforeAll(() => {
     home = mkdtempSync(join(tmpdir(), "optional-locks-twins-"));
   });
-  afterAll(() => rmSync(home, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(home), CLEANUP_TIMEOUT);
 
   it('t7508-status.sh: "--no-optional-locks prevents index update"', async () => {
     const native = staleIndexRepo("native");

@@ -28,7 +28,7 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CredentialRequest, Credentials } from "@statewalker/vcs-transport";
@@ -44,6 +44,7 @@ import { openOurs } from "./merge-native-helpers.js";
 import { gitAsync } from "./native-connect-support.js";
 import { nativeGitAvailable, nativeGitHttpBackend } from "./native-git-http-backend.js";
 import { gitOut, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -445,8 +446,8 @@ describeGit("http.* client configuration, as native git", () => {
   afterAll(async () => {
     await server?.close();
     backend?.close();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   beforeEach(() => {
     seen = [];
@@ -1200,7 +1201,7 @@ describeGit("http.<url>.* matching, with git config --get-urlmatch as the oracle
   beforeAll(() => {
     dir = mkdtempSync(join(tmpdir(), "http-urlmatch-"));
   });
-  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(dir), CLEANUP_TIMEOUT);
 
   const DEFAULT = "[http]\n\tmaxRetries = 1\n\tuserAgent = Test/0.1\n\n";
   const cases: Array<{ name: string; config: string; urls: string[] }> = [

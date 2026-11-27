@@ -41,6 +41,7 @@ import {
   noMaintenance,
 } from "./native-git-http-backend.js";
 import { gitOut, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 /** A native git that speaks HTTP (a git built without curl has no `git-remote-http`). */
 function nativeGitHasHttp(): boolean {
@@ -268,8 +269,8 @@ describeHttp("dumb HTTP client: as git's http-walker fetches", () => {
   });
   afterEach(async () => {
     await server.close();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it('t5550-http-fetch-dumb.sh: "clone http repository"', async () => {
     setupRepo();

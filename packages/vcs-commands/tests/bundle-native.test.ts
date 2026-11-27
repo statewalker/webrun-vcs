@@ -30,6 +30,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Git, GitApiError } from "../src/index.js";
 import { nativeIs25x } from "./hooks-native-support.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const compatibility: "2.43" | "2.56" = nativeIs25x ? "2.56" : "2.43";
 
@@ -192,9 +193,9 @@ describeGit("git bundle (t6020-bundle-misc, t5607-clone-bundle)", () => {
     sh(repo, T6020_SETUP);
     ours = await openOurs(repo);
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it('t6020-bundle-misc.sh: "create bundle from special rev: main^!"', async () => {
     await expectSameCreate(["main^!"]);

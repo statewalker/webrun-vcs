@@ -5,7 +5,7 @@
  * leave them out) against native git, for pre-commit and post-checkout. git 2.43 has no
  * configured hooks: it runs the script alone, and so do we following it.
  */
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -23,6 +23,7 @@ import {
 } from "./hooks-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -100,7 +101,7 @@ describeGit("configured hooks (hook.<name>.command): as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-config-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("pre-commit: the configured ones in order, then the script; a disabled one left out", async () => {
     const dir = base();
@@ -157,7 +158,7 @@ describeGit("configured hooks git 2.5x refuses: as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-config-bad-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   // git dies on its first hook lookup (the commit's pre-commit), before any commit; the
   // configuration goes into each twin after the add (whose hook lookup would die as well)

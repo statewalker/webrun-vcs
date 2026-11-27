@@ -18,6 +18,7 @@ import type { Git, GitApiError } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitHttpBackend } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -74,7 +75,7 @@ describeGit("remote URLs: insteadOf and pushInsteadOf, as native git", () => {
     git(src, "commit", "-qm", "two");
     git(src, "checkout", "-q", "main");
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /**
    * git 2.43 keeps an empty `remote.<name>.url` as a URL; 2.5x (and ours) read it as clearing
@@ -242,7 +243,7 @@ describeGit("protocol.allow, as native git", () => {
     git(src, "add", "a.txt");
     git(src, "commit", "-qm", "one");
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   type Case = { name: string; url: string; config?: string[][]; env?: Record<string, string> };
   const cases: Case[] = [
@@ -358,7 +359,7 @@ describeGit("review fixes: option-looking URLs, default remotes, clone sources, 
     git(root, "init", "-q", "--bare", "other.git");
     git(src, "push", "-q", "../other.git", "feat:refs/heads/only");
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   // ssh would run a command: git refuses an option-looking path (ssh and local), then host
   // (ssh, after protocol.ssh.allow), before it connects

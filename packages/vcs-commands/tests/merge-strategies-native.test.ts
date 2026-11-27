@@ -9,7 +9,7 @@
  * evened out before comparing.
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -39,6 +39,7 @@ import {
 } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitAtLeast } from "./native-git-working-copy.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -131,9 +132,9 @@ describeGit("merge strategies against native git", () => {
     root = mkdtempSync(join(tmpdir(), "merge-strategies-"));
     modern = gitAtLeast(gitOk(root, root, "--version"), 2, 44);
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   describe("-s resolve", () => {
     it('t7605-merge-resolve.sh: "merge c1 to c2"', async () => {

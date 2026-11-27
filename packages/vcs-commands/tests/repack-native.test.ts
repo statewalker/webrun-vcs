@@ -16,7 +16,6 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
-  rmSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -40,6 +39,7 @@ import {
 } from "./gc-native-twins-support.js";
 import { nativeIs25x } from "./hooks-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -225,7 +225,7 @@ describeGit("repack twins", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "repack-twins-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   describe("modes", () => {
     it("t7700-repack: incremental repack (git repack -d) packs the reachable loose objects", async () => {

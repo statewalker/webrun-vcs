@@ -19,6 +19,7 @@ import { catFileArgs, catFileTwin } from "./cat-file-native-support.js";
 import { compatibilityOf, Shell } from "./describe-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -58,7 +59,7 @@ describeGit("packed blobs above 1 GiB, native (statewalker/webrun-vcs#477)", () 
     expect(shell.ok(repo, "count-objects", "-v")).toMatch(/^in-pack: [1-9]/m);
     expect(shell.git(repo, ["cat-file", "-e", blob]).status).toBe(0);
   }, 300_000);
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t1006-cat-file.sh: "Type of $type is correct", "Size of $type is correct" of a packed blob above 1 GiB', async () => {
     for (const argv of [["-t", blob], ["-s", blob], ["-e", blob], ["--batch-check"]]) {

@@ -33,6 +33,7 @@ import {
   snapshot,
 } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 /** The git version on PATH: 2.43 or 2.5x. */
@@ -126,7 +127,7 @@ describeGit("git sparse-checkout against native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "sparse-checkout-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("set (cone): pattern file, config.worktree, skip-worktree entries and removed files", async () => {
     const { native, ours } = twins(base);
@@ -333,7 +334,7 @@ describeGit("index-writing commands in a sparse checkout against native git", ()
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "sparse-commands-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** Our checkout's warnings as git prints them (before "Switched to ..."). */
   const sparseLines = (stderr: string) =>
@@ -533,7 +534,7 @@ describeGit("sparse checkout without losing files, against native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "sparse-keep-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("expectFilesOutsideOfPatterns: checkout keeps a changed skip-worktree file", async () => {
     const { native, ours } = twins((dir) => {
@@ -697,7 +698,7 @@ describeGit("sparse checkout and ignore rules, against native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "sparse-ignore-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** A tracked root `.gitignore` of `*.tmp`, and `s/.gitignore` with `extra`. */
   const ignoring = (extra: string) => (dir: string) => {
@@ -802,7 +803,7 @@ describeGit(
     beforeAll(() => {
       root = mkdtempSync(join(tmpdir(), "sparse-stat-"));
     });
-    afterAll(() => rmSync(root, { recursive: true, force: true }));
+    afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
     const diffFiles = (dir: string) =>
       gitOk(root, dir, "--no-optional-locks", "diff-files", "--name-only");
@@ -838,7 +839,7 @@ describeGit("conflicts leaving the sparse checkout, against native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "sparse-conflict-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** s/c changed on main and other; k and s checked out, then the patterns narrowed to k. */
   const conflicting = (wasSkip: boolean) => (dir: string) => {
@@ -884,7 +885,7 @@ describeGit(
     beforeAll(() => {
       root = mkdtempSync(join(tmpdir(), "sparse-unlink-"));
     });
-    afterAll(() => rmSync(root, { recursive: true, force: true }));
+    afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
     /** k only, main and other differing in k/a, s/c's path taken by a directory. */
     const dirAtLeaving = (dir: string) => {
@@ -987,7 +988,7 @@ describeGit(
     beforeAll(() => {
       root = mkdtempSync(join(tmpdir(), "sparse-conflict-more-"));
     });
-    afterAll(() => rmSync(root, { recursive: true, force: true }));
+    afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
     /** k/a, s/c and s/d on base; `other` and main change s/c as `change` says. */
     const history =
@@ -1122,7 +1123,7 @@ describeGit("git sparse-checkout clean against native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "sparse-clean-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** A cone of k, with untracked and ignored files left in s/ and u/ (and s/t/). */
   function leftovers(dir: string) {
@@ -1216,7 +1217,7 @@ describeGit(
     beforeAll(() => {
       root = mkdtempSync(join(tmpdir(), "sparse-clean-ita-"));
     });
-    afterAll(() => rmSync(root, { recursive: true, force: true }));
+    afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
     /**
      * A cone of k with an intent-to-add s/ita (s/ and the root invalid in git's cache-tree),

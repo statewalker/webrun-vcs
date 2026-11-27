@@ -9,11 +9,12 @@
  * `RX_SEEDS` sets the number of cases (default 3000), `RX_SHOW` how many mismatches to print.
  */
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { compilePosixRegex, PosixRegexError } from "../../src/regex/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 
 const SEEDS = Number(process.env.RX_SEEDS ?? 3000);
 const SHOW = Number(process.env.RX_SHOW ?? 5);
@@ -81,9 +82,9 @@ int main(void) {
 `;
 
 let dir: string | undefined;
-afterAll(() => {
-  if (dir) rmSync(dir, { recursive: true, force: true });
-});
+afterAll(async () => {
+  if (dir) await removeTempDir(dir);
+}, CLEANUP_TIMEOUT);
 
 /** The compiled oracle, or undefined without a C compiler and glibc */
 function oracle(): string | undefined {

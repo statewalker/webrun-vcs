@@ -16,9 +16,9 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { createFetchHandler, type FetchOptions, fetch } from "../../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 import { type GitHttpBackend, gitHttpBackend } from "./git-http-backend.js";
 import {
-  cleanupDir,
   createTransportRepo,
   git,
   gitAvailable,
@@ -119,8 +119,8 @@ describeGit.each([2, 0] as const)("fetch client ← git http-backend (protocol v
   afterEach(async () => {
     backend.close();
     for (const c of clients.splice(0)) await c.close();
-    cleanupDir(root);
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("clones every object, maps the refs, follows the tags, reports the default branch", async () => {
     const tip = addCommits(remote.dir, 6, { time: 1_700_000_000 });
@@ -327,8 +327,8 @@ describeGit.each([true, false])("fetch client ← our createFetchHandler (v2: %s
   });
   afterEach(async () => {
     for (const r of repos.splice(0)) await r.close();
-    cleanupDir(root);
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** Our server, filled from the native repository with our client. */
   async function serve(): Promise<{ server: TransportRepo; connect: FetchOptions["fetchImpl"] }> {
