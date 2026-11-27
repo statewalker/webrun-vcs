@@ -28,7 +28,10 @@
 import { foldAsciiCase } from "@statewalker/vcs-utils/encoding";
 
 /** Code points HFS+ ignores when comparing names (git's `next_hfs_char`). */
-const HFS_IGNORABLE = /[‌-‏‪-‮⁪-⁯﻿]/g;
+const HFS_IGNORED = new Set([
+  0x200c, 0x200d, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x206a, 0x206b, 0x206c,
+  0x206d, 0x206e, 0x206f, 0xfeff,
+]);
 
 /** A component NTFS resolves to `.git`: `.git` or `git~1`, then only dots and spaces, or a stream. */
 const NTFS_DOTGIT = /^(?:\.git|git~1)[. ]*(?::.*)?$/i;
@@ -101,8 +104,7 @@ function isNtfsDotGeneric(name: string, dotName: string, shortPrefix: string): b
  * ```
  */
 export function isGitWorktreeFile(component: string, file: GitWorktreeFile): boolean {
-  // is_hfs_dot_generic folds ASCII only (any other code point ends the match)
-  if (foldAsciiCase(component.replace(HFS_IGNORABLE, "")) === `.${file}`) return true;
+  if (isHfsDot(component, file)) return true;
   return isNtfsDotGeneric(component, file, GIT_FILES[file]);
 }
 
@@ -132,7 +134,7 @@ export function isNtfsGitWorktreeFile(component: string, file: GitWorktreeFile):
  * ```
  */
 export function isDotGitComponent(component: string): boolean {
-  if (foldAsciiCase(component.replace(HFS_IGNORABLE, "")) === ".git") return true;
+  if (isHfsDot(component, "git")) return true;
   // git's is_ntfs_dotgit ends a name at a backslash on every platform
   return component.split("\\").some((part) => NTFS_DOTGIT.test(part));
 }
@@ -155,9 +157,32 @@ export interface WorktreePathOptions {
   protectHFS?: boolean;
 }
 
-/** git's `is_hfs_dot_generic`: whether HFS+ resolves `component` to `.<name>`. */
+/**
+ * git's `is_hfs_dot_generic`: whether HFS+ resolves `component` to `.<name>`. It reads code
+ * points as `next_hfs_char` does: the ignored ones skipped, and a byte outside valid UTF-8
+ * (`decodeGitPath`'s U+DC80..U+DCFF escapes, and U+FFFE/U+FFFF, which `pick_one_utf8_char`
+ * refuses) read as the end of the name, so `.git` followed by a truncated sequence is
+ * `.git`. Only ASCII is folded; any other code point ends the match.
+ */
 function isHfsDot(component: string, name: string): boolean {
-  return foldAsciiCase(component.replace(HFS_IGNORABLE, "")) === `.${name}`;
+  const points = component[Symbol.iterator]();
+  const next = (): number => {
+    for (;;) {
+      const step = points.next();
+      if (step.done) return 0;
+      const c = step.value.codePointAt(0) ?? 0;
+      if ((c >= 0xdc80 && c <= 0xdcff) || c === 0xfffe || c === 0xffff) return 0;
+      if (!HFS_IGNORED.has(c)) return c;
+    }
+  };
+  if (next() !== 0x2e) return false;
+  for (let i = 0; i < name.length; i++) {
+    const c = next();
+    if (c > 127) return false;
+    if (foldAsciiCase(String.fromCharCode(c)) !== name[i]) return false;
+  }
+  const c = next();
+  return c === 0 || c === 0x2f;
 }
 
 /**
