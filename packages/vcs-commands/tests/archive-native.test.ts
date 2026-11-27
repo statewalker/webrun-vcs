@@ -6,10 +6,24 @@
  * compressed streams inflated (git links the system zlib, ours pako). Run with the system
  * git (2.43) and with 2.5x first on `PATH`.
  */
-import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { once } from "node:events";
+import {
+  createWriteStream,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pipeline } from "node:stream/promises";
+import { createDeflate, deflateSync, constants as zlibConstants } from "node:zlib";
+import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
+import { type FilterDriverRegistry, installContentFilter } from "@statewalker/vcs-working-tree";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
@@ -19,9 +33,11 @@ import {
   nativeArchive,
   normalizeTgz,
   normalizeZip,
+  openArchiveRepo,
   oursArchive,
   tarCommitIdTwins,
 } from "./archive-native-support.js";
+import { shellFilterDriver } from "./host-drivers-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
@@ -52,6 +68,8 @@ async function twins(
     cwd?: string;
     env?: Record<string, string>;
     compare?: (out: Buffer) => unknown;
+    /** What only our twin is given (host drivers, a content filter installed) */
+    ours?: Pick<NonNullable<Parameters<typeof oursArchive>[3]>, "filterDrivers" | "prepare">;
   } = {},
 ): Promise<ArchiveOutcome> {
   const run = {
@@ -59,7 +77,13 @@ async function twins(
     ...(options.env ? { env: options.env } : {}),
   };
   const n = nativeArchive(home, dir, args, run);
-  const o = await oursArchive(home, dir, args, run);
+  const o = await oursArchive(home, dir, args, { ...run, ...options.ours });
+  // callStream writes the bytes call returns
+  const streamed = await oursArchive(home, dir, args, { ...run, ...options.ours, stream: true });
+  expect({ ...streamed, out: streamed.out.toString("hex") }).toEqual({
+    ...o,
+    out: o.out.toString("hex"),
+  });
   expectNotDatedNow(n);
   const view = (r: ArchiveOutcome, bytes: boolean) => ({
     status: r.status,
@@ -907,3 +931,478 @@ describeGit("git archive, JGit ArchiveCommandTest inputs (native oracle)", () =>
     await twins(repo, ["--format=tgz", "HEAD"], { compare: (out) => normalizeTgz(out) });
   });
 });
+
+/**
+ * A long-running process filter (gitprotocol-long-running-process, as t0021's
+ * rot13-filter.pl): it passes content through and logs each smudge's pathname and checkout
+ * metadata (`ref=`, `treeish=`, `blob=`) to the file it is given.
+ */
+const PROCESS_FILTER = String.raw`
+const fs = require("node:fs");
+const log = process.argv[2];
+let buf = Buffer.alloc(0);
+let waiting = null;
+process.stdin.on("data", (d) => { buf = Buffer.concat([buf, d]); if (waiting) { const w = waiting; waiting = null; w(); } });
+process.stdin.on("end", () => process.exit(0));
+const more = () => new Promise((r) => { waiting = r; });
+async function packet() {
+  while (buf.length < 4) await more();
+  const len = parseInt(buf.subarray(0, 4).toString(), 16);
+  if (len === 0) { buf = buf.subarray(4); return null; }
+  while (buf.length < len) await more();
+  const data = buf.subarray(4, len); buf = buf.subarray(len); return data;
+}
+async function list() { const out = []; for (let p; (p = await packet()) !== null; ) out.push(p); return out; }
+const pkt = (s) => { const b = Buffer.from(s); return Buffer.concat([Buffer.from((b.length + 4).toString(16).padStart(4, "0")), b]); };
+const write = (...parts) => process.stdout.write(Buffer.concat(parts));
+(async () => {
+  await list();
+  write(pkt("git-filter-server\n"), pkt("version=2\n"), Buffer.from("0000"));
+  await list();
+  write(pkt("capability=smudge\n"), Buffer.from("0000"));
+  for (;;) {
+    const header = (await list()).map((p) => p.toString().replace(/\n$/, ""));
+    const content = Buffer.concat(await list());
+    fs.appendFileSync(log, header.filter((l) => !l.startsWith("command=")).join(" ") + "\n");
+    write(pkt("status=success\n"), Buffer.from("0000"));
+    for (let at = 0; at < content.length; at += 65516) write(pkt(content.subarray(at, at + 65516)));
+    write(Buffer.from("0000"), Buffer.from("0000"));
+  }
+})();
+`;
+
+describeGit("git archive streaming, host files and settings, native (#349)", () => {
+  let root = "";
+  let repo = "";
+  let bare = "";
+  const DATE = {
+    GIT_COMMITTER_DATE: "2005-05-27 22:00 +0000",
+    GIT_AUTHOR_DATE: "2005-05-27 22:00 +0000",
+  };
+
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "archive-stream-native-"));
+    home = root;
+    repo = join(root, "repo");
+    mkdirSync(repo);
+    git(repo, ["init", "-q", "-b", "main"]);
+    put(repo, ".gitattributes", "subst export-subst\n");
+    put(repo, "big.bin", genrandom("big", 300_000));
+    put(repo, "d/big.txt", "the quick brown fox jumps over the lazy dog\n".repeat(30_000));
+    put(repo, "small", "small\n");
+    put(repo, "subst", `$Format:%H$\n${"padding line\n".repeat(20_000)}`);
+    git(repo, ["add", "."]);
+    git(repo, ["commit", "-q", "-m", "large"], DATE);
+    bare = join(root, "bare.git");
+    git(root, ["clone", "-q", "--template=", "--bare", repo, bare]);
+    put(root, "outside", "outside the repository\n");
+    put(root, "tool.sh", "#!/bin/sh\n");
+    execFileSync("chmod", ["755", join(root, "tool.sh")]);
+    mkdirSync(join(root, "adir"));
+    symlinkSync(join(root, "outside"), join(repo, "to-outside"));
+    symlinkSync("nowhere", join(repo, "dangling"));
+    symlinkSync(join(root, "adir"), join(repo, "to-dir"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  /** Runs `fn` with `key=value` in `dir`'s configuration (written into its file), then unsets it. */
+  async function withConfig(dir: string, entries: string[][], fn: () => Promise<void>) {
+    for (const [key, value] of entries)
+      git(dir, ["config", "--add", key as string, value as string]);
+    try {
+      await fn();
+    } finally {
+      for (const [key] of entries) git(dir, ["config", "--unset-all", key as string]);
+    }
+  }
+
+  it('t5000-tar-tree.sh: "git archive on large files"; t5003-archive-zip.sh: "git archive -0 --format=zip on large files", "git archive --format=zip on large files"', async () => {
+    await withConfig(repo, [["core.bigFileThreshold", "100k"]], async () => {
+      await twins(repo, ["HEAD"]);
+      await twins(repo, ["--prefix=p/", "HEAD", "d", "big.bin"]);
+      await twins(repo, ["-0", "--format=zip", "HEAD"]);
+      await twins(repo, ["--format=zip", "HEAD"], { compare: normalizeZip });
+      await twins(repo, ["-9", "--format=zip", "HEAD"], { compare: normalizeZip });
+      await twins(repo, ["--format=tgz", "HEAD"], { compare: normalizeTgz });
+      await twins(repo, ["-1", "--format=tar.gz", "HEAD"], { compare: normalizeTgz });
+    });
+    // threshold 0: every non-empty blob is streamed
+    await withConfig(repo, [["core.bigFileThreshold", "0"]], async () => {
+      await twins(repo, ["--format=zip", "HEAD"], { compare: normalizeZip });
+      await twins(repo, ["HEAD"]);
+    });
+    await withConfig(bare, [["core.bigFileThreshold", "100k"]], async () => {
+      await twins(bare, ["--format=zip", "HEAD"], { compare: normalizeZip });
+    });
+  });
+
+  it('t5000-tar-tree.sh: "invoke tar filter by format": a command streamed through as a pipe', async () => {
+    await withConfig(
+      repo,
+      [
+        ["core.bigFileThreshold", "100k"],
+        ["tar.gzn.command", "gzip -cn"],
+      ],
+      async () => {
+        // the same tar through the same gzip: byte for byte
+        await twins(repo, ["--format=gzn", "HEAD"]);
+        await twins(repo, ["-3", "--format=gzn", "HEAD"]);
+      },
+    );
+    await withConfig(repo, [["tar.bad.command", "cat >/dev/null; exit 1"]], async () => {
+      await twins(repo, ["--format=bad", "HEAD"]);
+    });
+  });
+
+  it("callStream writes the archive in chunks, a streamed blob never whole", async () => {
+    await withConfig(repo, [["core.bigFileThreshold", "100k"]], async () => {
+      const ours = await openArchiveRepo(home, repo);
+      const sizes: number[] = [];
+      for await (const chunk of ours.archive().setTree("HEAD").callStream())
+        sizes.push(chunk.length);
+      expect(sizes.length).toBeGreaterThan(10);
+      expect(Math.max(...sizes)).toBeLessThanOrEqual(256 * 1024);
+      // a consumer stopping early ends the run
+      const early = (await openArchiveRepo(home, repo)).archive().setFormat("zip").setTree("HEAD");
+      for await (const _ of early.callStream()) break;
+    });
+  });
+
+  it('t5000-tar-tree.sh: "git archive --add-file": absolute paths, files outside the repository, symbolic links followed, git\'s deaths', async () => {
+    const mtime = "--mtime=2002-02-02T02:02:02-0200";
+    await twins(repo, [`--add-file=${join(root, "outside")}`, "HEAD"]);
+    await twins(repo, [`--add-file=${join(root, "tool.sh")}`, "--format=zip", "-0", "HEAD"]);
+    await twins(repo, ["--add-file=../outside", "--prefix=x/", "--add-file=to-outside", "HEAD"]);
+    await twins(repo, ["--add-file=../outside", "HEAD"], { cwd: "d" });
+    await twins(repo, ["--add-file=dangling", "HEAD"]);
+    await twins(repo, ["--add-file=nope", "HEAD"], { cwd: "d" });
+    await twins(repo, ["--add-file=to-dir", "HEAD"]);
+    await twins(repo, [`--add-file=${join(root, "adir")}`, "HEAD"]);
+    await twins(repo, [`--add-file=${join(root, "missing")}`, mtime, "HEAD"]);
+    // a bare repository's paths are its git directory's
+    await twins(bare, ["--add-file=../outside", "HEAD"]);
+  });
+
+  it("valueless tar.<format>.command and tar.umask die (missing value), as a bad tar.umask", async () => {
+    const config = join(repo, ".git", "config");
+    const saved = readFileSync(config);
+    try {
+      writeFileSync(config, Buffer.concat([saved, Buffer.from('[tar "x"]\n\tcommand\n')]));
+      await twins(repo, ["HEAD"]);
+      await twins(repo, ["--list"]);
+      writeFileSync(config, Buffer.concat([saved, Buffer.from("[tar]\n\tumask\n")]));
+      await twins(repo, ["--format=zip", "HEAD"]);
+      writeFileSync(config, Buffer.concat([saved, Buffer.from("[tar]\n\tumask = 0x\n")]));
+      await twins(repo, ["HEAD"]);
+    } finally {
+      writeFileSync(config, saved);
+    }
+  });
+
+  it("core.bigFileThreshold is git's unsigned long: 4g, 0, and the values git refuses", async () => {
+    for (const value of ["4g", "lots", "-1", "99999999999g"]) {
+      await withConfig(repo, [["core.bigFileThreshold", value]], async () => {
+        await twins(repo, ["HEAD"]);
+        await twins(repo, ["--format=zip", "HEAD"], { compare: normalizeZip });
+        // 2.43 reads it when it starts (before `--list`), 2.5x at the first file it writes
+        await twins(repo, ["--list"]);
+        await twins(repo, ["--add-file=nope", "HEAD"]);
+      });
+    }
+  });
+
+  it("--worktree-attributes in a bare repository: 2.43 reads HEAD's attributes, 2.5x none", async () => {
+    const attrs = join(root, "attrs");
+    mkdirSync(attrs);
+    git(attrs, ["init", "-q", "-b", "main"]);
+    put(attrs, ".gitattributes", "ignored export-ignore\n");
+    put(attrs, "ignored", "x\n");
+    put(attrs, "kept", "y\n");
+    git(attrs, ["add", "."]);
+    git(attrs, ["commit", "-q", "-m", "attrs"], DATE);
+    const attrsBare = join(root, "attrs.git");
+    git(root, ["clone", "-q", "--template=", "--bare", attrs, attrsBare]);
+    await twins(attrsBare, ["--worktree-attributes", "HEAD"]);
+    await twins(attrsBare, ["HEAD"]);
+  });
+
+  /** A repository whose `bad.txt` is no UTF-8, and a `filter=x` file. */
+  function conversionRepo(name: string): string {
+    const dir = join(root, name);
+    mkdirSync(dir);
+    git(dir, ["init", "-q", "-b", "main"]);
+    put(dir, "bad.txt", Buffer.from([0x61, 0xc3, 0x28, 0x0a]));
+    put(dir, "f", "filtered\n");
+    git(dir, ["add", "."]);
+    put(dir, ".gitattributes", "bad.txt working-tree-encoding=UTF-16\nf filter=x\n");
+    git(dir, ["add", ".gitattributes"]);
+    git(dir, ["commit", "-q", "-m", "conversions"], DATE);
+    return dir;
+  }
+
+  it("an encoding git cannot write warns, with a worktree or not", async () => {
+    const dir = conversionRepo("encode");
+    await twins(dir, ["HEAD"]);
+    const dirBare = join(root, "encode.git");
+    git(root, ["clone", "-q", "--template=", "--bare", dir, dirBare]);
+    await twins(dirBare, ["HEAD"]);
+  });
+
+  it("a filter driver that is not required and fails: git's lines, the content unfiltered", async () => {
+    const dir = conversionRepo("failing");
+    const env = archiveEnv(home);
+    const drivers = { x: shellFilterDriver(dir, env) };
+    await withConfig(dir, [["filter.x.smudge", "false"]], async () => {
+      await twins(dir, ["HEAD"], {
+        ours: {
+          prepare: (ours) => {
+            const wc = ours.workingCopy;
+            installContentFilter(
+              {
+                history: wc.history,
+                checkout: wc.checkout,
+                worktree: wc.worktree,
+                config: wc.config,
+              },
+              { filterDrivers: drivers, environment: createNodeGitHostEnvironment({ env }) },
+            );
+          },
+        },
+      });
+    });
+    const dirBare = join(root, "failing.git");
+    git(root, ["clone", "-q", "--template=", "--bare", dir, dirBare]);
+    await withConfig(dirBare, [["filter.x.smudge", "exit 3"]], async () => {
+      await twins(dirBare, ["HEAD"], {
+        ours: { filterDrivers: { x: shellFilterDriver(dirBare, env) } },
+      });
+    });
+  });
+
+  it("a process filter is given the checkout metadata (ref, treeish, blob)", async () => {
+    const dir = conversionRepo("process");
+    const script = join(root, "process-filter.cjs");
+    writeFileSync(script, PROCESS_FILTER);
+    const nativeLog = join(root, "native.log");
+    const oursLog: string[] = [];
+    const logged: FilterDriverRegistry = {
+      x: {
+        smudge: async (content, context) => {
+          const m = context.metadata ?? {};
+          const fields = [
+            `pathname=${context.path}`,
+            ...(m.ref ? [`ref=${m.ref}`] : []),
+            ...(m.treeish ? [`treeish=${m.treeish}`] : []),
+            ...(m.blob ? [`blob=${m.blob}`] : []),
+          ];
+          oursLog.push(fields.join(" "));
+          return content;
+        },
+      },
+    };
+    const env = archiveEnv(home);
+    const ours = {
+      prepare: (repoOurs: Awaited<ReturnType<typeof openArchiveRepo>>) => {
+        const wc = repoOurs.workingCopy;
+        installContentFilter(
+          { history: wc.history, checkout: wc.checkout, worktree: wc.worktree, config: wc.config },
+          { filterDrivers: logged, environment: createNodeGitHostEnvironment({ env }) },
+        );
+      },
+    };
+    await withConfig(dir, [["filter.x.process", `node ${script} ${nativeLog}`]], async () => {
+      const commit = git(dir, ["rev-parse", "HEAD"]).trim();
+      const tree = git(dir, ["rev-parse", "HEAD^{tree}"]).trim();
+      for (const treeish of ["HEAD", "main", commit, tree]) {
+        rmSync(nativeLog, { force: true });
+        oursLog.length = 0;
+        const args = treeish === tree ? ["--mtime=2002-02-02T02:02:02-0200", tree] : [treeish];
+        // the content filter runs in both of our twins (call and callStream)
+        await twins(dir, args, { ours });
+        const native = readFileSync(nativeLog, "latin1").trim().split("\n");
+        expect(oursLog).toEqual([...native, ...native]);
+      }
+    });
+  });
+});
+
+/** The first `n` bytes native `git archive <args>` writes in `dir` (then it is killed, as by SIGPIPE). */
+async function nativeHead(dir: string, args: string[], n: number): Promise<Buffer> {
+  const child = spawn("git", ["archive", ...args], { cwd: dir, env: archiveEnv(home) });
+  const chunks: Buffer[] = [];
+  let got = 0;
+  for await (const chunk of child.stdout) {
+    chunks.push(chunk as Buffer);
+    got += (chunk as Buffer).length;
+    if (got >= n) break;
+  }
+  child.kill();
+  return Buffer.concat(chunks).subarray(0, n);
+}
+
+/** The first `n` bytes of our `callStream` for `git archive <args>` in `dir`. */
+async function oursHead(dir: string, args: string[], n: number): Promise<Buffer> {
+  const ours = await openArchiveRepo(home, dir);
+  const cmd = ours.archive().setLocalTimezone(() => 0);
+  for (const a of args) {
+    if (a.startsWith("--format=")) cmd.setFormat(a.slice(9));
+    else if (a.startsWith("--mtime=")) cmd.setMtime(a.slice(8));
+    else if (/^-\d$/.test(a)) cmd.setCompressionLevel(Number(a.slice(1)));
+    else cmd.setTree(a);
+  }
+  const chunks: Buffer[] = [];
+  let got = 0;
+  for await (const chunk of cmd.callStream()) {
+    chunks.push(Buffer.from(chunk));
+    got += chunk.length;
+    if (got >= n) break;
+  }
+  return Buffer.concat(chunks).subarray(0, n);
+}
+
+/** The SHA-1 of what native git and our `callStream` write, read as they write it. */
+async function streamedDigests(
+  dir: string,
+  args: string[],
+): Promise<{ native: string; ours: string }> {
+  const child = spawn("git", ["archive", ...args], { cwd: dir, env: archiveEnv(home) });
+  const nativeHash = createHash("sha1");
+  for await (const chunk of child.stdout) nativeHash.update(chunk as Buffer);
+  const ours = await openArchiveRepo(home, dir);
+  const cmd = ours
+    .archive()
+    .setLocalTimezone(() => 0)
+    .setCompressionLevel(0)
+    .setFormat("zip");
+  cmd.setTree(args[args.length - 1] as string);
+  const oursHash = createHash("sha1");
+  for await (const chunk of cmd.callStream()) oursHash.update(chunk);
+  return { native: nativeHash.digest("hex"), ours: oursHash.digest("hex") };
+}
+
+/** git's EXPENSIVE prerequisite (`GIT_TEST_LONG`): tests that write gigabytes. */
+const itExpensive = process.env.GIT_TEST_LONG ? it : it.skip;
+
+/** Writes `size` zero bytes as a loose blob of `dir`, streamed; its id. */
+async function writeZeroBlob(dir: string, size: number): Promise<string> {
+  const header = Buffer.from(`blob ${size}\0`);
+  const zeros = Buffer.alloc(1 << 20);
+  const hash = createHash("sha1").update(header);
+  for (let left = size; left > 0; left -= zeros.length) {
+    hash.update(left >= zeros.length ? zeros : zeros.subarray(0, left));
+  }
+  const id = hash.digest("hex");
+  const path = join(dir, ".git/objects", id.slice(0, 2), id.slice(2));
+  mkdirSync(join(path, ".."), { recursive: true });
+  const deflate = createDeflate({ level: 1 });
+  const done = pipeline(deflate, createWriteStream(path));
+  if (!deflate.write(header)) await once(deflate, "drain");
+  for (let left = size; left > 0; left -= zeros.length) {
+    if (!deflate.write(left >= zeros.length ? zeros : zeros.subarray(0, left))) {
+      await once(deflate, "drain");
+    }
+  }
+  deflate.end();
+  await done;
+  return id;
+}
+
+describeGit(
+  "git archive of huge blobs, native (t5000-tar-tree, t5004-archive-corner-cases)",
+  () => {
+    let root = "";
+
+    beforeAll(() => {
+      root = mkdtempSync(join(tmpdir(), "archive-huge-native-"));
+      home = root;
+    });
+    afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+    it('t5000-tar-tree.sh: "set up repository with huge blob", "generate tar with huge size"', async () => {
+      const repo = join(root, "huge");
+      mkdirSync(repo);
+      git(repo, ["init", "-q", "-b", "main"]);
+      // a 64 GiB blob's loose object, cut short after 2 KiB (git's t5000/huge-object)
+      const obj = "19f9c8273ec45a8938e6999cb59b3ff66739902a";
+      mkdirSync(join(repo, ".git/objects", obj.slice(0, 2)), { recursive: true });
+      writeFileSync(
+        join(repo, ".git/objects", obj.slice(0, 2), obj.slice(2)),
+        readFileSync(join(import.meta.dirname, "fixtures/t5000-huge-object")),
+      );
+      git(repo, ["update-index", "--add", "--cacheinfo", `100644,${obj},huge`]);
+      git(repo, ["commit", "-q", "-m", "huge"], { GIT_COMMITTER_DATE: "2005-05-27 22:00 +0000" });
+      // the pax `size` record (68719476737 overflows the ustar field) and the first data
+      const n = await nativeHead(repo, ["HEAD"], 4096);
+      const o = await oursHead(repo, ["HEAD"], 4096);
+      expect(n.length).toBe(4096);
+      expect(n.toString("latin1")).toContain("size=68719476737\n");
+      expect(o.toString("hex")).toBe(n.toString("hex"));
+    });
+
+    describe("a file bigger than 4 GiB", () => {
+      const SIZE = 4100 * 1024 * 1024;
+      let repo = "";
+      let tree = "";
+
+      beforeAll(() => {
+        repo = join(root, "big");
+        mkdirSync(repo);
+        git(repo, ["init", "-q", "-b", "main"]);
+        // as t5000's huge-object: a loose object declaring a 4100 MiB blob (t5004's big
+        // file), cut short after its first MiB; nothing checks its id or bytes while it
+        // streams (incompressible bytes, so that the stream is read in several chunks)
+        const obj = "754a93d6fada4c6873360e6cb4b209132271ab0e";
+        const head = Buffer.concat([Buffer.from(`blob ${SIZE}\0`), genrandom("big", 1 << 20)]);
+        const deflated = deflateSync(head, { finishFlush: zlibConstants.Z_SYNC_FLUSH });
+        mkdirSync(join(repo, ".git/objects", obj.slice(0, 2)), { recursive: true });
+        writeFileSync(join(repo, ".git/objects", obj.slice(0, 2), obj.slice(2)), deflated);
+        tree = execFileSync("git", ["mktree"], {
+          cwd: repo,
+          env: archiveEnv(home),
+          input: `100644 blob ${obj}\tbig-file\n`,
+          encoding: "latin1",
+        }).trim();
+      });
+
+      it('t5004-archive-corner-cases.sh: "zip archive with files bigger than 4GB": the zip64 local header', async () => {
+        const mtime = "--mtime=2002-02-02T02:02:02-0200";
+        for (const level of ["-0", "-6"]) {
+          // the local header: 30 bytes, the name, the mtime and zip64 extra fields
+          const header = 30 + "big-file".length + 9 + 20;
+          const n = await nativeHead(repo, [mtime, "--format=zip", level, tree], header);
+          const o = await oursHead(repo, [mtime, "--format=zip", level, tree], header);
+          expect(n.readUInt16LE(4)).toBe(45);
+          expect(n.readUInt32LE(22)).toBe(0xffffffff);
+          expect(n.readBigUInt64LE(30 + 8 + 9 + 4)).toBe(BigInt(SIZE));
+          expect(o.toString("hex")).toBe(n.toString("hex"));
+        }
+      });
+
+      itExpensive(
+        't5004-archive-corner-cases.sh: "zip archive with files bigger than 4GB": the whole -0 archive',
+        async () => {
+          const dir = join(root, "big-whole");
+          mkdirSync(dir);
+          git(dir, ["init", "-q", "-b", "main"]);
+          // written loose: git's hash-object -w packs it, and our pack reader refuses
+          // packed objects above 1 GiB
+          const blob = await writeZeroBlob(dir, SIZE);
+          const whole = execFileSync("git", ["mktree"], {
+            cwd: dir,
+            env: archiveEnv(home),
+            input: `100644 blob ${blob}\tbig-file\n`,
+            encoding: "latin1",
+          }).trim();
+          const commit = execFileSync("git", ["commit-tree", "-m", "big", whole], {
+            cwd: dir,
+            env: archiveEnv(home, { GIT_COMMITTER_DATE: "2005-05-27 22:00 +0000" }),
+            encoding: "latin1",
+          }).trim();
+          const { native, ours } = await streamedDigests(dir, ["--format=zip", "-0", commit]);
+          expect(ours).toBe(native);
+        },
+        1_200_000,
+      );
+    });
+  },
+);

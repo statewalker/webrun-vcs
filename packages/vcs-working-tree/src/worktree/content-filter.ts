@@ -5,6 +5,7 @@
  * and filter drivers. A working copy installs one built from its attributes and
  * configuration (`createGitContentFilter`); without one, content passes as it is.
  */
+import type { CheckoutMetadata } from "../convert/filter-driver.js";
 
 /** How a clean conversion is run. */
 export interface ContentConversionOptions {
@@ -25,6 +26,8 @@ export interface ContentConversionOptions {
   keepCrlf?: boolean;
   /** Receives warnings (git prints them as `warning: ...`) */
   onWarning?: (message: string) => void;
+  /** git's checkout metadata, handed to the filter driver of a smudge (`git archive`) */
+  metadata?: CheckoutMetadata;
 }
 
 /** The conversion of one path in one direction. */
