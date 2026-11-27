@@ -325,6 +325,12 @@ export async function applyRefUpdates(
      * ref. Default: one batch per ref (git 2.43).
      */
     batchNonAtomic?: boolean;
+    /**
+     * With nothing to write, still commit an empty transaction its reference-transaction
+     * hook hears (git 2.5x's do_fetch always, 2.43's with `--atomic`); not when an atomic
+     * fetch refused an update (git aborts its transaction then)
+     */
+    emptyTransaction?: boolean;
   } = {},
 ): Promise<string | undefined> {
   // git's fetch --atomic: a ref refused before the transaction (non-fast-forward, a tag it
@@ -333,7 +339,15 @@ export async function applyRefUpdates(
   if (options.atomic && updates.some((u) => u.status === "rejected")) return undefined;
   const writes = updates.filter((u) => u.status !== "rejected" && u.status !== "up-to-date");
   const deletes = options.atomic ? (options.deletes ?? []) : [];
-  if (writes.length === 0 && deletes.length === 0 && !options.initialEvenEmpty) return undefined;
+  if (writes.length === 0 && deletes.length === 0 && !options.initialEvenEmpty) {
+    if (options.emptyTransaction) {
+      await refStore.batch?.([], {
+        emptyTransaction: true,
+        ...(options.ident !== undefined ? { ident: options.ident } : {}),
+      });
+    }
+    return undefined;
+  }
   // git's update_local_ref: "<action>: <what>" per ref, else the one message given
   const logOf = (u: FetchRefUpdate) => ({
     message:
