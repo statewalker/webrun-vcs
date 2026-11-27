@@ -2,7 +2,10 @@
  * git's revision syntax against native `git rev-parse --verify`: one repository built by
  * native git, every revision resolved by both (the id on stdout, or the exact `fatal:`
  * line; `warning:` lines compared too). Reflog entries are dated relative to now, so
- * `@{<date>}` lookups land between them for both.
+ * `@{<date>}` lookups land between them for both: each lookup is at least half an hour from
+ * every entry and reads only relative forms (`4.hours.ago`, `yesterday` before all of them),
+ * so the two clocks, read moments apart, give one answer. The approxidate twin below, whose
+ * forms change with every second, pins one instant for both (`GIT_TEST_DATE_NOW`).
  */
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -546,35 +549,73 @@ describeGit("approxidate against native git, one timezone for both", () => {
     // does so only without a day, as ours: older git is not compared on such forms
     const version = /(\d+)\.(\d+)/.exec(execFileSync("git", ["--version"], { encoding: "utf8" }));
     const newGit = !!version && (Number(version[1]) > 2 || Number(version[2]) >= 50);
-    for (const zone of ["America/Los_Angeles", "Europe/Berlin", "UTC"]) {
+    // both read one pinned instant (git's GIT_TEST_DATE_NOW): forms keeping the time of day
+    // ("1 month ago") move with every second, so two clocks never agree reliably; the
+    // instants sit on the edges where approxidate's answers change: a summer-time change
+    // (and a date a day or a month after it, landing in the hour the change skipped or
+    // repeated), local midnight, noon and an hour boundary, each a second before and on it
+    const instants: Record<string, string[]> = {
+      "America/Los_Angeles": [
+        "2026-03-08T01:59:59-08:00",
+        "2026-03-09T02:30:00-07:00",
+        "2026-04-08T02:30:00-07:00",
+        "2026-11-01T01:59:59-07:00",
+        "2026-11-01T01:59:59-08:00",
+        "2026-11-02T01:30:00-08:00",
+        "2026-07-15T23:59:59-07:00",
+        "2026-07-15T11:59:59-07:00",
+        "2026-07-15T12:59:59-07:00",
+      ],
+      "Europe/Berlin": [
+        "2026-03-29T01:59:59+01:00",
+        "2026-03-30T02:30:00+02:00",
+        "2026-04-29T02:30:00+02:00",
+        "2026-10-25T02:59:59+02:00",
+        "2026-10-25T02:59:59+01:00",
+        "2026-10-26T02:30:00+01:00",
+        "2026-07-15T23:59:59+02:00",
+        "2026-07-15T11:59:59+02:00",
+      ],
+      UTC: [
+        "2026-07-15T23:59:59Z",
+        "2026-07-15T11:59:59Z",
+        "2026-07-15T12:59:59Z",
+        "2026-12-31T23:59:59Z",
+        "2026-02-28T23:59:59Z",
+      ],
+    };
+    for (const [zone, edges] of Object.entries(instants)) {
       process.env.TZ = zone;
-      for (const text of [
-        "1 month ago",
-        "june",
-        "january",
-        "10/11/2026",
-        "6/1/2026",
-        "2026-03-01",
-        "march 10 noon",
-        "3.months.ago",
-        "1.year.ago",
-        "yesterday",
-        "last friday",
-      ]) {
-        if (!newGit && text === "march 10 noon") continue;
-        const before = Math.floor(Date.now() / 1000);
-        const native = execFileSync("git", ["rev-parse", `--since=${text}`], {
-          env: { ...nativeGitEnv(root || tmpdir()), TZ: zone },
-          encoding: "utf8",
-        }).trim();
-        const after = Math.floor(Date.now() / 1000);
-        const ours = new Set(
-          [before, after].map((now) => `--max-age=${approxidateCareful(text, now).timestamp}`),
-        );
-        expect([zone, text, ours.has(native)]).toEqual([zone, text, true]);
+      for (const edge of edges) {
+        const before = Date.parse(edge) / 1000;
+        for (const now of [before, before + 1]) {
+          for (const text of [
+            "1 month ago",
+            "june",
+            "january",
+            "10/11/2026",
+            "6/1/2026",
+            "2026-03-01",
+            "march 10 noon",
+            "3.months.ago",
+            "1.year.ago",
+            "yesterday",
+            "last friday",
+            "noon",
+            "midnight",
+          ]) {
+            if (!newGit && text.includes("noon")) continue;
+            const native = execFileSync("git", ["rev-parse", `--since=${text}`], {
+              env: { ...nativeGitEnv(root || tmpdir()), TZ: zone, GIT_TEST_DATE_NOW: String(now) },
+              encoding: "utf8",
+            }).trim();
+            const ours = `--max-age=${approxidateCareful(text, now).timestamp}`;
+            expect([zone, now, text, ours]).toEqual([zone, now, text, native]);
+          }
+        }
       }
     }
-  });
+  }, 120_000);
 });
 
 // ---------------------------------------------------------------- abbreviated ids (P4.25)
