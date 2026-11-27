@@ -485,8 +485,8 @@ export async function fetchFromConnection(
   const refspecs = withTagSpec(resolver ? resolver.resolve(remoteRefs) : (given as string[]));
   const autoTags = writesRefs(refspecs);
   // git: a refspec naming a ref the remote does not have is an error (not for configured
-  // refspecs, `missingRefsOk`, nor against an empty remote, where nothing can match)
-  if (!options.missingRefsOk && !isEmpty) {
+  // refspecs, `missingRefsOk`)
+  if (!options.missingRefsOk) {
     const missing = missingSources(remoteRefs, refspecs);
     if (missing.length > 0) throw new TransportError(`couldn't find remote ref ${missing[0]}`);
   }
