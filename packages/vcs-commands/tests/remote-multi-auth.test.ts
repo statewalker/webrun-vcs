@@ -7,7 +7,7 @@
  * host, a smart-HTTP `testhttp://` connector whose server redirects one host to another.
  */
 
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -28,6 +28,7 @@ import { Git } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -145,7 +146,7 @@ describeGit("credentials of commands reaching several remotes", () => {
     git(src, "add", "a.txt");
     git(src, "commit", "-qm", "one");
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
   beforeEach(() => {
     seen = [];
   });
@@ -294,7 +295,7 @@ describeGit("credentials of git pull (statewalker-root#334)", () => {
     git(src, "add", "a.txt");
     git(src, "commit", "-qm", "one");
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
   beforeEach(() => {
     seen = [];
   });

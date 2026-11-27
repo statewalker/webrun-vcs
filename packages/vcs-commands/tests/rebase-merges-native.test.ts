@@ -9,7 +9,7 @@
  * stop and at the end.
  */
 
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -31,6 +31,7 @@ import {
   snapshot,
 } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -256,9 +257,9 @@ describeGit("rebase --rebase-merges, native twins", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "rebase-merges-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   for (const [label, steps, mode, config] of [
     ["a simple merge", simple, true, {}],

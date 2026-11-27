@@ -33,6 +33,7 @@ import { openOurs } from "./merge-native-helpers.js";
 import { daemonOpener, openTcpSocket, startTcpServer } from "./native-connect-support.js";
 import { nativeGitHttpBackend } from "./native-git-http-backend.js";
 import { testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 /** One run of `git cat-file --batch-command`: its exit status, stdout and fatal line. */
 interface Run {
@@ -449,8 +450,8 @@ export function defineRemoteObjectInfoTwins(bin: string | undefined): void {
       await ourHttp?.close();
       await nativeHttp?.close();
       closeBackend?.();
-      if (root && existsSync(root)) rmSync(root, { recursive: true, force: true });
-    });
+      if (root && existsSync(root)) await removeTempDir(root);
+    }, CLEANUP_TIMEOUT);
 
     /** Our cat-file over the same input. */
     async function runOurs(scenario: Scenario, server: Server, input: string): Promise<Run> {

@@ -18,13 +18,8 @@ import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { serveOverDuplex, type UploadPackRequestPolicy } from "../../src/index.js";
-import {
-  cleanupDir,
-  createTransportRepo,
-  gitAvailable,
-  makeTmpDir,
-  type TransportRepo,
-} from "./helpers.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
+import { createTransportRepo, gitAvailable, makeTmpDir, type TransportRepo } from "./helpers.js";
 import { type DuplexServer, listenDuplexes } from "./socket-server.js";
 
 const HAS_GIT = gitAvailable();
@@ -206,8 +201,8 @@ describeGit("Interop · real git client ← our upload-pack", { timeout: TEST_TI
   afterAll(async () => {
     await server.close();
     await repo.close();
-    cleanupDir(root);
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("protocol v2: --depth 1 clone, then --deepen 1, then --unshallow", async () => {
     const dst = join(root, "v2.git");

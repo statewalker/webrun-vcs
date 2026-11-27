@@ -12,7 +12,6 @@ import {
   mkdtempSync,
   readFileSync,
   realpathSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -27,6 +26,7 @@ import { Git } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitEnv } from "./native-git-http-backend.js";
 import { git3Binary, nativeGit3Env } from "./native-git3.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const git3 = git3Binary();
 const version = execFileSync("git", ["--version"], { encoding: "utf8" });
@@ -37,7 +37,7 @@ let root = "";
 beforeAll(() => {
   root = realpathSync(mkdtempSync(join(tmpdir(), "git3-defaults-")));
 });
-afterAll(() => rmSync(root, { recursive: true, force: true }));
+afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
 let n = 0;
 const fresh = (name: string) => join(root, `${name}-${n++}`);

@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import { createGitFilesBackend, gc, repack } from "../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const GIT_ENV = {
   ...process.env,
@@ -27,9 +28,9 @@ const git = (cwd: string, args: string[]) =>
   execFileSync("git", args, { cwd, env: GIT_ENV, maxBuffer: 1 << 30 }).toString();
 
 const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 
 /** A repository with `n` commits on main editing a few files (deltas to find), a tag and a branch. */
 function repo(n: number): string {

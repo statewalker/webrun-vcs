@@ -27,6 +27,7 @@ import {
   snapshot,
 } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -194,9 +195,9 @@ describeGit("rebase --onto, --keep-base, --fork-point", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "rebase-onto-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   describe("t3431-rebase-fork-point", () => {
     // A---B---D---E    (main)
@@ -804,9 +805,9 @@ describeGit("merge-base", () => {
     s.git("checkout", "-q", "derived");
     s.git("-c", "core.logallrefupdates=false", "branch", "no-reflog", "base");
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it('t6010-merge-base.sh: "merge-base G H"', async () => {
     await twin(["G", "H"], (m) => m.addCommit("G").addCommit("H"));

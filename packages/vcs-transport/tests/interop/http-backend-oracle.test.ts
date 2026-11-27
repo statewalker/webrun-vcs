@@ -15,8 +15,8 @@ import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { createFetchHandler } from "../../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 import {
-  cleanupDir,
   commitInRepo,
   createTransportRepo,
   gitAvailable,
@@ -273,8 +273,8 @@ describeGit("Interop · our smart-HTTP v2 server against git http-backend", () =
     await infoServer?.close();
     await strictServer?.close();
     await repo?.close();
-    if (root) cleanupDir(root);
-  });
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   const V2 = { "git-protocol": "version=2" };
   const POST = { "content-type": "application/x-git-upload-pack-request", ...V2 };

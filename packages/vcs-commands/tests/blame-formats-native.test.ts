@@ -40,6 +40,7 @@ import {
   open,
 } from "./blame-native-support.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 // the local zone of both (a zone with daylight saving time, for the `-local` modes)
 process.env.TZ = "Europe/Berlin";
@@ -49,9 +50,9 @@ const describeGit = nativeGitAvailable() && process.platform !== "win32" ? descr
 const NOW = 1700000000;
 
 let root: string | undefined;
-afterAll(() => {
-  if (root) rmSync(root, { recursive: true, force: true });
-});
+afterAll(async () => {
+  if (root) await removeTempDir(root);
+}, CLEANUP_TIMEOUT);
 const tmp = () => {
   root ??= mkdtempSync(join(tmpdir(), "blame-formats-native-"));
   return root;

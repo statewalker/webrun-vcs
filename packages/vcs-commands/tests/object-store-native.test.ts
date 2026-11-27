@@ -42,6 +42,7 @@ import {
   openOursGc,
 } from "./gc-native-twins-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -171,7 +172,7 @@ describeGit("object-store commands twins", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "object-store-twins-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   describe("prune", () => {
     it('t5304-prune.sh: "prune stale packs"', async () => {

@@ -37,6 +37,7 @@ import {
   snapshot,
 } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -82,7 +83,7 @@ describeGit("index flags through index rewrites, as git's unpack-trees keeps the
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "index-flags-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("reset --hard keeps the flags of unchanged entries and skip-worktree of changed ones", async () => {
     const { native, ours } = twins();
@@ -197,7 +198,7 @@ describeGit(
     beforeAll(() => {
       root = mkdtempSync(join(tmpdir(), "stash-index-patch-"));
     });
-    afterAll(() => rmSync(root, { recursive: true, force: true }));
+    afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
     /** a staged edit of a's last line stashed on main; side changes a's second line (its context) */
     function buildPatch(dir: string): string {
@@ -245,7 +246,7 @@ describeGit("--continue of a single pick stopped by -n, as git's continue_single
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "single-pick-continue-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** a: 1 (c0), 2 (c1), 3 (c2); then `<op> -n <c1 or side>` conflicts and a is resolved, staged */
   function buildPick(dir: string, op: "revert" | "cherry-pick"): void {
@@ -329,7 +330,7 @@ describeGit("a switch over an assume-unchanged file, as git's verify_uptodate ch
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "assume-unchanged-switch-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** f: one (c1, branch b), two (c2, main); b checked out, f assume-unchanged */
   function buildSwitch(dir: string): void {
@@ -400,7 +401,7 @@ describeGit(
     beforeAll(() => {
       root = mkdtempSync(join(tmpdir(), "cache-tree-edits-"));
     });
-    afterAll(() => rmSync(root, { recursive: true, force: true }));
+    afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
     /** Native git reading `input` on stdin. */
     const gitIn = (dir: string, input: string, ...args: string[]) =>
@@ -554,7 +555,7 @@ describeGit("intent-to-add, rm, a stale index and rebase over flagged entries, a
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "index-flags-more-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** a, d/x, d/y committed on main */
   function buildPlain(dir: string): void {
@@ -709,7 +710,7 @@ describeGit("add -N, commit --only, kept stat data and a stale instance, as git"
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "index-flags-follow-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   let k = 0;
   /** a, d/x, d/y committed on main; with `side`, a branch changing d/x and main changing a */

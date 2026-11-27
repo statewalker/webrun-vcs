@@ -4,12 +4,13 @@
  * with each entry's kind from `readdir` (no stat), never following a link; and paths that
  * are not plain (`.`, `..`, `//`) still resolve inside the root.
  */
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { PosixNodeFilesApi } from "../src/files/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 describe("PosixNodeFilesApi lstatMany and listKinds", () => {
   let base: string;
@@ -28,7 +29,7 @@ describe("PosixNodeFilesApi lstatMany and listKinds", () => {
     symlinkSync("nowhere", join(root, "d/dangling"));
     files = new PosixNodeFilesApi({ rootDir: root });
   });
-  afterEach(() => rmSync(base, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(base), CLEANUP_TIMEOUT);
 
   it("lstatMany answers as lstat does, in order", async () => {
     const paths = ["/a.txt", "/d/b.txt", "/d/sub/c.sh", "/link", "/d/dangling", "/d", "/missing"];

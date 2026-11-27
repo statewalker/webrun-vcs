@@ -14,7 +14,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -33,6 +32,7 @@ import {
 } from "./hooks-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -126,7 +126,7 @@ describeGit("cherry-pick -e and revert -e: git commit -n -e (as native git)", ()
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-pick-edit-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("cherry-pick -e: the editor in git commit's template, its hooks, the pick's author", async () => {
     const dir = join(root, "r");
@@ -287,7 +287,7 @@ describeGit("cherry-pick -e and revert -e through a conflict (as native git)", (
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-pick-edit-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("cherry-pick -e: options.edit saved, --continue commits the conflict with git commit's editor", async () => {
     const dir = join(root, "r");
@@ -359,7 +359,7 @@ describeGit("a clean pick whose commit fails: HEAD's lock held (as native git)",
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-pick-locked-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   async function compare(
     args: string[],

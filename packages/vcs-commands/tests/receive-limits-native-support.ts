@@ -13,7 +13,6 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -33,6 +32,7 @@ import { gitAsync, startTcpServer } from "./native-connect-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { nativeGit3Env } from "./native-git3.js";
 import { gitOut, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 export const describeGit =
   nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
@@ -226,8 +226,8 @@ export function receiveTwins() {
 
   afterAll(async () => {
     await daemon?.close();
-    rmSync(root, { recursive: true, force: true });
-  });
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /**
    * Three targets with `config` under a new directory: `n` (native git pushes to a path), `d`

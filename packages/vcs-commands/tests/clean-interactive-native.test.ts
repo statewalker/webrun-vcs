@@ -22,6 +22,7 @@ import {
 } from "./interactive-extras-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitAtLeast } from "./native-git-working-copy.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -101,7 +102,7 @@ describeGit("clean -i as native git", () => {
     root = mkdtempSync(join(tmpdir(), "clean-interactive-native-"));
     compat = gitAtLeast(gitOk(root, root, ["--version"]), 2, 50) ? "2.56" : "2.43";
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t7301-clean-interactive.sh: "git clean -i (c: clean hotkey)"', async () => {
     await compare(["-i"], ["c"]);

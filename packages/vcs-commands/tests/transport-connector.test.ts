@@ -27,6 +27,7 @@ import { Git, type GitApiError } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -126,7 +127,7 @@ describeGit("remote commands over registered connectors", () => {
     git(src, "commit", "-qm", "two");
     git(src, "checkout", "-q", "main");
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
   beforeEach(() => {
     calls = [];
   });

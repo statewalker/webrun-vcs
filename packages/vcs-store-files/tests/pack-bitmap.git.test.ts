@@ -19,7 +19,6 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -42,6 +41,7 @@ import {
   NO_CLOSURE_BITMAP_WARNING,
   repack,
 } from "../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const GIT_ENV: Record<string, string> = {
   ...(process.env as Record<string, string>),
@@ -75,9 +75,9 @@ const [major = 0, minor = 0] = (/(\d+)\.(\d+)/.exec(version) ?? []).slice(1).map
 const compatibility: "2.43" | "2.56" = major > 2 || minor >= 55 ? "2.56" : "2.43";
 
 const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 function tmp(prefix: string): string {
   const d = mkdtempSync(join(tmpdir(), prefix));
   dirs.push(d);

@@ -8,7 +8,7 @@
  * git in one copy of a repository with logging hooks and ours (with the Node hook runner) in
  * the other, and compares the hook logs and output.
  */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInMemoryFilesApi } from "@statewalker/vcs-core";
@@ -35,6 +35,7 @@ import {
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -104,7 +105,7 @@ describeGit("post-checkout and the merge hooks: as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-checkout-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("checkout and switch: the old and new HEAD and 1; paths and restore: HEAD HEAD 0", async () => {
     const dir = join(root, "r");
@@ -320,7 +321,7 @@ describeGit("clone through a symbolic link: post-checkout's GIT_DIR (as native g
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-clone-link-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("GIT_DIR is the real path of the new repository's git directory", async () => {
     const real = join(root, "real");
@@ -378,7 +379,7 @@ describeGit(
     beforeEach(() => {
       root = mkdtempSync(join(tmpdir(), "hooks-lock-path-"));
     });
-    afterEach(() => rmSync(root, { recursive: true, force: true }));
+    afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
     it("a repository reached through a symbolic link: the logical $PWD path, not the real one", async () => {
       const real = join(root, "real");

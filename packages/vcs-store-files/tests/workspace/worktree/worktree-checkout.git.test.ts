@@ -4,12 +4,13 @@
  * `git hash-object`.
  */
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import { createFileWorktree, createGitFilesBackend } from "../../../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../../temp-dir-support.js";
 
 const GIT_ENV = {
   ...process.env,
@@ -28,9 +29,9 @@ const git = (cwd: string, args: string[]) =>
     .trim();
 
 const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const d of dirs) await removeTempDir(d);
+}, CLEANUP_TIMEOUT);
 
 /** Files of several shapes: text, CRLF text, binary, nested, empty, and multi-chunk. */
 function fixture(): Record<string, Uint8Array> {

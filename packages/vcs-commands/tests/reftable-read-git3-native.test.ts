@@ -9,7 +9,7 @@
  * Scenarios come from git's `t/t0610-reftable-basics.sh` (named in each test), ported by hand.
  */
 import { spawnSync } from "node:child_process";
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isSymbolicRef, type Refs } from "@statewalker/vcs-core";
@@ -23,6 +23,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { openOurs } from "./merge-native-helpers.js";
 import { git3Binary, nativeGit3Env } from "./native-git3.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const git3 = git3Binary();
 
@@ -33,7 +34,7 @@ describe.skipIf(!git3)("reading reftable repositories (git 3.0 oracle)", () => {
     root = mkdtempSync(join(tmpdir(), "reftable-read-"));
     repo = join(root, "repo");
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** Native git 3.0 in `cwd`; its stdout. `env` adds variables (dates, compaction). */
   function g(cwd: string, args: string[], env: Record<string, string> = {}): string {

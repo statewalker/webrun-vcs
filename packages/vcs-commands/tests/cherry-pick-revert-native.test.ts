@@ -25,6 +25,7 @@ import {
 } from "./merge-native-helpers.js";
 import { buildHistory, type History, text } from "./merge-native-scenarios.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -78,9 +79,9 @@ describeGit("cherry-pick and revert write the worktree as native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "pick-worktree-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("a clean cherry-pick writes the files and commits with the commit's author", async () => {
     const { native, ours } = twins({
@@ -218,9 +219,9 @@ describeGit("state files after a pick or merge that ends early, as native git", 
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "pick-state-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   it("a pick that commits drops the CHERRY_PICK_HEAD and MERGE_MSG of a stopped empty one", async () => {
     const { native, ours } = twins({
@@ -274,9 +275,9 @@ describeGit("a refused merge's restore over a directory at a tracked file, as na
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "restore-dir-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** A directory (holding m) where f was, after `prepare`; side changes f. */
   const setups: [string, (dir: string) => void][] = [

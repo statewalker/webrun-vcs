@@ -18,6 +18,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createGitFilesBackend } from "../../../src/create-git-files-backend.js";
 import { createWorkingCopyConfig } from "../../../src/workspace/working-copy/index.js";
 import { createFileWorktree } from "../../../src/workspace/worktree/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../../temp-dir-support.js";
 
 let tmp: string;
 /** The files API's root and the repository's worktree: `<tmp>/srv/root` (`.git` in it) */
@@ -104,7 +105,7 @@ const environment = () =>
 
 describe("config includes: git's rule, confined to the files API, or none", () => {
   beforeEach(layout);
-  afterEach(() => rmSync(tmp, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(tmp), CLEANUP_TIMEOUT);
 
   async function configWith(includes: boolean | "files" | undefined) {
     const files = createNodeFilesApi({ rootDir: root });
@@ -210,7 +211,7 @@ describe("config includes: git's rule, confined to the files API, or none", () =
 
 describe("FileWorktree.openRepository: configIncludes", () => {
   beforeEach(layout);
-  afterEach(() => rmSync(tmp, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(tmp), CLEANUP_TIMEOUT);
 
   async function open(configIncludes?: boolean | "files") {
     const files = createNodeFilesApi({ rootDir: root });
@@ -261,7 +262,7 @@ describe('config includes "files": confined to the repository, size-capped', () 
   beforeEach(() => {
     base = mkdtempSync(join(tmpdir(), "config-tenants-"));
   });
-  afterEach(() => rmSync(base, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(base), CLEANUP_TIMEOUT);
 
   /** A bare repository `<base>/<name>.git` whose config has `lines` after its core section. */
   function bare(name: string, lines: string[]): string {
@@ -372,7 +373,7 @@ describe("FileWorktree.openRepository of a linked worktree's git directory", () 
   beforeEach(() => {
     base = mkdtempSync(join(tmpdir(), "config-linked-"));
   });
-  afterEach(() => rmSync(base, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(base), CLEANUP_TIMEOUT);
 
   it("reads its config.worktree, its HEAD for onbranch: and its directory for gitdir:", async () => {
     const env = {

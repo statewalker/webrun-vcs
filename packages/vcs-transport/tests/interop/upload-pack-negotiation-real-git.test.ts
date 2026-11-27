@@ -18,8 +18,8 @@ import { ObjectType } from "@statewalker/vcs-core";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { createFetchHandler, fetch, fetchOverDuplex, serveOverDuplex } from "../../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 import {
-  cleanupDir,
   createTransportRepo,
   gitAvailable,
   loopbackEnv,
@@ -239,8 +239,8 @@ describeGit("Interop · upload-pack v0 negotiation as git's", { timeout: TIMEOUT
   afterAll(async () => {
     await relay?.close();
     await server?.close();
-    if (root) cleanupDir(root);
-  });
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   /** The same stateless v0 request to git and to ours. */
   async function both(

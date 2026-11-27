@@ -5,7 +5,7 @@
  * whole output of each format is compared byte for byte.
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -13,13 +13,14 @@ import { afterAll, describe, expect, it } from "vitest";
 import type { StatusCommand } from "../src/index.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitRun, openRepo, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
 let root: string | undefined;
-afterAll(() => {
-  if (root) rmSync(root, { recursive: true, force: true });
-});
+afterAll(async () => {
+  if (root) await removeTempDir(root);
+}, CLEANUP_TIMEOUT);
 const home = () => {
   root ??= mkdtempSync(join(tmpdir(), "status-rename-"));
   return root;

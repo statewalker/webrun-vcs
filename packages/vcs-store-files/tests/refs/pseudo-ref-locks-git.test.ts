@@ -5,7 +5,7 @@
  * native git reads.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
@@ -20,6 +20,7 @@ import {
   GitMergeStateStore,
   GitRevertStateStore,
 } from "../../src/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 
 /** A clean git environment: no user or system config, a fixed identity (CI has none). */
 const env = {
@@ -39,9 +40,9 @@ const git = (cwd: string, args: string[]) =>
   execFileSync("git", args, { cwd, env, encoding: "utf8", stdio: "pipe" }).trim();
 
 const roots: string[] = [];
-afterAll(() => {
-  for (const r of roots) rmSync(r, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const r of roots) await removeTempDir(r);
+}, CLEANUP_TIMEOUT);
 
 function tempDir() {
   const dir = mkdtempSync(join(tmpdir(), "pseudo-ref-locks-git-"));

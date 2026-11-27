@@ -4,7 +4,7 @@
  * t4054 (a tree holding the null id), t4044 (unique abbreviations).
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -12,6 +12,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { READ_TREE_3WAY, runNative, runOurs } from "./diff-plumbing-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -39,9 +40,9 @@ describeGit("plumbing diffs against native git", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "diff-plumbing-"));
   });
-  afterAll(() => {
-    if (root) rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    if (root) await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   describe("t4002-diff-basic.sh", () => {
     let dir = "";

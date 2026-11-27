@@ -7,13 +7,14 @@
  * dates, so the stash ids are equal.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, openRepo, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -88,7 +89,7 @@ describeGit("stash create: as native git, nothing but the commit", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "stash-create-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   for (const message of [undefined, "a message"]) {
     it(`stash create${message ? ` "${message}"` : ""}: same commit, nothing else changed`, async () => {

@@ -14,6 +14,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { CheckoutResult, Git } from "../src/index.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, openRepo, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -146,9 +147,9 @@ const never = () => {
 beforeAll(() => {
   root = mkdtempSync(join(tmpdir(), "pathspec-file-native-"));
 });
-afterAll(() => {
-  rmSync(root, { recursive: true, force: true });
-});
+afterAll(async () => {
+  await removeTempDir(root);
+}, CLEANUP_TIMEOUT);
 
 /** git's test_commit: `<name>.t` holding `<name>`, committed as `<name>`. */
 function testCommit(dir: string, name: string): void {

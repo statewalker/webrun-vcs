@@ -17,6 +17,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { CheckoutIndexFailedError } from "../src/index.js";
 import { gitOk, openOurs, put, snapshot } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -191,7 +192,7 @@ describeGit("git checkout-index against native git", () => {
     root = mkdtempSync(join(tmpdir(), "checkout-index-native-"));
   });
 
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it('t2006-checkout-index-basic.sh: "checkout-index reports errors (cmdline)", "checkout-index reports errors (stdin)"', async () => {
     const t = twins((d) => {

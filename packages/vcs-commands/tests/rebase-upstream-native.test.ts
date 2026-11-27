@@ -5,7 +5,7 @@
  * with git's `fatal: invalid upstream '<x>'` with nothing written.
  */
 
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,6 +15,7 @@ import { GitApiError, RebaseStatus } from "../src/index.js";
 import { git, INTEROP_IDENT, normalizeState, openOurs, snapshot } from "./merge-native-helpers.js";
 import { buildHistory, type History, text } from "./merge-native-scenarios.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -46,9 +47,9 @@ describeGit("rebase: an upstream given by name", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "rebase-upstream-"));
   });
-  afterAll(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterAll(async () => {
+    await removeTempDir(root);
+  }, CLEANUP_TIMEOUT);
 
   for (const upstream of ["main", "main~0", "refs/heads/main"]) {
     it(`setUpstream("${upstream}") rebases as git rebase ${upstream}`, async () => {

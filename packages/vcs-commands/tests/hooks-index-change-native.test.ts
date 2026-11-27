@@ -7,7 +7,7 @@
  * git in one copy of a repository with a logging hook and ours in the other.
  */
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -23,6 +23,7 @@ import {
 } from "./hooks-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -72,7 +73,7 @@ describeGit("post-index-change hook: as native git", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-index-change-"));
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("add and commit: 0 0; commit -a with index.lock held", async () => {
     const dir = base();

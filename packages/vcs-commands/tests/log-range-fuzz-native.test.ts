@@ -23,6 +23,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { Git, type LogCommand, RevFilter } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -225,7 +226,7 @@ describeGit("log <revs> -- <pathspec> with exclusions against native git (fuzzed
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "log-range-fuzz-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** git 2.50 and later ask a root commit's filter (2.43 compares it without). */
   function rootFilters(): boolean {
@@ -387,7 +388,7 @@ describeGit("log <revs> [-- <pathspec forms>] against native git (fuzzed)", () =
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "log-plain-fuzz-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   async function open(dir: string): Promise<Git> {
     const files = createNodeFilesApi({ rootDir: dir });
@@ -518,7 +519,7 @@ describeGit("log -- :(attr:...) / :(prefix:N) against native git (fuzzed)", () =
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "log-attr-fuzz-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   for (const seed of SEEDS.slice(0, 2)) {
     it(`seed ${seed}: attribute and prefix magic selects git's commits`, async () => {
@@ -580,7 +581,7 @@ describeGit("log keeps a few dozen bytes per commit it walks", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "log-table-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("a 3000-commit history: git's order, and the walk's table stays compact", async () => {
     const dir = join(root, "repo");
@@ -756,7 +757,7 @@ describeGit("log -- :(attr) / :(icase,prefix) / multibyte :(prefix) against nati
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "log-byte-fuzz-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   for (const seed of SEEDS.slice(0, 2)) {
     it(`seed ${seed}: index-only attributes, icase prefixes and byte prefixes as git`, async () => {
@@ -838,7 +839,7 @@ describeGit("log -- :(attr) in a bare repository reads no in-tree attributes (gi
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "log-attr-bare-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it("only builtin, global and info/attributes count; HEAD's .gitattributes does not", async () => {
     const work = join(root, "work");
@@ -893,7 +894,7 @@ describeGit("log -- :(prefix:<n>) refuses what git refuses", () => {
       env: nativeGitEnv(root),
     });
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it.each([":(prefix:abc)a", ":(prefix: )a", ":(prefix:2x)a", ":(prefix:+)a"])(
     "%s: invalid parameter for pathspec magic 'prefix'",

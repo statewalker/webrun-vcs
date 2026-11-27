@@ -24,6 +24,7 @@ import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import { createGitFilesBackend } from "../../../src/create-git-files-backend.js";
 import { filesStagingStore } from "../../../src/storage/loose/index.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../../temp-dir-support.js";
 
 const GIT_ENV = {
   ...process.env,
@@ -46,9 +47,9 @@ const tempDir = (prefix: string) => {
   dirs.push(dir);
   return dir;
 };
-afterAll(() => {
-  for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
-});
+afterAll(async () => {
+  for (const dir of dirs) await removeTempDir(dir);
+}, CLEANUP_TIMEOUT);
 
 /** Counts the files a FilesApi creates (`write` and `createExclusive`) and its moves. */
 function counting(files: FilesApi) {

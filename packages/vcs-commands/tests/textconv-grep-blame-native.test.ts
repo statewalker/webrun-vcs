@@ -19,6 +19,7 @@ import { formatBlamePorcelain, type Git, installTextconvRunner } from "../src/in
 import { shellTextconvRunner } from "./host-drivers-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -34,9 +35,9 @@ let counter = 0;
 beforeAll(() => {
   root = mkdtempSync(join(tmpdir(), "textconv-grep-blame-"));
 });
-afterAll(() => {
-  rmSync(root, { recursive: true, force: true });
-});
+afterAll(async () => {
+  await removeTempDir(root);
+}, CLEANUP_TIMEOUT);
 
 function env(): Record<string, string> {
   return nativeGitEnv(root);

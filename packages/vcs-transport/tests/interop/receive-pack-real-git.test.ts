@@ -26,6 +26,7 @@ import {
   serveOverDuplex,
 } from "../../src/index.js";
 import { pushRequest, runReceivePack, ZERO } from "../helpers/receive-pack-harness.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "../temp-dir-support.js";
 import {
   cleanupDir,
   createTransportRepo,
@@ -241,7 +242,7 @@ describeGit(
       for (const child of children) child.kill("SIGKILL");
       children.clear();
     });
-    afterAll(() => cleanupDir(root));
+    afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
     /** Both servers start as copies of src's main; returns both reports. */
     async function both(
@@ -649,8 +650,8 @@ describeGit(
 
     afterAll(async () => {
       await server?.close();
-      cleanupDir(root);
-    });
+      await removeTempDir(root);
+    }, CLEANUP_TIMEOUT);
 
     /** A fresh server repository (a copy of src) and a clone to push from. */
     async function fresh(name: string): Promise<string> {
@@ -850,8 +851,8 @@ describeGit(
 
     afterAll(async () => {
       await tcp.close();
-      cleanupDir(root);
-    });
+      await removeTempDir(root);
+    }, CLEANUP_TIMEOUT);
 
     it("pushes, and the update hook refuses one ref while the other lands", async () => {
       repo = await ourCopy(src.dir);

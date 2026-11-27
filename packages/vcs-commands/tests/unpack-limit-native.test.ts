@@ -10,7 +10,7 @@
  * to our receive-pack served over git:// and smart HTTP, which read the limit from the served
  * repository's config.
  */
-import { cpSync, mkdtempSync, rmSync } from "node:fs";
+import { cpSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -31,6 +31,7 @@ import { openOurs } from "./merge-native-helpers.js";
 import { gitAsync, startTcpServer } from "./native-connect-support.js";
 import { nativeGitAvailable, noMaintenance } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -52,9 +53,9 @@ beforeAll(() => {
   }
 });
 
-afterAll(() => {
-  if (root) rmSync(root, { recursive: true, force: true });
-});
+afterAll(async () => {
+  if (root) await removeTempDir(root);
+}, CLEANUP_TIMEOUT);
 
 /** A repository's layout: loose and packed object counts, packs, and its objects. */
 function layout(dir: string) {

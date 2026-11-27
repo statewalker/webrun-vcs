@@ -43,6 +43,7 @@ import {
   REFLOG_EXPIRY_DEFAULTS,
 } from "./gc-native-twins-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 const it25x = nativeIs25x ? it : it.skip;
@@ -167,7 +168,7 @@ describeGit("git maintenance run twins", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "maintenance-twins-"));
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   describe("task selection", () => {
     it('t7900-maintenance.sh: "run --task=<task>"', async () => {

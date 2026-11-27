@@ -5,7 +5,7 @@
  * does under 2.43 compatibility.
  */
 
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -19,6 +19,7 @@ import {
 import { nativeIs25x } from "./hooks-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile } from "./status-native-support.js";
+import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 const it25 = nativeIs25x ? it : it.skip;
@@ -77,7 +78,7 @@ describeGit("git clone --revision, as native git", () => {
     commit("feature commit", "Hello world!");
     git(src, "switch", "-q", "main");
   });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   it25('t5621-clone-revision.sh: "clone with --revision being a branch"', async () => {
     const o = await same(["--revision=refs/heads/feature"], (c) =>
