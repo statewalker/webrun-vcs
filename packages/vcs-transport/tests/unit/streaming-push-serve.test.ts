@@ -53,28 +53,45 @@ function lazyPack(n: number) {
   return { state, pack };
 }
 
+/** A large request's first POST: remote-curl's probe_rpc (`0000`), answered with a flush. */
+function probeAnswer(): (request: Request) => Promise<Response | undefined> {
+  let probed = false;
+  return async (request) => {
+    if (probed) return undefined;
+    probed = true;
+    expect(new TextDecoder().decode(await request.arrayBuffer())).toBe("0000");
+    return new Response("0000");
+  };
+}
+
 describe("push: the request body streams", () => {
   it("detects streaming request bodies on this runtime (Node)", () => {
     expect(supportsRequestStreams()).toBe(true);
   });
 
   it("sends a ReadableStream with duplex half, pulled as the server reads it", async () => {
+    const probed = probeAnswer();
     const { state, pack } = lazyPack(50);
     let producedWhenPosted = -1;
     let received = 0;
     const result = await push({
       url: "http://example.test/repo.git",
       refspecs: ["refs/heads/main:refs/heads/main"],
+      // the least http.postBuffer: every request is large (post_rpc streams only those)
+      http: { postBuffer: 65520 },
       ...local(() => pack()),
       fetchImpl: async (request: Request) => {
         if (request.url.includes("/info/refs")) return new Response(advertisement);
+        const probe = await probed(request);
+        if (probe) return probe;
         producedWhenPosted = state.produced;
         expect(request.body).toBeInstanceOf(ReadableStream);
         received = (await request.arrayBuffer()).byteLength;
         return new Response(`${pkt("unpack ok\n")}${pkt("ok refs/heads/main\n")}0000`);
       },
     });
-    expect(producedWhenPosted).toBe(0); // nothing written before the request is read
+    // only what showed the request large is produced before it is read (git's buffer)
+    expect(producedWhenPosted).toBeLessThanOrEqual(1);
     expect(state.produced).toBe(50);
     expect(result.ok).toBe(true);
     expect(result.packObjects).toBe(7);
@@ -356,18 +373,22 @@ describe("request bodies: when to stream", () => {
   });
 
   it("push retries a refused streamed body with a collected one and counts it once", async () => {
+    const probed = probeAnswer();
     let exports = 0;
     let posts = 0;
     const result = await push({
       url: "http://example.test/repo.git",
       refspecs: ["refs/heads/main:refs/heads/main"],
       streamRequestBody: true,
+      http: { postBuffer: 65520 },
       ...local(() => {
         exports++;
         return lazyPack(3).pack();
       }),
       fetchImpl: async (request: Request) => {
         if (request.url.includes("/info/refs")) return new Response(advertisement);
+        const probe = await probed(request);
+        if (probe) return probe;
         posts++;
         if (posts === 1) {
           // refused before the body was read (Chromium over HTTP/1.1)

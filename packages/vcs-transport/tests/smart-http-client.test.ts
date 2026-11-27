@@ -385,6 +385,110 @@ describe("Digest authentication (RFC 7616)", () => {
   });
 });
 
+describe("post_rpc's large requests (http.postBuffer, probe_rpc)", () => {
+  const unauthorized = () =>
+    new Response(null, { status: 401, headers: { "WWW-Authenticate": 'Basic realm="r"' } });
+  const guarded = (request: Request) =>
+    request.method === "POST" && request.headers.get("authorization") === null
+      ? unauthorized()
+      : new Response("ok");
+  const helper = { fill: () => ({ username: "u", password: "p" }) };
+
+  async function* chunks(sizes: number[], produced: number[]) {
+    for (const size of sizes) {
+      produced.push(size);
+      yield new Uint8Array(size);
+    }
+  }
+
+  async function run(sizes: number[], postBuffer?: number) {
+    const { instance, requests } = client(guarded, postBuffer === undefined ? {} : { postBuffer }, {
+      credentialHelper: helper,
+    });
+    await instance.discover("git-receive-pack", {}, direct);
+    const produced: number[] = [];
+    const sent: string[] = [];
+    const answer = await instance.postRpc(
+      chunks(sizes, produced),
+      () =>
+        instance.post("git-receive-pack", {}, { body: new TextEncoder().encode("0000") }, direct),
+      async (body, large) => {
+        let length = 0;
+        if (body instanceof Uint8Array) length = body.length;
+        else for await (const chunk of body) length += chunk.length;
+        sent.push(`${large ? "large" : "small"} ${length}`);
+        return instance.post("git-receive-pack", {}, { body: new Uint8Array(length) }, direct);
+      },
+    );
+    const shape = requests.map((r) => `${r.method} ${r.headers.get("authorization") ?? "-"}`);
+    return { answer, produced, sent, shape };
+  }
+
+  it("a request within the buffer is sent whole and again after the 401, produced once", async () => {
+    const outcome = await run([65520, 65520]);
+    expect(outcome.answer.status).toBe(200);
+    expect(outcome.produced).toEqual([65520, 65520]);
+    expect(outcome.sent).toEqual(["small 131040", "small 131040"]);
+    expect(outcome.shape).toEqual(["GET -", "POST -", "POST Basic dTpw"]);
+  });
+
+  it("a larger one is probed, then sent once (default buffer: 16 * 65520, less 65520)", async () => {
+    // 982800 bytes still fit, one more does not
+    const fits = await run([982800]);
+    expect(fits.sent).toEqual(["small 982800", "small 982800"]);
+    const outcome = await run([982800, 1, 5]);
+    expect(outcome.answer.status).toBe(200);
+    expect(outcome.produced).toEqual([982800, 1, 5]);
+    expect(outcome.sent).toEqual(["large 982806"]);
+    // the probe (401, then with the helper's credentials), then the request
+    expect(outcome.shape).toEqual(["GET -", "POST -", "POST Basic dTpw", "POST Basic dTpw"]);
+  });
+
+  it("http.postBuffer sets the limit (at least LARGE_PACKET_MAX: any request is large)", async () => {
+    const outcome = await run([10], 65520);
+    expect(outcome.sent).toEqual(["large 10"]);
+  });
+
+  it("a probe refused gives its answer back and sends nothing", async () => {
+    const { instance } = client(() => unauthorized(), {}, {});
+    let sent = false;
+    const answer = await instance.postRpc(
+      new Uint8Array(2_000_000),
+      () => instance.post("git-receive-pack", {}, { body: new Uint8Array(4) }, direct),
+      async () => {
+        sent = true;
+        return new Response("ok");
+      },
+    );
+    expect(answer.status).toBe(401);
+    expect(sent).toBe(false);
+  });
+
+  it("a large request answering 401 is not sent again", async () => {
+    let posts = 0;
+    const { instance } = client(
+      (request) => {
+        if (request.method !== "POST") return new Response("ok");
+        posts++;
+        return posts === 1 ? new Response("ok") : unauthorized();
+      },
+      {},
+      { credentialHelper: helper },
+    );
+    let sends = 0;
+    const answer = await instance.postRpc(
+      new Uint8Array(2_000_000),
+      () => instance.post("git-receive-pack", {}, { body: new Uint8Array(4) }, direct),
+      async () => {
+        sends++;
+        return instance.post("git-receive-pack", {}, { body: new Uint8Array(1) }, direct);
+      },
+    );
+    expect(answer.status).toBe(401);
+    expect(sends).toBe(1);
+  });
+});
+
 describe("post_rpc's re-authentication and http.proactiveAuth", () => {
   it("asks the helper when a POST answers 401 and sends it again, approving what worked", async () => {
     const log: string[] = [];

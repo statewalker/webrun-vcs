@@ -8,7 +8,7 @@
  * `GIT_HTTP_RETRY_AFTER` and `GIT_HTTP_MAX_RETRY_TIME` override the configuration.
  *
  * Read here: `extraHeader`, `userAgent`, `followRedirects`, `emptyAuth`, `proactiveAuth`
- * (2.46+), `maxRetries`, `retryAfter`, `maxRetryTime`. TLS, proxy, cookie, version and speed keys are the host
+ * (2.46+), `maxRetries`, `retryAfter`, `maxRetryTime`, `postBuffer`. TLS, proxy, cookie, version and speed keys are the host
  * `fetch`'s business and are not read.
  *
  * @example
@@ -101,6 +101,17 @@ export function httpClientSettingsOf(
       case "maxretrytime":
         settings.maxRetryTime = int(key, value);
         break;
+      case "postbuffer": {
+        // git_config_ssize_t, then no less than LARGE_PACKET_MAX
+        const size = ssize(key, value);
+        if (size < 0) {
+          options.onWarning?.(
+            `warning: negative value for http.postBuffer; defaulting to ${LARGE_PACKET_MAX}`,
+          );
+        }
+        settings.postBuffer = Math.max(size, LARGE_PACKET_MAX);
+        break;
+      }
     }
   }
   if (sawExtraHeader && extraHeaders.length > 0) settings.extraHeaders = extraHeaders;
@@ -122,6 +133,41 @@ export function httpClientSettingsOf(
   if (maxRetryTime !== undefined) settings.maxRetryTime = maxRetryTime;
   if (options.compatibility === "2.43") settings.rateLimitRetries = false;
   return settings;
+}
+
+/** pkt-line.h's LARGE_PACKET_MAX: the least `http.postBuffer` git uses */
+const LARGE_PACKET_MAX = 65520;
+
+const SSIZE_UNITS: Record<string, bigint> = { "": 1n, k: 1024n, m: 1024n ** 2n, g: 1024n ** 3n };
+
+/** git_config_ssize_t (64 bits): a number with an optional k/m/g unit, else git's death. */
+function ssize(key: string, value: string | undefined): number {
+  const m = /^\s*([+-]?)(0[xX][0-9a-fA-F]+|[0-9]+)([kKmMgG]?)$/.exec(value ?? "");
+  const digits = m?.[2];
+  const n =
+    digits === undefined
+      ? undefined
+      : /^0[xX]/.test(digits)
+        ? BigInt(digits)
+        : digits.length > 1 && digits.startsWith("0")
+          ? /[89]/.test(digits)
+            ? undefined
+            : BigInt(`0o${digits.slice(1)}`)
+          : BigInt(digits);
+  if (n === undefined || !m) {
+    throw new InvalidConfigError(
+      key,
+      `fatal: bad numeric config value '${value ?? ""}' for '${key}': invalid unit`,
+    );
+  }
+  const magnitude = n * (SSIZE_UNITS[(m[3] as string).toLowerCase()] as bigint);
+  if (m[1] === "-" ? magnitude > 2n ** 63n : magnitude > 2n ** 63n - 1n) {
+    throw new InvalidConfigError(
+      key,
+      `fatal: bad numeric config value '${value}' for '${key}': out of range`,
+    );
+  }
+  return Number(m[1] === "-" ? -magnitude : magnitude);
 }
 
 function missingValue(key: string): InvalidConfigError {
