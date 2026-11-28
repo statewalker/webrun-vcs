@@ -83,7 +83,9 @@ describeGit("a want-ref whose ref moves between ls-refs and fetch, as native git
       const script = oneTime;
       if (!script) return response;
       const bytes = new Uint8Array(await response.arrayBuffer());
-      const text = new TextDecoder("latin1").decode(bytes);
+      // one character per byte (TextDecoder's "latin1" is windows-1252)
+      let text = "";
+      for (const b of bytes) text += String.fromCharCode(b);
       const modified = sedOnce(text, script.from, script.to);
       if (modified === text) {
         return new Response(bytes, { status: response.status, headers: response.headers });
@@ -193,7 +195,9 @@ describeGit("a want-ref whose ref moves between ls-refs and fetch, as native git
     });
   }
 
-  it(`t5703-upload-pack-ref-in-want.sh: "server is initially ahead - ref in want" (--deepen=1)`, async () => {
+  // not in t5703: the deepening fetch of its "initially ahead" case (the id the server sent is
+  // what fetch-pack's connectivity check walks from)
+  it("a deepening fetch (--deepen=1) of a ref that moved ahead between ls-refs and fetch", async () => {
     git(repo(), "config", "uploadpack.allowRefInWant", "true");
     const { theirs, error, native, mine } = await twins(
       shallowPristine,
