@@ -84,6 +84,7 @@ import {
   writePairPatch,
 } from "../results/diff-output.js";
 import { DiffPickaxe } from "../results/diff-pickaxe.js";
+import { LinePrefixSink } from "../results/line-prefix-sink.js";
 import { quotePath } from "../results/quote-path.js";
 import {
   parseWhitespaceRule,
@@ -817,6 +818,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   private mergeBase = false;
   /** Whether `--rotate-to`/`--skip-to` need their exact path (`git diff`; not `git log`) */
   private rotateStrict = true;
+  /** {@link callFormats} reports where diff.c's `diff_line_prefix` goes (`log --graph`) */
+  private linePrefix = false;
   /** git's `has_changes` of the last call */
   private changesFound = false;
   /** git's `check_failed`: `--check` found an error in the last call */
@@ -881,6 +884,19 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   setRotateStrict(strict: boolean): this {
     this.checkCallable();
     this.rotateStrict = strict;
+    return this;
+  }
+
+  /**
+   * diff.c's `diff_line_prefix` (`log --graph`'s padding): {@link callFormats} gives the
+   * offsets in its output where it goes (`prefixPoints`, for `insertLinePrefix`): before
+   * every line, except where git's word diff leaves it out
+   *
+   * @internal
+   */
+  setLinePrefixPoints(on: boolean): this {
+    this.checkCallable();
+    this.linePrefix = on;
     return this;
   }
 
@@ -1518,6 +1534,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     follow?: string,
   ): Promise<{
     bytes?: Uint8Array;
+    /** With {@link setLinePrefixPoints}: where the line prefix goes in `bytes` */
+    prefixPoints?: number[];
     followPath?: string;
     followChange?: ChangeType.RENAME | ChangeType.COPY;
   }> {
@@ -1564,11 +1582,15 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       const withHeaders = this.includesConflictHeaders(headers);
       if (collected.entries.length === 0 && collected.combined.length === 0 && !withHeaders)
         return followed;
-      const sink = new ByteSink();
+      const sink = this.linePrefix ? new LinePrefixSink() : new ByteSink();
       const queued = await this.writeFormats(sink, formats, collected, headers);
       // diffcore_std left nothing (`--diff-filter`, `--skip-to`): no diff, as an empty one
       if (queued === 0 && collected.combined.length === 0 && !withHeaders) return followed;
-      return { bytes: sink.bytes(), ...followed };
+      return {
+        bytes: sink.bytes(),
+        ...(sink instanceof LinePrefixSink ? { prefixPoints: sink.points } : {}),
+        ...followed,
+      };
     });
   }
 
@@ -1632,6 +1654,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     this.resetExternal();
     const options = this.outputOptions();
     Object.assign(options, this.prefixes());
+    if (sink instanceof LinePrefixSink) options.linePrefix = sink;
     if (this.textOptions.reverse) {
       // diff -R swaps the prefixes with the sides (`diff --git b/f a/f`)
       [options.srcPrefix, options.dstPrefix] = [
