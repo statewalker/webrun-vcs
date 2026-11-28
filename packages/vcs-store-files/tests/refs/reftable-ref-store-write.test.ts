@@ -99,6 +99,29 @@ describe("reftable ref store writes", () => {
     expect(await tableNames(files)).toEqual(before);
   });
 
+  // statewalker/webrun-vcs#500: git fetch --atomic with a refused update
+  it("an aborted transaction tells the hook aborted alone and writes nothing", async () => {
+    const { files, refs } = await store({ autoCompaction: false });
+    await refs.set("refs/heads/main", A);
+    const before = await tableNames(files);
+    const heard: string[] = [];
+    refs.setTransactionHook(async (state, updates) => {
+      heard.push(`${state}: ${updates.map((u) => `${u.old} ${u.new} ${u.name}`).join(",")}`);
+    });
+    const result = await refs.batch(
+      [
+        { name: "refs/heads/main", old: A, new: B },
+        { name: "refs/heads/new", old: null, new: C },
+      ],
+      { abortTransaction: true },
+    );
+    expect(result).toEqual({ ok: false, rejected: [] });
+    expect(heard).toEqual([`aborted: ${A} ${B} refs/heads/main,null ${C} refs/heads/new`]);
+    expect(await tableNames(files)).toEqual(before);
+    expect((await refs.resolve("refs/heads/main"))?.objectId).toBe(A);
+    expect(await refs.has("refs/heads/new")).toBe(false);
+  });
+
   it("tells the hook preparing, prepared, committed; a refusal aborts with nothing written", async () => {
     const { files, refs } = await store({ autoCompaction: false });
     await refs.set("refs/heads/main", A);

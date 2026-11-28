@@ -227,3 +227,34 @@ describe("loose ref batches (git's files_transaction_finish) [Git files]", () =>
     expect(await refs.has("refs/heads/gone")).toBe(true);
   });
 });
+
+// statewalker/webrun-vcs#500: git fetch --atomic with a refused update
+describe("aborted transactions (git's ref_transaction_abort of an open one) [Git files]", () => {
+  const oid = (n: number): ObjectId => n.toString(16).padStart(40, "a");
+
+  it("tells the hook aborted alone, with the commands as given, and writes nothing", async () => {
+    const { files, refs } = await gitFilesRefs();
+    await refs.batch([{ name: "refs/heads/p", new: oid(1) }]);
+    const heard: string[] = [];
+    refs.setTransactionHook(async (state, updates) => {
+      heard.push(`${state}: ${updates.map((u) => `${u.old} ${u.new} ${u.name}`).join(",")}`);
+      return true;
+    });
+    const result = await refs.batch(
+      [
+        { name: "refs/heads/p", old: oid(1), new: oid(2) },
+        { name: "refs/heads/r", old: null, new: oid(3) },
+      ],
+      { abortTransaction: true },
+    );
+    expect(result).toEqual({ ok: false, rejected: [] });
+    expect(heard).toEqual([
+      `aborted: ${oid(1)} ${oid(2)} refs/heads/p,null ${oid(3)} refs/heads/r`,
+    ]);
+    expect((await refs.resolve("refs/heads/p"))?.objectId).toBe(oid(1));
+    expect(await files.stats("/.git/refs/heads/r")).toBeUndefined();
+    heard.length = 0;
+    await refs.batch([], { abortTransaction: true });
+    expect(heard).toEqual(["aborted: "]);
+  });
+});

@@ -28,6 +28,7 @@ import type {
   SymbolicRefLogOptions,
 } from "@statewalker/vcs-core";
 import {
+  abortedBatch,
   compareRefNames,
   createReflogReaderOf,
   deleteReflogLine,
@@ -323,6 +324,7 @@ export class KVRefStore implements Refs {
    * compare-and-swap of the root value, then the reflog lines.
    */
   async batch(commands: RefCommand[], options?: BatchOptions): Promise<BatchResult> {
+    if (options?.abortTransaction) return abortedBatch(commands, options);
     let applied: PlannedRefUpdate[] = [];
     let committed = 0;
     const result = await this.update<BatchResult>(

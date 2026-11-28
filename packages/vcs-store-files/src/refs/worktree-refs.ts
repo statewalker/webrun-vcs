@@ -247,6 +247,12 @@ class WorktreeRefs implements Refs {
   }
 
   async batch(commands: RefCommand[], options?: BatchOptions): Promise<BatchResult> {
+    // a transaction told to its hook with no ref written (an empty one, an aborted one): the
+    // repository's store tells it through this worktree's hook, the commands as given
+    if (options?.abortTransaction || (commands.length === 0 && options?.emptyTransaction)) {
+      const hook = this.transactionHook;
+      return this.common.batch(commands, hook ? { ...options, transactionHook: hook } : options);
+    }
     const commonCommands: RefCommand[] = [];
     const ownCommands: RefCommand[] = [];
     const logged: { via: string[]; name: string }[] = [];
