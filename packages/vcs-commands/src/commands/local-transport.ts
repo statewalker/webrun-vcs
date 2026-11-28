@@ -14,6 +14,7 @@ import {
   type GitServeSettings,
   openDuplexConnection,
   openDuplexReceivePackConnection,
+  type PackObjectsHook,
   type PushCertSignatureCheck,
   pushCertificateEnv,
   type ReceiveCommand,
@@ -201,7 +202,14 @@ export async function openLocalRemote(
 export async function withLocalUploadPack<T>(
   remote: OpenedRepository,
   run: (connection: UploadPackConnection) => Promise<T>,
-  options: { protocolVersion?: 0 | 1 | 2 } = {},
+  options: {
+    protocolVersion?: 0 | 1 | 2;
+    /**
+     * git's `uploadpack.packObjectsHook` as the spawned upload-pack reads it (system and
+     * global files only: `packObjectsHookOf(hooks, { commandLine: false })`)
+     */
+    packObjectsHook?: PackObjectsHook;
+  } = {},
 ): Promise<T> {
   const head = await remote.history.refs.get("HEAD").catch(() => undefined);
   const settings = serverSettingsOf(remote);
@@ -244,6 +252,8 @@ export async function withLocalUploadPack<T>(
       ...(settings.promisorRemoteInfo !== undefined
         ? { promisorRemoteInfo: settings.promisorRemoteInfo }
         : {}),
+      // uploadpack.packObjectsHook (protected configuration, never the repository's)
+      ...(options.packObjectsHook ? { packObjectsHook: options.packObjectsHook } : {}),
       ...(head && "target" in head ? { currentBranch: head.target } : {}),
     }))().finally(() => server.close?.());
   try {

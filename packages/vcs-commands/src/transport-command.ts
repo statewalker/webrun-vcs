@@ -15,6 +15,7 @@ import {
 } from "./commands/bundle/index.js";
 import { hostEnvironmentOf } from "./commands/git-ident.js";
 import { httpClientSettingsOf } from "./commands/http-config.js";
+import { remoteHookSession } from "./commands/local-transport.js";
 import { createPromisorFetcher, promisorOf } from "./commands/promisor-remote.js";
 import {
   bundleRemoteOf,
@@ -358,6 +359,9 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
       httpSettings: (url) => this.httpSettingsFor(url),
       ...(this.credentialHelper ? { credentialHelper: this.credentialHelper } : {}),
       ...httpSessionSettings(this._workingCopy),
+      // a local remote's upload-pack runs the protected uploadpack.packObjectsHook through
+      // this host's runner, in the remote's git directory, with local_repo_env cleared
+      localHooks: (remote) => remoteHookSession(this._workingCopy, remote, { localPush: true }),
     };
   }
 

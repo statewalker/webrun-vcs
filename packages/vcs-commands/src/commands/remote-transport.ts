@@ -43,6 +43,7 @@ import {
   withLocalReceivePack,
   withLocalUploadPack,
 } from "./local-transport.js";
+import { packObjectsHookOf } from "./serve-repository.js";
 import { repositoryPlaceOf } from "./worktree-support.js";
 
 /** A remote URL resolved to the transport that reaches it. */
@@ -354,6 +355,12 @@ export interface RemoteSessionOptions {
   alternateAllowed?: (scheme: string) => boolean;
   /** HTTP: `$GIT_SMART_HTTP` (false: the dumb protocol) */
   smartHttp?: boolean;
+  /**
+   * A local remote's hooks, as the upload-pack git's local transport spawns runs them
+   * (`remoteHookSession(workingCopy, remote, { localPush: true })`): its
+   * `uploadpack.packObjectsHook`, from the system and global files only
+   */
+  localHooks?: (remote: OpenedRepository) => HookSession | undefined;
 }
 
 /**
@@ -446,8 +453,14 @@ export async function withRemoteUploadPack<T>(
   run: (connection: UploadPackConnection) => Promise<T>,
 ): Promise<T> {
   if (remote.kind === "local") {
+    // git-upload-pack '<path>' reads the system and global files, never the command line's
+    // config (connect.c's local_repo_env) nor the repository's
+    const packObjectsHook = await packObjectsHookOf(options.localHooks?.(remote.repository), {
+      commandLine: false,
+    });
     return withLocalUploadPack(remote.repository, run, {
       protocolVersion: options.protocolVersion,
+      ...(packObjectsHook ? { packObjectsHook } : {}),
     });
   }
   if (remote.kind === "bundle") return withBundleUploadPack(remote.remote, createDuplexPair, run);

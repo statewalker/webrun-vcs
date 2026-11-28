@@ -180,6 +180,10 @@ export async function servedRepositoryOf(
  * pack-objects ...` through the shell, in the git directory). Undefined when none is set or
  * no runner can start it.
  *
+ * With `commandLine: false` the command line's entries (scope `command`) do not count: git's
+ * local transport starts `git-upload-pack '<path>'` with connect.c's `local_repo_env` cleared
+ * (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`), so only the system and global files reach it.
+ *
  * @example
  * ```ts
  * // ~/.gitconfig: [uploadpack] packObjectsHook = /srv/bin/pack-cache
@@ -188,11 +192,13 @@ export async function servedRepositoryOf(
  */
 export async function packObjectsHookOf(
   hooks: HookSession | undefined,
+  options: { commandLine?: boolean } = {},
 ): Promise<PackObjectsHook | undefined> {
   const environment = hooks?.hostEnvironment;
   if (!hooks?.enabled || !environment) return undefined;
   let command: string | undefined;
   for (const entry of await readProtectedConfig(environment)) {
+    if (options.commandLine === false && entry.scope === "command") continue;
     if (entry.key.toLowerCase() === "uploadpack.packobjectshook") command = entry.value;
   }
   if (!command) return undefined;
