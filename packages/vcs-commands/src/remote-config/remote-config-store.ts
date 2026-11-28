@@ -131,6 +131,12 @@ interface GitConfigLike {
    * includes or `config.worktree`), in file order: what git's config writer edits.
    */
   getLocal?(key: string): unknown[];
+  /**
+   * Optional: sets every value of a key as git's `set_multivar` with a value pattern edits
+   * them (values kept stay on their lines, a replaced one is written where it stood, removed
+   * ones are unset), as `GitWorkingCopyConfig` does; without it the values are set and added.
+   */
+  editValues?(key: string, values: unknown[]): void;
 }
 
 /** A config value, its text as written and where it was read (see {@link RemoteConfigStore.valuesWithOrigin}). */
@@ -799,6 +805,16 @@ export class RemoteConfigStore {
     }
     this.config.set(key, values[0]);
     for (const value of values.slice(1)) this.config.add(key, value);
+  }
+
+  /**
+   * Sets every value of a config variable as git's pattern edits change them (`git config
+   * <key> <new> <pattern>`, `--unset-all <key> <pattern>`): the values kept stay where they
+   * are, a replaced value is written on its line, the removed ones are unset.
+   */
+  editValues(key: string, values: string[]): void {
+    if (this.config.editValues) this.config.editValues(key, values);
+    else this.setValues(key, values);
   }
 
   /** Flush to the backing file, if the config has one. */
