@@ -44,6 +44,14 @@ export function nextFlush(stateless: boolean, count: number): number {
   return count < PIPESAFE_FLUSH ? count * 2 : count + PIPESAFE_FLUSH;
 }
 
+/** One want of a v2 request with `ref-in-want`: a ref by name, or an id (no name). */
+export interface WantEntry {
+  /** The ref asked for by name (`want-ref <name>`); undefined: `want <oid>` */
+  name?: string;
+  /** The id the ref was listed at, or the id wanted */
+  oid: string;
+}
+
 /** What to fetch, and what the client has. */
 export interface FetchPackRequest {
   /** Object ids to fetch (ref tips) */
@@ -96,12 +104,13 @@ export interface FetchPackRequest {
    */
   sessionId?: string;
   /**
-   * Refs to ask for by name, `want-ref <name>`, when the server takes them (v2
-   * `fetch=... ref-in-want`, git's add_wants): each name's id is then left out of the `want`
-   * lines, and the ids the server answers come back as {@link FetchPackResult.wantedRefs}.
-   * Ignored by a server without `ref-in-want`
+   * The request's wants in git's add_wants order, for a server that takes them by name (v2
+   * `fetch=... ref-in-want`): an entry with a name is `want-ref <name>`, one without is
+   * `want <oid>`, both kinds interleaved as listed; a {@link wants} id no entry names goes
+   * after them as `want <id>`. The ids the server answers for the names come back as
+   * {@link FetchPackResult.wantedRefs}. Ignored by a server without `ref-in-want`
    */
-  wantRefs?: ReadonlyArray<{ name: string; oid: string }>;
+  wantRefs?: ReadonlyArray<WantEntry>;
   /**
    * The protocols the client takes packfile URIs over (git's `fetch.uriProtocols`): sent as
    * `packfile-uris <list>` to a server advertising `fetch=... packfile-uris`, keeping only
@@ -485,18 +494,23 @@ async function fetchPackV2(
     const protocols = (request.uriProtocols ?? []).filter((p) => p === "http" || p === "https");
     if (protocols.length > 0) head.push(encodePacketLine(`packfile-uris ${protocols.join(",")}`));
   }
-  // add_wants: `want-ref <name>` for the refs asked for by name when the server takes them,
-  // `want <id>` for the rest
-  const byName = fetchFeatures(connection).has("ref-in-want") ? (request.wantRefs ?? []) : [];
-  const named = new Set(byName.map((r) => r.oid));
-  for (const oid of request.wants) {
-    if (!named.has(oid)) head.push(encodePacketLine(`want ${oid}`));
-  }
+  // add_wants: one line per sought entry in its order, `want-ref <name>` for a ref asked for
+  // by name when the server takes them, `want <id>` otherwise
+  const ordered = fetchFeatures(connection).has("ref-in-want") ? (request.wantRefs ?? []) : [];
+  const covered = new Set<string>();
+  // the names asked for (the wanted-refs answer may name only those)
   const asked = new Set<string>();
-  for (const { name } of byName) {
-    if (asked.has(name)) continue;
-    asked.add(name);
-    head.push(encodePacketLine(`want-ref ${name}`));
+  const written = new Set<string>();
+  for (const { name, oid } of ordered) {
+    const line = name !== undefined ? `want-ref ${name}` : `want ${oid}`;
+    covered.add(oid);
+    if (name !== undefined) asked.add(name);
+    if (written.has(line)) continue;
+    written.add(line);
+    head.push(encodePacketLine(line));
+  }
+  for (const oid of request.wants) {
+    if (!covered.has(oid)) head.push(encodePacketLine(`want ${oid}`));
   }
   let wantedRefs: Map<string, string> | undefined;
   let packfileUris: PackfileUri[] | undefined;
