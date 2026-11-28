@@ -1,5 +1,20 @@
 # @statewalker/vcs-transport
 
+## 0.15.0
+
+### Minor Changes
+
+- Release of the changes since the last published version:
+  
+  - @statewalker/vcs-core crosses a breaking line
+
+### Patch Changes
+
+- a5a278f: `git fetch --atomic` with a refused update (a non-fast-forward without `+`, a tag it would clobber) now aborts its transaction as git does: the reference-transaction hook hears `aborted` with the updates queued so far (the pruned refs, then the accepted updates; none in a dry run), in git 2.43 and 2.5x alike. `BatchOptions.abortTransaction` asks a ref store for such an aborted transaction (files, reftable and linked-worktree stores), and a linked worktree's store now tells an empty transaction to its hook too (statewalker/webrun-vcs#500). Every store answers such a batch without writing (`abortedBatch` for stores with no hook of their own: memory, KV, SQL).
+- 8f797af: A fetch without `--atomic` whose reference-transaction hook refuses now leaves in `FETCH_HEAD` the lines git writes before it dies: every line under git 2.5x (one transaction after them all, a no-op fetch's empty one included), the lines up to the refused ref's own transaction under 2.43. With `--atomic` `FETCH_HEAD` stays truncated, as before. vcs-transport's `fetchResultOf(error)` and `refusedRefOf(error)` give a caller what the fetch had done when the hook refused (statewalker/webrun-vcs#503).
+- Updated dependencies [a5a278f]
+  - @statewalker/vcs-core@0.14.0
+
 ## 0.14.0
 
 ### Minor Changes
