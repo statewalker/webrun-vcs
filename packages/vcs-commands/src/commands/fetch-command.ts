@@ -21,6 +21,7 @@ import {
   type FetchRefUpdate,
   fetchFromConnection,
   fetchRefcolWidth,
+  fetchResultOf,
   fetchUpdateDisplay,
   formatFetchDisplay,
   formatFetchHead,
@@ -33,6 +34,7 @@ import {
   ObjectFormatMismatchError,
   parseRefSpec,
   type RefSpec,
+  refusedRefOf,
   type TagMode,
   type FetchOptions as TransportFetchOptions,
   transportSummaryWidth,
@@ -1130,9 +1132,45 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     };
     // git's fetch runs with fetch_if_missing = 0: its walks read through the history's view
     // without lazy fetch (the facade above), never a store-wide switch
+    // the FETCH_HEAD lines of a fetch, as git's get_ref_map marks them
+    const markedOf = (result: FetchClientResult) =>
+      this.fetchHeadEntries(result, {
+        given: given.length,
+        merge: mergeRefs,
+        // explicit refspecs (and the HEAD of an unconfigured remote) are all to merge;
+        // configured ones only when the first names one ref and no upstream is set
+        explicit: !useConfig,
+        firstIsExact: given.length > 0 && !parseRefSpec(given[0]).wildcard,
+        hasMerge: upstream !== undefined,
+      });
     const result = await withRemoteUploadPack(remote, sessionOptions, (connection) =>
       fetchFromConnection(connection, fetchOptions),
-    ).catch((error: unknown) => {
+    ).catch(async (error: unknown) => {
+      // a refusing reference-transaction hook (git dies): without --atomic append_fetch_head
+      // had written each line as the refs were stored, all of them before git 2.5x's one
+      // transaction, those up to the refused ref's own in 2.43's one per ref; with --atomic
+      // they wait for commit_fetch_head and FETCH_HEAD stays truncated (statewalker/webrun-vcs#503)
+      const partial =
+        error instanceof RefTransactionAbortedError ? fetchResultOf(error) : undefined;
+      if (partial && writesFetchHead && !this.atomic && checkout?.writeFetchHead) {
+        // in git's write order (store_updated_refs' two passes: the lines for merge first)
+        const kept = (await markedOf(partial)).filter((e) => !e.shallowRejected);
+        const marked = [
+          ...kept.filter((e) => !e.notForMerge),
+          ...kept.filter((e) => e.notForMerge),
+        ];
+        const refusedRef = refusedRefOf(error);
+        const at =
+          refusedRef === undefined ? -1 : marked.findIndex((e) => e.localRef === refusedRef);
+        const written = at < 0 ? marked : marked.slice(0, at + 1);
+        await checkout.writeFetchHead(
+          formatFetchHead(
+            written.map(({ oid, remoteRef, notForMerge }) => ({ oid, remoteRef, notForMerge })),
+            remoteUrl,
+          ),
+          { append: true },
+        );
+      }
       // git dies on a source that names no remote ref (a hidden one included)
       const message = error instanceof Error ? error.message : "";
       if (message.startsWith("couldn't find remote ref ")) {
@@ -1166,15 +1204,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     // a failed --atomic transaction: git's error after the ref lines
     if (result.refTransactionError !== undefined) errors.push(result.refTransactionError);
 
-    const marked = await this.fetchHeadEntries(result, {
-      given: given.length,
-      merge: mergeRefs,
-      // explicit refspecs (and the HEAD of an unconfigured remote) are all to merge;
-      // configured ones only when the first names one ref and no upstream is set
-      explicit: !useConfig,
-      firstIsExact: given.length > 0 && !parseRefSpec(given[0]).wildcard,
-      hasMerge: upstream !== undefined,
-    });
+    const marked = await markedOf(result);
     // store_updated_refs: a ref rejected for the shallow commits it needs is skipped, with
     // git's warning when it is for merge
     for (const e of marked) {
