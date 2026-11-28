@@ -126,6 +126,27 @@ export function createRefBatchTests(
       expect(await snapshot(refs)).toBe("");
     });
 
+    // statewalker/webrun-vcs#500: git fetch --atomic aborting its open transaction
+    it("an aborted transaction writes nothing and tells only the batch's hook aborted", async () => {
+      await seed(["refs/heads/a", oid(1)]);
+      const heard: string[] = [];
+      const r = await refs.batch(
+        [
+          { name: "refs/heads/a", old: oid(1), new: oid(2) },
+          { name: "refs/heads/n", old: null, new: oid(3) },
+        ],
+        {
+          abortTransaction: true,
+          transactionHook: async (state, updates) => {
+            heard.push(`${state}: ${updates.map((u) => u.name).join(",")}`);
+          },
+        },
+      );
+      expect(r).toEqual({ ok: false, rejected: [] });
+      expect(heard).toEqual(["aborted: refs/heads/a,refs/heads/n"]);
+      expect(await snapshot(refs)).toBe("refs/heads/a=aaa1");
+    });
+
     itMulti("one mismatching old value rejects the whole batch", async () => {
       await seed(["refs/heads/a", oid(1)], ["refs/heads/b", oid(2)]);
       const r = await refs.batch([

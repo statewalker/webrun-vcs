@@ -273,8 +273,9 @@ describe("applyRefUpdates", () => {
       [[upToDate], true, [[]]],
       // every update refused before the transaction (non-atomic): the empty commit
       [[refused()], false, [[]]],
-      // --atomic with a refusal: git aborts its transaction, nothing is committed
-      [[refused()], true, []],
+      // --atomic with a refusal: git aborts its transaction, nothing is committed (the
+      // aborted batch, statewalker/webrun-vcs#500)
+      [[refused()], true, [[]]],
     ] as const) {
       const { refStore, batches } = local({ "refs/heads/a": C });
       await applyRefUpdates([...updates], refStore, { atomic, emptyTransaction: true });
@@ -284,6 +285,60 @@ describe("applyRefUpdates", () => {
     const { refStore, batches } = local({ "refs/heads/a": C });
     await applyRefUpdates([upToDate], refStore);
     expect(batches).toEqual([]);
+  });
+});
+
+describe("applyRefUpdates: an atomic fetch with a refused update (statewalker/webrun-vcs#500)", () => {
+  const update = (
+    localRef: string,
+    oldOid: string | undefined,
+    newOid: string,
+  ): FetchRefUpdate => ({
+    remoteRef: localRef,
+    localRef,
+    oldOid,
+    newOid,
+    status: "fast-forward" as const,
+    summary: "..",
+  });
+
+  it("aborts the transaction with the stale refs, then the accepted updates, writing nothing", async () => {
+    const calls: { commands: unknown[]; options: unknown }[] = [];
+    const refStore: RefStore = {
+      get: async () => undefined,
+      update: async () => {
+        throw new Error("no write expected");
+      },
+      listAll: async () => new Map<string, string>().entries(),
+      batch: async (commands, options) => {
+        calls.push({ commands, options });
+        return { ok: false, rejected: [] };
+      },
+    };
+    const accepted = { ...update("refs/heads/a", C, A), status: "fast-forward" as const };
+    const created = { ...update("refs/heads/n", undefined, B), status: "new" as const };
+    const refused = {
+      ...update("refs/heads/c", D, B),
+      status: "rejected" as const,
+      summary: "[rejected]",
+    };
+    const upToDate = { ...update("refs/heads/u", C, C), status: "up-to-date" as const };
+    const result = await applyRefUpdates([accepted, refused, upToDate, created], refStore, {
+      atomic: true,
+      deletes: ["refs/heads/gone"],
+      emptyTransaction: true,
+    });
+    expect(result).toBeUndefined();
+    expect(calls).toEqual([
+      {
+        commands: [
+          { name: "refs/heads/gone", new: null },
+          { name: "refs/heads/a", old: C, new: A },
+          { name: "refs/heads/n", old: null, new: B },
+        ],
+        options: { abortTransaction: true },
+      },
+    ]);
   });
 });
 
