@@ -1153,7 +1153,12 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       const partial =
         error instanceof RefTransactionAbortedError ? fetchResultOf(error) : undefined;
       if (partial && writesFetchHead && !this.atomic && checkout?.writeFetchHead) {
-        const marked = (await markedOf(partial)).filter((e) => !e.shallowRejected);
+        // in git's write order (store_updated_refs' two passes: the lines for merge first)
+        const kept = (await markedOf(partial)).filter((e) => !e.shallowRejected);
+        const marked = [
+          ...kept.filter((e) => !e.notForMerge),
+          ...kept.filter((e) => e.notForMerge),
+        ];
         const refusedRef = refusedRefOf(error);
         const at =
           refusedRef === undefined ? -1 : marked.findIndex((e) => e.localRef === refusedRef);

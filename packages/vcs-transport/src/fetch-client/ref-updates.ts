@@ -448,8 +448,10 @@ export async function applyRefUpdates(
     try {
       result = await refStore.batch([command(u)], logOf(u));
     } catch (error) {
-      // a refusing reference-transaction hook: git dies at this ref (one transaction per ref)
-      noteRefusedRef(error, u.localRef);
+      // a refusing reference-transaction hook: git 2.43 dies at this ref (one transaction per
+      // ref, each line written before it); 2.5x's one batched transaction (here a single
+      // write) comes after every line
+      if (!options.batchNonAtomic) noteRefusedRef(error, u.localRef);
       throw error;
     }
     if (!result.ok) reject(u, result.rejected[0]?.reason ?? "rejected");

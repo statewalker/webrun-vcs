@@ -322,6 +322,14 @@ describe("applyRefUpdates: a refusing reference-transaction hook (statewalker/we
     expect(error).toBeInstanceOf(Error);
     expect(refusedRefOf(error)).toBeUndefined();
   });
+
+  it("names none under batched updates even for a single write (git 2.5x's one transaction)", async () => {
+    const error = await applyRefUpdates([update("refs/heads/a", A)], refusing(), {
+      batchNonAtomic: true,
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(Error);
+    expect(refusedRefOf(error)).toBeUndefined();
+  });
 });
 
 describe("isFastForward under clock skew", () => {
