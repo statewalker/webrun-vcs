@@ -5,6 +5,7 @@
 import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { ObjectId } from "../../common/id/index.js";
 import {
+  abortedBatch,
   type BatchOptions,
   type BatchResult,
   batchBySingleRef,
@@ -201,6 +202,7 @@ export class MemoryRefs implements Refs {
    * reflog lines as git does (`options.ident`, `options.message`).
    */
   batch(commands: RefCommand[], options?: BatchOptions): Promise<BatchResult> {
+    if (options?.abortTransaction) return abortedBatch(commands, options);
     return this.exclusive(() => this.applyBatch(commands, options));
   }
 

@@ -56,6 +56,7 @@ function keepsBySize(count: number, limit = DEFAULT_UNPACK_LIMIT): boolean {
 }
 
 import {
+  abortFetchTransaction,
   applyRefUpdates,
   type FetchRefUpdate,
   mapRefs,
@@ -1185,10 +1186,10 @@ export async function fetchFromConnection(
       throw error;
     });
     if (failure !== undefined) result.refTransactionError = failure;
-  } else if (
-    options.emptyTransaction &&
-    !(options.atomic && result.refUpdates.some((u) => u.status === "rejected"))
-  ) {
+  } else if (options.atomic && result.refUpdates.some((u) => u.status === "rejected")) {
+    // a dry run queues no update, but do_fetch still aborts its open transaction
+    await abortFetchTransaction(refStore);
+  } else if (options.emptyTransaction) {
     // a dry run queues no update (s_update_ref), but do_fetch still commits its transaction
     await refStore.batch?.([], { emptyTransaction: true });
   }

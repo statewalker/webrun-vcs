@@ -37,6 +37,7 @@ import { decodeGitPath, encodeGitPath, gitCharWidth } from "@statewalker/vcs-uti
 import { InvalidArgumentError } from "../errors/index.js";
 import type { DiffColors } from "../results/diff-color.js";
 import { ChangeType } from "../results/diff-entry.js";
+import { insertLinePrefix } from "../results/line-prefix-sink.js";
 import { type DateMode, DEFAULT_DATE_MODE, parseDateMode, showDate } from "./date-format.js";
 import { type DiffOutputFormat, type DiffTextOptions, hasPickaxe } from "./diff-command.js";
 import { LogGraph } from "./log-graph.js";
@@ -351,11 +352,24 @@ export interface LogOutputHost {
     entry: LogOutputEntry,
     parent: ObjectId | undefined,
     formats: DiffOutputFormat[],
-    options: { statWidth?: number; follow?: string; fullDiff?: boolean; abbrev?: number },
+    options: {
+      statWidth?: number;
+      follow?: string;
+      fullDiff?: boolean;
+      abbrev?: number;
+      /**
+       * diff.c's `diff_line_prefix` (the graph's padding) is inserted by the log: a host
+       * may say where with `prefixPoints` (git's word diff leaves it out of most lines);
+       * without them the log prefixes every line
+       */
+      linePrefix?: boolean;
+    },
   ): Promise<{
     bytes?: Uint8Array;
     followPath?: string;
     followChange?: ChangeType.RENAME | ChangeType.COPY;
+    /** The offsets in `bytes` where the line prefix goes, ascending */
+    prefixPoints?: readonly number[];
   }>;
   /**
    * The combined diff of a merge (`-c`, `--cc`): the paths that differ from every parent,
@@ -376,10 +390,12 @@ export interface LogOutputHost {
       follow?: string;
       fullDiff?: boolean;
       abbrev?: number;
+      /** As {@link LogOutputHost.diff}'s */
+      linePrefix?: boolean;
       /** The commits the log has processed before this one (git 2.43 freed their parents) */
       processed?: ReadonlySet<ObjectId>;
     },
-  ): Promise<{ bytes?: Uint8Array; followPath?: string }>;
+  ): Promise<{ bytes?: Uint8Array; followPath?: string; prefixPoints?: readonly number[] }>;
   combinedDiff(
     entry: LogOutputEntry,
     options: {
@@ -1286,6 +1302,7 @@ export class LogPrinter {
     const width = this.graph ? this.graph.getWidth() : 0;
     const diffOptions = {
       ...(width ? { statWidth: 80 - width } : {}),
+      ...(this.graph ? { linePrefix: true } : {}),
       ...(this.follow && this.followPath !== undefined ? { follow: this.followPath } : {}),
       ...(this.options.fullDiff ? { fullDiff: true } : {}),
       ...this.diffAbbrev(),
@@ -1293,7 +1310,11 @@ export class LogPrinter {
     if (remerge && !this.host.remergeDiff) {
       throw new Error("--remerge-diff: the log's host cannot re-merge");
     }
-    const result: { bytes?: Uint8Array; followPath?: string } =
+    const result: {
+      bytes?: Uint8Array;
+      followPath?: string;
+      prefixPoints?: readonly number[];
+    } =
       lineLog && this.host.lineLogDiff
         ? await this.host.lineLogDiff(entry, this.formats, this.diffAbbrev())
         : remerge && this.host.remergeDiff
@@ -1319,7 +1340,13 @@ export class LogPrinter {
         this.out.text("\n");
       }
     }
-    this.out.bytes(prefixLines(result.bytes, this.padding()));
+    // the graph's padding once the commit's header is out (git's prefix callback runs then)
+    const padding = this.padding();
+    this.out.bytes(
+      result.prefixPoints
+        ? insertLinePrefix(result.bytes, result.prefixPoints, bytesOf(padding))
+        : prefixLines(result.bytes, padding),
+    );
   }
 
   /** combine-diff.c's diff_tree_combined for a merge */

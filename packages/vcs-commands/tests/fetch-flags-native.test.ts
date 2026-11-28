@@ -515,6 +515,9 @@ describeGit("git fetch --atomic: the reference-transaction hook, as native git",
     if (args.includes("--tags")) fetch.setTagOpt(TagOption.FETCH_TAGS);
     if (args.includes("--prune")) fetch.setRemoveDeletedRefs(true);
     if (args.includes("--dry-run")) fetch.setDryRun(true);
+    // the refspecs after the remote's name
+    const refspecs = args.slice(args.indexOf("origin") + 1);
+    if (refspecs.length > 0) fetch.setRefSpecs(...refspecs);
     let result: FetchResult | undefined;
     let error: Error | undefined;
     try {
@@ -607,6 +610,38 @@ describeGit("git fetch --atomic: the reference-transaction hook, as native git",
     });
     await expectHookTwins(dir, ["origin"], true);
   });
+
+  /**
+   * statewalker/webrun-vcs#500: an update refused before the transaction (a non-fast-forward
+   * without `+`, a tag it would clobber) makes do_fetch abort its open transaction, so the
+   * hook hears `aborted` with no line (2.43 and 2.5x, a dry run too)
+   */
+  function rewritten(name: string): string {
+    const dir = repository(name, { branches: ["other", "stale"], tags: ["moved"] });
+    git(dir, "fetch", "-q", "--tags", "origin");
+    const up = join(dir, "up.git");
+    git(up, "branch", "-D", "stale");
+    git(up, "branch", "added", "main");
+    // a commit that does not descend from `other`, and the tag moved onto it
+    const id = git(up, "commit-tree", "-m", "rewritten", "main^{tree}").trim();
+    git(up, "update-ref", "refs/heads/other", id);
+    git(up, "tag", "-f", "moved", id);
+    return dir;
+  }
+
+  for (const args of [
+    ["--atomic", "origin", "other:refs/remotes/origin/other"],
+    ["--atomic", "--dry-run", "origin", "other:refs/remotes/origin/other"],
+    ["--atomic", "origin", "refs/tags/*:refs/tags/*"],
+    ["--atomic", "--dry-run", "origin", "refs/tags/*:refs/tags/*"],
+    // the stale refs queued first, then the accepted updates
+    ["--atomic", "--prune", "origin", "refs/heads/*:refs/remotes/origin/*"],
+  ]) {
+    it(`a refused update aborts the transaction: fetch ${args.join(" ")}`, async () => {
+      const dir = rewritten(`refused-${counter++}`);
+      await expectHookTwins(dir, args);
+    });
+  }
 });
 
 // git 2.5x only: 2.43's set_head writes no symbolic ref in a transaction (and fetch has none)
