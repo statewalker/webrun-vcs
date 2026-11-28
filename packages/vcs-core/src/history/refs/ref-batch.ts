@@ -748,3 +748,18 @@ export function abortedTransactionUpdates(commands: readonly RefCommand[]): RefT
     new: c.new,
   }));
 }
+
+/**
+ * A batch asked with {@link BatchOptions.abortTransaction}, for stores without a transaction
+ * hook of their own: nothing is written, the batch's own hook (if given) hears `aborted`.
+ * Every store must answer such a batch without applying its commands.
+ */
+export async function abortedBatch(
+  commands: readonly RefCommand[],
+  options?: BatchOptions,
+): Promise<BatchResult> {
+  await options?.transactionHook?.("aborted", abortedTransactionUpdates(commands), {
+    asAsked: true,
+  });
+  return { ok: false, rejected: [] };
+}
