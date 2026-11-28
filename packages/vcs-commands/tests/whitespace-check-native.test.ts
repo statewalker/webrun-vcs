@@ -449,6 +449,77 @@ describeGit("t4015-diff-whitespace", () => {
   });
 });
 
+describeGit("log --graph --check (statewalker/webrun-vcs#312)", () => {
+  // diff.c's checkdiff_consume writes diff_line_prefix (the graph's padding) before each
+  // `<file>:<line>: <error>.` line and before the offending line it shows
+  it('t4015-diff-whitespace.sh: "check with no whitespace errors (diff-tree)", "check with trailing whitespace (diff-tree)", "check with space before tab in indent (diff-tree)" under log --graph, with a merge', async () => {
+    const dir = repo(`
+      echo "foo();" >x
+      git add x
+      commit -m initial
+      git checkout -q -b side
+      echo "side(); " >y
+      printf " \tbar();\n" >>y
+      git add y
+      commit -m "side with errors"
+      git checkout -q main
+      echo "foo();" >x
+      echo "bar();" >>x
+      commit -m "new commit" x
+      echo "foo(); " >x
+      commit -m "another commit" x
+      test_tick
+      git merge -q --no-edit side
+      echo " 	foo();" >x
+      commit -m "yet another" x
+    `);
+    const out: string[] = [];
+    const graph: LogOutputOptions = { check: true, graph: true };
+    await twinLog(out, dir, ["--graph", "--check"], (l) => l, graph);
+    await twinLog(out, dir, ["--graph", "--check", "--oneline"], (l) => l, {
+      ...graph,
+      oneline: true,
+    });
+    await twinLog(
+      out,
+      dir,
+      ["--graph", "--check", "--color"],
+      (l) => l.setDiffOptions({ color: true }),
+      graph,
+    );
+    await twinLog(out, dir, ["--graph", "--check", "--stat"], (l) => l, { ...graph, stat: true });
+    await twinLog(out, dir, ["--graph", "--check", "-p"], (l) => l, { ...graph, patch: true });
+    await twinLog(out, dir, ["--graph", "--check", "-m"], (l) => l, { ...graph, m: true });
+    await twinLog(out, dir, ["--graph", "--check", "--cc"], (l) => l, { ...graph, cc: true });
+    expect(out).toEqual([]);
+  });
+
+  it("exits 0 under log --graph --check for a history without whitespace errors", async () => {
+    const dir = repo(`
+      echo "foo();" >x
+      git add x
+      commit -m initial
+      git checkout -q -b side
+      echo "side();" >y
+      git add y
+      commit -m side
+      git checkout -q main
+      echo "bar();" >>x
+      commit -m "new commit" x
+      test_tick
+      git merge -q --no-edit side
+    `);
+    const out: string[] = [];
+    await twinLog(out, dir, ["--graph", "--check"], (l) => l, { check: true, graph: true });
+    await twinLog(out, dir, ["--graph", "--check", "--oneline"], (l) => l, {
+      check: true,
+      graph: true,
+      oneline: true,
+    });
+    expect(out).toEqual([]);
+  });
+});
+
 describeGit("t4017-diff-retval", () => {
   it('t4017-diff-retval.sh: "--check --exit-code returns 0 for no difference", "--check --exit-code returns 1 for a clean difference", "--check --exit-code returns 3 for a dirty difference", "--check with --no-pager returns 2 for dirty difference", "check should test not just the last line", "check detects leftover conflict markers", "check honors conflict marker length"', async () => {
     const dir = repo(`
