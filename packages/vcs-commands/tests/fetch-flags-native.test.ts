@@ -571,6 +571,20 @@ describeGit("git fetch --atomic: the reference-transaction hook, as native git",
       await expectHookTwins(dir, args);
     });
   }
+
+  // statewalker/webrun-vcs#503: a hook refusing the transaction; without --atomic FETCH_HEAD
+  // keeps the lines git wrote before it died (2.5x: every line before its one transaction;
+  // 2.43: the lines up to the refused ref's own transaction), with --atomic none
+  for (const updates of [true, false]) {
+    for (const args of [["origin"], ["--atomic", "origin"]]) {
+      it(`a refusing hook, FETCH_HEAD: fetch ${args.join(" ")} (${updates ? "updates" : "no-op"})`, async () => {
+        const dir = repository(`refusing-${counter++}`, {
+          branches: updates ? ["a-new", "z-new"] : [],
+        });
+        await expectHookTwins(dir, args, true);
+      });
+    }
+  }
 });
 
 // git 2.5x only: 2.43's set_head writes no symbolic ref in a transaction (and fetch has none)
