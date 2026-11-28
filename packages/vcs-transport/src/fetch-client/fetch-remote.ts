@@ -1210,6 +1210,11 @@ export async function fetchFromConnection(
             initialEvenEmpty: !isEmpty,
           }
         : {}),
+    }).catch((error: unknown) => {
+      // a refusing reference-transaction hook: the caller still writes the FETCH_HEAD lines
+      // git had written (statewalker/webrun-vcs#503)
+      noteFetchResult(error, result);
+      throw error;
     });
     if (failure !== undefined) result.refTransactionError = failure;
   } else if (options.atomic && result.refUpdates.some((u) => u.status === "rejected")) {
@@ -1220,6 +1225,25 @@ export async function fetchFromConnection(
     await refStore.batch?.([], { emptyTransaction: true });
   }
   return result;
+}
+
+const FETCH_RESULT = Symbol.for("@statewalker/vcs-transport:fetch-result");
+
+function noteFetchResult(error: unknown, result: FetchClientResult): void {
+  if (typeof error === "object" && error !== null) {
+    (error as { [FETCH_RESULT]?: FetchClientResult })[FETCH_RESULT] = result;
+  }
+}
+
+/**
+ * What a fetch had fetched and planned when writing its refs threw `error` (a refusing
+ * reference-transaction hook: `RefTransactionAbortedError`), so the caller can write the
+ * `FETCH_HEAD` lines git writes before it dies; undefined for any other error. With
+ * {@link refusedRefOf} the ref whose own transaction was refused (git 2.43's one per ref).
+ */
+export function fetchResultOf(error: unknown): FetchClientResult | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  return (error as { [FETCH_RESULT]?: FetchClientResult })[FETCH_RESULT];
 }
 
 /** `ls-refs` (protocol v2): the refs under `prefixes`, with symrefs, peeled tags, an unborn HEAD. */

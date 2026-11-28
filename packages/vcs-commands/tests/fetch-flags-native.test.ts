@@ -477,14 +477,24 @@ describeGit("git fetch --atomic: the reference-transaction hook, as native git",
    * A repository fetching from `up.git` inside it (so each twin has its own copy), with
    * `extra` branches and tags added upstream after a first fetch, and the logging hook.
    */
-  function repository(name: string, extra: { branches?: string[]; tags?: string[] }): string {
+  function repository(
+    name: string,
+    extra: { branches?: string[]; tags?: string[]; before?: string[]; upstream?: boolean },
+  ): string {
     const dir = join(root, name);
     mkdirSync(dir);
     git(dir, "init", "-q", "-b", "main");
     putFile(dir, "a.txt", "a\n");
     git(dir, "add", "a.txt");
     git(dir, "commit", "-qm", "base");
+    // `before`: branches the first fetch already brings
+    for (const b of extra.before ?? []) git(dir, "branch", b);
     git(dir, "clone", "-q", "--bare", ".", "up.git");
+    if (extra.upstream) {
+      // as a clone sets it: main's line in FETCH_HEAD is for merge
+      git(dir, "config", "branch.main.remote", "origin");
+      git(dir, "config", "branch.main.merge", "refs/heads/main");
+    }
     git(dir, "remote", "add", "origin", "up.git");
     git(dir, "fetch", "-q", "origin");
     for (const b of extra.branches ?? []) git(join(dir, "up.git"), "branch", b, "main");
@@ -574,6 +584,32 @@ describeGit("git fetch --atomic: the reference-transaction hook, as native git",
       await expectHookTwins(dir, args);
     });
   }
+
+  // statewalker/webrun-vcs#503: a hook refusing the transaction; without --atomic FETCH_HEAD
+  // keeps the lines git wrote before it died (2.5x: every line before its one transaction;
+  // 2.43: the lines up to the refused ref's own transaction), with --atomic none
+  for (const updates of [true, false]) {
+    for (const args of [["origin"], ["--atomic", "origin"]]) {
+      it(`a refusing hook, FETCH_HEAD: fetch ${args.join(" ")} (${updates ? "updates" : "no-op"})`, async () => {
+        const dir = repository(`refusing-${counter++}`, {
+          branches: updates ? ["a-new", "z-new"] : [],
+        });
+        await expectHookTwins(dir, args, true);
+      });
+    }
+  }
+
+  // review of statewalker/webrun-vcs#568: with an upstream, git 2.43 writes the merge line
+  // before the refused ref's (its first pass); a single changed ref under 2.5x is still its
+  // one transaction, after every line
+  it("a refusing hook, FETCH_HEAD: one new ref, an upstream, refs after it", async () => {
+    const dir = repository(`refusing-${counter++}`, {
+      branches: ["b-new"],
+      before: ["c", "z"],
+      upstream: true,
+    });
+    await expectHookTwins(dir, ["origin"], true);
+  });
 
   /**
    * statewalker/webrun-vcs#500: an update refused before the transaction (a non-fast-forward
