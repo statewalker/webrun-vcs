@@ -51,6 +51,7 @@ import type {
   SymbolicRefLogOptions,
 } from "@statewalker/vcs-core";
 import {
+  abortedTransactionUpdates,
   createPeeledTagRef,
   createRef,
   createSymbolicRef,
@@ -812,6 +813,11 @@ export class ReftableRefStore implements Refs {
 
   private async transact(commands: RefCommand[], o: BatchOptions): Promise<BatchResult> {
     const hook = o.transactionHook ?? this.transactionHook;
+    // git's ref_transaction_abort of an open transaction: the hook hears `aborted` alone
+    if (o.abortTransaction) {
+      await hook?.("aborted", abortedTransactionUpdates(commands), { asAsked: true });
+      return { ok: false, rejected: [] };
+    }
     if (commands.length === 0) {
       if (o.emptyTransaction && hook) {
         await this.tell(hook, "preparing", []);

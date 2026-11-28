@@ -336,6 +336,28 @@ describe("WorktreeRefs and the reference-transaction hook", () => {
     );
   });
 
+  // statewalker/webrun-vcs#500: a fetch in a linked worktree (the repository's transaction)
+  it("an aborted or empty transaction is told through the worktree's hook", async () => {
+    const { history, refs, commit } = await linked();
+    const seen: string[] = [];
+    (refs as unknown as HookedRefs).setTransactionHook(async (state, updates) => {
+      seen.push(`${state} ${updates.map((u) => u.name).join(",")}`);
+      return undefined;
+    });
+    const result = await refs.batch([{ name: "refs/remotes/origin/x", new: commit }], {
+      abortTransaction: true,
+    });
+    expect(result.ok).toBe(false);
+    expect(await history.refs.has("refs/remotes/origin/x")).toBe(false);
+    await refs.batch([], { emptyTransaction: true });
+    expect(seen).toEqual([
+      "aborted refs/remotes/origin/x",
+      "preparing ",
+      "prepared ",
+      "committed ",
+    ]);
+  });
+
   it("removeAll: a refusal of the repository's transaction deletes none of the worktree's", async () => {
     const { history, refs, commit } = await linked();
     await history.refs.set("refs/heads/gone", commit);

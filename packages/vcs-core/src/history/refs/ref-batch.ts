@@ -153,6 +153,20 @@ export interface BatchOptions extends RefLogOptions {
    */
   emptyTransaction?: boolean;
   /**
+   * Queue the commands and abort the transaction without preparing it: nothing is written or
+   * checked, and the reference-transaction hook hears only `aborted`, with the commands as
+   * given (git's `ref_transaction_abort` of an open transaction: `git fetch --atomic` when an
+   * update was refused, a non-fast-forward or a tag it would clobber, after the accepted ones
+   * were queued; none in a dry run, so no line). The result is not `ok`, with nothing
+   * rejected. Stores without a hook do nothing.
+   *
+   * @example
+   * ```typescript
+   * await refs.batch([{ name: "refs/remotes/origin/a", old: null, new: id }], { abortTransaction: true });
+   * ```
+   */
+  abortTransaction?: boolean;
+  /**
    * Commit the batch as git's files backend does (`files_transaction_finish`): each updated
    * ref written into its own lock and renamed over its loose file, packed-refs touched only
    * to drop the refs the batch deletes, after the renames (`git fetch --atomic`, git 2.5x's
@@ -719,4 +733,18 @@ export class RefTransactionAbortedError extends Error {
     this.name = "RefTransactionAbortedError";
     this.packed = options.packed ?? false;
   }
+}
+
+/**
+ * The updates an aborted open transaction tells its hook ({@link BatchOptions.abortTransaction}):
+ * the commands as queued, each by the name it gave (git's `run_transaction_hook` over the
+ * transaction's updates, before any was dereferenced).
+ */
+export function abortedTransactionUpdates(commands: readonly RefCommand[]): RefTransactionUpdate[] {
+  return commands.map((c) => ({
+    requested: c.name,
+    name: c.name,
+    ...(c.old !== undefined ? { old: c.old } : {}),
+    new: c.new,
+  }));
 }
