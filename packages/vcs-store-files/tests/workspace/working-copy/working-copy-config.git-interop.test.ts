@@ -443,6 +443,217 @@ describe("GitWorkingCopyConfig <-> native git", () => {
       await both("[a]\n\ty=1\n\tx = 1", (c) => c.unset("a.x"), [["--unset-all", "a.x"]]);
       await both("[a]\n\tx = 1\n[b]\n\ty=1", (c) => c.unset("a.x"), [["--unset-all", "a.x"]]);
     });
+
+    it("removes a header whose line carries the section's only variable", async () => {
+      await both("[a] x = 1\n", (c) => c.unset("a.x"), [["--unset-all", "a.x"]]);
+      await both("[a] x = 1 # c\n", (c) => c.unset("a.x"), [["--unset-all", "a.x"]]);
+      await both("[a] x = 1\n[b]\n\tz=1\n", (c) => c.unset("a.x"), [["--unset-all", "a.x"]]);
+      await both("[b]\n\ty=1\n\n[a] x = 1\n\n[c]\n\tw=1\n", (c) => c.unset("a.x"), [
+        ["--unset-all", "a.x"],
+      ]);
+      await both("[a]\n\tx=2\n[a] x = 1\n", (c) => c.unset("a.x"), [["--unset-all", "a.x"]]);
+      await both(
+        "[a] x = 1\n\ty = 2\n",
+        (c) => {
+          c.unset("a.x");
+          c.unset("a.y");
+        },
+        [
+          ["--unset-all", "a.x"],
+          ["--unset-all", "a.y"],
+        ],
+      );
+    });
+
+    it("keeps such a header where a variable or a comment stays", async () => {
+      await both("[a] x = 1\n\ty = 2\n", (c) => c.unset("a.x"), [["--unset-all", "a.x"]]);
+      await both("[a] x = 1\n\ty = 2\n", (c) => c.unset("a.y"), [["--unset-all", "a.y"]]);
+      await both("# k\n[a] x = 1\n", (c) => c.unset("a.x"), [["--unset-all", "a.x"]]);
+      await both("[a] x = 1\n\t# k\n", (c) => c.unset("a.x"), [["--unset-all", "a.x"]]);
+      await both(
+        "[a] x = 1\n\ty=2\n",
+        (c) => {
+          c.unset("a.x");
+          c.add("a.x", "3");
+        },
+        [
+          ["--unset-all", "a.x"],
+          ["--add", "a.x", "3"],
+        ],
+      );
+    });
+
+    it("removes one header of a line holding several, keeping the others", async () => {
+      await both("[a][b]\n\tz=1\n", (c) => c.unset("b.z"), [["--unset-all", "b.z"]]);
+      await both("[a][b]\n\tz=1", (c) => c.unset("b.z"), [["--unset-all", "b.z"]]);
+      await both("[a] [b]\n\tz=1\n[c]\n\tw=1\n", (c) => c.unset("b.z"), [["--unset-all", "b.z"]]);
+      await both("[a]\n\tq=1\n[c][b]\n\tz=1\n", (c) => c.unset("b.z"), [["--unset-all", "b.z"]]);
+      await both("[a][b] z=1\n", (c) => c.unset("b.z"), [["--unset-all", "b.z"]]);
+      await both("[a][b] z=1\n\tq=2\n", (c) => c.unset("b.z"), [["--unset-all", "b.z"]]);
+      await both("[b][b]\n\tz=1\n", (c) => c.unset("b.z"), [["--unset-all", "b.z"]]);
+      await both("[a] [b] # c\n\tz=1\n", (c) => c.unset("b.z"), [["--unset-all", "b.z"]]);
+      await both("[a]\n\tq=1\n[a][b]\n\tz=1\n", (c) => c.unset("a.q"), [["--unset-all", "a.q"]]);
+      await both("[c]\n\tw=1\n[a]\n\tq=1\n[a] [b]\n\tz=1\n", (c) => c.unset("a.q"), [
+        ["--unset-all", "a.q"],
+      ]);
+      await both(
+        "[a][b]\n\tz=1\n",
+        (c) => {
+          c.unset("b.z");
+          c.add("b.z", "2");
+        },
+        [
+          ["--unset-all", "b.z"],
+          ["--add", "b.z", "2"],
+        ],
+      );
+      await both(
+        "[a][b]\n\tz=1\n",
+        (c) => {
+          c.unset("b.z");
+          c.set("a.k", "v");
+        },
+        [
+          ["--unset-all", "b.z"],
+          ["a.k", "v"],
+        ],
+      );
+    });
+
+    it("writes a new key of a section whose header shared a removed section's line", async () => {
+      await both(
+        "[x]\n\tq = 1\n[a][b]\n\tz = 1\n",
+        (c) => {
+          c.set("a.x", "v");
+          c.set("b.k", "w");
+          c.unsetSection("b");
+        },
+        [
+          ["a.x", "v"],
+          ["b.k", "w"],
+          ["--remove-section", "b"],
+        ],
+      );
+      await both(
+        "[a][b]\n\tz = 1\n",
+        (c) => {
+          c.set("a.x", "v");
+          c.unset("b.z");
+          c.unsetSection("b");
+        },
+        // git's unset already removed `[b]` (nothing left for --remove-section)
+        [
+          ["a.x", "v"],
+          ["--unset-all", "b.z"],
+        ],
+      );
+    });
+
+    it("adds a value of a key at its section's end, after its last variable", async () => {
+      const remote = '[remote "o"]\n\turl = a\n\tfetch = +refs/heads/*:refs/remotes/o/*\n';
+      await both(remote, (c) => c.add("remote.o.url", "b"), [["--add", "remote.o.url", "b"]]);
+      await both(
+        remote,
+        (c) => {
+          c.add("remote.o.url", "b");
+          c.add("remote.o.url", "c");
+        },
+        [
+          ["--add", "remote.o.url", "b"],
+          ["--add", "remote.o.url", "c"],
+        ],
+      );
+      await both(
+        remote,
+        (c) => {
+          c.add("remote.o.url", "b");
+          c.set("remote.o.k", "v");
+        },
+        [
+          ["--add", "remote.o.url", "b"],
+          ["remote.o.k", "v"],
+        ],
+      );
+      await both(
+        remote,
+        (c) => {
+          c.set("remote.o.k", "v");
+          c.add("remote.o.url", "b");
+        },
+        [
+          ["remote.o.k", "v"],
+          ["--add", "remote.o.url", "b"],
+        ],
+      );
+      await both("[r]\n\turl=a\n\tfetch = f\n\n# next\n[s]\n\tk=1\n", (c) => c.add("r.url", "b"), [
+        ["--add", "r.url", "b"],
+      ]);
+      await both("[r]\n\turl=a\n[s]\n\tk=1\n[r]\n\tfetch = f\n", (c) => c.add("r.url", "b"), [
+        ["--add", "r.url", "b"],
+      ]);
+      await both("[r]\n\turl=a\n\tfetch = f\n[s]\n\tk=1\n[r]\n", (c) => c.add("r.url", "b"), [
+        ["--add", "r.url", "b"],
+      ]);
+      await both("[r]\n\turl=a\n\tfetch = f\n\t# tail\n[s]\n", (c) => c.add("r.url", "b"), [
+        ["--add", "r.url", "b"],
+      ]);
+      await both("[r] url=a\n\tfetch = f\n", (c) => c.add("r.url", "b"), [["--add", "r.url", "b"]]);
+      await both("[r]\n\turl=a\n\tfetch = f", (c) => c.add("r.url", "b"), [
+        ["--add", "r.url", "b"],
+      ]);
+    });
+
+    it("sets a new key after its section's last variable, not after a comment", async () => {
+      await both("[r]\n\turl=a\n\tfetch = f\n\n# next\n[s]\n\tk=1\n", (c) => c.set("r.k", "v"), [
+        ["r.k", "v"],
+      ]);
+      await both("[r]\n\turl=a\n\tfetch = f\n\t# tail\n[s]\n", (c) => c.set("r.k", "v"), [
+        ["r.k", "v"],
+      ]);
+    });
+
+    it("ends the file with a newline when its last line is written anew", async () => {
+      await both("[a]\n\tx=1", (c) => c.set("a.x", "2"), [["a.x", "2"]]);
+      await both("[a]\n\tx=1", (c) => c.set("a.y", "2"), [["a.y", "2"]]);
+      await both("[a]\n\tx=1", (c) => c.add("a.x", "2"), [["--add", "a.x", "2"]]);
+      await both("# k\n[a] x = 1", (c) => c.unset("a.x"), [["--unset-all", "a.x"]]);
+      await both("[a][b] z=1", (c) => c.unset("b.z"), [["--unset-all", "b.z"]]);
+      await both("[a]\n\tx=1\n\ty=2", (c) => c.set("a.x", "2"), [["a.x", "2"]]);
+      await both("[a]\n\tx=1\n\tx=2", (c) => c.editValues("a.x", ["1", "9"]), [
+        ["a.x", "9", "^2$"],
+      ]);
+    });
+
+    it("edits values in place: one replaced where it is, matching ones unset", async () => {
+      const content = "[a]\n\tx=1\n\ty=0\n\tx=2\n";
+      await both(content, (c) => c.editValues("a.x", ["1", "9"]), [["a.x", "9", "^2$"]]);
+      await both(content, (c) => c.editValues("a.x", ["1"]), [["--unset-all", "a.x", "^2$"]]);
+      await both("[a]\n\tx=1\n[b]\n\tz=0\n[a]\n\tx=2\n", (c) => c.editValues("a.x", ["1"]), [
+        ["--unset-all", "a.x", "^2$"],
+      ]);
+      await both(
+        content,
+        (c) => {
+          c.add("a.x", "3");
+          c.editValues("a.x", ["1", "2", "4"]);
+        },
+        [
+          ["--add", "a.x", "3"],
+          ["a.x", "4", "^3$"],
+        ],
+      );
+      await both(
+        content,
+        (c) => {
+          c.editValues("a.x", ["2"]);
+          c.add("a.x", "5");
+        },
+        [
+          ["--unset-all", "a.x", "^1$"],
+          ["--add", "a.x", "5"],
+        ],
+      );
+    });
   });
 
   describe("booleans, as git_config_bool reads them", () => {

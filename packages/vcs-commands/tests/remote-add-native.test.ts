@@ -368,12 +368,12 @@ describeGit("git remote add / set-url / -v, as native git", () => {
     ];
     for (const step of steps) await expectSameSetUrl(n, o, step);
 
-    // url as the section's last variable: an added value goes after it (git adds at the
-    // section's end, our writer after the key's other values: the same place here)
+    // url before fetch, as `remote add` writes them: an added URL goes after fetch (git adds
+    // at the section's end), a replaced one stays on its line, a deleted one leaves its line
     const [n2, o2] = twins();
     for (const d of [n2, o2]) {
-      git(join(root, d), "config", "remote.someremote.fetch", "+refs/heads/*:refs/remotes/s/*");
       git(join(root, d), "config", "remote.someremote.url", "foo");
+      git(join(root, d), "config", "remote.someremote.fetch", "+refs/heads/*:refs/remotes/s/*");
     }
     for (const step of [
       ["--add", "someremote", "bar"],
