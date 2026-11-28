@@ -1072,7 +1072,7 @@ export class RemoteSetUrlCommand extends GitCommand<RemoteConfig> {
     const hits = values.filter((v) => matchesUrl(regex, v)).length;
     if (this.deleteMode) {
       if (hits === 0) throw new GitApiError(`fatal: could not unset '${key}'`);
-      store.setValues(
+      store.editValues(
         key,
         values.filter((v): v is string => v !== undefined && !matchesUrl(regex, v)),
       );
@@ -1118,7 +1118,7 @@ function replaceMatching(
     store.addValue(key, newValue);
     return;
   }
-  store.setValues(
+  store.editValues(
     key,
     values.map((v) => (matchesUrl(regex, v) ? newValue : (v ?? ""))),
   );
