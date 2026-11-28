@@ -13,7 +13,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDefaultTransports } from "@statewalker/vcs-transport";
@@ -33,6 +33,12 @@ let root: string;
 let srv: string;
 let counter = 0;
 const git = (cwd: string, ...args: string[]) => gitOut(root, cwd, args);
+
+// one temporary root for the file; each describe block works in a directory of its own
+beforeAll(() => {
+  root = mkdtempSync(join(tmpdir(), "want-ref-order-"));
+});
+afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
 /** The wants, deepen and have lines upload-pack read, in order. */
 function requestLines(trace: string): string[] {
@@ -56,7 +62,6 @@ describeGit("want-ref lines in git's order, as native git", () => {
   const ids: Record<string, string> = {};
 
   beforeAll(() => {
-    root = mkdtempSync(join(tmpdir(), "want-ref-order-"));
     srv = join(root, "srv");
     const repo = join(srv, "repo");
     git(root, "init", "-q", "-b", "main", repo);
@@ -72,8 +77,6 @@ describeGit("want-ref lines in git's order, as native git", () => {
     ids.main = commit(repo, "main");
     git(repo, "config", "uploadpack.allowRefInWant", "true");
   });
-
-  afterAll(() => removeTempDir(root), CLEANUP_TIMEOUT);
 
   /** An empty repository, and our working copy of it. */
   async function emptyRepo(name: string): Promise<{ dir: string; ours: Git }> {
@@ -116,6 +119,14 @@ describeGit("want-ref lines in git's order, as native git", () => {
       () => ["refs/heads/zeta:refs/x/zeta", `${ids.alpha}:refs/x/exact`, "alpha:refs/x/alpha"],
     ],
     ["two names of one commit", () => ["twin:refs/x/twin", "alpha:refs/x/alpha"]],
+    [
+      "exact ids alone, in both orders",
+      () =>
+        [ids.zeta, ids.mid, ids.alpha]
+          .sort()
+          .reverse()
+          .map((id, i) => `${id}:refs/x/e${i}`),
+    ],
     ["a followed tag", () => ["zeta:refs/x/zeta", "beta:refs/x/beta"]],
   ];
 
@@ -214,12 +225,13 @@ function run(
 for (const oracle of ORACLES) {
   describeGit(`want-ref from a shallow server, as native git (${oracle.name})`, () => {
     let base: string;
+    let shalSrv: string;
     const env = () => oracle.env(base);
 
     beforeAll(() => {
-      base = mkdtempSync(join(tmpdir(), "want-ref-shallow-"));
-      root = base;
-      srv = join(base, "srv");
+      base = join(root, `shallow-${oracle.bin === "git" ? "path" : "git3"}`);
+      shalSrv = join(base, "srv");
+      mkdirSync(base, { recursive: true });
       const full = join(base, "full");
       git(base, "init", "-q", "-b", "main", full);
       for (const n of [1, 2, 3, 4, 5]) commit(full, `c${n}`);
@@ -234,19 +246,17 @@ for (const oracle of ORACLES) {
         ["shal-ref", "true"],
         ["shal-plain", "false"],
       ] as const) {
-        const dest = join(srv, name);
+        const dest = join(shalSrv, name);
         git(base, "clone", "-q", "--no-local", "--depth", "2", "--no-single-branch", full, dest);
         git(dest, "config", "uploadpack.allowRefInWant", refInWant);
       }
     });
 
-    afterAll(() => removeTempDir(base), CLEANUP_TIMEOUT);
-
     const transports = (trace?: string) =>
       createDefaultTransports({
         openSocket: async () =>
           childDuplex(
-            spawn(oracle.bin, daemonArgs(srv), {
+            spawn(oracle.bin, daemonArgs(shalSrv), {
               env: { ...env(), ...(trace ? { GIT_TRACE_PACKET: trace } : {}) },
             }),
           ),
@@ -271,7 +281,7 @@ for (const oracle of ORACLES) {
             "clone",
             "-q",
             ...(depth ? ["--depth", String(depth), "--no-single-branch"] : []),
-            `file://${join(srv, repo)}`,
+            `file://${join(shalSrv, repo)}`,
             dest,
           ]);
         const plain = join(base, `plain-${n}`);

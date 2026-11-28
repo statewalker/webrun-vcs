@@ -982,8 +982,8 @@ export async function fetchFromConnection(
               ? 1
               : compareRefNames(x.name as string, y.name as string);
       ordered.push(...soughtByName.sort(byName));
-      ordered.push(...soughtById.sort((x, y) => (x.oid < y.oid ? -1 : x.oid > y.oid ? 1 : 0)));
     }
+    ordered.push(...soughtById.sort((x, y) => (x.oid < y.oid ? -1 : x.oid > y.oid ? 1 : 0)));
     await runFetchPack(wants, {
       ...(ordered.length > 0 ? { wantRefs: ordered } : {}),
       depth,
