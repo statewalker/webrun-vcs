@@ -5,6 +5,7 @@
  */
 
 import {
+  abortedBatch,
   type BatchOptions,
   type BatchResult,
   createReflogReaderOf,
@@ -149,6 +150,7 @@ export class SQLRefStore implements Refs {
    * reflog line that cannot be written fails the batch, which then changes nothing.
    */
   async batch(commands: RefCommand[], options?: BatchOptions): Promise<BatchResult> {
+    if (options?.abortTransaction) return abortedBatch(commands, options);
     if (commands.length === 0) return { ok: true, rejected: [] };
     return this.db.transaction(async (tx) => {
       const plan = await planRefBatch(commands, {
