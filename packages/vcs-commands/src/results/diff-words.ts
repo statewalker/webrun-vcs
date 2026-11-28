@@ -18,9 +18,13 @@
  * mode, one `-`/`+`/` ` line per piece with `~` for each newline in porcelain mode. Context
  * lines are printed without their sign (porcelain: with it, followed by `~`).
  *
- * Not reproduced: under `log --graph` git writes the graph's line prefix in word mode only
- * where a word hunk starts on a new line or a piece's text has a newline, so porcelain lines
- * (and some plain or color lines) go without it; `git log` prefixes every line of ours.
+ * Under `log --graph` (`linePrefix`, diff.c's `diff_line_prefix`) hunk headers and context
+ * lines start with the prefix as usual, but the word diff places it itself, as git does: where
+ * a word hunk starts on a new line (`color_words_output_graph_prefix`) and after each newline
+ * inside a piece's text (`fn_out_diff_words_write_helper`); porcelain's `~` lines and most of
+ * its `-`/`+` lines go without it. Its chunks are marked for the `LinePrefixSink` the output
+ * goes through, which records where the prefix goes. A word hunk's prefix is git's `fputs`,
+ * which bypasses `--color-moved`'s buffer: it lands at the start of the patch there.
  *
  * @module
  */
@@ -34,7 +38,13 @@ import {
 import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 
 import { GitApiError } from "../errors/index.js";
-import { type ColoredHunk, coloredHunkHeader, type DiffColors } from "./diff-color.js";
+import {
+  type ColoredHunk,
+  coloredHunkHeader,
+  type DiffColors,
+  MovedLineBuffer,
+} from "./diff-color.js";
+import { type LinePrefixSink, markLinePrefix } from "./line-prefix-sink.js";
 
 /** `--word-diff=<mode>` (`--color-words` is `color`) */
 export type WordDiffMode = "plain" | "color" | "porcelain";
@@ -49,6 +59,12 @@ export interface WordDiffOptions {
   regex?: PosixRegex;
   /** The palette of `--color`; unset, no colors */
   colors?: DiffColors;
+  /**
+   * The sink the whole output goes through, placing diff.c's `diff_line_prefix` (`log
+   * --graph`'s padding): each chunk is marked with the prefixes git's word diff writes before
+   * it, and the sink adds none inside it; unset, the chunks are not marked
+   */
+  linePrefix?: LinePrefixSink;
 }
 
 /** One kind of piece of a style (diff.c's `diff_words_style_elem`) */
@@ -150,26 +166,87 @@ class Pieces {
    * Prints the piece as `DIFF_SYMBOL_WORD_DIFF` does (`fprintf("%.*s")`): up to its first NUL
    * byte, whatever follows (suffix, reset, newline) dropped with it
    */
-  flushTo(sink: ByteSink): void {
+  flushTo(sink: ByteSink, prefix: Prefixes | undefined): void {
+    const out = (b: Uint8Array) => (prefix ? prefix.push(sink, b) : sink.push(b));
     for (const p of this.parts) {
       const nul = p.indexOf(0);
       if (nul < 0) {
-        sink.push(p);
+        out(p);
         continue;
       }
-      if (nul > 0) sink.push(p.subarray(0, nul));
+      if (nul > 0) out(p.subarray(0, nul));
       break;
     }
     this.parts = [];
   }
 }
 
-/** `fn_out_diff_words_write_helper`: `text` as pieces of `el`, `newline` for each LF */
-function writeHelper(sink: ByteSink, el: StyleElem, newline: Uint8Array, text: Uint8Array): void {
+/**
+ * The line prefixes the word diff writes (`DIFF_SYMBOL_WORD_DIFF`s of `diff_line_prefix`),
+ * each attached to the next chunk it pushes
+ */
+class Prefixes {
+  private pending = 0;
+
+  constructor(
+    /** The output's sink when the writer's sink reaches it in order (no scratch sink) */
+    private readonly direct: LinePrefixSink | undefined,
+  ) {}
+
+  /** A prefix before whatever is pushed next */
+  add(): void {
+    this.pending++;
+  }
+
+  /**
+   * A prefix `fputs` writes to the file (`fn_out_diff_words_aux`): ahead of the symbols
+   * `--color-moved` buffers, else where it stands
+   */
+  addDirect(): void {
+    if (this.direct) this.direct.addPoint();
+    else this.add();
+  }
+
+  /** `bytes`, written by the word diff (no prefix inside it), after the pending prefixes */
+  push(sink: ByteSink, bytes: Uint8Array): void {
+    if (bytes.length === 0) return;
+    // a view of its own: the mark belongs to the array, and style bytes are pushed often
+    sink.push(markLinePrefix(bytes.subarray(0), { before: this.pending, own: true }));
+    this.pending = 0;
+  }
+
+  /**
+   * `bytes` printed through `emit_line_0` (a context line, a hunk header: the prefix at each
+   * line start as usual), after the pending prefixes
+   */
+  pushLine(sink: ByteSink, bytes: Uint8Array): void {
+    if (bytes.length === 0) return;
+    sink.push(
+      this.pending > 0
+        ? markLinePrefix(bytes.subarray(0), { before: this.pending, own: false })
+        : bytes,
+    );
+    this.pending = 0;
+  }
+}
+
+/**
+ * `fn_out_diff_words_write_helper`: `text` as pieces of `el`, `newline` for each LF, the line
+ * prefix (when placed) before each piece after a newline
+ */
+function writeHelper(
+  sink: ByteSink,
+  el: StyleElem,
+  newline: Uint8Array,
+  text: Uint8Array,
+  prefix: Prefixes | undefined,
+): void {
   const sb = new Pieces();
+  let print = false;
   let at = 0;
   let count = text.length;
   while (count > 0) {
+    if (print) prefix?.add();
     const nl = text.subarray(at, at + count).indexOf(NEWLINE);
     if (nl !== 0) {
       const colored = el.color !== undefined && el.color !== "";
@@ -183,9 +260,10 @@ function writeHelper(sink: ByteSink, el: StyleElem, newline: Uint8Array, text: U
     sb.bytes(newline);
     count -= nl + 1;
     at += nl + 1;
-    if (count > 0) sb.flushTo(sink);
+    print = true;
+    if (count > 0) sb.flushTo(sink, prefix);
   }
-  sb.flushTo(sink);
+  sb.flushTo(sink, prefix);
 }
 
 /** One side's words (diff.c's `diff_words_buffer`): `orig[0]` is the empty 0th word */
@@ -249,12 +327,18 @@ class WordDiffState {
   private minus: Uint8Array[] = [];
   private plus: Uint8Array[] = [];
   private readonly style: Style;
+  /** `diff_words_data.current_plus`, an offset into the added text */
+  private currentPlus = 0;
+  /** `diff_words_data.last_minus` */
+  private lastMinus = 0;
 
   constructor(
     private readonly sink: ByteSink,
     private readonly regex: PosixRegex | undefined,
     mode: WordDiffMode,
     colors: DiffColors | undefined,
+    /** Where `diff_line_prefix` goes, undefined when not placed */
+    private readonly prefix: Prefixes | undefined,
   ) {
     this.style = styleOf(mode, colors);
   }
@@ -269,6 +353,22 @@ class WordDiffState {
     if (this.minus.length > 0 || this.plus.length > 0) this.show();
   }
 
+  /** The line prefix as its own `DIFF_SYMBOL_WORD_DIFF` */
+  private writePrefix(): void {
+    this.prefix?.add();
+  }
+
+  /**
+   * `color_words_output_graph_prefix`: at the first hunk when it starts the added text, or
+   * where the added text printed so far ends with a newline
+   */
+  private prefixDue(plus: Uint8Array): boolean {
+    return (
+      (this.lastMinus === 0 && this.currentPlus === 0) ||
+      (this.currentPlus > 0 && plus[this.currentPlus - 1] === NEWLINE)
+    );
+  }
+
   /** `diff_words_show` */
   private show(): void {
     const minus = concat(this.minus);
@@ -276,12 +376,15 @@ class WordDiffState {
     this.minus = [];
     this.plus = [];
     const style = this.style;
+    const prefix = this.prefix;
     if (plus.length === 0) {
       // special case: only removal
-      writeHelper(this.sink, style.oldWord, style.newline, minus);
+      this.writePrefix();
+      writeHelper(this.sink, style.oldWord, style.newline, minus, prefix);
       return;
     }
-    let currentPlus = 0;
+    this.currentPlus = 0;
+    this.lastMinus = 0;
     const mw = fillWords(minus, this.regex);
     const pw = fillWords(plus, this.regex);
     for (const change of xdiffHunks(mw.lines, pw.lines)) {
@@ -290,19 +393,42 @@ class WordDiffState {
       const plusFirst = change.chg2 ? change.i2 + 1 : change.i2;
       const [minusBegin, minusEnd] = span(mw.orig, minusFirst, change.chg1);
       const [plusBegin, plusEnd] = span(pw.orig, plusFirst, change.chg2);
+      // fputs(line_prefix): straight to the file, past the --color-moved buffer
+      if (this.prefixDue(plus)) this.prefix?.addDirect();
+      const currentPlus = this.currentPlus;
       if (currentPlus !== plusBegin) {
-        writeHelper(this.sink, style.ctx, style.newline, plus.subarray(currentPlus, plusBegin));
+        writeHelper(
+          this.sink,
+          style.ctx,
+          style.newline,
+          plus.subarray(currentPlus, plusBegin),
+          prefix,
+        );
       }
       if (minusBegin !== minusEnd) {
-        writeHelper(this.sink, style.oldWord, style.newline, minus.subarray(minusBegin, minusEnd));
+        writeHelper(
+          this.sink,
+          style.oldWord,
+          style.newline,
+          minus.subarray(minusBegin, minusEnd),
+          prefix,
+        );
       }
       if (plusBegin !== plusEnd) {
-        writeHelper(this.sink, style.newWord, style.newline, plus.subarray(plusBegin, plusEnd));
+        writeHelper(
+          this.sink,
+          style.newWord,
+          style.newline,
+          plus.subarray(plusBegin, plusEnd),
+          prefix,
+        );
       }
-      currentPlus = plusEnd;
+      this.currentPlus = plusEnd;
+      this.lastMinus = minusFirst;
     }
-    if (currentPlus !== plus.length) {
-      writeHelper(this.sink, style.ctx, style.newline, plus.subarray(currentPlus));
+    if (this.currentPlus !== plus.length) {
+      if (this.prefixDue(plus)) this.writePrefix();
+      writeHelper(this.sink, style.ctx, style.newline, plus.subarray(this.currentPlus), prefix);
     }
   }
 }
@@ -330,19 +456,14 @@ function concat(parts: Uint8Array[]): Uint8Array {
 }
 
 /** diff.c's `emit_line_0` without a sign: `set` before the text, the reset after it */
-function emitLine(sink: ByteSink, set: string, reset: string, line: Uint8Array): void {
+function emitLine(set: string, reset: string, line: Uint8Array): Uint8Array {
   let len = line.length;
   const hasNewline = len > 0 && line[len - 1] === NEWLINE;
   if (hasNewline) len--;
   const hasCr = len > 0 && line[len - 1] === 0x0d;
   if (hasCr) len--;
-  if (len > 0) {
-    if (set) sink.push(enc(set));
-    sink.push(line.subarray(0, len));
-    if (reset) sink.push(enc(reset));
-  }
-  if (hasCr) sink.push(Uint8Array.of(0x0d));
-  if (hasNewline) sink.push(Uint8Array.of(NEWLINE));
+  if (len === 0 || (!set && !reset)) return line;
+  return concat([enc(set), line.subarray(0, len), enc(reset), line.subarray(len)]);
 }
 
 /**
@@ -358,12 +479,17 @@ export function writeWordDiffHunks(
   options: WordDiffOptions,
 ): void {
   const colors = options.colors;
-  const state = new WordDiffState(sink, options.regex, options.mode, colors);
+  const outer = options.linePrefix;
+  const prefix = outer
+    ? new Prefixes(sink === outer || sink instanceof MovedLineBuffer ? outer : undefined)
+    : undefined;
+  const state = new WordDiffState(sink, options.regex, options.mode, colors, prefix);
+  const emit = (bytes: Uint8Array) => (prefix ? prefix.pushLine(sink, bytes) : sink.push(bytes));
   const context = colors?.context ?? "";
   const reset = colors?.reset ?? "";
   for (const hunk of hunks) {
     state.flush();
-    sink.push(colors ? coloredHunkHeader(hunk.header, colors) : hunk.header);
+    emit(colors ? coloredHunkHeader(hunk.header, colors) : hunk.header);
     for (const line of hunk.lines) {
       const bytes = line.bytes;
       // xdl_emit_diffrec: an incomplete line gets its LF (the marker after it is eaten)
@@ -376,11 +502,13 @@ export function writeWordDiffHunks(
       state.flush();
       if (options.mode === "porcelain") {
         // DIFF_SYMBOL_WORDS_PORCELAIN: the line with its sign, then "~"
-        emitLine(sink, context, reset, concat([Uint8Array.of(0x20), text]));
-        sink.push(TILDE_LINE);
+        emit(emitLine(context, reset, concat([Uint8Array.of(0x20), text])));
+        // printed with fputs, without the line prefix
+        if (prefix) prefix.push(sink, TILDE_LINE.slice());
+        else sink.push(TILDE_LINE);
       } else {
         // DIFF_SYMBOL_WORDS: the line without its sign
-        emitLine(sink, context, reset, text);
+        emit(emitLine(context, reset, text));
       }
     }
   }

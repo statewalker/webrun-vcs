@@ -54,6 +54,7 @@ import { gitBinaryPatch } from "./binary-patch.js";
 import { type ColoredHunk, type DiffColors, WSEH_NEW, writeColoredHunks } from "./diff-color.js";
 import type { LineRange } from "./diff-entry.js";
 import { compileWordRegex, writeWordDiffHunks } from "./diff-words.js";
+import type { LinePrefixSink } from "./line-prefix-sink.js";
 import { cutToLineRanges, lineRangesSpan } from "./line-range-hunks.js";
 import { quoteCStyleBody, quotePath, quoteTwo } from "./quote-path.js";
 
@@ -231,6 +232,12 @@ export interface DiffOutputOptions
    * asks for the plain word diff
    */
   wordDiffRegex?: string;
+  /**
+   * diff.c's `diff_line_prefix` (`log --graph`'s padding) is placed later, by this sink the
+   * whole output goes through: it puts the prefix before every line except in the chunks the
+   * writers that place it themselves (the word diff) mark
+   */
+  linePrefix?: LinePrefixSink;
   /** `diff.wordRegex`: the word regex of a pair whose drivers give none */
   defaultWordRegex?: string;
 }
@@ -755,6 +762,7 @@ async function builtinDiff(
       mode: wordDiff,
       ...(pattern !== undefined ? { regex: compileWordRegex(pattern) } : {}),
       ...(colors ? { colors } : {}),
+      ...(options.linePrefix ? { linePrefix: options.linePrefix } : {}),
     });
     return;
   }

@@ -3031,7 +3031,13 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       oldTree: ObjectId,
       newTree: ObjectId,
       formats: DiffOutputFormat[],
-      options: { statWidth?: number; follow?: string; fullDiff?: boolean; abbrev?: number },
+      options: {
+        statWidth?: number;
+        follow?: string;
+        fullDiff?: boolean;
+        abbrev?: number;
+        linePrefix?: boolean;
+      },
       prepare?: (diff: DiffCommand) => void,
     ) => {
       // the trees themselves: a full id names its object, so no revision is looked up
@@ -3044,6 +3050,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         .setRotateStrict(false)
         .setTreeWalk(this.treeWalk)
         .shareReadsOf(this);
+      if (options.linePrefix) diff.setLinePrefixPoints(true);
       if (this.colorSettings) diff.setColorSettings(this.colorSettings);
       diff.setOptions({
         ...this.diffOptions,
