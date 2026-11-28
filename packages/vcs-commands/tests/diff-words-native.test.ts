@@ -344,10 +344,88 @@ describeGit("t4034-diff-words", () => {
       patch: true,
       graph: true,
     });
-    // not porcelain: git writes the graph's prefix only where a word hunk starts or a
-    // piece's text has a newline, so most porcelain lines go without it; ours prefixes each
+    await twinLog(
+      out,
+      dir,
+      ["--graph", "-p", "--word-diff=porcelain"],
+      { wordDiff: "porcelain" },
+      {
+        patch: true,
+        graph: true,
+      },
+    );
     await twinShow(out, dir, ["--word-diff=porcelain"], { wordDiff: "porcelain" });
     await twinShow(out, dir, ["--color-words=."], colorWords("."));
+    expect(out).toEqual([]);
+  });
+
+  it('t4034-diff-words.sh: "setup history with two files" under --graph; t4202-log.sh: "log --graph with diff and stats"', async () => {
+    // diff.c writes the graph's line prefix in word mode only where a word hunk starts on a
+    // new line or a piece's text holds a newline (fn_out_diff_words_write_helper,
+    // color_words_output_graph_prefix); context lines and hunk headers get it as usual
+    const dir = join(tmp(), `repo-${++repoCount}`);
+    sh(
+      dir,
+      `git init -q -b main .
+      ${T4034_SETUP}
+      printf 'h(4)\\n\\na = b + c\\nkeep one\\nkeep two\\nlast line\\n' >f
+      printf 'one two three\\nfour five\\n' >g
+      printf 'gone away\\nstays\\n' >h
+      git add f g h
+      commit -minitial
+      git checkout -q -b side
+      printf 'h(4),hh[44]\\n\\na = b + c\\n\\naa = a\\nkeep one\\nkeep two\\nlast  line here\\n' >f
+      commit -mside -a
+      git checkout -q main
+      printf 'one 2 three\\nfour\\nfive six\\nseven\\n' >g
+      printf 'stays\\n' >h
+      commit -mmain -a
+      git merge -q --no-edit side
+      printf 'two three\\n4\\n5 six\\nseven eight\\n' >g
+      printf 'stays\\nnew\\n' >h
+      commit -mafter -a`,
+    );
+    const out: string[] = [];
+    const graph: LogOutputOptions = { patch: true, graph: true };
+    await twinLog(
+      out,
+      dir,
+      ["--graph", "-p", "--word-diff=porcelain"],
+      { wordDiff: "porcelain" },
+      graph,
+    );
+    await twinLog(out, dir, ["--graph", "-p", "--word-diff=plain"], { wordDiff: "plain" }, graph);
+    await twinLog(out, dir, ["--graph", "-p", "--word-diff=color"], { wordDiff: "color" }, graph);
+    await twinLog(out, dir, ["--graph", "-p", "--color-words"], colorWords(), graph);
+    await twinLog(out, dir, ["--graph", "-p", "--color-words=."], colorWords("."), graph);
+    await twinLog(
+      out,
+      dir,
+      ["--graph", "-p", "--word-diff=porcelain", "--color"],
+      { wordDiff: "porcelain", color: true },
+      graph,
+    );
+    await twinLog(
+      out,
+      dir,
+      ["--graph", "-p", "--word-diff=plain", "--unified=0"],
+      { wordDiff: "plain", context: 0 },
+      graph,
+    );
+    await twinLog(
+      out,
+      dir,
+      ["--graph", "-p", "--color-words", "--color-moved"],
+      { ...colorWords(), colorMoved: true },
+      graph,
+    );
+    await twinLog(
+      out,
+      dir,
+      ["--graph", "--stat", "-p", "--word-diff=porcelain"],
+      { wordDiff: "porcelain" },
+      { ...graph, stat: true },
+    );
     expect(out).toEqual([]);
   });
 
