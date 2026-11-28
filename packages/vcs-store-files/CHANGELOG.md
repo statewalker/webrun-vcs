@@ -1,5 +1,22 @@
 # @statewalker/vcs-store-files
 
+## 0.14.0
+
+### Minor Changes
+
+- Release of the changes since the last published version:
+  
+  - @statewalker/vcs-core crosses a breaking line
+
+### Patch Changes
+
+- cae7a48: `GitWorkingCopyConfig.save()` writes `git config`'s bytes in more edit cases: a section whose header line carries its only variable (`[a] x = 1`) goes when that variable is unset, a line holding several headers (`[a][b]`) keeps the headers whose sections stay, new lines go after the section's last variable (not after a trailing comment), `add` appends a value of an existing key at its section's end, and the new `editValues` edits a key's values in place as git's value-pattern edits do. `git remote set-url` (replace, `--add`, `--delete`) now writes the same configuration bytes as git. Values read the same as before; no stored format changes.
+- a5a278f: `git fetch --atomic` with a refused update (a non-fast-forward without `+`, a tag it would clobber) now aborts its transaction as git does: the reference-transaction hook hears `aborted` with the updates queued so far (the pruned refs, then the accepted updates; none in a dry run), in git 2.43 and 2.5x alike. `BatchOptions.abortTransaction` asks a ref store for such an aborted transaction (files, reftable and linked-worktree stores), and a linked worktree's store now tells an empty transaction to its hook too (statewalker/webrun-vcs#500). Every store answers such a batch without writing (`abortedBatch` for stores with no hook of their own: memory, KV, SQL).
+- Updated dependencies
+- Updated dependencies [a5a278f]
+  - @statewalker/vcs-working-tree@0.14.0
+  - @statewalker/vcs-core@0.14.0
+
 ## 0.13.0
 
 ### Minor Changes

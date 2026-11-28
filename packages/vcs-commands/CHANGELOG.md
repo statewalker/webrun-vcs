@@ -1,5 +1,31 @@
 # @statewalker/vcs-commands
 
+## 0.15.0
+
+### Minor Changes
+
+- Release of the changes since the last published version:
+  
+  - @statewalker/vcs-core crosses a breaking line
+
+### Patch Changes
+
+- cae7a48: `GitWorkingCopyConfig.save()` writes `git config`'s bytes in more edit cases: a section whose header line carries its only variable (`[a] x = 1`) goes when that variable is unset, a line holding several headers (`[a][b]`) keeps the headers whose sections stay, new lines go after the section's last variable (not after a trailing comment), `add` appends a value of an existing key at its section's end, and the new `editValues` edits a key's values in place as git's value-pattern edits do. `git remote set-url` (replace, `--add`, `--delete`) now writes the same configuration bytes as git. Values read the same as before; no stored format changes.
+- 8f797af: A fetch without `--atomic` whose reference-transaction hook refuses now leaves in `FETCH_HEAD` the lines git writes before it dies: every line under git 2.5x (one transaction after them all, a no-op fetch's empty one included), the lines up to the refused ref's own transaction under 2.43. With `--atomic` `FETCH_HEAD` stays truncated, as before. vcs-transport's `fetchResultOf(error)` and `refusedRefOf(error)` give a caller what the fetch had done when the hook refused (statewalker/webrun-vcs#503).
+- 67494c9: `log --graph -p` with `--word-diff` (porcelain, plain, color) and `--color-words` now writes the graph's line prefix where git's diff.c does: only where a word hunk starts on a new line or after a newline inside a piece, so porcelain's `~` and most `-`/`+` lines go without it (statewalker/webrun-vcs#310).
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies [cae7a48]
+- Updated dependencies [a5a278f]
+- Updated dependencies [8f797af]
+  - @statewalker/vcs-store-files@0.14.0
+  - @statewalker/vcs-store-mem@0.14.0
+  - @statewalker/vcs-transport@0.15.0
+  - @statewalker/vcs-working-tree@0.14.0
+  - @statewalker/vcs-core@0.14.0
+
 ## 0.14.0
 
 ### Minor Changes

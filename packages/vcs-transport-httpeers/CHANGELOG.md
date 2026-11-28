@@ -1,5 +1,22 @@
 # @statewalker/vcs-transport-httpeers
 
+## 0.12.0
+
+### Minor Changes
+
+- Release of the changes since the last published version:
+  
+  - @statewalker/vcs-core crosses a breaking line
+  - @statewalker/vcs-transport crosses a breaking line
+
+### Patch Changes
+
+- Updated dependencies
+- Updated dependencies [a5a278f]
+- Updated dependencies [8f797af]
+  - @statewalker/vcs-transport@0.15.0
+  - @statewalker/vcs-core@0.14.0
+
 ## 0.11.0
 
 ### Minor Changes
