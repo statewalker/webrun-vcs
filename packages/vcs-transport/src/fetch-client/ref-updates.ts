@@ -451,10 +451,38 @@ export async function applyRefUpdates(
     if (result.ok) return undefined;
   }
   for (const u of rest) {
-    const result = await refStore.batch([command(u)], logOf(u));
+    let result: Awaited<ReturnType<NonNullable<RefStore["batch"]>>>;
+    try {
+      result = await refStore.batch([command(u)], logOf(u));
+    } catch (error) {
+      // a refusing reference-transaction hook: git 2.43 dies at this ref (one transaction per
+      // ref, each line written before it); 2.5x's one batched transaction (here a single
+      // write) comes after every line
+      if (!options.batchNonAtomic) noteRefusedRef(error, u.localRef);
+      throw error;
+    }
     if (!result.ok) reject(u, result.rejected[0]?.reason ?? "rejected");
   }
   return undefined;
+}
+
+const REFUSED_REF = Symbol.for("@statewalker/vcs-transport:fetch-refused-ref");
+
+/** Records on a thrown error the ref whose own transaction the hook refused. */
+function noteRefusedRef(error: unknown, ref: string): void {
+  if (typeof error === "object" && error !== null) {
+    (error as { [REFUSED_REF]?: string })[REFUSED_REF] = ref;
+  }
+}
+
+/**
+ * The local ref whose own transaction (one per ref: git 2.43's fetch without `--atomic`) a
+ * reference-transaction hook refused, when `error` is that refusal; undefined for a refusal
+ * of a transaction of several refs.
+ */
+export function refusedRefOf(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  return (error as { [REFUSED_REF]?: string })[REFUSED_REF];
 }
 
 /** A refspec source that is a full object id (of either format: the remote's ids). */
