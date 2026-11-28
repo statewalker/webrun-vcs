@@ -17,6 +17,7 @@ import {
   planRefUpdates,
   type RemoteRef,
   refPrefixes,
+  refusedRefOf,
 } from "../../src/fetch-client/index.js";
 
 const A = "a".repeat(40);
@@ -285,6 +286,50 @@ describe("applyRefUpdates", () => {
     const { refStore, batches } = local({ "refs/heads/a": C });
     await applyRefUpdates([upToDate], refStore);
     expect(batches).toEqual([]);
+  });
+});
+
+describe("applyRefUpdates: a refusing reference-transaction hook (statewalker/webrun-vcs#503)", () => {
+  const update = (localRef: string, newOid: string): FetchRefUpdate => ({
+    remoteRef: localRef,
+    localRef,
+    newOid,
+    status: "new",
+    summary: "[new branch]",
+  });
+  const refusing = (): RefStore => ({
+    get: async () => undefined,
+    update: async () => {},
+    listAll: async () => new Map<string, string>().entries(),
+    batch: async () => {
+      throw new Error("in 'preparing' phase, update aborted by the reference-transaction hook");
+    },
+  });
+
+  it("names the ref whose own transaction was refused (one per ref)", async () => {
+    const error = await applyRefUpdates(
+      [update("refs/heads/a", A), update("refs/heads/b", B)],
+      refusing(),
+    ).catch((e: unknown) => e);
+    expect(refusedRefOf(error)).toBe("refs/heads/a");
+  });
+
+  it("names none for a transaction of several refs", async () => {
+    const error = await applyRefUpdates(
+      [update("refs/heads/a", A), update("refs/heads/b", B)],
+      refusing(),
+      { batchNonAtomic: true },
+    ).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(Error);
+    expect(refusedRefOf(error)).toBeUndefined();
+  });
+
+  it("names none under batched updates even for a single write (git 2.5x's one transaction)", async () => {
+    const error = await applyRefUpdates([update("refs/heads/a", A)], refusing(), {
+      batchNonAtomic: true,
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(Error);
+    expect(refusedRefOf(error)).toBeUndefined();
   });
 });
 
