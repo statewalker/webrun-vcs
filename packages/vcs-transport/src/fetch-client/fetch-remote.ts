@@ -39,6 +39,7 @@ import {
   type ServerShallowUpdate,
   serverOptionLines,
   serverSupportsFilter,
+  type WantEntry,
 } from "./fetch-pack.js";
 import type { NegotiationAlgorithm, NegotiatorSource } from "./negotiator.js";
 import { importPackfileUri } from "./packfile-uris.js";
@@ -738,9 +739,15 @@ export async function fetchFromConnection(
     if (fetched.wantedRefs?.size) {
       // what the server sent: each name's answered id, and every id asked by `want <id>`;
       // an id two refs shared stays while one of them still names it
-      const named = new Set((request.wantRefs ?? []).map((r) => r.oid));
+      const entries = request.wantRefs ?? [];
+      const byId = new Set(entries.filter((r) => r.name === undefined).map((r) => r.oid));
+      const named = new Set(
+        entries.filter((r) => r.name !== undefined && !byId.has(r.oid)).map((r) => r.oid),
+      );
       const sent = new Set(wants.filter((oid) => !named.has(oid)));
-      for (const r of request.wantRefs ?? []) sent.add(fetched.wantedRefs.get(r.name) ?? r.oid);
+      for (const r of entries) {
+        if (r.name !== undefined) sent.add(fetched.wantedRefs.get(r.name) ?? r.oid);
+      }
       const kept = wants.filter((oid) => sent.has(oid));
       for (const oid of sent) if (!kept.includes(oid)) kept.push(oid);
       wants.splice(0, wants.length, ...kept);
@@ -886,19 +893,24 @@ export async function fetchFromConnection(
   // wants: the selected tips not here yet (all of them when deepening: their history changes)
   const wants: string[] = [];
   const wanted = new Set<string>();
-  // the refs fetch-pack asks for by name (`want-ref`) where the server takes them: each
-  // wanted ref listed by the remote (not an id a refspec names: git's exact_oid)
+  // fetch-pack's sought refs that add_wants writes (where the server takes `want-ref`): each
+  // wanted ref listed by the remote by name, an id a refspec names (git's exact_oid) by id
   const listedNames = new Set(remoteRefs.map((r) => r.name));
-  const wantRefs: Array<{ name: string; oid: string }> = [];
+  const soughtByName: WantEntry[] = [];
+  const soughtById: WantEntry[] = [];
+  const seek = (p: PlannedRef) => {
+    if (listedNames.has(p.remoteRef)) soughtByName.push({ name: p.remoteRef, oid: p.oid });
+    else soughtById.push({ oid: p.oid });
+  };
   for (const p of planned) {
     if (wanted.has(p.oid)) {
-      if (listedNames.has(p.remoteRef)) wantRefs.push({ name: p.remoteRef, oid: p.oid });
+      seek(p);
       continue;
     }
     if (deepen || options.refetch || !(await complete.isComplete(p.oid))) {
       wants.push(p.oid);
       wanted.add(p.oid);
-      if (listedNames.has(p.remoteRef)) wantRefs.push({ name: p.remoteRef, oid: p.oid });
+      seek(p);
     }
   }
   // find_non_local_tags puts the tags of objects fetched or already here into the ref map
@@ -915,6 +927,8 @@ export async function fetchFromConnection(
       if (!(await complete.isComplete(oid))) {
         wants.push(oid);
         wanted.add(oid);
+        // in the ref map, so sought by name too
+        soughtByName.push({ name: ref.name, oid });
       }
     }
   }
@@ -951,11 +965,28 @@ export async function fetchFromConnection(
     const soughtNames = new Set([...sought, ...opportunistic].map((p) => p.remoteRef));
     if (options.cloning) soughtNames.add("HEAD");
     promisorSought = remoteRefs.filter((r) => r.oid && soughtNames.has(r.name));
-    // an id an exact-id refspec asks for too stays a `want <id>` (its ref may move)
-    const exact = new Set(planned.filter((p) => !listedNames.has(p.remoteRef)).map((p) => p.oid));
-    const byName = wantRefs.filter((r) => !exact.has(r.oid));
+    // add_wants' order: one pass over the sought refs sorted by name (do_fetch_pack, a clone's
+    // remote HEAD first: wanted_peer_refs), then the ids no listed ref matched, sorted as
+    // fetch-pack sorts its sought array (an exact id's name is its hex)
+    const ordered: WantEntry[] = [];
+    if (soughtByName.length > 0) {
+      const head = options.cloning ? remoteRefs.find((r) => r.name === "HEAD") : undefined;
+      if (head?.oid && wanted.has(head.oid)) {
+        soughtByName.push({ name: "HEAD", oid: head.oid });
+      }
+      const byName = (x: WantEntry, y: WantEntry) =>
+        x.name === y.name
+          ? 0
+          : x.name === "HEAD"
+            ? -1
+            : y.name === "HEAD"
+              ? 1
+              : compareRefNames(x.name as string, y.name as string);
+      ordered.push(...soughtByName.sort(byName));
+    }
+    ordered.push(...soughtById.sort((x, y) => (x.oid < y.oid ? -1 : x.oid > y.oid ? 1 : 0)));
     await runFetchPack(wants, {
-      ...(byName.length > 0 ? { wantRefs: byName } : {}),
+      ...(ordered.length > 0 ? { wantRefs: ordered } : {}),
       depth,
       deepenRelative: options.deepenRelative,
       deepenSince,
