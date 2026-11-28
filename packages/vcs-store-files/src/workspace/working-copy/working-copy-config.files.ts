@@ -156,6 +156,112 @@ export interface ConfigFilesApi {
  * not touched are written back verbatim, so comments, blank lines, key order
  * and hand-written formatting survive a round-trip.
  */
+/**
+ * A key edited line by line ({@link GitWorkingCopyConfig.editValues}): what becomes of each
+ * of its lines in the file (in file order), and the values written after the section's last
+ * variable. Its values are those of the lines not dropped, then the appended ones.
+ */
+interface ValuePlan {
+  /** The key's values array this plan describes (it is valid while they are the same) */
+  values: unknown[];
+  slots: { line: ConfigLine; kind: "keep" | "write" | "drop"; value: unknown }[];
+  appended: unknown[];
+  /** When the first appended value was given (see `givenAt`) */
+  appendedAt: number;
+}
+
+/**
+ * The plan giving a key `newValues` as git's pattern edits do, from `plan`: the longest
+ * common run of values stays (kept lines as written), between two kept values the old ones
+ * are replaced in order on their lines and the extra old ones dropped, and new values after
+ * every line go to the appended ones. Undefined where a new value would need a line of its
+ * own between the key's lines (no pattern edit of git does that).
+ */
+function editPlan(plan: ValuePlan, newValues: unknown[]): ValuePlan | undefined {
+  type Slot = { line?: ConfigLine; value: unknown };
+  const old: Slot[] = [
+    ...plan.slots
+      .filter((slot) => slot.kind !== "drop")
+      .map((slot): Slot => ({ line: slot.line, value: slot.value })),
+    ...plan.appended.map((value): Slot => ({ value })),
+  ];
+  // values read from the file are converted (`1` a number): compare them as text
+  const textOf = (value: unknown) => (value === undefined ? undefined : String(value));
+  const same = (a: unknown, b: unknown) => textOf(a) === textOf(b);
+  const n = old.length;
+  const m = newValues.length;
+  // longest common subsequence of the values
+  const lcs: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0));
+  const at = (i: number, j: number): number => lcs[i]?.[j] ?? 0;
+  for (let i = n - 1; i >= 0; i--) {
+    const row = lcs[i] as number[];
+    for (let j = m - 1; j >= 0; j--) {
+      row[j] = same(old[i]?.value, newValues[j])
+        ? at(i + 1, j + 1) + 1
+        : Math.max(at(i + 1, j), at(i, j + 1));
+    }
+  }
+  const dropped = new Set<ConfigLine>();
+  const written = new Map<ConfigLine, unknown>();
+  const appended: unknown[] = [];
+  let lastLine = -1;
+  for (const [index, slot] of old.entries()) if (slot.line) lastLine = index;
+  let i = 0;
+  let j = 0;
+  // the old values from i and the new ones from j up to a common value (or the ends)
+  const gap = (oldEnd: number, newEnd: number): boolean => {
+    const olds = old.slice(i, oldEnd);
+    const news = newValues.slice(j, newEnd);
+    for (const [k, slot] of olds.entries()) {
+      if (k < news.length) {
+        if (slot.line) written.set(slot.line, news[k]);
+        else appended.push(news[k]);
+      } else if (slot.line) {
+        dropped.add(slot.line);
+      }
+    }
+    if (news.length > olds.length) {
+      // a value with no old one to take the place of: only after every line of the key
+      if (oldEnd <= lastLine) return false;
+      appended.push(...news.slice(olds.length));
+    }
+    return true;
+  };
+  let a = 0;
+  let b = 0;
+  while (a < n && b < m) {
+    if (same(old[a]?.value, newValues[b])) {
+      if (!gap(a, b)) return undefined;
+      const slot = old[a] as Slot;
+      if (!slot.line) appended.push(slot.value);
+      a++;
+      b++;
+      i = a;
+      j = b;
+    } else if (at(a + 1, b) >= at(a, b + 1)) {
+      a++;
+    } else {
+      b++;
+    }
+  }
+  if (!gap(n, m)) return undefined;
+  const values: unknown[] = [];
+  const slots = plan.slots.map((slot): ValuePlan["slots"][number] => {
+    if (slot.kind === "drop" || dropped.has(slot.line)) {
+      return { line: slot.line, kind: "drop", value: undefined };
+    }
+    if (written.has(slot.line)) {
+      const value = written.get(slot.line);
+      values.push(value);
+      return { line: slot.line, kind: "write", value };
+    }
+    values.push(slot.value);
+    return slot;
+  });
+  values.push(...appended);
+  return { values, slots, appended, appendedAt: plan.appendedAt };
+}
+
 type ConfigLine =
   | {
       kind: "text";
@@ -171,6 +277,11 @@ type ConfigLine =
       kind: "section";
       text: string;
       section: string;
+      /**
+       * The sections of the headers written before this one on its line (`[a][b]`: `a`),
+       * which a removal of this section keeps, as git's does
+       */
+      priorSections?: string[];
       /** Canonical key of a variable written on the same line as the header. */
       inlineKey?: string;
       inlineValue?: unknown;
@@ -277,6 +388,17 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
   private readonly spelling: Map<string, string> = new Map();
   /** Sections removed by {@link unsetSection}. */
   private readonly removedSections: Set<string> = new Set();
+  /**
+   * How a key's lines are written where its values were edited line by line, as git's
+   * writer edits them ({@link add}, {@link editValues}); a key changed otherwise has none.
+   */
+  private plans: Map<string, ValuePlan> = new Map();
+  /**
+   * When each key got its first value in this session (or after an unset), so the new lines
+   * of a section are written in that order, as git appends each at the section's end
+   */
+  private givenAt: Map<string, number> = new Map();
+  private given = 0;
   /** Keys mirrored as own properties (for the WorkingCopyConfig index signature). */
   private readonly mirroredKeys: Set<string> = new Set();
   private trailingNewline = true;
@@ -583,6 +705,8 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     this.dirtyKeys.clear();
     this.relocated.clear();
     this.removedSections.clear();
+    this.plans = new Map();
+    this.givenAt = new Map();
     this.loaded = true;
     await this.resolveOwnIncludes();
     this.noteChanged();
@@ -734,6 +858,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     const canonical = requireCanonicalKey(key);
     requireStorableValue(key, value);
     this.spelling.set(canonical, key);
+    this.noteGiven(canonical);
     this.relocateIfUnset(canonical);
     this.values.set(canonical, [value]);
     this.dirtyKeys.add(canonical);
@@ -751,6 +876,19 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     const canonical = requireCanonicalKey(key);
     requireStorableValue(key, value);
     this.spelling.set(canonical, key);
+    const plan = this.editablePlan(canonical);
+    if (plan) {
+      // git's `--add`: the value goes after the section's last variable, the key's other
+      // lines staying as they are
+      if (plan.appended.length === 0) plan.appendedAt = ++this.given;
+      plan.appended.push(value);
+      plan.values.push(value);
+      this.dirtyKeys.add(canonical);
+      this.mirror(canonical);
+      this.resolvedCache = undefined;
+      return;
+    }
+    this.noteGiven(canonical);
     this.relocateIfUnset(canonical);
     const values = this.values.get(canonical);
     if (values) values.push(value);
@@ -758,6 +896,93 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     this.dirtyKeys.add(canonical);
     this.mirror(canonical);
     this.resolvedCache = undefined;
+  }
+
+  /**
+   * Set every value of a key as git's `set_multivar` with a value pattern edits them: the
+   * values kept stay on their lines as written, a value replaced is written on the line of
+   * the one it replaces, the values gone are unset (with git's `maybe_remove_section`), and
+   * values added after the others go after the section's last variable. `git remote
+   * set-url <name> <new> <old>` and `set-url --delete` change a remote's URLs so. Where the
+   * new values are no such edit of the old ones, they are {@link set} and {@link add}ed.
+   *
+   * @example
+   * ```typescript
+   * // [remote "o"] url = a / fetch = … / url = b
+   * config.editValues("remote.o.url", ["a", "c"]); // url = b becomes url = c, in place
+   * ```
+   */
+  editValues(key: string, newValues: unknown[]): void {
+    const canonical = requireCanonicalKey(key);
+    for (const value of newValues) requireStorableValue(key, value);
+    const plan = this.editablePlan(canonical);
+    const edited = plan && editPlan(plan, newValues);
+    if (!plan || !edited) {
+      if (newValues.length === 0) {
+        this.unset(key);
+        return;
+      }
+      this.set(key, newValues[0]);
+      for (const value of newValues.slice(1)) this.add(key, value);
+      return;
+    }
+    this.spelling.set(canonical, key);
+    if (plan.appended.length === 0 && edited.appended.length > 0) {
+      edited.appendedAt = ++this.given;
+    }
+    this.plans.set(canonical, edited);
+    this.values.set(canonical, edited.values);
+    this.dirtyKeys.add(canonical);
+    this.mirror(canonical);
+    this.resolvedCache = undefined;
+  }
+
+  /** The key's lines in this file (none of a removed section), in file order. */
+  private linesOfKey(canonical: string): ConfigLine[] {
+    if (this.removedSections.has(sectionOfKey(canonical))) return [];
+    return this.lines.filter((line) => keyOfLine(line) === canonical);
+  }
+
+  /**
+   * The line-by-line plan of a key that has lines in this file: its current one, or one
+   * keeping every line where the key is unchanged since the load; none where its values were
+   * changed otherwise (they are written as one run) or it has no line.
+   */
+  private editablePlan(canonical: string): ValuePlan | undefined {
+    if (!this.loaded || this.relocated.has(canonical)) return undefined;
+    const values = this.values.get(canonical);
+    if (!values || values.length === 0) return undefined;
+    const lines = this.linesOfKey(canonical);
+    if (lines.length === 0) return undefined;
+    if (this.dirtyKeys.has(canonical)) return this.validPlan(canonical, lines);
+    if (lines.length !== values.length) return undefined;
+    const plan: ValuePlan = {
+      values,
+      slots: lines.map((line, index) => ({ line, kind: "keep", value: values[index] })),
+      appended: [],
+      appendedAt: 0,
+    };
+    this.plans.set(canonical, plan);
+    return plan;
+  }
+
+  /** The key's plan, if it still describes its values and lines. */
+  private validPlan(canonical: string, lines?: ConfigLine[]): ValuePlan | undefined {
+    const plan = this.plans.get(canonical);
+    if (!plan || plan.values !== this.values.get(canonical) || this.relocated.has(canonical)) {
+      return undefined;
+    }
+    const current = lines ?? this.linesOfKey(canonical);
+    if (current.length !== plan.slots.length) return undefined;
+    for (const [index, line] of current.entries()) {
+      if (plan.slots[index]?.line !== line) return undefined;
+    }
+    return plan;
+  }
+
+  /** A key gets values while it has none: its new lines come after those given before. */
+  private noteGiven(canonical: string): void {
+    if ((this.values.get(canonical)?.length ?? 0) === 0) this.givenAt.set(canonical, ++this.given);
   }
 
   /** A key unset in this session gets new values: they are written at its section's end. */
@@ -1072,6 +1297,8 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     this.dirtyKeys.clear();
     this.relocated.clear();
     this.removedSections.clear();
+    this.plans = new Map();
+    this.givenAt = new Map();
     this.includedEntries = new Map();
     this.resolvedCache = undefined;
 
@@ -1128,48 +1355,87 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     if (this.mirroredKeys.delete(key)) delete this[key];
   }
 
+  /** The plans of the keys edited line by line that still describe their values. */
+  private savePlans(): Map<string, ValuePlan> {
+    const plans = new Map<string, ValuePlan>();
+    for (const key of this.plans.keys()) {
+      if (!this.dirtyKeys.has(key)) continue;
+      const plan = this.validPlan(key);
+      if (plan) plans.set(key, plan);
+    }
+    return plans;
+  }
+
+  /** Whether a variable's line goes in a save: unset, relocated, or dropped by its plan. */
+  private lineGone(line: ConfigLine, key: string, plans: Map<string, ValuePlan>): boolean {
+    if (this.relocated.has(key)) return true;
+    if (!this.dirtyKeys.has(key)) return false;
+    if ((this.values.get(key)?.length ?? 0) === 0) return true;
+    return plans.get(key)?.slots.find((slot) => slot.line === line)?.kind === "drop";
+  }
+
   /**
    * The lines a save leaves out, as git's `config --unset-all` (one run per key, its
    * `maybe_remove_section`) leaves them out: each variable unset in this session (no
-   * values left, or {@link relocated}), and the whole section around it when every variable
-   * of its run of headers goes (consecutive headers of one section count as one, the blank
-   * lines before the first header going with it), unless a comment stands in the run, right
-   * before it, or after a header's `]`.
+   * values left, {@link relocated}, or dropped by its plan), and the whole section around it
+   * when every variable of its run of headers goes (consecutive headers of one section count
+   * as one, the blank lines before the first header going with it), unless a comment stands
+   * in the run, right before it, or after a header's `]`. A variable written on a header
+   * line counts as one of the section's; of a line holding several headers (`[a][b]`) only
+   * those of the removed run go, the rest of the line staying (`kept`, and the section its
+   * last header left opens in `keptSection`).
    */
-  private removedLines(): boolean[] {
+  private removedLines(plans: Map<string, ValuePlan>): {
+    removed: boolean[];
+    kept: Map<number, string>;
+    keptSection: Map<number, string>;
+  } {
     type Event =
-      | { kind: "section"; section: string }
-      | { kind: "entry"; section: string; gone: boolean }
+      | { kind: "section"; section: string; part: number }
+      | { kind: "entry"; section: string; gone: boolean; inline: boolean }
       | { kind: "comment" | "blank" };
     const events: { event: Event; line: number }[] = [];
     this.lines.forEach((line, index) => {
       if (line.kind === "section") {
-        events.push({ event: { kind: "section", section: line.section }, line: index });
-        if (line.inlineKey !== undefined || headerHasComment(line.text)) {
-          // a variable on the header line is left alone; a comment there keeps the section
-          events.push({ event: { kind: "comment" }, line: index });
+        const sections = [...(line.priorSections ?? []), line.section];
+        for (const [part, section] of sections.entries()) {
+          events.push({ event: { kind: "section", section, part }, line: index });
+        }
+        // a comment after the header keeps the section
+        if (headerHasComment(line.text)) events.push({ event: { kind: "comment" }, line: index });
+        if (line.inlineKey !== undefined) {
+          const gone = this.lineGone(line, line.inlineKey, plans);
+          events.push({
+            event: { kind: "entry", section: line.section, gone, inline: true },
+            line: index,
+          });
         }
       } else if (line.kind === "entry") {
-        const gone =
-          this.relocated.has(line.key) ||
-          (this.dirtyKeys.has(line.key) && (this.values.get(line.key)?.length ?? 0) === 0);
-        events.push({ event: { kind: "entry", section: line.section, gone }, line: index });
+        const gone = this.lineGone(line, line.key, plans);
+        events.push({
+          event: { kind: "entry", section: line.section, gone, inline: false },
+          line: index,
+        });
       } else if (line.topLevel) {
-        events.push({ event: { kind: "entry", section: "", gone: false }, line: index });
+        events.push({
+          event: { kind: "entry", section: "", gone: false, inline: false },
+          line: index,
+        });
       } else {
         const blank = line.text.trim() === "";
         events.push({ event: { kind: blank ? "blank" : "comment" }, line: index });
       }
     });
 
-    const removed: boolean[] = new Array(this.lines.length).fill(false);
+    const gone = new Set<number>();
     const done = new Set<number>();
     for (let j = 0; j < events.length; j++) {
       const at = events[j]?.event;
       if (at?.kind !== "entry" || !at.gone || done.has(j)) continue;
       const section = at.section;
       done.add(j);
-      removed[events[j]?.line as number] = true;
+      // a variable on a header line goes with the header only (else the header stays)
+      if (!at.inline) gone.add(j);
       // backward: the first variable of its run, no comment before it
       let begin: number | undefined;
       let sectionSeen = false;
@@ -1217,15 +1483,58 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
       }
       if (keep) continue;
       for (const k of consumed) done.add(k);
-      for (let k = begin; k < end; k++) removed[events[k]?.line as number] = true;
+      for (let k = begin; k < end; k++) gone.add(k);
     }
-    return removed;
+
+    // a line goes when all its events go; of a header line holding several headers, the
+    // leading or trailing ones the removal covered go (git removes bytes, not lines)
+    const removed: boolean[] = new Array(this.lines.length).fill(false);
+    const kept = new Map<number, string>();
+    const keptSection = new Map<number, string>();
+    const byLine = new Map<number, number[]>();
+    for (const [index, { line }] of events.entries()) {
+      const list = byLine.get(line);
+      if (list) list.push(index);
+      else byLine.set(line, [index]);
+    }
+    for (const [lineIndex, list] of byLine) {
+      if (!list.some((k) => gone.has(k))) continue;
+      if (list.every((k) => gone.has(k))) {
+        removed[lineIndex] = true;
+        continue;
+      }
+      const line = this.lines[lineIndex];
+      if (line?.kind !== "section") continue;
+      const parts = list.filter((k) => events[k]?.event.kind === "section");
+      const goneParts = parts.map((k) => gone.has(k));
+      const first = goneParts.indexOf(true);
+      if (first < 0) continue;
+      const spans = headerSpans(line.text);
+      if (spans.length !== parts.length) continue;
+      if (goneParts.slice(first).every(Boolean) && first > 0) {
+        // `[a][b]` whose `[b]` goes: `[a]` stays
+        kept.set(lineIndex, line.text.slice(0, spans[first - 1]?.end));
+        const sections = [...(line.priorSections ?? []), line.section];
+        keptSection.set(lineIndex, sections[first - 1] as string);
+      } else if (first === 0) {
+        const last = goneParts.indexOf(false);
+        if (last > 0 && goneParts.slice(last).every((g) => !g)) {
+          // `[a][b]` whose `[a]` goes: `[b]` stays, with what follows it
+          kept.set(lineIndex, line.text.slice(spans[last]?.start));
+        }
+      }
+    }
+    return { removed, kept, keptSection };
   }
 
   /**
    * Serialize config to Git format, preserving untouched lines verbatim.
    */
   private serializeGitConfig(): string {
+    const plans = this.savePlans();
+    const slotOf = (key: string, line: ConfigLine) =>
+      plans.get(key)?.slots.find((slot) => slot.line === line);
+
     // Keys that already have a line in the file (ignoring removed sections).
     const fileKeys = new Set<string>();
     for (const line of this.lines) {
@@ -1239,70 +1548,105 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
       }
     }
 
-    // Keys that need a brand-new line, grouped by section (insertion order).
-    const newKeysBySection = new Map<string, string[]>();
+    // Values that need brand-new lines, grouped by section: those of keys without a line,
+    // and the values added to a key edited line by line, in the order they were given
+    const pendingBySection = new Map<string, { key: string; values: unknown[]; at: number }[]>();
     for (const [key, values] of this.values) {
-      if (values.length === 0 || fileKeys.has(key)) continue;
+      if (values.length === 0) continue;
+      let pending = values;
+      let at = this.givenAt.get(key) ?? 0;
+      if (fileKeys.has(key)) {
+        const plan = plans.get(key);
+        if (!plan || plan.appended.length === 0) continue;
+        pending = plan.appended;
+        at = plan.appendedAt;
+      }
       const section = sectionOfKey(key);
-      const keys = newKeysBySection.get(section);
-      if (keys) keys.push(key);
-      else newKeysBySection.set(section, [key]);
+      const list = pendingBySection.get(section);
+      if (list) list.push({ key, values: pending, at });
+      else pendingBySection.set(section, [{ key, values: pending, at }]);
     }
+    for (const list of pendingBySection.values()) list.sort((a, b) => a.at - b.at);
 
     // Which lines go (git's unset with `maybe_remove_section`, see removedLines)
-    const removed = this.removedLines();
+    const { removed, kept, keptSection } = this.removedLines(plans);
 
-    // Where to append new keys of an existing section: after its last
-    // non-blank line left, so they land inside the section and not after a blank
-    // separator that visually belongs to the next one. A section whose every line
-    // goes gets its new keys in a section of its own at the end of the file, as git
-    // writes a key set after the unset emptied its section.
+    // Where to append new lines of an existing section: after its last header or variable
+    // left, as git's `set_multivar` does (a comment or blank line after them stays after the
+    // new ones). A section whose every line goes gets its new keys in a section of its own
+    // at the end of the file, as git writes a key set after the unset emptied its section.
     const insertionPoint = new Map<string, number>();
-    let walked = "";
     this.lines.forEach((line, index) => {
       if (removed[index]) return;
-      if (line.kind === "section") walked = line.section;
-      const blank = line.kind === "text" && line.text.trim() === "";
-      if (walked && !blank) insertionPoint.set(walked, index);
+      if (line.kind === "section")
+        insertionPoint.set(keptSection.get(index) ?? line.section, index);
+      else if (line.kind === "entry") insertionPoint.set(line.section, index);
     });
 
     const out: string[] = [];
     const emittedKeys = new Set<string>();
     const filledSections = new Set<string>();
+    const nameOf = (key: string) => this.spelling.get(key) ?? key;
 
     const emitValues = (key: string): void => {
       if (emittedKeys.has(key)) return;
       emittedKeys.add(key);
-      const name = this.spelling.get(key) ?? key;
-      for (const value of this.values.get(key) ?? []) out.push(formatEntry(name, value));
+      for (const value of this.values.get(key) ?? []) out.push(formatEntry(nameOf(key), value));
     };
+    // whether the last line written is one git writes anew (it ends it with a newline)
+    let rewroteLast = false;
 
     this.lines.forEach((line, index) => {
       const section = sectionOfLine(line);
       const dropped = section !== undefined && this.removedSections.has(section);
 
       if (!dropped && !removed[index]) {
+        const text = kept.get(index) ?? line.text;
+        rewroteLast = false;
         if (line.kind === "entry") {
-          if (this.dirtyKeys.has(line.key)) emitValues(line.key);
-          else out.push(line.text);
+          const slot = slotOf(line.key, line);
+          if (slot?.kind === "write") {
+            out.push(formatEntry(nameOf(line.key), slot.value));
+            rewroteLast = true;
+          } else if (slot) {
+            out.push(line.text);
+          } else if (this.dirtyKeys.has(line.key)) {
+            emitValues(line.key);
+            rewroteLast = true;
+          } else {
+            out.push(line.text);
+          }
         } else if (
           line.kind === "section" &&
           line.inlineKey !== undefined &&
+          !keptSection.has(index) &&
           this.dirtyKeys.has(line.inlineKey)
         ) {
           // Rewrite the header without its inline variable, then re-emit it.
-          out.push(formatSectionHeader(line.section));
-          emitValues(line.inlineKey);
+          const key = line.inlineKey;
+          const slot = slotOf(key, line);
+          if (slot?.kind === "keep") {
+            out.push(text);
+          } else {
+            out.push(headerOnly(text));
+            if (slot?.kind === "write") out.push(formatEntry(nameOf(key), slot.value));
+            else if (!slot && !this.relocated.has(key)) emitValues(key);
+            rewroteLast = true;
+          }
         } else {
-          out.push(line.text);
+          out.push(text);
+          rewroteLast = keptSection.has(index);
         }
       }
 
       for (const [section2, at] of insertionPoint) {
         if (at !== index || this.removedSections.has(section2)) continue;
-        const keys = newKeysBySection.get(section2);
-        if (!keys) continue;
-        for (const key of keys) emitValues(key);
+        const pending = pendingBySection.get(section2);
+        if (!pending) continue;
+        for (const { key, values } of pending) {
+          for (const value of values) out.push(formatEntry(nameOf(key), value));
+        }
+        if (pending.length > 0) rewroteLast = true;
         filledSections.add(section2);
       }
     });
@@ -1311,14 +1655,16 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     const endRemoved = lastIndex >= 0 && removed[lastIndex] === true;
 
     // Sections that do not exist in the file yet.
-    for (const [section, keys] of newKeysBySection) {
+    for (const [section, pending] of pendingBySection) {
       if (filledSections.has(section)) continue;
       out.push(formatSectionHeader(section));
-      for (const key of keys) emitValues(key);
+      for (const { key, values } of pending) {
+        for (const value of values) out.push(formatEntry(nameOf(key), value));
+      }
     }
 
     if (out.length === 0) return "";
-    const ends = this.trailingNewline || (endRemoved && out.length > 0);
+    const ends = this.trailingNewline || ((endRemoved || rewroteLast) && out.length > 0);
     return out.join("\n") + (ends ? "\n" : "");
   }
 }
@@ -2156,19 +2502,41 @@ function requireSectionName(section: string): string {
  * a comment, which keeps the section when its last variable is unset).
  */
 function headerHasComment(text: string): boolean {
-  let i = text.indexOf("[");
-  if (i < 0) return false;
-  let quoted = false;
-  for (i++; i < text.length; i++) {
-    const c = text[i];
-    if (quoted) {
-      if (c === "\\") i++;
-      else if (c === '"') quoted = false;
-    } else if (c === '"') quoted = true;
-    else if (c === "]") break;
-  }
-  const rest = text.slice(i + 1).trimStart();
+  const spans = headerSpans(text);
+  const rest = text.slice(spans[spans.length - 1]?.end ?? 0).trimStart();
   return rest.startsWith("#") || rest.startsWith(";");
+}
+
+/**
+ * Where each section header of a header line starts (its `[`) and ends (after its `]`):
+ * `[a] [b] x = 1` has two.
+ */
+function headerSpans(text: string): { start: number; end: number }[] {
+  const spans: { start: number; end: number }[] = [];
+  let i = 0;
+  for (;;) {
+    while (i < text.length && isConfigSpace(text[i] as string) && text[i] !== "\n") i++;
+    if (text[i] !== "[") return spans;
+    const start = i;
+    let quoted = false;
+    for (i++; i < text.length; i++) {
+      const c = text[i];
+      if (quoted) {
+        if (c === "\\") i++;
+        else if (c === '"') quoted = false;
+      } else if (c === '"') quoted = true;
+      else if (c === "]") break;
+    }
+    if (i >= text.length) return spans;
+    i++;
+    spans.push({ start, end: i });
+  }
+}
+
+/** A header line without the variable written on it (git's copy up to the variable). */
+function headerOnly(text: string): string {
+  const spans = headerSpans(text);
+  return text.slice(0, spans[spans.length - 1]?.end ?? text.length);
 }
 
 function keyOfLine(line: ConfigLine): string | undefined {
@@ -2303,10 +2671,13 @@ function parseConfigText(text: string): ParsedConfig {
     next = group.end + 1;
     let header: Extract<ConfigLine, { kind: "section" }> | undefined;
     let entry: Extract<ConfigItem, { kind: "entry" }> | undefined;
+    const sections: string[] = [];
     for (const item of group.items) {
       if (item.kind === "section") {
         section = item.section;
         header = { kind: "section", text: groupText, section };
+        if (sections.length > 0) header.priorSections = [...sections];
+        sections.push(section);
         entry = undefined;
       } else {
         entry = item;
