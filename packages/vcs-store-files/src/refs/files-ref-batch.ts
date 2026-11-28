@@ -35,6 +35,7 @@ import type {
   SymbolicRefLogOptions,
 } from "@statewalker/vcs-core";
 import {
+  abortedTransactionUpdates,
   compareRefNames,
   deleteReflogLine,
   isRefObjectId,
@@ -1343,6 +1344,12 @@ export function createFilesRefOps(
     requestedAs?: string,
     through: string[] = [],
   ): Promise<BatchResult> => {
+    // git's ref_transaction_abort of an open transaction: the hook hears `aborted` alone
+    if (batchOptions.abortTransaction) {
+      const hook = batchOptions.transactionHook ?? options.transactionHook?.();
+      await hook?.("aborted", abortedTransactionUpdates(commands), { asAsked: true });
+      return { ok: false, rejected: [] };
+    }
     // (an empty initial transaction still writes packed-refs: git's write_remote_refs)
     if (commands.length === 0 && !batchOptions.initial) {
       const hook = batchOptions.emptyTransaction
