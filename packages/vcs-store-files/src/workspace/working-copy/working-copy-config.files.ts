@@ -1575,9 +1575,21 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     // left, as git's `set_multivar` does (a comment or blank line after them stays after the
     // new ones). A section whose every line goes gets its new keys in a section of its own
     // at the end of the file, as git writes a key set after the unset emptied its section.
+    // A line of a section removed by unsetSection is dropped whole (the headers before it on
+    // its line too), so it opens no section and keeps no header
+    const droppedLine = (line: ConfigLine) => {
+      const section = sectionOfLine(line);
+      return section !== undefined && this.removedSections.has(section);
+    };
+    for (const index of [...kept.keys()]) {
+      if (droppedLine(this.lines[index] as ConfigLine)) {
+        kept.delete(index);
+        keptSection.delete(index);
+      }
+    }
     const insertionPoint = new Map<string, number>();
     this.lines.forEach((line, index) => {
-      if (removed[index]) return;
+      if (removed[index] || droppedLine(line)) return;
       if (line.kind === "section")
         insertionPoint.set(keptSection.get(index) ?? line.section, index);
       else if (line.kind === "entry") insertionPoint.set(line.section, index);

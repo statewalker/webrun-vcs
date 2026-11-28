@@ -520,6 +520,35 @@ describe("GitWorkingCopyConfig <-> native git", () => {
       );
     });
 
+    it("writes a new key of a section whose header shared a removed section's line", async () => {
+      await both(
+        "[x]\n\tq = 1\n[a][b]\n\tz = 1\n",
+        (c) => {
+          c.set("a.x", "v");
+          c.set("b.k", "w");
+          c.unsetSection("b");
+        },
+        [
+          ["a.x", "v"],
+          ["b.k", "w"],
+          ["--remove-section", "b"],
+        ],
+      );
+      await both(
+        "[a][b]\n\tz = 1\n",
+        (c) => {
+          c.set("a.x", "v");
+          c.unset("b.z");
+          c.unsetSection("b");
+        },
+        // git's unset already removed `[b]` (nothing left for --remove-section)
+        [
+          ["a.x", "v"],
+          ["--unset-all", "b.z"],
+        ],
+      );
+    });
+
     it("adds a value of a key at its section's end, after its last variable", async () => {
       const remote = '[remote "o"]\n\turl = a\n\tfetch = +refs/heads/*:refs/remotes/o/*\n';
       await both(remote, (c) => c.add("remote.o.url", "b"), [["--add", "remote.o.url", "b"]]);
