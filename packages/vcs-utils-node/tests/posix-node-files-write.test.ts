@@ -3,6 +3,7 @@
  * and large files, and a batch view that keeps what it verified across file moves.
  */
 import {
+  chmodSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -10,12 +11,19 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BeyondSymlinkError } from "@statewalker/vcs-utils/files";
+import {
+  adjustSharedPerm,
+  BeyondSymlinkError,
+  createMountedFilesApi,
+  parseSharedRepository,
+  withSharedPerm,
+} from "@statewalker/vcs-utils/files";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PosixNodeFilesApi } from "../src/files/index.js";
 import { CLEANUP_TIMEOUT, removeTempDir } from "./temp-dir-support.js";
@@ -159,5 +167,137 @@ describe("PosixNodeFilesApi batch view with maxAgeMs (review of P4.36)", () => {
     await expect(view.write("/objects/ab/three", [enc.encode("3")])).rejects.toThrow(
       BeyondSymlinkError,
     );
+  });
+});
+
+/** Whether this process can give a regular file setuid, setgid and sticky bits (root can). */
+function highBitsStick(dir: string): boolean {
+  const probe = join(dir, "probe");
+  writeFileSync(probe, "");
+  chmodSync(probe, 0o7600);
+  const ok = (statSync(probe).mode & 0o7777) === 0o7600;
+  unlinkSync(probe);
+  return ok;
+}
+
+describe("PosixNodeFilesApi setuid, setgid and sticky bits (statewalker/webrun-vcs#273)", () => {
+  let root: string;
+  let files: PosixNodeFilesApi;
+  let sticks = false;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "posix-high-bits-"));
+    files = new PosixNodeFilesApi({ rootDir: root });
+    sticks = highBitsStick(root);
+  });
+  afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
+  const modeOf = (name: string) => statSync(join(root, name)).mode & 0o7777;
+
+  it("write over a file keeps its setuid, setgid and sticky bits (small and large content)", async (ctx) => {
+    if (!sticks) ctx.skip();
+    const large = new Uint8Array(1 << 20).fill(0x61);
+    for (const [name, mode] of [
+      ["sgid", 0o2640],
+      ["suid", 0o4600],
+      ["sticky", 0o1600],
+    ] as const) {
+      writeFileSync(join(root, name), "old");
+      chmodSync(join(root, name), mode);
+      await files.write(`/${name}`, [new TextEncoder().encode("new")]);
+      expect(modeOf(name), name).toBe(mode);
+      expect(readFileSync(join(root, name), "utf8")).toBe("new");
+      await files.write(`/${name}`, [large]);
+      expect(modeOf(name), `${name} (large)`).toBe(mode);
+      expect(statSync(join(root, name)).size).toBe(large.length);
+    }
+  });
+
+  it("a new file and a replaced link get no high bits", async (ctx) => {
+    if (!sticks) ctx.skip();
+    writeFileSync(join(root, "t"), "target");
+    chmodSync(join(root, "t"), 0o2640);
+    symlinkSync("t", join(root, "l"));
+    await files.write("/l", [new TextEncoder().encode("x")]);
+    expect(lstatSync(join(root, "l")).isFile()).toBe(true);
+    expect(modeOf("l") & 0o7000).toBe(0);
+    expect(modeOf("t")).toBe(0o2640);
+    await files.write("/n", [new TextEncoder().encode("x")]);
+    expect(modeOf("n") & 0o7000).toBe(0);
+  });
+
+  it("chmod of a regular file never raises setuid, setgid or sticky bits", async () => {
+    for (const mode of [0o4755, 0o2755, 0o1755, 0o7755]) {
+      writeFileSync(join(root, "f"), "");
+      chmodSync(join(root, "f"), 0o644);
+      await files.chmod("/f", mode);
+      expect(modeOf("f"), mode.toString(8)).toBe(0o755);
+    }
+  });
+
+  it("chmod of a regular file drops high bits it already had (only highBitsFrom keeps them)", async (ctx) => {
+    if (!sticks) ctx.skip();
+    writeFileSync(join(root, "f"), "");
+    chmodSync(join(root, "f"), 0o2640);
+    await files.chmod("/f", 0o2600);
+    expect(modeOf("f")).toBe(0o600);
+  });
+
+  it("chmod with highBitsFrom keeps only the high bits that file carries", async (ctx) => {
+    if (!sticks) ctx.skip();
+    writeFileSync(join(root, "config"), "");
+    chmodSync(join(root, "config"), 0o2640);
+    writeFileSync(join(root, "config.lock"), "");
+    await files.chmod("/config.lock", 0o2640, { highBitsFrom: "/config" });
+    expect(modeOf("config.lock")).toBe(0o2640);
+    // bits the reference lacks are never raised
+    await files.chmod("/config.lock", 0o6640, { highBitsFrom: "/config" });
+    expect(modeOf("config.lock")).toBe(0o2640);
+    // a reference that is a link, a directory or missing lends nothing
+    symlinkSync("config", join(root, "link"));
+    mkdirSync(join(root, "dir"));
+    chmodSync(join(root, "dir"), 0o2755);
+    for (const ref of ["/link", "/dir", "/missing"]) {
+      await files.chmod("/config.lock", 0o2640, { highBitsFrom: ref });
+      expect(modeOf("config.lock"), ref).toBe(0o640);
+    }
+  });
+
+  it("shared-repository adjustments and rewrites keep the high bits a file has", async (ctx) => {
+    if (!sticks) ctx.skip();
+    const group = parseSharedRepository("group");
+    writeFileSync(join(root, "config"), "");
+    chmodSync(join(root, "config"), 0o2600);
+    await adjustSharedPerm(files, "/config", group);
+    expect(modeOf("config")).toBe(0o2660);
+    const shared = withSharedPerm(files, () => group);
+    await shared.write("/config", [new TextEncoder().encode("x")]);
+    expect(modeOf("config")).toBe(0o2660);
+    writeFileSync(join(root, "config.lock"), "");
+    await (shared as PosixNodeFilesApi).chmod("/config.lock", 0o2600, { highBitsFrom: "/config" });
+    expect(modeOf("config.lock")).toBe(0o2660);
+  });
+
+  it("a mounted FilesApi passes highBitsFrom on within one mount only", async (ctx) => {
+    if (!sticks) ctx.skip();
+    mkdirSync(join(root, "m"));
+    const mounted = createMountedFilesApi(files, {
+      "/mnt": new PosixNodeFilesApi({ rootDir: join(root, "m") }),
+    });
+    for (const dir of [root, join(root, "m")]) {
+      writeFileSync(join(dir, "ref"), "");
+      chmodSync(join(dir, "ref"), 0o2640);
+      writeFileSync(join(dir, "lock"), "");
+    }
+    await mounted.chmod?.("/mnt/lock", 0o2640, { highBitsFrom: "/mnt/ref" });
+    expect(modeOf("m/lock")).toBe(0o2640);
+    await mounted.chmod?.("/mnt/lock", 0o2640, { highBitsFrom: "/ref" });
+    expect(modeOf("m/lock")).toBe(0o640);
+    await mounted.chmod?.("/lock", 0o2640, { highBitsFrom: "/../ref" });
+    expect(modeOf("lock")).toBe(0o640);
+  });
+
+  it("a directory still takes setgid (shared repositories) but never setuid or sticky", async () => {
+    mkdirSync(join(root, "d"));
+    await files.chmod("/d", 0o7775);
+    expect(modeOf("d")).toBe(0o2775);
   });
 });

@@ -14,7 +14,7 @@
  * @module
  */
 
-import type { FilesApi, LinkStats } from "./files-api.js";
+import type { ChmodOptions, FilesApi, LinkStats } from "./files-api.js";
 import { dirname, normalizePath } from "./path-utils.js";
 
 /** `core.sharedRepository=umask` (or false): the umask decides. */
@@ -112,7 +112,7 @@ export function sharedPermOf(kind: LinkStats["kind"], mode: number, shared: numb
 
 type ModeFilesApi = FilesApi & {
   lstat?(path: string): Promise<LinkStats | undefined>;
-  chmod?(path: string, mode: number): Promise<void>;
+  chmod?(path: string, mode: number, options?: ChmodOptions): Promise<void>;
   withLstatCache?(options?: { maxAgeMs?: number }): FilesApi;
 };
 
@@ -135,7 +135,8 @@ export async function adjustSharedPerm(
   if (stats?.mode === undefined || stats.kind === "symlink") return;
   const old = stats.mode & 0o7777;
   const next = sharedPermOf(stats.kind, old, shared) & 0o7777;
-  if (next !== old) await posix.chmod(path, next);
+  // calc_shared_perm keeps the setuid, setgid and sticky bits the file has
+  if (next !== old) await posix.chmod(path, next, { highBitsFrom: path });
 }
 
 /**
@@ -253,8 +254,8 @@ export function withSharedPerm(files: FilesApi, shared: () => number, scope = "/
             return moved;
           };
         case "chmod":
-          return async (path: string, bits: number) => {
-            await posix.chmod?.(path, bits);
+          return async (path: string, bits: number, options?: ChmodOptions) => {
+            await posix.chmod?.(path, bits, options);
             const mode = shared();
             if (mode && inScope(path)) await adjustSharedPerm(target, path, mode);
           };
@@ -304,7 +305,7 @@ export function withReadOnlyObjectFiles(files: FilesApi, objectsDir: string): Fi
   const dropWriteBits = async (path: string) => {
     const stats = await posix.lstat?.(path);
     if (stats?.kind === "file" && stats.mode !== undefined && stats.mode & 0o222) {
-      await posix.chmod?.(path, stats.mode & 0o7555);
+      await posix.chmod?.(path, stats.mode & 0o7555, { highBitsFrom: path });
     }
   };
   type Content = Parameters<FilesApi["write"]>[1];

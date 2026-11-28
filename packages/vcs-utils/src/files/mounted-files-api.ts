@@ -13,6 +13,7 @@ import { mergeInPathOrder } from "@statewalker/webrun-files";
 import { BeyondSymlinkError } from "./beyond-symlink-error.js";
 import { appendByRewrite } from "./file-utils.js";
 import type {
+  ChmodOptions,
   FileInfo,
   FileStats,
   FilesApi,
@@ -249,10 +250,18 @@ class RoutedFilesApi implements PosixFilesApi {
     await r.files.symlink(target, r.path).catch((e) => this.outerError(e, r, path));
   }
 
-  async chmod(path: string, mode: number): Promise<void> {
+  async chmod(path: string, mode: number, options?: ChmodOptions): Promise<void> {
     const r = this.at(path);
     if (!r.files.chmod) throw new Error(`chmod is not supported at ${path}`);
-    await r.files.chmod(r.path, mode).catch((e) => this.outerError(e, r, path));
+    // a reference file lends its bits only from the same mount
+    let from: Route | undefined;
+    try {
+      from = options?.highBitsFrom !== undefined ? this.at(options.highBitsFrom) : undefined;
+    } catch {
+      from = undefined;
+    }
+    const forwarded = from && from.files === r.files ? { highBitsFrom: from.path } : undefined;
+    await r.files.chmod(r.path, mode, forwarded).catch((e) => this.outerError(e, r, path));
   }
 
   async openLinkTarget(path: string): Promise<PosixFilesApi | undefined> {

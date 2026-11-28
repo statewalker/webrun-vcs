@@ -40,6 +40,7 @@ import * as nodePath from "node:path";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
   BeyondSymlinkError,
+  type ChmodOptions,
   type DirectoryEntry,
   type LinkStats,
   type ListKindsOptions,
@@ -401,7 +402,8 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     }
     try {
       // a regular file keeps its permission bits (as NodeFilesApi); a link is replaced
-      // by a new file of the default mode
+      // by a new file of the default mode. Setuid, setgid and sticky bits are set once the
+      // content is written (`fillNewFile`): a write by a process without CAP_FSETID clears them.
       if (existing?.isFile()) fchmodSync(fd, existing.mode & 0o777);
     } catch (error) {
       closeSync(fd);
@@ -409,7 +411,7 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
       throw error;
     }
     // closes the file, and removes it on a failure
-    await fillNewFile(fd, tmp, content);
+    await fillNewFile(fd, tmp, content, existing?.isFile() ? existing.mode & 0o7777 : undefined);
     try {
       await replaceFile(tmp, real, {
         platform: this.windows ? "win32" : "linux",
@@ -664,24 +666,38 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
   /**
    * Sets the permission bits (`mode & 0o777`: never setuid or sticky, and setgid only on a
    * directory, as git's shared repositories set it) on a descriptor opened without following
-   * a link, so a link swapped in is never chmod'ed through.
+   * a link, so a link swapped in is never chmod'ed through. A regular file keeps the setuid,
+   * setgid and sticky bits of `mode` that the regular file `options.highBitsFrom` carries (a
+   * lock given the bits of the file it replaces: git's config lock, `st_mode & 07777`).
    */
-  async chmod(path: string, mode: number): Promise<void> {
+  async chmod(path: string, mode: number, options?: ChmodOptions): Promise<void> {
     const real = await this.realNoLinks(path);
+    const highBits =
+      options?.highBitsFrom !== undefined ? await this.highBitsOf(options.highBitsFrom) : 0;
     // synchronous calls: short metadata calls, each round trip through libuv's thread pool
     // costs more than the call (every loose object written gets one: git's 0444)
     try {
-      this.chmodSync(path, real, mode);
+      this.chmodSync(path, real, mode, highBits);
     } catch (error) {
       if (!(error instanceof ChmodThroughLinkError)) this.forgetOn(error);
       throw error;
     }
   }
 
-  private chmodSync(path: string, real: string, mode: number): void {
+  /** The setuid, setgid and sticky bits of the regular file at `path` (0 for anything else). */
+  private async highBitsOf(path: string): Promise<number> {
+    try {
+      const stat = await lstatOrUndefined(await this.realNoLinks(path));
+      return stat?.isFile() ? stat.mode & 0o7000 : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  private chmodSync(path: string, real: string, mode: number, highBits = 0): void {
     const before = lstatSync(fsPath(real));
     if (before.isSymbolicLink()) throw new ChmodThroughLinkError(path);
-    mode &= before.isDirectory() ? 0o2777 : 0o777;
+    mode &= before.isDirectory() ? 0o2777 : 0o777 | highBits;
     let fd: number;
     try {
       fd = openSync(fsPath(real), fsConstants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
@@ -993,9 +1009,16 @@ function openNewSync(real: string): number | undefined {
  * the file. Content is gathered into 64 KiB writes; the last write (all of a small file: a
  * loose object, a lock file) and the close are synchronous calls, as small reads are
  * (`readSmallSync`): round trips through libuv's thread pool cost far more than writing a few
- * kilobytes to the page cache.
+ * kilobytes to the page cache. `mode`, when it carries setuid, setgid or sticky bits, is set
+ * after the content is written and before the close (a write by a process without CAP_FSETID
+ * clears them).
  */
-async function fillNewFile(fd: number, real: string, content: Content): Promise<void> {
+async function fillNewFile(
+  fd: number,
+  real: string,
+  content: Content,
+  mode?: number,
+): Promise<void> {
   let done = false;
   try {
     const batch: Uint8Array[] = [];
@@ -1013,6 +1036,7 @@ async function fillNewFile(fd: number, real: string, content: Content): Promise<
       }
     }
     if (batched > 0) writeAllSync(fd, joined());
+    if (mode !== undefined && (mode & 0o7000) !== 0) fchmodSync(fd, mode);
     done = true;
   } finally {
     closeSync(fd);

@@ -817,7 +817,8 @@ async function lockConfigFile(
       const chmod = (files as PosixFilesApi).chmod;
       try {
         if (!chmod) throw new Error("the storage cannot set file modes");
-        await chmod.call(files, lockPath, read.mode & 0o7777);
+        // setuid, setgid and sticky bits only as the file carries them (`highBitsFrom`)
+        await chmod.call(files, lockPath, read.mode & 0o7777, { highBitsFrom: read.path });
       } catch (error) {
         await rollback();
         return {
