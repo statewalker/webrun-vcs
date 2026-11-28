@@ -910,6 +910,14 @@ export class FileWorktree implements Worktree {
       if (await this.kindOf(fullPath)) throw new Error(`Cannot replace ${path}`);
     }
 
+    // a file with setuid, setgid or sticky bits is removed first: a FilesApi `write` keeps an
+    // existing file's bits, and git's checkout_entry never carries them over (it unlinks and
+    // creates the file afresh), so new content never inherits a setuid bit
+    if (existing === "file" && ((await this.files.lstat?.(fullPath))?.mode ?? 0) & 0o7000) {
+      await this.files.remove(fullPath);
+      if (await this.kindOf(fullPath)) throw new Error(`Cannot replace ${path}`);
+    }
+
     // Create parent directories if needed
     if (options?.createParents !== false) {
       const parentPath = this.getParentPath(fullPath);

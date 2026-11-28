@@ -568,6 +568,29 @@ const scenarios: Scenario[] = [
     ],
   },
   {
+    // statewalker/webrun-vcs#273: git chmods its lock to `st_mode & 07777`, so setuid,
+    // setgid and sticky bits survive every rewrite (a user outside the file's group cannot
+    // set setgid: the bit then stays off in both twins alike)
+    title: "setuid, setgid and sticky bits stay through set, unset and rename-section",
+    files: { global: "[user]\n\tname = A\n", cfg: "[a]\n\tx = 1\n" },
+    watch: ["cfg"],
+    steps: [
+      {
+        args: ["core.k", "v"],
+        before: (dir) => {
+          chmodSync(join(dir, ".git/config"), 0o2640);
+          chmodSync(join(dir, "global"), 0o4600);
+          chmodSync(join(dir, "cfg"), 0o1600);
+        },
+      },
+      ["--global", "user.email", "e"],
+      ["--file=cfg", "a.y", "2"],
+      ["--unset", "core.k"],
+      ["--global", "--rename-section", "user", "person"],
+      ["--file=cfg", "--remove-section", "a"],
+    ],
+  },
+  {
     title: "t1300 symlinked configuration: --global and an absolute --file through a link",
     env: { GIT_CONFIG_GLOBAL: "{dir}/glink" },
     files: { "sub/real": "[a]\n\tx = 1\n", "sub/other": "[b]\n\ty = 1\n" },

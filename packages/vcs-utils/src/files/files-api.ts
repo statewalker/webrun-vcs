@@ -204,6 +204,16 @@ export interface DirectoryEntry {
   kind?: LinkStats["kind"];
 }
 
+/** Options of {@link PosixFilesApi.chmod}. */
+export interface ChmodOptions {
+  /**
+   * A regular file (never followed through a link) whose setuid, setgid and sticky bits the
+   * chmod'ed regular file may keep from `mode`: bits it lacks are dropped, so nothing is raised
+   * beyond what that file already has. Storages that keep no such bits ignore it.
+   */
+  highBitsFrom?: string;
+}
+
 /**
  * A FilesApi over storage that holds symbolic links (and, optionally, POSIX modes): a local
  * filesystem (`createNodeFilesApi`), or any FilesApi wrapped to simulate links
@@ -224,7 +234,8 @@ export interface DirectoryEntry {
  * - Recursive `list` never descends into a link.
  *
  * **Modes.** With `chmod` and a `mode` in `lstat`, permission bits are kept; `write` of an
- * existing regular file keeps its bits, a new file gets the storage's default.
+ * existing regular file keeps its bits (setuid, setgid and sticky included), a new file gets
+ * the storage's default.
  *
  * **Paths.** `pathSeparators` names the characters the storage splits names on: `"/\\"` on
  * Windows, where `a\b` would be `a` / `b` (worktrees then apply git's Windows path rules);
@@ -265,8 +276,13 @@ export interface PosixFilesApi extends FilesApi {
    * where the storage has no such directory (memory, browsers): such paths stay unreadable.
    */
   readonly rootDirectory?: string;
-  /** Set the permission bits (`mode & 0o777`, setgid `0o2000` on a directory where kept) of a file or directory; refuses a link */
-  chmod?(path: string, mode: number): Promise<void>;
+  /**
+   * Set the permission bits (`mode & 0o777`, setgid `0o2000` on a directory where kept) of a
+   * file or directory; refuses a link. A regular file takes setuid, setgid and sticky bits of
+   * `mode` only through `options.highBitsFrom`, and only those that file already carries (a
+   * lock taking the bits of the file it replaces, as git's config lock takes `st_mode & 07777`).
+   */
+  chmod?(path: string, mode: number, options?: ChmodOptions): Promise<void>;
   /**
    * Create a symbolic link at `path` pointing to `target` (bytes, as stored in a tree).
    * Parent directories are created as needed; an existing entry at `path` is an error.

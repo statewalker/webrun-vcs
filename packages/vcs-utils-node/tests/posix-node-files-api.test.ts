@@ -267,14 +267,17 @@ describe("PosixNodeFilesApi writes as NodeFilesApi (replaceFile, writeBatched)",
     expect(new TextDecoder().decode(new Uint8Array(written))).toBe("hello world");
   });
 
-  it("never carries setuid, setgid or sticky bits", async () => {
+  it("never raises setuid, setgid or sticky bits, and a write keeps those a file has (#273)", async () => {
     const files = new PosixNodeFilesApi({ rootDir: root });
     writeFileSync(join(root, "f"), "x");
     await files.chmod("/f", 0o4755);
     expect(statSync(join(root, "f")).mode & 0o7777).toBe(0o755);
-    chmodSync(join(root, "f"), 0o2750);
+    chmodSync(join(root, "f"), 0o2740);
+    // a process that cannot set setgid on the file (outside its group) never had the bit; with
+    // no group execute the kernel keeps it through the write
+    const kept = statSync(join(root, "f")).mode & 0o7777;
     await files.write("/f", [enc.encode("y")]);
-    expect(statSync(join(root, "f")).mode & 0o7777).toBe(0o750);
+    expect(statSync(join(root, "f")).mode & 0o7777).toBe(kept);
   });
 
   it.skipIf(process.platform === "win32")("reads a FIFO as nothing, without blocking", async () => {

@@ -40,6 +40,7 @@ import * as nodePath from "node:path";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
   BeyondSymlinkError,
+  type ChmodOptions,
   type DirectoryEntry,
   type LinkStats,
   type ListKindsOptions,
@@ -400,9 +401,11 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
       fd = openSync(fsPath(tmp), "wx", 0o666);
     }
     try {
-      // a regular file keeps its permission bits (as NodeFilesApi); a link is replaced
-      // by a new file of the default mode
-      if (existing?.isFile()) fchmodSync(fd, existing.mode & 0o777);
+      // a regular file keeps its permission bits, setuid, setgid and sticky included (git's
+      // lock takes `st_mode & 07777`); a link is replaced by a new file of the default mode.
+      // As git chmods its lock before writing, the content written afterwards lets the kernel
+      // clear setuid (and setgid with group execute) for a process without CAP_FSETID.
+      if (existing?.isFile()) fchmodSync(fd, existing.mode & 0o7777);
     } catch (error) {
       closeSync(fd);
       rmQuiet(tmp);
@@ -664,24 +667,38 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
   /**
    * Sets the permission bits (`mode & 0o777`: never setuid or sticky, and setgid only on a
    * directory, as git's shared repositories set it) on a descriptor opened without following
-   * a link, so a link swapped in is never chmod'ed through.
+   * a link, so a link swapped in is never chmod'ed through. A regular file keeps the setuid,
+   * setgid and sticky bits of `mode` that the regular file `options.highBitsFrom` carries (a
+   * lock given the bits of the file it replaces: git's config lock, `st_mode & 07777`).
    */
-  async chmod(path: string, mode: number): Promise<void> {
+  async chmod(path: string, mode: number, options?: ChmodOptions): Promise<void> {
     const real = await this.realNoLinks(path);
+    const highBits =
+      options?.highBitsFrom !== undefined ? await this.highBitsOf(options.highBitsFrom) : 0;
     // synchronous calls: short metadata calls, each round trip through libuv's thread pool
     // costs more than the call (every loose object written gets one: git's 0444)
     try {
-      this.chmodSync(path, real, mode);
+      this.chmodSync(path, real, mode, highBits);
     } catch (error) {
       if (!(error instanceof ChmodThroughLinkError)) this.forgetOn(error);
       throw error;
     }
   }
 
-  private chmodSync(path: string, real: string, mode: number): void {
+  /** The setuid, setgid and sticky bits of the regular file at `path` (0 for anything else). */
+  private async highBitsOf(path: string): Promise<number> {
+    try {
+      const stat = await lstatOrUndefined(await this.realNoLinks(path));
+      return stat?.isFile() ? stat.mode & 0o7000 : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  private chmodSync(path: string, real: string, mode: number, highBits = 0): void {
     const before = lstatSync(fsPath(real));
     if (before.isSymbolicLink()) throw new ChmodThroughLinkError(path);
-    mode &= before.isDirectory() ? 0o2777 : 0o777;
+    mode &= before.isDirectory() ? 0o2777 : 0o777 | highBits;
     let fd: number;
     try {
       fd = openSync(fsPath(real), fsConstants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
