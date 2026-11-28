@@ -333,12 +333,19 @@ export async function applyRefUpdates(
     emptyTransaction?: boolean;
   } = {},
 ): Promise<string | undefined> {
-  // git's fetch --atomic: a ref refused before the transaction (non-fast-forward, a tag it
-  // would clobber) aborts it, nothing is written, no stale ref deleted (the other lines
-  // still read as accepted)
-  if (options.atomic && updates.some((u) => u.status === "rejected")) return undefined;
   const writes = updates.filter((u) => u.status !== "rejected" && u.status !== "up-to-date");
   const deletes = options.atomic ? (options.deletes ?? []) : [];
+  // git's fetch --atomic: a ref refused before the transaction (non-fast-forward, a tag it
+  // would clobber) aborts it, nothing is written, no stale ref deleted (the other lines
+  // still read as accepted); its hook hears `aborted` with what was queued, the stale refs
+  // first, then the accepted updates (statewalker/webrun-vcs#500)
+  if (options.atomic && updates.some((u) => u.status === "rejected")) {
+    await abortFetchTransaction(refStore, [
+      ...deletes.map((name) => ({ name, old: undefined, new: null })),
+      ...writes.map((u) => ({ name: u.localRef, old: u.oldOid ?? null, new: u.newOid })),
+    ]);
+    return undefined;
+  }
   if (writes.length === 0 && deletes.length === 0 && !options.initialEvenEmpty) {
     if (options.emptyTransaction) {
       await refStore.batch?.([], {
@@ -559,4 +566,22 @@ export async function isFastForward(
     }
   }
   return false;
+}
+
+/**
+ * git's ref_transaction_abort of the fetch's open transaction: the reference-transaction hook
+ * hears `aborted` with the updates queued (`commands`; none in a dry run), nothing written.
+ */
+export async function abortFetchTransaction(
+  refStore: RefStore,
+  commands: readonly { name: string; old?: string | null; new: string | null }[] = [],
+): Promise<void> {
+  await refStore.batch?.(
+    commands.map((c) => ({
+      name: c.name,
+      ...(c.old !== undefined ? { old: c.old } : {}),
+      new: c.new,
+    })),
+    { abortTransaction: true },
+  );
 }

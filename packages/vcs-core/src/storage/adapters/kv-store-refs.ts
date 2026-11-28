@@ -18,6 +18,8 @@
 import type { KvStore } from "@statewalker/webrun-storage";
 import type { ObjectId } from "../../common/id/index.js";
 import {
+  abortedBatch,
+  type BatchOptions,
   type BatchResult,
   batchBySingleRef,
   type RefCommand,
@@ -102,7 +104,8 @@ export function kvStoreRefs(kv: KvStore): Refs {
     getReflog(): Promise<ReflogReader | undefined> {
       return Promise.resolve(undefined);
     },
-    batch(commands: RefCommand[]): Promise<BatchResult> {
+    batch(commands: RefCommand[], options?: BatchOptions): Promise<BatchResult> {
+      if (options?.abortTransaction) return abortedBatch(commands, options);
       return batchBySingleRef(refs, commands);
     },
   };
