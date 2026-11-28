@@ -3,6 +3,7 @@
  * and large files, and a batch view that keeps what it verified across file moves.
  */
 import {
+  appendFileSync,
   chmodSync,
   lstatSync,
   mkdirSync,
@@ -180,6 +181,21 @@ function highBitsStick(dir: string): boolean {
   return ok;
 }
 
+/**
+ * The mode a file of `mode` has once this process writes to it: the kernel clears setuid (and
+ * setgid with group execute) on a write by a process without CAP_FSETID, as it does for git
+ * writing its lock after the chmod. Root keeps every bit.
+ */
+function modeAfterWrite(dir: string, mode: number): number {
+  const probe = join(dir, "probe-write");
+  writeFileSync(probe, "");
+  chmodSync(probe, mode);
+  appendFileSync(probe, "x");
+  const after = statSync(probe).mode & 0o7777;
+  unlinkSync(probe);
+  return after;
+}
+
 describe("PosixNodeFilesApi setuid, setgid and sticky bits (statewalker/webrun-vcs#273)", () => {
   let root: string;
   let files: PosixNodeFilesApi;
@@ -192,7 +208,7 @@ describe("PosixNodeFilesApi setuid, setgid and sticky bits (statewalker/webrun-v
   afterEach(() => removeTempDir(root), CLEANUP_TIMEOUT);
   const modeOf = (name: string) => statSync(join(root, name)).mode & 0o7777;
 
-  it("write over a file keeps its setuid, setgid and sticky bits (small and large content)", async (ctx) => {
+  it("write over a file keeps its setuid, setgid and sticky bits as the kernel leaves them (small and large content)", async (ctx) => {
     if (!sticks) ctx.skip();
     const large = new Uint8Array(1 << 20).fill(0x61);
     for (const [name, mode] of [
@@ -202,11 +218,13 @@ describe("PosixNodeFilesApi setuid, setgid and sticky bits (statewalker/webrun-v
     ] as const) {
       writeFileSync(join(root, name), "old");
       chmodSync(join(root, name), mode);
+      const expected = modeAfterWrite(root, mode);
       await files.write(`/${name}`, [new TextEncoder().encode("new")]);
-      expect(modeOf(name), name).toBe(mode);
+      expect(modeOf(name), name).toBe(expected);
       expect(readFileSync(join(root, name), "utf8")).toBe("new");
+      chmodSync(join(root, name), mode);
       await files.write(`/${name}`, [large]);
-      expect(modeOf(name), `${name} (large)`).toBe(mode);
+      expect(modeOf(name), `${name} (large)`).toBe(expected);
       expect(statSync(join(root, name)).size).toBe(large.length);
     }
   });
@@ -270,7 +288,7 @@ describe("PosixNodeFilesApi setuid, setgid and sticky bits (statewalker/webrun-v
     expect(modeOf("config")).toBe(0o2660);
     const shared = withSharedPerm(files, () => group);
     await shared.write("/config", [new TextEncoder().encode("x")]);
-    expect(modeOf("config")).toBe(0o2660);
+    expect(modeOf("config")).toBe(modeAfterWrite(root, 0o2660));
     writeFileSync(join(root, "config.lock"), "");
     await (shared as PosixNodeFilesApi).chmod("/config.lock", 0o2600, { highBitsFrom: "/config" });
     expect(modeOf("config.lock")).toBe(0o2660);

@@ -272,8 +272,9 @@ describe("PosixNodeFilesApi writes as NodeFilesApi (replaceFile, writeBatched)",
     writeFileSync(join(root, "f"), "x");
     await files.chmod("/f", 0o4755);
     expect(statSync(join(root, "f")).mode & 0o7777).toBe(0o755);
-    chmodSync(join(root, "f"), 0o2750);
-    // a process that cannot set setgid on the file (outside its group) never had the bit
+    chmodSync(join(root, "f"), 0o2740);
+    // a process that cannot set setgid on the file (outside its group) never had the bit; with
+    // no group execute the kernel keeps it through the write
     const kept = statSync(join(root, "f")).mode & 0o7777;
     await files.write("/f", [enc.encode("y")]);
     expect(statSync(join(root, "f")).mode & 0o7777).toBe(kept);

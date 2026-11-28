@@ -401,17 +401,18 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
       fd = openSync(fsPath(tmp), "wx", 0o666);
     }
     try {
-      // a regular file keeps its permission bits (as NodeFilesApi); a link is replaced
-      // by a new file of the default mode. Setuid, setgid and sticky bits are set once the
-      // content is written (`fillNewFile`): a write by a process without CAP_FSETID clears them.
-      if (existing?.isFile()) fchmodSync(fd, existing.mode & 0o777);
+      // a regular file keeps its permission bits, setuid, setgid and sticky included (git's
+      // lock takes `st_mode & 07777`); a link is replaced by a new file of the default mode.
+      // As git chmods its lock before writing, the content written afterwards lets the kernel
+      // clear setuid (and setgid with group execute) for a process without CAP_FSETID.
+      if (existing?.isFile()) fchmodSync(fd, existing.mode & 0o7777);
     } catch (error) {
       closeSync(fd);
       rmQuiet(tmp);
       throw error;
     }
     // closes the file, and removes it on a failure
-    await fillNewFile(fd, tmp, content, existing?.isFile() ? existing.mode & 0o7777 : undefined);
+    await fillNewFile(fd, tmp, content);
     try {
       await replaceFile(tmp, real, {
         platform: this.windows ? "win32" : "linux",
@@ -1009,16 +1010,9 @@ function openNewSync(real: string): number | undefined {
  * the file. Content is gathered into 64 KiB writes; the last write (all of a small file: a
  * loose object, a lock file) and the close are synchronous calls, as small reads are
  * (`readSmallSync`): round trips through libuv's thread pool cost far more than writing a few
- * kilobytes to the page cache. `mode`, when it carries setuid, setgid or sticky bits, is set
- * after the content is written and before the close (a write by a process without CAP_FSETID
- * clears them).
+ * kilobytes to the page cache.
  */
-async function fillNewFile(
-  fd: number,
-  real: string,
-  content: Content,
-  mode?: number,
-): Promise<void> {
+async function fillNewFile(fd: number, real: string, content: Content): Promise<void> {
   let done = false;
   try {
     const batch: Uint8Array[] = [];
@@ -1036,7 +1030,6 @@ async function fillNewFile(
       }
     }
     if (batched > 0) writeAllSync(fd, joined());
-    if (mode !== undefined && (mode & 0o7000) !== 0) fchmodSync(fd, mode);
     done = true;
   } finally {
     closeSync(fd);
