@@ -646,6 +646,119 @@ describeGit("upload-pack configuration, as native git", () => {
       expect(blobsOf(theirs.dest)).toEqual([]);
       expect(blobsOf(mine.dest)).toEqual([]);
     });
+
+    // ── a local path (statewalker/webrun-vcs#387): git's local transport starts
+    // `git-upload-pack '<path>'`, which reads the system and global files (connect.c's
+    // local_repo_env clears the command line's config); ours serves it in process
+
+    /** Our client's host environment over `env`, hooks run as the native git on PATH. */
+    const ourClientEnvironment = (env: Record<string, string>) =>
+      createNodeGitHostEnvironment({
+        env,
+        hookRunner: createNodeHookRunner({ env, compatibility: nativeIs256() ? "2.56" : "2.43" }),
+      });
+    /** Our `git clone --no-local <hooked>` with `env`, protocol `version`. */
+    const ourLocalClone = async (env: Record<string, string>, version = "2") => {
+      clearHookResults();
+      const dest = join(root, `dst-${counter++}`);
+      git(root, "init", "-q", "-b", "main", dest);
+      git(dest, "config", "protocol.version", version);
+      const mine = await openOurs(
+        root,
+        ourClientEnvironment(env),
+        undefined,
+        dest.slice(root.length + 1),
+      );
+      let error: unknown;
+      try {
+        await mine.clone().setURI(hooked).setLocal(false).call();
+      } catch (e) {
+        error = e;
+      }
+      return { error, dest, ...hookResults() };
+    };
+
+    for (const version of ["0", "2"]) {
+      it(`t5544-pack-objects-hook.sh: "hook runs via global config" over a local path (v${version})`, async () => {
+        const env = { ...hookEnv, GIT_CONFIG_PARAMETERS: `'protocol.version=${version}'` };
+        const theirs = await clone(hooked, env);
+        const mine = await ourLocalClone(hookEnv, version);
+        expect(theirs.status, theirs.stderr).toBe(0);
+        expect(mine.error).toBeUndefined();
+        expect(theirs.ran).toBe(true);
+        expect(mine.ran).toBe(true);
+        expect(mine.args).toBe(theirs.args);
+        expect(mine.stdin).toBe(theirs.stdin);
+        const objects = (dest: string) =>
+          git(dest, "rev-list", "--objects", "--all").split("\n").sort();
+        expect(objects(mine.dest)).toEqual(objects(theirs.dest));
+      });
+    }
+
+    it(`t5544-pack-objects-hook.sh: "hook runs via global config": a fetch from a local path`, async () => {
+      const fetchInto = (dir: string) => {
+        git(root, "init", "-q", "-b", "main", dir);
+      };
+      clearHookResults();
+      const theirsDir = join(root, `fetch-${counter++}`);
+      fetchInto(theirsDir);
+      const r = await gitAsync(root, theirsDir, ["fetch", "-q", hooked, "main"], hookEnv);
+      expect(r.status, r.stderr).toBe(0);
+      const theirs = hookResults();
+      clearHookResults();
+      const mineDir = join(root, `fetch-${counter++}`);
+      fetchInto(mineDir);
+      const mine = await openOurs(
+        root,
+        ourClientEnvironment(hookEnv),
+        undefined,
+        mineDir.slice(root.length + 1),
+      );
+      await mine.fetch().setRemote(hooked).setRefSpecs("main").call();
+      const ours = hookResults();
+      expect(theirs.ran).toBe(true);
+      expect(ours.ran).toBe(true);
+      expect(ours.args).toBe(theirs.args);
+      expect(ours.stdin).toBe(theirs.stdin);
+      expect(git(mineDir, "rev-parse", "FETCH_HEAD").trim()).toBe(ids.c3);
+    });
+
+    it(`t5544-pack-objects-hook.sh: "hook does not run from repo config" over a local path`, async () => {
+      git(hooked, "config", "uploadpack.packObjectsHook", "./hook");
+      try {
+        const theirs = await clone(hooked, testEnv(root));
+        const mine = await ourLocalClone(testEnv(root));
+        expect(theirs.status, theirs.stderr).toBe(0);
+        expect(mine.error).toBeUndefined();
+        expect(theirs.ran).toBe(false);
+        expect(mine.ran).toBe(false);
+      } finally {
+        git(hooked, "config", "--unset", "uploadpack.packObjectsHook");
+      }
+    });
+
+    it("the client's -c uploadpack.packObjectsHook does not reach a local path's upload-pack (local_repo_env)", async () => {
+      const cmdline = testEnv(root);
+      const count = Number(cmdline.GIT_CONFIG_COUNT ?? "0");
+      const env = {
+        ...cmdline,
+        GIT_CONFIG_COUNT: String(count + 1),
+        [`GIT_CONFIG_KEY_${count}`]: "uploadpack.packObjectsHook",
+        [`GIT_CONFIG_VALUE_${count}`]: "./hook",
+      };
+      const theirs = await clone(hooked, env);
+      const theirsDashC = await clone(hooked, testEnv(root), [
+        "-c",
+        "uploadpack.packObjectsHook=./hook",
+      ]);
+      const mine = await ourLocalClone(env);
+      expect(theirs.status, theirs.stderr).toBe(0);
+      expect(theirsDashC.status, theirsDashC.stderr).toBe(0);
+      expect(mine.error).toBeUndefined();
+      expect(theirs.ran).toBe(false);
+      expect(theirsDashC.ran).toBe(false);
+      expect(mine.ran).toBe(false);
+    });
   });
 
   // ── transfer.advertiseSID (t5705) ──────────────────────────────────────────────────────

@@ -211,6 +211,7 @@ export function createPromisorFetcher(
       const { prepareRemote, protocolVersionOf, withRemoteUploadPack } = await import(
         "./remote-transport.js"
       );
+      const { remoteHookSession } = await import("./local-transport.js");
       const prepared = await prepareRemote(
         workingCopy,
         url,
@@ -233,6 +234,8 @@ export function createPromisorFetcher(
               : settings;
           },
           ...(options.credentialHelper ? { credentialHelper: options.credentialHelper } : {}),
+          // a local promisor's upload-pack runs the protected uploadpack.packObjectsHook
+          localHooks: (remote) => remoteHookSession(workingCopy, remote, { localPush: true }),
         },
         async (connection) => {
           try {
